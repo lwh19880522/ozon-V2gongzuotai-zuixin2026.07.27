@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ozon Product Media Generator"
+  short_description: "Generate verified Ozon product media"
+  default_prompt: "Use $ozon-product-media-generator to claim and process the next product from the local Ozon image queue."

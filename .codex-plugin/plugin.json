@@ -1,0 +1,36 @@
+{
+  "name": "ozon-v2-ops-controller",
+  "version": "0.2.0",
+  "description": "Ozon V2 controller for deduped collection, real supplier SKU review, and verified image queues.",
+  "author": {
+    "name": "Ozon V2"
+  },
+  "license": "UNLICENSED",
+  "keywords": [
+    "ozon",
+    "automation",
+    "mcp",
+    "collection",
+    "image-generation",
+    "supplier-sku"
+  ],
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Ozon V2 Ops Controller",
+    "shortDescription": "Verified Ozon collection and image workbench.",
+    "longDescription": "Controls Ozon V2 collection runs, real supplier SKU selection, locked subject masters, and resumable five-worker image generation queues with one reserved agent slot.",
+    "developerName": "Ozon V2",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Run Ozon V2 doctor.",
+      "Start a deduped seed-gated Ozon V2 run.",
+      "Show Ozon V2 run status.",
+      "Process the next verified Ozon image job."
+    ],
+    "brandColor": "#2563EB"
+  }
+}

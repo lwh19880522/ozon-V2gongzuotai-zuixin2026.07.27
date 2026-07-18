@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ozon Image Generation Controller"
+  short_description: "Coordinate five reusable Ozon image workers"
+  default_prompt: "Use $ozon-image-generation-controller to supervise exactly five reusable image worker tasks for the specified Ozon V2 batch while keeping one agent slot reserved for recovery, diagnosis, or human intervention."

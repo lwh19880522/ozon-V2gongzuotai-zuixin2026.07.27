@@ -1,0 +1,64 @@
+{
+  "manifest_version": 3,
+  "name": "Ozon V2 Browser Bridge",
+  "version": "0.1.51",
+  "description": "Runs Ozon and user-verified 1688 collection tasks in the current browser session and writes evidence back to the local workbench.",
+  "permissions": [
+    "alarms",
+    "scripting",
+    "storage",
+    "tabs",
+    "windows"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:8765/*",
+    "http://localhost:8765/*",
+    "https://www.ozon.ru/*",
+    "https://ozon.ru/*",
+    "https://*.ozone.ru/*",
+    "https://www.1688.com/*",
+    "https://*.1688.com/*",
+    "https://login.taobao.com/*"
+  ],
+  "action": {
+    "default_title": "Run Ozon V2 Bridge"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.1688.com/*",
+        "https://*.1688.com/*",
+        "https://login.taobao.com/*"
+      ],
+      "js": [
+        "supplier_content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://www.ozon.ru/*",
+        "https://ozon.ru/*"
+      ],
+      "js": [
+        "seller_evidence.js",
+        "product_evidence.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "http://127.0.0.1:8765/*",
+        "http://localhost:8765/*"
+      ],
+      "js": [
+        "workbench_content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

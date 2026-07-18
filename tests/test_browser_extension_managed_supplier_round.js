@@ -1,0 +1,225 @@
+"use strict";
+
+const assert = require("assert");
+const fs = require("fs");
+const path = require("path");
+const vm = require("vm");
+
+const listeners = {};
+const stored = { openedTasks: {}, currentRunId: "" };
+const tabs = new Map();
+const windows = new Map();
+const removedTabs = [];
+const removedWindows = [];
+const postedPaths = [];
+let nextTabId = 10;
+let nextWindowId = 70;
+
+function event(name) {
+  return { addListener(listener) { listeners[name] = listener; } };
+}
+
+function urlsFrom(value) {
+  return Array.isArray(value) ? value : [value];
+}
+
+const chrome = {
+  storage: { local: {
+    async get(defaults) { return { ...defaults, ...stored }; },
+    async set(values) { Object.assign(stored, values); },
+  } },
+  tabs: {
+    onCreated: event("tabCreated"),
+    onUpdated: event("tabUpdated"),
+    onRemoved: event("tabRemoved"),
+    async get(tabId) {
+      if (!tabs.has(tabId)) throw new Error("tab not found");
+      return tabs.get(tabId);
+    },
+    async query(queryInfo = {}) {
+      const values = [...tabs.values()];
+      if (!queryInfo.url) return values;
+      return values.filter((tab) => /1688\.com\//i.test(tab.url || ""));
+    },
+    async create({ url, windowId, active = false }) {
+      const tab = { id: nextTabId++, url, windowId, active };
+      tabs.set(tab.id, tab);
+      return tab;
+    },
+    async update(tabId, changes) {
+      const tab = { ...tabs.get(tabId), ...changes };
+      tabs.set(tabId, tab);
+      return tab;
+    },
+    async reload() {},
+    async sendMessage() { return { ok: true }; },
+    async remove(tabId) {
+      removedTabs.push(tabId);
+      tabs.delete(tabId);
+      if (listeners.tabRemoved) listeners.tabRemoved(tabId);
+    },
+  },
+  windows: {
+    onRemoved: event("windowRemoved"),
+    async create({ url, focused, type }) {
+      const windowId = nextWindowId++;
+      // Edge can collapse an array of identical 1688 home URLs into one tab.
+      // The bridge must add the remaining lane tabs explicitly in this window.
+      const tabUrl = urlsFrom(url)[0];
+      const createdTabs = [{ id: nextTabId++, url: tabUrl, windowId, active: true }];
+      tabs.set(createdTabs[0].id, createdTabs[0]);
+      const created = { id: windowId, tabs: createdTabs, focused, type };
+      windows.set(windowId, created);
+      // Edge may finish creating the tabs before Window.tabs is populated.
+      // The bridge must recover them with chrome.tabs.query instead of opening again.
+      return { ...created, tabs: [] };
+    },
+    async remove(windowId) {
+      removedWindows.push(windowId);
+      windows.delete(windowId);
+      for (const [tabId, tab] of [...tabs.entries()]) {
+        if (tab.windowId === windowId) tabs.delete(tabId);
+      }
+      if (listeners.windowRemoved) listeners.windowRemoved(windowId);
+    },
+  },
+  scripting: { async executeScript() {} },
+  alarms: { create() {}, onAlarm: event("alarm") },
+  runtime: {
+    getManifest() { return { version: "0.1.45-test" }; },
+    onInstalled: event("installed"),
+    onStartup: event("startup"),
+    onMessage: event("message"),
+  },
+  action: { onClicked: event("action") },
+};
+
+const context = vm.createContext({
+  chrome,
+  console,
+  fetch: async (url, options = {}) => {
+    if (options.method === "POST") postedPaths.push(String(url));
+    return { ok: true, json: async () => ({ ok: true, code: "ok", data: {} }) };
+  },
+  setInterval() { return 1; },
+  setTimeout,
+  clearTimeout,
+  encodeURIComponent,
+  Date,
+  Promise,
+});
+const backgroundPath = path.join(__dirname, "..", "browser_extension", "ozon_v2_bridge", "background.js");
+vm.runInContext(fs.readFileSync(backgroundPath, "utf8"), context, { filename: backgroundPath });
+
+function supplierTask(itemCount, token = "managed-token") {
+  return {
+    ok: true,
+    code: "browser_task.supplier_selection_ready",
+    message: "ready",
+    data: {
+      run_id: "wb-managed-round",
+      created_at: "2026-07-15T04:00:00+00:00",
+      task_type: "supplier_selection",
+      dispatch_token: token,
+      capture_url: "/api/batches/wb-managed-round/supplier-selection/capture",
+      reject_url: "/api/batches/wb-managed-round/supplier-review/reject",
+      contract: {
+        items: Array.from({ length: itemCount }, (_, index) => ({
+          channel_index: index,
+          seed_id: `seed-${index + 1}`,
+          ozon_product_id: `ozon-${index + 1}`,
+          reference_image_url: `https://ir.ozone.ru/${index + 1}.jpg`,
+        })),
+      },
+    },
+  };
+}
+
+function sendMessage(message, tab) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error(`message response timeout: ${message.type}`)), 1000);
+    listeners.message(message, { tab }, (response) => {
+      clearTimeout(timeout);
+      resolve(response);
+    });
+  });
+}
+
+(async () => {
+  const task = supplierTask(7);
+  const result = await context.performOpenTask(task, "managed_round_test", { allowCreate: true });
+  assert.equal(result.opened, true);
+  assert.equal(windows.size, 1, "one managed window must be created per round");
+  const entry = stored.openedTasks["wb-managed-round:supplier_selection"];
+  assert.equal(entry.channels.length, 5, "one managed round must be capped at five lanes");
+  assert.equal(tabs.size, 5, "all five lane tabs must be created atomically in the managed window");
+  assert.ok(entry.channels.every((channel) => channel.state === "waiting_user"));
+
+  const firstChannel = entry.channels[0];
+  const originalTabId = firstChannel.tabId;
+  const searchResultTab = {
+    id: 200,
+    windowId: entry.windowId,
+    openerTabId: originalTabId,
+    url: "https://air.1688.com/kapp/1688-search/pc-image-search/?tab=imageSearch",
+    active: true,
+  };
+  tabs.set(searchResultTab.id, searchResultTab);
+  assert.equal(typeof context.handleSupplierTabCreated, "function", "managed child-tab adoption must be implemented");
+  await context.handleSupplierTabCreated(searchResultTab);
+  assert.equal(entry.channels[0].tabId, searchResultTab.id, "the image-search result must inherit the lane binding");
+  assert.ok(removedTabs.includes(originalTabId), "the previous lane page must close after the search result is adopted");
+
+  const detailTab = {
+    id: 201,
+    windowId: entry.windowId,
+    openerTabId: searchResultTab.id,
+    url: "https://detail.1688.com/offer/123456789012.html",
+    active: true,
+  };
+  tabs.set(detailTab.id, detailTab);
+  await context.handleSupplierTabCreated(detailTab);
+  assert.equal(entry.channels[0].tabId, detailTab.id, "the product detail must keep the same lane binding");
+  assert.ok(removedTabs.includes(searchResultTab.id), "the search result page must close after the detail page is adopted");
+  assert.equal(tabs.size, 5, "search and detail navigation must not increase the managed lane count");
+  assert.equal(postedPaths.some((value) => value.includes("/runner/stop")), false, "lane adoption must not pause the batch");
+
+  for (const channel of entry.channels.slice(0, 4)) {
+    const response = await sendMessage(
+      { type: "ozon_v2_supplier_channel_terminal", state: "collected" },
+      tabs.get(channel.tabId) || { id: channel.tabId, windowId: entry.windowId },
+    );
+    assert.equal(response.ok, true);
+  }
+  const lastChannel = entry.channels[4];
+  const terminal = await sendMessage(
+    { type: "ozon_v2_supplier_channel_terminal", state: "user_skipped" },
+    tabs.get(lastChannel.tabId),
+  );
+  assert.equal(terminal.ok, true);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(entry.channels.map((channel) => channel.state), [
+    "collected", "collected", "collected", "collected", "user_skipped",
+  ]);
+  assert.equal(removedWindows.length, 1, "the managed window must close after every lane is terminal");
+  assert.equal(entry.closedByUser, false, "extension-completed closure must never look like a user cancellation");
+
+  stored.openedTasks = {};
+  tabs.clear();
+  windows.clear();
+  removedWindows.length = 0;
+  const userCloseTask = supplierTask(1, "user-close-token");
+  await context.performOpenTask(userCloseTask, "managed_round_test", { allowCreate: true });
+  const userEntry = stored.openedTasks["wb-managed-round:supplier_selection"];
+  assert.equal(typeof context.handleManagedSupplierWindowRemoved, "function", "managed window close handling must be implemented");
+  await context.handleManagedSupplierWindowRemoved(userEntry.windowId);
+  assert.equal(userEntry.closedByUser, true, "closing the managed window manually must pause the task");
+  const reopen = await context.performOpenTask(userCloseTask, "managed_round_test", { allowCreate: true });
+  assert.equal(reopen.stopped, true, "the same dispatch token must not reopen after a user closure");
+  assert.ok(postedPaths.some((value) => value.includes("/api/batches/wb-managed-round/runner/stop")));
+
+  process.stdout.write("browser managed supplier round: OK\n");
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});

@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "ozon-v2": {
+      "command": "python",
+      "args": [
+        "mcp/server.py"
+      ]
+    }
+  }
+}
+

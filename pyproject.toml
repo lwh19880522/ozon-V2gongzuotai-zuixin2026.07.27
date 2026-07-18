@@ -1,0 +1,10 @@
+[project]
+name = "ozon-v2-ops-controller"
+version = "0.1.0"
+description = "Ozon V2 automation controller built around dedupe, seed sampling, and collection contracts."
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
