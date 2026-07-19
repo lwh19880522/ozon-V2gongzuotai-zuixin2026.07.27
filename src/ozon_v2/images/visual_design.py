@@ -17,7 +17,16 @@ from PIL import Image, ImageDraw, ImageFont
 CURRENT_VISUAL_CONTRACT_VERSION = "ozon-visual-v1"
 MIN_VISUAL_DIMENSION = 320
 SCENE_FIELDS = ("environment", "lighting", "camera", "shot_scale", "buyer_question")
-SCENE_SLOTS = ("main_01", "main_02", "detail_01", "detail_04", "detail_05", "detail_06")
+SCENE_SLOTS = (
+    "main_01",
+    "main_02",
+    "detail_01",
+    "detail_02",
+    "detail_03",
+    "detail_04",
+    "detail_05",
+    "detail_06",
+)
 FORBIDDEN_PROMOTIONAL_COPY = (
     "лучший",
     "хит",

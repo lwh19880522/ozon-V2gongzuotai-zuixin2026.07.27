@@ -98,6 +98,44 @@ def test_scene_slots_need_three_dimensions_of_difference() -> None:
     )
 
 
+def test_scene_diversity_covers_detail_02_and_detail_03_in_a_full_eight_slot_set() -> None:
+    recipes = {
+        "main_01": "clean_hero",
+        "main_02": "integrated_rail",
+        "detail_01": "context_caption",
+        "detail_02": "feature_callout",
+        "detail_03": "metric_panel",
+        "detail_04": "context_caption",
+        "detail_05": "metric_panel",
+        "detail_06": "integrated_rail",
+    }
+    scene_signatures = {
+        slot_id: _scene(
+            environment=f"{slot_id}_environment",
+            lighting=f"{slot_id}_lighting",
+            camera=f"{slot_id}_camera",
+            shot_scale=f"{slot_id}_shot_scale",
+            buyer_question=f"{slot_id}_buyer_question",
+        )
+        for slot_id in recipes
+    }
+    scene_signatures["detail_03"] = _scene(
+        environment="detail_02_environment",
+        lighting="detail_02_lighting",
+        camera="detail_02_camera",
+        shot_scale="detail_02_shot_scale",
+        buyer_question="detail_03_buyer_question",
+    )
+    specs = tuple(
+        _spec(slot_id, recipe, scene_signature=scene_signatures[slot_id])
+        for slot_id, recipe in recipes.items()
+    )
+
+    assert validate_visual_set(specs) == [
+        "scene slots detail_02 and detail_03 differ in fewer than three dimensions"
+    ]
+
+
 def test_slot_contract_rejects_version_slot_recipe_copy_limit_and_missing_copy() -> None:
     invalid = _spec("unknown", "clean_hero", contract_version="old")
     wrong_recipe = _spec("detail_01", "clean_hero", facts=(_fact(),))
