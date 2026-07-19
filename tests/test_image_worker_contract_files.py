@@ -114,3 +114,8 @@ def test_product_media_skill_uses_visual_contract_v3_storyboard_and_local_copy_r
     assert all(slot in detail_a_prompt for slot in ("detail_01", "detail_02", "detail_03"))
     assert all(slot in detail_b_prompt for slot in ("detail_04", "detail_05", "detail_06"))
     assert "copy failure repairs only the local text layer" in prompt_contract
+    for prompt in (main_prompt, detail_a_prompt, detail_b_prompt, repair_prompt):
+        assert "icons" in prompt
+    assert "invented claims" in main_prompt
+    assert "second structure or verified metric" in detail_a_prompt
+    assert "detail, material" not in detail_a_prompt

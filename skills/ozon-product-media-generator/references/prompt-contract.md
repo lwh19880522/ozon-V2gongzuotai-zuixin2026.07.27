@@ -25,7 +25,7 @@ Append only verified values to a fixed prompt asset:
 1. User-confirmed supplier SKU receipt.
 2. Locked supplier subject evidence images.
 3. Accepted supplier facts and gallery images.
-4. Generated white subject as a derived shape anchor only.
+4. Generated clean white-background subject as a derived shape anchor only.
 5. Ozon references for composition, lighting, and layout only.
 
 Stop when identity, quantity, or composition conflicts. Compare every output against locked evidence for silhouette, count, color, proportions, structure, parts, accessories, print, and set composition. Reject changed or ambiguous products, plain or near-white product-only finished slots, roles without visible proof, or a scene that is not distinct from accepted slots. Russian copy cannot substitute for visual proof.
