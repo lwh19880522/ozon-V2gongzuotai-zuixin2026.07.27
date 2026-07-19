@@ -388,13 +388,17 @@ def _draw_fact(
     headline_font: ImageFont.FreeTypeFont,
     detail_font: ImageFont.FreeTypeFont,
     accent_rgb: tuple[int, int, int],
+    headline_fill: tuple[int, int, int] | None = None,
+    detail_fill: tuple[int, int, int] | None = None,
 ) -> int:
+    headline_fill = headline_fill or accent_rgb
+    detail_fill = detail_fill or (244, 244, 244)
     for line in _wrap(draw, fact.headline.upper(), headline_font, max_width):
-        draw.text((x, y), line, font=headline_font, fill=(*accent_rgb, 255))
+        draw.text((x, y), line, font=headline_font, fill=(*headline_fill, 255))
         y += _line_height(draw, line, headline_font) + 2
     y += 3
     for line in _wrap(draw, fact.detail, detail_font, max_width):
-        draw.text((x, y), line, font=detail_font, fill=(244, 244, 244, 255))
+        draw.text((x, y), line, font=detail_font, fill=(*detail_fill, 255))
         y += _line_height(draw, line, detail_font) + 2
     return y + 12
 
@@ -464,6 +468,7 @@ def _draw_callouts(
         _draw_fact(
             draw, fact, left + margin // 2, top + margin // 2, box_width - margin,
             headline_font, detail_font, spec.accent_rgb,
+            headline_fill=(25, 32, 51), detail_fill=(70, 75, 85),
         )
 
 

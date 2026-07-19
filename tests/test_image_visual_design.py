@@ -380,6 +380,47 @@ def test_render_visual_renders_verified_russian_integrated_rail(tmp_path: Path) 
     assert receipt["mobile_readability_passed"] is True
 
 
+def test_feature_callout_uses_dark_copy_on_its_light_panel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ozon_v2.images import visual_design
+
+    source = tmp_path / "light-source.png"
+    output = tmp_path / "callout.png"
+    Image.new("RGB", (900, 1200), (250, 250, 250)).save(source)
+    captured_fills: list[tuple[object, object]] = []
+
+    def capture_fact(
+        draw: object,
+        fact: object,
+        x: int,
+        y: int,
+        max_width: int,
+        headline_font: object,
+        detail_font: object,
+        accent_rgb: object,
+        headline_fill: object = None,
+        detail_fill: object = None,
+    ) -> int:
+        captured_fills.append((headline_fill, detail_fill))
+        return y
+
+    monkeypatch.setattr(visual_design, "_draw_fact", capture_fact)
+
+    render_visual(
+        source,
+        output,
+        _render_spec(
+            slot_id="detail_02",
+            recipe="feature_callout",
+            callout_points=((0.2, 0.5),),
+        ),
+        {LOCKED_HASH},
+    )
+
+    assert captured_fills == [((25, 32, 51), (70, 75, 85))]
+
+
 @pytest.mark.parametrize("panel_side", ["left", "right"])
 def test_integrated_rail_keeps_copy_content_inside_safe_margin(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, panel_side: str
