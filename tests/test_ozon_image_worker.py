@@ -603,6 +603,146 @@ def test_all_valid_v3_slots_can_be_ready_for_review(tmp_path: Path) -> None:
     assert reviewed["status"] == "manual_review_required"
 
 
+def test_user_review_requeues_only_selected_slots_and_preserves_old_outputs(
+    tmp_path: Path,
+) -> None:
+    queue, claimed = _record_eight_v3_slots(tmp_path)
+    queue.mark_ready_for_review(
+        claimed["job_id"], claimed["worker_id"], claimed["lease_epoch"]
+    )
+    before = {
+        slot["slot_id"]: slot for slot in queue.list_slots(claimed["job_id"])
+    }
+
+    result = queue.request_repairs(
+        claimed["job_id"],
+        [
+            {
+                "slot_id": "main_02",
+                "issue_code": "russian_copy",
+                "note": "俄文太小",
+            },
+            {
+                "slot_id": "detail_03",
+                "issue_code": "selling_point",
+                "note": "用途不清楚",
+            },
+        ],
+        now_epoch=500,
+    )
+
+    after = {
+        slot["slot_id"]: slot for slot in queue.list_slots(claimed["job_id"])
+    }
+    assert result["job"]["status"] == "pending"
+    assert result["job"]["worker_id"] is None
+    assert result["job"]["lease_expires"] is None
+    assert result["job"]["heartbeat_at"] is None
+    assert {
+        slot_id
+        for slot_id, slot in after.items()
+        if slot["status"] == "repair_pending"
+    } == {"main_02", "detail_03"}
+    assert after["main_02"]["accepted_path"] == before["main_02"]["accepted_path"]
+    assert after["main_02"]["receipt_json"] == before["main_02"]["receipt_json"]
+    assert after["main_02"]["review_issue_code"] == "russian_copy"
+    assert after["main_02"]["review_note"] == "俄文太小"
+    assert after["main_02"]["review_requested_at"] == 500
+    assert after["detail_03"]["review_issue_code"] == "selling_point"
+    assert after["detail_03"]["review_note"] == "用途不清楚"
+    for slot_id in set(before) - {"main_02", "detail_03"}:
+        assert after[slot_id] == before[slot_id]
+
+
+@pytest.mark.parametrize(
+    ("repairs", "expected_code"),
+    [
+        ([], "image_job.repair_selection_invalid"),
+        (
+            [
+                {"slot_id": "main_01", "issue_code": "composition", "note": ""},
+                {"slot_id": "main_01", "issue_code": "scene_quality", "note": ""},
+            ],
+            "image_job.repair_selection_invalid",
+        ),
+        (
+            [{"slot_id": "main_01", "issue_code": "unknown", "note": ""}],
+            "image_job.repair_feedback_invalid",
+        ),
+        (
+            [{"slot_id": "main_01", "issue_code": "other", "note": "   "}],
+            "image_job.repair_feedback_invalid",
+        ),
+        (
+            [{"slot_id": "main_01", "issue_code": "composition", "note": "x" * 501}],
+            "image_job.repair_feedback_invalid",
+        ),
+        (
+            [{"slot_id": "missing", "issue_code": "composition", "note": ""}],
+            "image_job.repair_slot_invalid",
+        ),
+    ],
+)
+def test_repair_request_validation_is_atomic(
+    tmp_path: Path,
+    repairs: list[dict[str, str]],
+    expected_code: str,
+) -> None:
+    queue, claimed = _record_eight_v3_slots(tmp_path)
+    queue.mark_ready_for_review(
+        claimed["job_id"], claimed["worker_id"], claimed["lease_epoch"]
+    )
+    before = queue.snapshot(claimed["job_id"])
+
+    with pytest.raises(ValueError) as caught:
+        queue.request_repairs(claimed["job_id"], repairs, now_epoch=500)
+
+    assert getattr(caught.value, "code", None) == expected_code
+    assert queue.snapshot(claimed["job_id"]) == before
+
+
+def test_repair_request_rejects_non_reviewable_job_without_side_effects(
+    tmp_path: Path,
+) -> None:
+    queue, claimed = _record_eight_v3_slots(tmp_path)
+    before = queue.snapshot(claimed["job_id"])
+
+    with pytest.raises(ValueError) as caught:
+        queue.request_repairs(
+            claimed["job_id"],
+            [{"slot_id": "main_01", "issue_code": "composition", "note": ""}],
+            now_epoch=500,
+        )
+
+    assert getattr(caught.value, "code", None) == "image_job.repair_not_reviewable"
+    assert queue.snapshot(claimed["job_id"]) == before
+
+
+def test_repair_request_rejects_exhausted_slot_without_side_effects(
+    tmp_path: Path,
+) -> None:
+    queue, claimed = _record_eight_v3_slots(tmp_path)
+    queue.mark_ready_for_review(
+        claimed["job_id"], claimed["worker_id"], claimed["lease_epoch"]
+    )
+    with queue._connect() as connection:
+        connection.execute(
+            "UPDATE image_slots SET repair_count = 2 WHERE job_id = ? AND slot_id = ?",
+            (claimed["job_id"], "detail_01"),
+        )
+    before = queue.snapshot(claimed["job_id"])
+
+    with pytest.raises(ValueError) as caught:
+        queue.request_repairs(
+            claimed["job_id"],
+            [{"slot_id": "detail_01", "issue_code": "scene_quality", "note": ""}],
+            now_epoch=500,
+        )
+
+    assert getattr(caught.value, "code", None) == "image_job.repair_limit_reached"
+    assert queue.snapshot(claimed["job_id"]) == before
+
+
 def test_receipt_payload_parser_and_acceptance_reject_non_mapping_validation_and_prompt_shape(
     tmp_path: Path,
 ) -> None:

@@ -15,6 +15,17 @@ from ozon_v2.images.worker import CURRENT_PROMPT_VERSION, LEGACY_PROMPT_VERSION,
 REGULAR_IMAGE_WORKER_IDS = tuple(
     f"ozon-image-worker-{index:02d}" for index in range(1, 6)
 )
+REPAIR_ISSUE_CODES = frozenset(
+    {
+        "product_truth",
+        "scene_quality",
+        "composition",
+        "selling_point",
+        "russian_copy",
+        "other",
+    }
+)
+MAX_REVIEW_NOTE_LENGTH = 500
 
 SLOT_DEFINITIONS = (
     ("main_01", "main", "main_1x2", 1),
@@ -26,6 +37,12 @@ SLOT_DEFINITIONS = (
     ("detail_05", "detail", "detail_b_1x3", 2),
     ("detail_06", "detail", "detail_b_1x3", 3),
 )
+
+
+class ImageRepairRequestError(ValueError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class ImageGenerationQueue:
@@ -95,6 +112,7 @@ class ImageGenerationQueue:
             )
             self._ensure_lease_epoch_column(connection)
             self._ensure_repair_count_column(connection)
+            self._ensure_review_feedback_columns(connection)
 
     @staticmethod
     def _ensure_lease_epoch_column(connection: sqlite3.Connection) -> None:
@@ -117,6 +135,22 @@ class ImageGenerationQueue:
                 "ALTER TABLE image_slots "
                 "ADD COLUMN repair_count INTEGER NOT NULL DEFAULT 0"
             )
+
+    @staticmethod
+    def _ensure_review_feedback_columns(connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(image_slots)")
+        }
+        definitions = {
+            "review_issue_code": "TEXT",
+            "review_note": "TEXT",
+            "review_requested_at": "REAL",
+        }
+        for name, declaration in definitions.items():
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE image_slots ADD COLUMN {name} {declaration}"
+                )
 
     @staticmethod
     def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -225,6 +259,148 @@ class ImageGenerationQueue:
             "job": job,
             "slots": self.list_slots(job_id),
             "attempts": self.list_attempts(job_id),
+        }
+
+    def request_repairs(
+        self,
+        job_id: str,
+        repairs: list[dict[str, Any]],
+        *,
+        now_epoch: float | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(repairs, list) or not repairs:
+            raise ImageRepairRequestError(
+                "image_job.repair_selection_invalid",
+                "At least one image slot must be selected for repair.",
+            )
+
+        normalized: list[dict[str, str]] = []
+        seen_slots: set[str] = set()
+        for repair in repairs:
+            if not isinstance(repair, dict):
+                raise ImageRepairRequestError(
+                    "image_job.repair_selection_invalid",
+                    "Every image repair selection must be an object.",
+                )
+            slot_id = str(repair.get("slot_id") or "").strip()
+            if not slot_id or slot_id in seen_slots:
+                raise ImageRepairRequestError(
+                    "image_job.repair_selection_invalid",
+                    "Image repair slots must be present and unique.",
+                )
+            issue_code = str(repair.get("issue_code") or "").strip()
+            note_value = repair.get("note", "")
+            if not isinstance(note_value, str):
+                raise ImageRepairRequestError(
+                    "image_job.repair_feedback_invalid",
+                    "Image repair notes must be text.",
+                )
+            note = note_value.strip()
+            if issue_code not in REPAIR_ISSUE_CODES:
+                raise ImageRepairRequestError(
+                    "image_job.repair_feedback_invalid",
+                    "Image repair issue_code is not supported.",
+                )
+            if len(note) > MAX_REVIEW_NOTE_LENGTH:
+                raise ImageRepairRequestError(
+                    "image_job.repair_feedback_invalid",
+                    f"Image repair notes must not exceed {MAX_REVIEW_NOTE_LENGTH} characters.",
+                )
+            if issue_code == "other" and not note:
+                raise ImageRepairRequestError(
+                    "image_job.repair_feedback_invalid",
+                    "A note is required when the image repair issue is other.",
+                )
+            seen_slots.add(slot_id)
+            normalized.append(
+                {"slot_id": slot_id, "issue_code": issue_code, "note": note}
+            )
+
+        now = time.time() if now_epoch is None else float(now_epoch)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            job = connection.execute(
+                "SELECT * FROM image_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if (
+                job is None
+                or job["status"] != "manual_review_required"
+                or job["worker_id"] is not None
+                or job["lease_expires"] is not None
+            ):
+                connection.rollback()
+                raise ImageRepairRequestError(
+                    "image_job.repair_not_reviewable",
+                    "Image repairs can only be requested at the manual review gate.",
+                )
+
+            placeholders = ",".join("?" for _ in normalized)
+            slot_ids = [repair["slot_id"] for repair in normalized]
+            rows = connection.execute(
+                f"""
+                SELECT * FROM image_slots
+                WHERE job_id = ? AND slot_id IN ({placeholders})
+                """,
+                (job_id, *slot_ids),
+            ).fetchall()
+            slots_by_id = {str(row["slot_id"]): row for row in rows}
+            if set(slots_by_id) != set(slot_ids) or any(
+                slots_by_id[slot_id]["status"] != "accepted" for slot_id in slot_ids
+            ):
+                connection.rollback()
+                raise ImageRepairRequestError(
+                    "image_job.repair_slot_invalid",
+                    "Every selected image slot must exist and be accepted.",
+                )
+            if any(int(slots_by_id[slot_id]["repair_count"]) >= 2 for slot_id in slot_ids):
+                connection.rollback()
+                raise ImageRepairRequestError(
+                    "image_job.repair_limit_reached",
+                    "A selected image slot has reached the repair limit.",
+                )
+
+            for repair in normalized:
+                connection.execute(
+                    """
+                    UPDATE image_slots
+                    SET status = 'repair_pending', review_issue_code = ?,
+                        review_note = ?, review_requested_at = ?
+                    WHERE job_id = ? AND slot_id = ?
+                    """,
+                    (
+                        repair["issue_code"],
+                        repair["note"],
+                        now,
+                        job_id,
+                        repair["slot_id"],
+                    ),
+                )
+            connection.execute(
+                """
+                UPDATE image_jobs
+                SET status = 'pending', worker_id = NULL, lease_expires = NULL,
+                    heartbeat_at = NULL, updated_at = ?
+                WHERE job_id = ?
+                """,
+                (now, job_id),
+            )
+            updated_job = connection.execute(
+                "SELECT * FROM image_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            updated_slots = connection.execute(
+                f"""
+                SELECT * FROM image_slots
+                WHERE job_id = ? AND slot_id IN ({placeholders})
+                ORDER BY ordinal
+                """,
+                (job_id, *slot_ids),
+            ).fetchall()
+            connection.commit()
+        return {
+            "job": dict(updated_job),
+            "slots": [dict(slot) for slot in updated_slots],
         }
 
     def claim_next(
