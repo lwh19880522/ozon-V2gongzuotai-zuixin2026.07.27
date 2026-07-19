@@ -1,56 +1,41 @@
 ---
 name: ozon-product-media-generator
-description: Use when an Ozon V2 image-queue product has a user-locked real 1688 SKU and one or more subject evidence images and needs a verified white-background subject, main images, supporting images, slot repair, or resumable Codex worker execution.
+description: Use when an Ozon V2 image-queue product has a user-locked 1688 SKU and supplier evidence and needs resumable product-media generation, slot repair, or review handoff.
 ---
 
 # Ozon Product Media Generator
 
 ## Core contract
 
-Process one claimed product from the Ozon V2 SQLite image queue. Preserve the exact user-locked supplier SKU, all locked subject evidence images, and every evidence hash. First generate one reusable clean white-background subject from those images. Then return two main images and six supporting images to eight fixed slots, and stop for user review.
+Process one claimed product from the Ozon V2 SQLite image queue. Preserve the exact user-locked supplier SKU, every locked subject-evidence image, and its SHA-256. New attempts use receipt prompt version `ozon-image-v3`; read `ozon-image-v2` only as a historical receipt compatibility format.
 
-The white-background subject is an intermediate identity anchor. It must never become one of the eight finished slots, and its plain white catalog background must not propagate into the finished main or supporting images. Use receipt prompt version `ozon-image-v2` for every new slot attempt.
+The white-background subject is an intermediate identity anchor. It must never become one of the eight finished slots, and its plain white catalog background must not propagate into a finished image. The first attempt uses exactly four mandatory image-generation calls: one white subject, one 1x2 main grid, and two 1x3 supporting grids.
 
-Use `imagegen` for bitmap generation. Use `scripts/ozon_image_worker.py` for queue ownership, deterministic grid cropping, result receipts, stop, resume, and final review handoff.
+Use `imagegen` only for bitmap scenes. Use `scripts/ozon_image_worker.py` for queue ownership, deterministic crop, `render-visual`, receipts, stop, resume, and review handoff.
 
 ## Worker flow
 
-1. Run only inside one internal subagent spawned by the controller. Claim with exactly one mapped stable queue worker ID: `ozon-image-worker-01`, `ozon-image-worker-02`, `ozon-image-worker-03`, `ozon-image-worker-04`, or `ozon-image-worker-05`. Never use `ozon-image-worker-06`; it is not a regular worker identity, and any sixth child slot exposed by the runtime stays reserved for recovery, diagnosis, or human intervention.
+1. Run only inside one internal subagent spawned by the controller. Claim with exactly one mapped stable queue worker ID: `ozon-image-worker-01`, `ozon-image-worker-02`, `ozon-image-worker-03`, `ozon-image-worker-04`, or `ozon-image-worker-05`. Never use `ozon-image-worker-06`; any sixth child slot stays reserved for recovery, diagnosis, or human intervention.
 2. Claim one whole product. Do not work without the returned lease epoch.
-3. Read the locked `subject_master_json`, selection hash, exact set quantity, exact set composition, all locked subject evidence images, and eight slot rows from the queue snapshot.
-4. Read [prompt-contract.md](references/prompt-contract.md). Load [white-subject-prompt.txt](assets/white-subject-prompt.txt) and the matching slot prompt asset byte-for-byte.
-5. Verify every locked evidence path and SHA-256. Use all locked subject evidence images to generate one reusable clean white-background subject. If the evidence conflicts about identity, exact quantity, or set composition, stop instead of guessing.
-6. Verify the generated white-background subject against the receipt and all evidence images, including exact set quantity and set composition. Record its path and SHA-256 as a derived shape anchor.
-7. Before generation, assign every finished slot a distinct evidence-backed commercial role and visual proof plan. A role name or later caption is not proof; the pixels must visibly demonstrate the role.
-8. Generate one horizontal 1x2 main grid with `imagegen`, using the generated white-background subject as the shape anchor and the locked supplier evidence as final product truth. Ozon images may guide composition only.
-9. Save the raw grid locally, crop it with `crop-grid --layout 1x2`, validate both panels, and record `main_01` and `main_02` separately.
-10. Generate two horizontal 1x3 supporting grids with the same verified subject anchor and evidence set. Crop each with `crop-grid --layout 1x3`, then record `detail_01` through `detail_06`.
-11. Add only verified Russian copy after crop. Do not ask the image model to render text. Copy never substitutes for visual proof.
-12. Reject any finished slot that is a plain or near-white product-only catalog view, merely changes the camera angle, reuses the anchor background, or fails its assigned commercial role. Compare it with all already accepted slots for material scene and purpose differences.
-13. Freeze every accepted slot immediately. Repair only a failed slot with a single-image generation; allow at most two repairs per slot.
-14. Renew the heartbeat during long generation. A stale lease must stop immediately without writing.
-15. When all eight slots are accepted, call `ready-for-review`. Never upload or mark final approval from this Skill.
+3. Read the locked `subject_master_json`, selection hash, exact set quantity and composition, all locked subject evidence images, and eight slot rows. Verify every evidence path and SHA-256 before generation.
+4. Read [prompt-contract.md](references/prompt-contract.md). Load [white-subject-prompt.txt](assets/white-subject-prompt.txt), [main-grid-prompt.txt](assets/main-grid-prompt.txt), [detail-grid-a-prompt.txt](assets/detail-grid-a-prompt.txt), [detail-grid-b-prompt.txt](assets/detail-grid-b-prompt.txt), and [repair-slot-prompt.txt](assets/repair-slot-prompt.txt) byte-for-byte.
+5. Generate and verify one reusable clean white-background subject from all locked evidence. If evidence conflicts about identity, exact quantity, or set composition, stop instead of guessing. Record its path and SHA-256 as a derived shape anchor.
+6. Assign the fixed storyboard before generation: `main_01` clean hero; `main_02` integrated information rail; `detail_01` main use; `detail_02` first feature structure; `detail_03` second structure or verified metric; `detail_04` second lifestyle context; `detail_05` scale, fit, or third supported context; `detail_06` remaining buyer question.
+7. Make exactly four mandatory image-generation calls for the first attempt: one white subject, one 1x2 main grid, and two 1x3 supporting grids. The white subject transfers identity and geometry only; locked supplier evidence remains final truth.
+8. Crop the main grid with `crop-grid --layout 1x2` into `main_01` and `main_02`. Crop each supporting grid with `crop-grid --layout 1x3` into `detail_01` through `detail_06`. Freeze an accepted slot immediately.
+9. After crop and any conservative upscale, run local `render-visual` for every slot and merge its returned validation fragment into that slot receipt. Typography, icons, panels, overflow, and safe-area repairs are local: do not call imagegen for typography.
+10. Inspect pixels against locked evidence and accepted slots. `main_01` has zero copy. Add only allowed verified Russian facts locally to the other approved recipes; each fact cites a locked supplier SHA-256, and a number requires `numeric_verified=true`.
+11. A copy failure repairs only the local text layer and never consumes an image-generation attempt. Repair only a scene or product-truth failure with one replacement image for that failed slot; preserve its buyer question and use [repair-slot-prompt.txt](assets/repair-slot-prompt.txt). Allow at most two scene repairs per slot.
+12. Renew the heartbeat during long generation. A stale lease must stop immediately without writing. When all eight slots are accepted, call `ready-for-review`. Never upload or mark final approval from this Skill.
 
 ## Non-negotiable boundaries
 
-- The supplier selection receipt is purchasing and product truth.
-- Every locked subject evidence image must come from the confirmed supplier product and its SHA-256 must not change.
-- The generated clean white-background subject is derived from evidence. It is a reusable shape anchor, not a new source of product facts.
-- The anchor transfers identity and geometry only. It does not transfer its white background, empty studio treatment, or product-only composition to finished slots.
-- One visible subject means one sales unit. A four-piece SKU must show the same four-piece set in every image.
-- Preserve exact count, color, shape, proportions, structure, parts, accessories, print, and set contents.
-- Do not create a new bundle, substitute another SKU, invent accessories, or infer unsupported facts.
-- Do not use an Ozon image as the product-shape anchor.
-- Main images default to no text. Supporting copy must be verified Russian and added locally after crop.
-- Do not overwrite an accepted slot or continue after stop, lease loss, subject-evidence mismatch, generated-subject mismatch, or receipt failure.
-- Do not report progress unless a real queue claim, file, crop, receipt, or accepted slot exists.
-- An accepted receipt must name its `slot_role` and set every `ozon-image-v2` marketing-scene validation flag required by the prompt contract to true. Never assert a flag without inspecting the actual pixels.
+- Supplier selection and locked supplier evidence are purchasing and product truth. The anchor is not a source of new facts.
+- One visible subject means one sales unit. Preserve exact count, set composition, color, silhouette, proportions, structure, parts, accessories, print, and package contents. Never create a new bundle, substitute another SKU, invent accessories, or infer unsupported facts.
+- Every scene slot must visibly fulfill its storyboard role. Any two accepted scene signatures differ in at least three of environment, lighting, camera, shot scale, and buyer question; an angle or background-color change alone is invalid.
+- The model must not render text, numbers, logos, badges, watermarks, prices, discounts, panel labels, or collage borders. Local rendering alone may add permitted Russian typography and layout recipes.
+- Reject every finished slot that is a plain or near-white product-only catalog view, copies the anchor background, lacks visible proof, or duplicates an accepted scene. Copy never substitutes for visual proof.
+- An accepted v3 receipt names its `slot_role`, contains `visual_spec`, and sets `visual_design_passed`, `russian_copy_passed`, `safe_area_passed`, and `mobile_readability_passed` to true, along with the marketing-scene flags in the prompt contract. Never assert a flag without inspecting the pixels.
+- Do not overwrite an accepted slot or continue after stop, lease loss, subject-evidence mismatch, generated-subject mismatch, or receipt failure. Do not report progress unless a real claim, file, crop, receipt, or accepted slot exists.
 
-## Fixed assets
-
-- White-background subject: [white-subject-prompt.txt](assets/white-subject-prompt.txt)
-- Main 1x2 grid: [main-grid-prompt.txt](assets/main-grid-prompt.txt)
-- Supporting 1x3 grid: [detail-grid-prompt.txt](assets/detail-grid-prompt.txt)
-- Single-slot repair: [repair-slot-prompt.txt](assets/repair-slot-prompt.txt)
-
-Append only the task identity and verified facts allowed by the prompt contract. Do not rewrite the fixed bodies.
+Append only task identity and verified values allowed by the prompt contract. Do not rewrite fixed prompt bodies.

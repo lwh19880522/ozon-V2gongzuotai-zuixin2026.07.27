@@ -1,47 +1,33 @@
 # Prompt Contract
 
-Prompt and receipt contract version: `ozon-image-v2`.
+## Visual contract v3
+
+New scenes and receipts use `ozon-image-v3` with `ozon-visual-v1`; `ozon-image-v2` is read-only historical receipt compatibility. A first attempt makes exactly four image-generation calls: one white identity anchor, one 1x2 main grid, and two 1x3 supporting grids. The anchor is identity and geometry only and must never be an accepted finished slot.
+
+The fixed slots are `main_01` clean_hero with zero copy; `main_02` integrated_rail with at most two verified Russian fact blocks; and supporting slots using only their allowed `ozon-visual-v1` recipes. Every fact cites a locked supplier SHA-256. Any numeric fact requires `numeric_verified=true`. The image model renders no text, numbers, icons, logos, badges, prices, or discounts.
+
+After crop and any conservative upscale, run local `render-visual` and merge its validation fragment into the slot receipt. A copy failure repairs only the local text layer and never consumes an image-generation attempt. Scene or product-truth failure alone may use a single-slot image repair.
+
+Any two accepted scene slots differ in at least three of environment, lighting, camera, shot scale, and buyer question. An accepted v3 receipt includes its complete `visual_spec`, `visual_contract_version=ozon-visual-v1`, and these four true pass flags: `visual_design_passed`, `russian_copy_passed`, `safe_area_passed`, and `mobile_readability_passed`.
 
 ## Allowed dynamic inputs
 
-Append only these verified values to a fixed prompt asset:
+Append only verified values to a fixed prompt asset:
 
-- Run ID, product ID, supplier offer ID, and supplier SKU ID.
+- Run ID, product ID, supplier offer ID, supplier SKU ID, and slot ID.
 - Supplier selection SHA-256 and every locked subject-evidence SHA-256.
-- Exact selected options, set quantity, composition, color, dimensions, material, parts, and accessories present in accepted evidence.
-- Absolute paths for all locked supplier subject evidence images.
-- Generated clean white-background subject path and SHA-256 after evidence verification.
-- Approved Ozon style-reference paths.
-- One slot role and its verified selling-point facts.
-- A request to reserve a clean copy zone for supporting images.
+- Exact selected options, set quantity, composition, color, dimensions, material, parts, accessories, print, and package contents supported by locked evidence.
+- Absolute paths for locked supplier evidence and the derived white-subject anchor path and SHA-256.
+- One fixed storyboard buyer question, its allowed layout recipe, and verified Russian facts with evidence hashes.
 
-## Truth priority
+## Truth priority and acceptance
 
 1. User-confirmed supplier SKU receipt.
 2. Locked supplier subject evidence images.
-3. Accepted supplier facts and supplier gallery images.
-4. Generated clean white-background subject as a derived shape anchor only.
-5. Ozon evidence for composition, lighting, and layout only.
+3. Accepted supplier facts and gallery images.
+4. Generated white subject as a derived shape anchor only.
+5. Ozon references for composition, lighting, and layout only.
 
-When sources conflict, stop the product. Never blend conflicting facts.
+Stop when identity, quantity, or composition conflicts. Compare every output against locked evidence for silhouette, count, color, proportions, structure, parts, accessories, print, and set composition. Reject changed or ambiguous products, plain or near-white product-only finished slots, roles without visible proof, or a scene that is not distinct from accepted slots. Russian copy cannot substitute for visual proof.
 
-## Russian copy
-
-The model must not render copy. After crop, use one short Russian headline and up to two short Russian facts drawn only from accepted evidence. Main slots default to no copy. Unsupported dimensions, performance, durability, material, count, or accessories are forbidden.
-
-## Acceptance
-
-Compare every output first with the Locked supplier subject evidence images, then with the Generated clean white-background subject. Verify silhouette, exact count, color, proportions, structure, visible parts, accessories, and set composition. Reject any changed or ambiguous subject. A visually attractive image cannot override product truth.
-
-The generated white-background subject is an intermediate identity anchor only. Reject a finished slot that copies its plain or near-white product-only catalog treatment, shows only another angle, or does not visibly fulfill its assigned commercial role. Russian copy cannot substitute for visual proof.
-
-Every accepted receipt must contain a non-empty `slot_role` and these boolean fields set to true after actual pixel inspection:
-
-- `product_truth`
-- `slot_role_satisfied`
-- `role_visually_demonstrated`
-- `not_plain_or_near_white_product_only`
-- `distinct_from_accepted_slots`
-- `copy_not_used_as_visual_evidence`
-
-The queue also applies a deterministic pixel guard to reject the washed-out high-luminance, low-color, near-white anchor treatment even when a worker incorrectly self-reports a pass. `ready-for-review` re-verifies every frozen file hash and requires eight distinct roles before handoff. A headline, role label, or `accepted=true` alone is never sufficient.
+Every accepted receipt has non-empty `slot_role` and true `product_truth`, `slot_role_satisfied`, `role_visually_demonstrated`, `not_plain_or_near_white_product_only`, `distinct_from_accepted_slots`, and `copy_not_used_as_visual_evidence`. The deterministic pixel guard and `ready-for-review` recheck output hashes and the full set before handoff.

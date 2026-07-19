@@ -51,18 +51,24 @@ def test_product_media_contract_keeps_white_anchor_out_of_finished_slots() -> No
     main_prompt = (skill_root / "assets" / "main-grid-prompt.txt").read_text(
         encoding="utf-8"
     )
-    detail_prompt = (skill_root / "assets" / "detail-grid-prompt.txt").read_text(
+    detail_a_prompt = (skill_root / "assets" / "detail-grid-a-prompt.txt").read_text(
+        encoding="utf-8"
+    )
+    detail_b_prompt = (skill_root / "assets" / "detail-grid-b-prompt.txt").read_text(
         encoding="utf-8"
     )
     repair_prompt = (skill_root / "assets" / "repair-slot-prompt.txt").read_text(
         encoding="utf-8"
     )
-    combined = "\n".join((skill, prompt_contract, main_prompt, detail_prompt, repair_prompt))
+    combined = "\n".join(
+        (skill, prompt_contract, main_prompt, detail_a_prompt, detail_b_prompt, repair_prompt)
+    )
 
     assert "intermediate identity anchor" in skill
     assert "must never become one of the eight finished slots" in skill
     assert "plain or near-white product-only" in main_prompt
-    assert "plain or near-white product-only" in detail_prompt
+    assert "plain or near-white product-only" in detail_a_prompt
+    assert "plain or near-white product-only" in detail_b_prompt
     assert "plain or near-white product-only" in repair_prompt
     assert "Russian copy cannot substitute for visual proof" in prompt_contract
     assert "slot_role_satisfied" in prompt_contract
@@ -70,4 +76,41 @@ def test_product_media_contract_keeps_white_anchor_out_of_finished_slots() -> No
     assert "not_plain_or_near_white_product_only" in prompt_contract
     assert "distinct_from_accepted_slots" in prompt_contract
     assert "copy_not_used_as_visual_evidence" in prompt_contract
-    assert "ozon-image-v2" in combined
+    assert "ozon-image-v3" in combined
+
+
+def test_product_media_skill_uses_visual_contract_v3_storyboard_and_local_copy_repairs() -> None:
+    skill_root = ROOT / "skills" / "ozon-product-media-generator"
+    skill = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+    prompt_contract = (skill_root / "references" / "prompt-contract.md").read_text(
+        encoding="utf-8"
+    )
+    main_prompt = (skill_root / "assets" / "main-grid-prompt.txt").read_text(encoding="utf-8")
+    detail_a_prompt = (skill_root / "assets" / "detail-grid-a-prompt.txt").read_text(
+        encoding="utf-8"
+    )
+    detail_b_prompt = (skill_root / "assets" / "detail-grid-b-prompt.txt").read_text(
+        encoding="utf-8"
+    )
+    repair_prompt = (skill_root / "assets" / "repair-slot-prompt.txt").read_text(
+        encoding="utf-8"
+    )
+    combined = "\n".join(
+        (skill, prompt_contract, main_prompt, detail_a_prompt, detail_b_prompt, repair_prompt)
+    )
+
+    assert "ozon-image-v3" in combined
+    assert "exactly four mandatory image-generation calls" in skill
+    assert "one white subject" in skill
+    assert "one 1x2 main grid" in skill
+    assert "two 1x3 supporting grids" in skill
+    assert "render-visual" in skill
+    assert "do not call imagegen for typography" in skill
+    assert "detail-grid-a-prompt.txt" in skill
+    assert "detail-grid-b-prompt.txt" in skill
+    assert "detail-grid-prompt.txt" not in skill
+    assert "main_01" in main_prompt and "clean hero" in main_prompt
+    assert "main_02" in main_prompt and "integrated information rail" in main_prompt
+    assert all(slot in detail_a_prompt for slot in ("detail_01", "detail_02", "detail_03"))
+    assert all(slot in detail_b_prompt for slot in ("detail_04", "detail_05", "detail_06"))
+    assert "copy failure repairs only the local text layer" in prompt_contract
