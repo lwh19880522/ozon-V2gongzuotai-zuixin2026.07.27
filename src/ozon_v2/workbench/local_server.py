@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
@@ -1790,12 +1790,19 @@ def build_supplier_review_html(run_id: str) -> str:
 def build_image_workspace_html(run_id: str) -> str:
     safe_run_id = json.dumps(run_id)
     worker_ids = "、".join(REGULAR_IMAGE_WORKER_IDS)
+    subagent_mappings = "、".join(
+        f"ozon_image_worker_{index:02d} -> {worker_id}"
+        for index, worker_id in enumerate(REGULAR_IMAGE_WORKER_IDS, start=1)
+    )
     controller_command = (
         f"\u542f\u52a8 Ozon V2 \u751f\u56fe\u603b\u63a7\uff1a\u6279\u6b21 {run_id}\u3002"
         "\u8bfb\u53d6\u5e76\u4e25\u683c\u6267\u884c\u5de5\u4f5c\u533a\u6280\u80fd skills/ozon-image-generation-controller/SKILL.md\uff1b"
-        f"\u53ea\u521b\u5efa\u5e76\u590d\u7528 5 \u4e2a\u56fa\u5b9a\u751f\u56fe\u5de5\u4f5c\u4efb\u52a1\uff0c\u5206\u522b\u4f7f\u7528 {worker_ids}\uff1b"
+        f"只在当前 Codex 总控任务内部使用 spawn_agent 创建并复用最多 5 个动态生图子智能体；每轮新增数量取 5 减现有生图子智能体数、尚未分派商品数、当前空闲内部并发位数三者最小值，映射为 {subagent_mappings}；"
+        "\u4e25\u7981\u4f7f\u7528 create_thread\u3001fork_thread \u6216\u4efb\u4f55\u4f1a\u5728\u4fa7\u8fb9\u680f\u521b\u5efa\u7528\u6237\u53ef\u89c1\u4efb\u52a1\u6216\u7ebf\u7a0b\u7684\u63a5\u53e3\uff1b"
+        "可用并发位少于 5 时继续使用所有成功创建的子智能体，不得停机；不得因没有新增空位而停止现有子智能体；若 spawn_agent 失败则缩小到成功数量；只有当前无可用并发位且尚无现有子智能体时才不领取任务并报告等待，不得退回 create_thread 或用户可见任务；"
+        f"\u6bcf\u4e2a\u5b50\u667a\u80fd\u4f53\u53ea\u80fd\u7528\u6620\u5c04\u7684\u961f\u5217 worker ID \u9886\u53d6\u4efb\u52a1\uff1a{worker_ids}\uff1b\u5b50\u667a\u80fd\u4f53\u7a7a\u95f2\u540e\u4f7f\u7528 followup_task \u7ee7\u7eed\u6d3e\u53d1\uff1b"
         "\u6301\u7eed\u9886\u53d6\u5f53\u524d\u6279\u6b21\u961f\u5217\u4efb\u52a1\uff0c\u76f4\u5230\u961f\u5217\u4e3a\u7a7a\u3001\u8fdb\u5165\u4eba\u5de5\u5ba1\u6838\u6216\u9047\u5230\u963b\u585e\u95e8\u7981\u3002"
-        "\u4e0d\u5f97\u4e0a\u4f20\uff0c\u4e0d\u5f97\u4fee\u6539\u4e1a\u52a1\u4ee3\u7801\uff1b\u4e0d\u5f97\u521b\u5efa\u7b2c 6 \u4e2a\u5e38\u89c4\u751f\u56fe worker\uff0c\u4fdd\u7559 1 \u4e2a\u5b50\u667a\u80fd\u4f53\u4f4d\u7f6e\u7528\u4e8e\u5931\u8d25\u6062\u590d\u3001\u8bca\u65ad\u6216\u4eba\u5de5\u4ecb\u5165\u3002"
+        "不得上传，不得修改业务代码；不得创建第 6 个常规生图 worker；当运行时提供第 6 个子智能体并发位时，保留 1 个子智能体位置用于失败恢复、诊断或人工介入。"
     )
     controller_command_html = html.escape(controller_command)
     return f"""<!doctype html>
@@ -1912,14 +1919,14 @@ def build_image_workspace_html(run_id: str) -> str:
             <div class="gate-row blocked"><span class="gate-icon">!</span><div><strong>Codex 生图队列 (Codex Image Queue)</strong><span id="gateMessage">等待真实 SKU 与主体证据确认。</span></div></div>
           <div class="controller-panel">
             <strong>&#29983;&#22270;&#24635;&#25511;&#21629;&#20196; (Image Controller Command)</strong>
-            <p>\u590d\u5236\u540e\u7c98\u8d34\u5230\u4e00\u4e2a\u65b0\u7684 Codex \u4efb\u52a1\uff1b\u603b\u63a7\u4f1a\u521b\u5efa\u5e76\u6301\u7eed\u590d\u7528 5 \u4e2a\u56fa\u5b9a\u751f\u56fe\u5de5\u4f5c\u4efb\u52a1\uff0c\u5e76\u4fdd\u7559 1 \u4e2a\u5b50\u667a\u80fd\u4f53\u4f4d\u7f6e\u3002</p>
+            <p>复制后粘贴到一个新的 Codex 总控任务；总控只使用 spawn_agent，按当前队列任务量和可用并发位创建并复用最多 5 个动态 Codex 生图子智能体，可用几个就使用几个，不会创建侧边栏任务。</p>
             <div id="imageControllerCommand" class="controller-command">{controller_command_html}</div>
             <div class="controller-actions">
               <button id="copyImageControllerCommand" type="button">&#22797;&#21046;&#24635;&#25511;&#21629;&#20196; (Copy Command)</button>
               <span id="imageControllerCopyStatus" class="copy-status" aria-live="polite"></span>
             </div>
           </div>
-          </div><div class="gate-callout">5 \u4e2a\u56fa\u5b9a Codex \u751f\u56fe worker \u6309\u6574\u4ef6\u5546\u54c1\u9886\u53d6\u4efb\u52a1\uff1b\u53e6\u4fdd\u7559 1 \u4e2a\u5b50\u667a\u80fd\u4f53\u4f4d\u7f6e\u7528\u4e8e\u5931\u8d25\u6062\u590d\u3001\u8bca\u65ad\u6216\u4eba\u5de5\u4ecb\u5165\u3002\u53ea\u56de\u4f20\u901a\u8fc7\u771f\u5b9e\u6027\u6821\u9a8c\u7684 2 \u5f20\u4e3b\u56fe\u4e0e 6 \u5f20\u526f\u56fe\u3002</div><button id="startGeneration" class="primary" disabled>等待 Codex 生图线程 (Waiting for Codex Workers)</button><div id="imageJobControls" class="job-controls"><div id="imageJobStatus" class="job-status">当前商品尚未入队</div><button id="stopImageJob" type="button" disabled>停止生图 (Stop Generation)</button><button id="resumeImageJob" type="button" disabled>继续生图 (Resume Generation)</button></div></aside>
+          </div><div class="gate-callout">最多 5 个动态 Codex 生图子智能体在总控任务内部按整件商品领取任务，可用几个就调动几个；当运行时提供第 6 个子智能体并发位时，保留 1 个子智能体位置用于失败恢复、诊断或人工介入。只回传通过真实性校验的 2 张主图与 6 张副图。</div><button id="startGeneration" class="primary" disabled>等待 Codex 生图子智能体 (Waiting for Codex Subagents)</button><div id="imageJobControls" class="job-controls"><div id="imageJobStatus" class="job-status">当前商品尚未入队</div><button id="stopImageJob" type="button" disabled>停止生图 (Stop Generation)</button><button id="resumeImageJob" type="button" disabled>继续生图 (Resume Generation)</button></div></aside>
         </div>
       </main>
     </div>
@@ -1977,7 +1984,7 @@ def build_image_workspace_html(run_id: str) -> str:
       $("imageJobStatus").textContent = job ? `${{job.job_id}} · ${{status}}` : status;
       $("stopImageJob").disabled = !job || ["stopped","manual_review_required","completed","failed"].includes(status);
       $("resumeImageJob").disabled = !job || status !== "stopped";
-      $("startGeneration").textContent = status === "manual_review_required" ? "等待用户审核 8 张图 (Review Required)" : status === "in_progress" ? "Codex 正在生成 (Generating)" : status === "pending" ? "已进入 Codex 队列 (Queued)" : "等待 Codex 生图线程 (Waiting for Codex Workers)";
+      $("startGeneration").textContent = status === "manual_review_required" ? "等待用户审核 8 张图 (Review Required)" : status === "in_progress" ? "Codex 正在生成 (Generating)" : status === "pending" ? "已进入 Codex 队列 (Queued)" : "等待 Codex 生图子智能体 (Waiting for Codex Subagents)";
     }}
     function renderImageItemAt(index) {{
       const container = $("imageItems");
@@ -1994,7 +2001,7 @@ def build_image_workspace_html(run_id: str) -> str:
       const sources = document.createElement("div"); sources.className = "source-grid";
       sources.append(sourcePanel("Ozon 参考图 (Ozon Reference)", item.ozon_reference_images || [], "没有 Ozon 参考图"));
       sources.append(sourcePanel("供应商原图 (Supplier Source)", item.supplier_source_images || [], "等待用户核实并采集 1688 商品"));
-      sources.append(sourcePanel("生成结果 (Generated)", generatedImageUrls(item), "等待 Codex 生图线程回传真实结果"));
+      sources.append(sourcePanel("生成结果 (Generated)", generatedImageUrls(item), "等待 Codex 生图子智能体回传真实结果"));
       card.append(head, sources); container.append(card); container.scrollTop = 0;
       renderImageJobControls(item);
     }}
@@ -2357,7 +2364,15 @@ def create_handler(
                     )
                     return
                 action = path.rsplit("/", 1)[-1]
-                self._send_json(runtime_controller.schedule(action, self.server))
+                self._send_json(
+                    runtime_controller.schedule(
+                        action,
+                        self.server,
+                        open_edge_after_restart=(
+                            action == "restart" and payload.get("open_edge") is True
+                        ),
+                    )
+                )
                 return
             if path == "/api/batches":
                 bridge = self._bridge_status_payload()

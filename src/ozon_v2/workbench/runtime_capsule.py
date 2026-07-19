@@ -184,7 +184,7 @@ RUNTIME_CAPSULE_BODY = r"""
       <div class="ozon-runtime-actions">
         <button id="ozonRuntimeRefresh" class="ozon-runtime-action" type="button">重新检测 (Refresh)</button>
         <a class="ozon-runtime-action" href="/diagnostics">运行诊断 (Diagnostics)</a>
-        <button id="ozonRuntimeRestart" class="ozon-runtime-action ozon-runtime-action-primary" type="button">重启工具台 (Restart)</button>
+        <button id="ozonRuntimeRestart" class="ozon-runtime-action ozon-runtime-action-primary" type="button">重启并连接 (Reconnect)</button>
         <button id="ozonRuntimeStop" class="ozon-runtime-action ozon-runtime-action-danger" type="button">停止工具台 (Stop)</button>
       </div>
     </section>
@@ -265,8 +265,16 @@ RUNTIME_CAPSULE_BODY = r"""
     setStatus("service", service.code, service.code === "online" ? `正常 · PID ${service.pid} · 端口 ${service.port}` : "离线 (Offline)");
     setStatus("extension", extension.code, extensionDetail(extension));
     setStatus("task", task.code, taskDetail(task));
-    message.dataset.tone = service.code === "online" ? "ok" : "bad";
-    message.textContent = service.code === "online" ? "工具台服务正常 (Workbench Online)" : "工具台连接失败 (Connection Failed)";
+    if (service.code !== "online") {
+      message.dataset.tone = "bad";
+      message.textContent = "工具台连接失败 (Connection Failed)";
+    } else if (extension.code === "ready") {
+      message.dataset.tone = "ok";
+      message.textContent = "工具台已连接 (Workbench Connected)";
+    } else {
+      message.dataset.tone = "warn";
+      message.textContent = "服务在线，扩展离线 (Service Online, Extension Offline)";
+    }
   }
 
   async function fetchStatus() {
@@ -373,33 +381,48 @@ RUNTIME_CAPSULE_BODY = r"""
     const previousPid = lastStatus && lastStatus.service ? lastStatus.service.pid : null;
     restartButton.disabled = true;
     stopButton.disabled = true;
-    restartButton.textContent = "正在重启 (Restarting)";
+    restartButton.textContent = "正在重连 (Reconnecting)";
     message.dataset.tone = "warn";
-    message.textContent = "正在关闭并恢复服务 (Restart in Progress)";
+    message.textContent = "正在重启服务并用 Edge 恢复扩展连接 (Reconnect in Progress)";
     try {
-      const response = await fetch("/api/runtime/restart", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+      const response = await fetch("/api/runtime/restart", { method: "POST", headers: { "Content-Type": "application/json" }, body: '{"open_edge": true}' });
       if (!response.ok) throw new Error("Restart request failed");
       let sawOffline = false;
-      const deadline = Date.now() + 30000;
+      let serviceRecovered = false;
+      const deadline = Date.now() + 20000;
       while (Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 500));
         try {
           const status = await fetchStatus();
-          if ((sawOffline && status.service.code === "online") || (previousPid && status.service.pid !== previousPid)) {
+          const restarted = (sawOffline && status.service.code === "online") || (previousPid && status.service.pid !== previousPid);
+          if (restarted) {
+            serviceRecovered = true;
+          }
+          if (serviceRecovered && status.extension && status.extension.code === "ready") {
             window.location.reload();
             return;
+          }
+          if (serviceRecovered) {
+            render(status);
+            message.dataset.tone = "warn";
+            message.textContent = "服务已重启，正在等待 Edge 扩展心跳 (Waiting for Extension)";
           }
         } catch (_) {
           sawOffline = true;
         }
       }
-      throw new Error("Restart timed out");
+      if (!serviceRecovered) throw new Error("Restart timed out");
+      message.dataset.tone = "bad";
+      message.textContent = "本地服务已重启，但扩展仍离线；请检查新打开的 Edge 工具台页";
+      restartButton.disabled = false;
+      stopButton.disabled = false;
+      restartButton.textContent = "重启并连接 (Reconnect)";
     } catch (error) {
       message.dataset.tone = "bad";
       message.textContent = `${error.message || error} · 请用桌面图标启动`;
       restartButton.disabled = false;
       stopButton.disabled = false;
-      restartButton.textContent = "重启工具台 (Restart)";
+      restartButton.textContent = "重启并连接 (Reconnect)";
     }
   });
 

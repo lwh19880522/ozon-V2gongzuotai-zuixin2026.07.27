@@ -18,7 +18,7 @@
   "interface": {
     "displayName": "Ozon V2 Ops Controller",
     "shortDescription": "Verified Ozon collection and image workbench.",
-    "longDescription": "Controls Ozon V2 collection runs, real supplier SKU selection, locked subject masters, and resumable five-worker image generation queues with one reserved agent slot.",
+    "longDescription": "Controls Ozon V2 collection runs, real supplier SKU selection, locked subject masters, and a resumable dynamic pool of up to five subagents with any sixth child slot reserved.",
     "developerName": "Ozon V2",
     "category": "Productivity",
     "capabilities": [

@@ -672,7 +672,7 @@ class WorkbenchService:
             gate_message = "主体已确认，但本地生图任务尚未完整入列 (Image queue entry is missing)."
         elif not all_reviewable:
             gate_code = "waiting_for_codex_workers"
-            gate_message = "任务已进入本地队列，等待 5 个固定 Codex 生图 worker 处理 (Waiting for Codex workers)."
+            gate_message = "任务已进入本地队列，等待最多 5 个动态 Codex 生图子智能体按可用容量处理 (Waiting for available Codex image subagents)."
         else:
             gate_code = "image_review_required"
             gate_message = "八张图片已回写，等待用户逐张审核 (Eight images are ready for review)."

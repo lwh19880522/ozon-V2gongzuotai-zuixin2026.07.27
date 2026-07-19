@@ -6,12 +6,28 @@
     [Parameter(Mandatory = $true)]
     [string]$RuntimeState,
     [Parameter(Mandatory = $true)]
-    [string]$ProjectRoot
+    [string]$ProjectRoot,
+    [switch]$OpenEdgeAfterRestart
 )
 
 $ErrorActionPreference = 'Stop'
 $ControlScript = Join-Path $ProjectRoot 'scripts\workbench_control.ps1'
 $RestartStatusFile = Join-Path $RuntimeState 'restart-status.json'
+$WorkbenchUrl = "http://127.0.0.1:$Port/"
+
+function Open-WorkbenchInEdge {
+    $edgeCandidates = @(
+        (Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe'),
+        (Join-Path $env:ProgramFiles 'Microsoft\Edge\Application\msedge.exe')
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and (Test-Path -LiteralPath $_) }
+    $edgeCommand = Get-Command 'msedge.exe' -ErrorAction SilentlyContinue
+    $edgePath = if ($null -ne $edgeCommand) { $edgeCommand.Source } elseif ($edgeCandidates.Count -gt 0) { $edgeCandidates[0] } else { $null }
+    if ($null -ne $edgePath) {
+        Start-Process -FilePath $edgePath -ArgumentList @($WorkbenchUrl) | Out-Null
+        return
+    }
+    Start-Process -FilePath "microsoft-edge:$WorkbenchUrl" | Out-Null
+}
 
 function Write-RestartStatus {
     param([string]$Status, [int]$Attempt, [string]$Details)
@@ -73,6 +89,15 @@ for ($attempt = 1; $attempt -le 2; $attempt++) {
     $errorText = if (Test-Path -LiteralPath $attemptError) { (Get-Content -LiteralPath $attemptError -Raw -Encoding UTF8 | Out-String).Trim() } else { '' }
     $details = "$outputText $errorText".Trim()
     if ($exitCode -eq 0) {
+        if ($OpenEdgeAfterRestart) {
+            try {
+                Open-WorkbenchInEdge
+                $details = "$details Edge workbench opened for extension reconnect.".Trim()
+            }
+            catch {
+                $details = "$details Edge open failed: $($_.Exception.Message)".Trim()
+            }
+        }
         Write-RestartStatus -Status 'succeeded' -Attempt $attempt -Details $details
         exit 0
     }

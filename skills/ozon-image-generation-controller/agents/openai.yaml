@@ -1,4 +1,4 @@
 interface:
   display_name: "Ozon Image Generation Controller"
-  short_description: "Coordinate five reusable Ozon image workers"
-  default_prompt: "Use $ozon-image-generation-controller to supervise exactly five reusable image worker tasks for the specified Ozon V2 batch while keeping one agent slot reserved for recovery, diagnosis, or human intervention."
+  short_description: "Coordinate a dynamic Ozon image subagent pool"
+  default_prompt: "Use $ozon-image-generation-controller to supervise up to five reusable image subagents inside the current Codex task. Keep the existing pool and add workers from queued work and available capacity, up to five; continue with fewer than five. Use spawn_agent only. Never use create_thread, fork_thread, or any user-visible task API. Keep any sixth child slot reserved for recovery, diagnosis, or human intervention."

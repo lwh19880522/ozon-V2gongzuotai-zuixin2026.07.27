@@ -15,6 +15,7 @@ from urllib.request import Request, urlopen
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONTROL_SCRIPT = PROJECT_ROOT / "scripts" / "workbench_control.ps1"
 LAUNCHER_SCRIPT = PROJECT_ROOT / "scripts" / "launch_workbench.ps1"
+RESTART_HELPER_SCRIPT = PROJECT_ROOT / "scripts" / "workbench_restart_helper.ps1"
 SHORTCUT_SCRIPT = PROJECT_ROOT / "scripts" / "create_workbench_shortcut.ps1"
 
 
@@ -159,6 +160,7 @@ class WorkbenchControlScriptTests(unittest.TestCase):
     def test_launcher_and_shortcut_are_one_safe_entry(self) -> None:
         launcher = LAUNCHER_SCRIPT.read_text(encoding="utf-8-sig")
         shortcut = SHORTCUT_SCRIPT.read_text(encoding="utf-8-sig")
+        restart_helper = RESTART_HELPER_SCRIPT.read_text(encoding="utf-8-sig")
 
         self.assertIn("workbench_control.ps1", launcher)
         self.assertIn("NoOpen", launcher)
@@ -167,6 +169,9 @@ class WorkbenchControlScriptTests(unittest.TestCase):
         self.assertIn("Ozon V2 工具台.lnk", shortcut)
         self.assertIn("launch_workbench.ps1", shortcut)
         self.assertNotIn("startup", shortcut.lower())
+        self.assertIn("OpenEdgeAfterRestart", restart_helper)
+        self.assertIn("msedge.exe", restart_helper)
+        self.assertIn("http://127.0.0.1:$Port/", restart_helper)
 
     def test_launcher_no_open_starts_healthy_service(self) -> None:
         self.runtime_dir.mkdir(parents=True, exist_ok=True)

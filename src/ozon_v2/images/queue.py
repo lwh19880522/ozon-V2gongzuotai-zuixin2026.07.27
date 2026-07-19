@@ -319,6 +319,12 @@ class ImageGenerationQueue:
     def record_slot_result(self, receipt: SlotResultReceipt) -> dict[str, Any]:
         if not receipt.verify():
             raise ValueError("slot result receipt failed validation")
+        acceptance_errors = receipt.acceptance_contract_errors()
+        if acceptance_errors:
+            raise ValueError(
+                "accepted slot failed marketing-scene validation: "
+                + "; ".join(acceptance_errors)
+            )
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             job = connection.execute(
@@ -431,6 +437,31 @@ class ImageGenerationQueue:
             if int(remaining["count"]) != 0:
                 connection.rollback()
                 raise ValueError("all eight image slots must be accepted before review")
+            accepted_receipts = connection.execute(
+                "SELECT receipt_json FROM image_slots WHERE job_id = ? ORDER BY rowid",
+                (job_id,),
+            ).fetchall()
+            slot_roles: list[str] = []
+            for stored in accepted_receipts:
+                try:
+                    receipt = SlotResultReceipt.from_dict(json.loads(stored["receipt_json"]))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    connection.rollback()
+                    raise ValueError("accepted slot receipt is missing or invalid") from None
+                if not receipt.verify():
+                    connection.rollback()
+                    raise ValueError("accepted slot receipt failed final verification")
+                acceptance_errors = receipt.acceptance_contract_errors()
+                if acceptance_errors:
+                    connection.rollback()
+                    raise ValueError(
+                        "accepted slot failed marketing-scene validation: "
+                        + "; ".join(acceptance_errors)
+                    )
+                slot_roles.append(str(receipt.validation["slot_role"]).strip().casefold())
+            if len(set(slot_roles)) != len(slot_roles):
+                connection.rollback()
+                raise ValueError("all eight accepted slot roles must be distinct")
             connection.execute(
                 """
                 UPDATE image_jobs

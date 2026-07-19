@@ -32,8 +32,14 @@ class FakeRuntimeController:
     def __init__(self) -> None:
         self.actions: list[str] = []
 
-    def schedule(self, action: str, server: ThreadingHTTPServer) -> dict:
-        self.actions.append(action)
+    def schedule(
+        self,
+        action: str,
+        server: ThreadingHTTPServer,
+        *,
+        open_edge_after_restart: bool = False,
+    ) -> dict:
+        self.actions.append((action, open_edge_after_restart))
         return {
             "ok": True,
             "code": f"runtime.{action}_scheduled",
@@ -150,9 +156,10 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
 
         try:
             for action in ("restart", "stop"):
+                request_payload = {"open_edge": True} if action == "restart" else {}
                 request = Request(
                     base_url + f"/api/runtime/{action}",
-                    data=b"{}",
+                    data=json.dumps(request_payload).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
                     method="POST",
                 )
@@ -164,7 +171,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             server.server_close()
             thread.join(timeout=5)
 
-        self.assertEqual(["restart", "stop"], controller.actions)
+        self.assertEqual([("restart", True), ("stop", False)], controller.actions)
 
     def test_runtime_capsule_is_injected_once_on_every_workbench_page(self) -> None:
         run_id = "runtime-capsule-test"
@@ -184,12 +191,15 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
                 self.assertIn("/api/runtime/status", body)
                 self.assertIn("/api/runtime/restart", body)
                 self.assertIn("/api/runtime/stop", body)
+                self.assertIn('"open_edge": true', body)
                 self.assertIn("确认停止 (Confirm Stop)", body)
                 self.assertIn("服务 (Service)", body)
                 self.assertIn("扩展 (Extension)", body)
                 self.assertIn("任务 (Task)", body)
                 self.assertIn("background: rgba(20, 24, 23, .96)", body)
                 self.assertIn("const summaryLabels = {", body)
+                self.assertIn("服务在线，扩展离线", body)
+                self.assertIn("重启并连接 (Reconnect)", body)
 
     def test_batch_api_creates_batch_and_events(self) -> None:
         created = self.post_json("/api/batches", {"target_count": 2})
@@ -1291,9 +1301,18 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         for index in range(1, 6):
             self.assertIn(f"ozon-image-worker-{index:02d}", page)
         self.assertNotIn("ozon-image-worker-06", page)
+        self.assertIn("spawn_agent", page)
+        self.assertIn("create_thread", page)
+        self.assertIn("\u6700\u591a 5 \u4e2a\u52a8\u6001 Codex \u751f\u56fe\u5b50\u667a\u80fd\u4f53", page)
+        self.assertIn("\u6bcf\u8f6e\u65b0\u589e\u6570\u91cf\u53d6", page)
+        self.assertIn("\u4e0d\u5f97\u56e0\u6ca1\u6709\u65b0\u589e\u7a7a\u4f4d\u800c\u505c\u6b62\u73b0\u6709\u5b50\u667a\u80fd\u4f53", page)
+        self.assertIn("\u53ef\u7528\u5e76\u53d1\u4f4d\u5c11\u4e8e 5 \u65f6\u7ee7\u7eed", page)
+        self.assertIn("\u4e0d\u5f97\u9000\u56de create_thread", page)
+        self.assertNotIn("5 \u4e2a\u56fa\u5b9a Codex \u751f\u56fe\u5b50\u667a\u80fd\u4f53", page)
+        self.assertNotIn("5 \u4e2a\u56fa\u5b9a\u751f\u56fe\u5de5\u4f5c\u4efb\u52a1", page)
+        self.assertNotIn("Codex \u751f\u56fe\u7ebf\u7a0b", page)
         self.assertIn("\u4e0d\u5f97\u521b\u5efa\u7b2c 6 \u4e2a\u5e38\u89c4\u751f\u56fe worker", page)
         self.assertIn("\u4fdd\u7559 1 \u4e2a\u5b50\u667a\u80fd\u4f53\u4f4d\u7f6e\u7528\u4e8e\u5931\u8d25\u6062\u590d\u3001\u8bca\u65ad\u6216\u4eba\u5de5\u4ecb\u5165", page)
-        self.assertIn("5 \u4e2a\u56fa\u5b9a Codex \u751f\u56fe worker", page)
         self.assertIn(run_id, page)
         self.assertIn("navigator.clipboard.writeText", page)
         self.assertIn('document.execCommand("copy")', page)

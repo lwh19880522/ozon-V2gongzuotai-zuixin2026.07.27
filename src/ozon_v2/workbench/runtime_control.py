@@ -48,7 +48,13 @@ class WorkbenchRuntimeController:
         )
         self._write_state(current)
 
-    def schedule(self, action: str, server: Any) -> dict[str, Any]:
+    def schedule(
+        self,
+        action: str,
+        server: Any,
+        *,
+        open_edge_after_restart: bool = False,
+    ) -> dict[str, Any]:
         if action not in {"stop", "restart"}:
             raise ValueError(f"Unsupported runtime action: {action}")
         with self._lock:
@@ -76,7 +82,7 @@ class WorkbenchRuntimeController:
         )
         self._write_state(current)
         if action == "restart":
-            self._spawn_restart_helper(pid)
+            self._spawn_restart_helper(pid, open_edge_after_restart=open_edge_after_restart)
 
         threading.Thread(
             target=self._shutdown_after_response,
@@ -92,7 +98,7 @@ class WorkbenchRuntimeController:
             "errors": [],
         }
 
-    def _spawn_restart_helper(self, pid: int) -> None:
+    def _spawn_restart_helper(self, pid: int, *, open_edge_after_restart: bool) -> None:
         helper = self.project_root / "scripts" / "workbench_restart_helper.ps1"
         command = [
             "powershell.exe",
@@ -113,6 +119,8 @@ class WorkbenchRuntimeController:
             "-ProjectRoot",
             str(self.project_root),
         ]
+        if open_edge_after_restart:
+            command.append("-OpenEdgeAfterRestart")
         subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,

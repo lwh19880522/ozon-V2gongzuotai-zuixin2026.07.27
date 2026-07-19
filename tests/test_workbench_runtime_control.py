@@ -61,8 +61,23 @@ class WorkbenchRuntimeControllerTests(unittest.TestCase):
         self.assertIn(str(self.project_root / "scripts" / "workbench_restart_helper.ps1"), command)
         self.assertIn("4321", command)
         self.assertIn("8765", command)
+        self.assertNotIn("-OpenEdgeAfterRestart", command)
         state = json.loads((self.runtime_dir / "workbench.json").read_text(encoding="utf-8"))
         self.assertEqual("restarting", state["status"])
+
+    def test_user_requested_reconnect_passes_explicit_edge_open_switch(self) -> None:
+        controller = WorkbenchRuntimeController(self.project_root, self.runtime_dir, port=8765)
+        controller.mark_running(4321)
+
+        with patch("ozon_v2.workbench.runtime_control.subprocess.Popen") as popen:
+            controller.schedule(
+                "restart",
+                FakeServer(),
+                open_edge_after_restart=True,
+            )
+
+        command = popen.call_args.args[0]
+        self.assertIn("-OpenEdgeAfterRestart", command)
 
     def test_stop_schedules_shutdown_without_spawning_helper(self) -> None:
         controller = WorkbenchRuntimeController(self.project_root, self.runtime_dir, port=8765)
@@ -78,7 +93,7 @@ class WorkbenchRuntimeControllerTests(unittest.TestCase):
         state = json.loads((self.runtime_dir / "workbench.json").read_text(encoding="utf-8"))
         self.assertEqual("stopping", state["status"])
 
-    def test_restart_helper_is_bounded_and_never_opens_browser(self) -> None:
+    def test_restart_helper_is_bounded_and_opens_edge_only_when_explicitly_requested(self) -> None:
         helper_path = Path(__file__).resolve().parents[1] / "scripts" / "workbench_restart_helper.ps1"
 
         helper = helper_path.read_text(encoding="utf-8-sig")
@@ -86,8 +101,11 @@ class WorkbenchRuntimeControllerTests(unittest.TestCase):
         self.assertIn("$attempt -le 2", helper)
         self.assertIn("workbench_control.ps1", helper)
         self.assertIn("restart-status.json", helper)
-        self.assertNotIn("msedge", helper.lower())
-        self.assertNotIn("start-process http", helper.lower())
+        self.assertIn("[switch]$OpenEdgeAfterRestart", helper)
+        self.assertIn("if ($OpenEdgeAfterRestart)", helper)
+        self.assertIn("msedge.exe", helper.lower())
+        self.assertNotIn("--user-data-dir", helper.lower())
+        self.assertNotIn("--load-extension", helper.lower())
 
     def test_unknown_action_is_rejected(self) -> None:
         controller = WorkbenchRuntimeController(self.project_root, self.runtime_dir, port=8765)

@@ -33,8 +33,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\workbench_cont
 
 ## 生图并发契约 (Image worker contract)
 
-- 固定常规 worker：`ozon-image-worker-01` 至 `ozon-image-worker-05`。
-- 第 6 个子智能体位置只用于失败恢复、诊断或人工介入，不得被常规生图任务占用。
+- 可用生图身份为 `ozon_image_worker_01` 至 `ozon_image_worker_05`，分别映射队列 worker ID `ozon-image-worker-01` 至 `ozon-image-worker-05`。
+- 总控通过 `spawn_agent` 按待处理商品数和当前空闲并发位动态启用 0–5 个内部子智能体；可用几个就使用几个，只增补空位、不缩减现有池，不因少于 5 个而停止。
+- 常规生图最多使用 5 个子智能体；运行时提供第 6 个子智能体位置时，将其保留给失败恢复、诊断或人工介入。不得使用 `create_thread` 或创建用户可见的侧边栏任务。
 - 生图队列按整件商品原子领取，保留租约、续租、停止、恢复和结果回写边界。
 
 ## 验证 (Verification)
