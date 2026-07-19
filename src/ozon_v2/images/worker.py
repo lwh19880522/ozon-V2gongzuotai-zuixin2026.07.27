@@ -8,9 +8,11 @@ from typing import Any
 from PIL import Image
 
 from ozon_v2.domain.supplier_sku import stable_sha256
+from ozon_v2.images.visual_design import CURRENT_VISUAL_CONTRACT_VERSION
 
 
-CURRENT_PROMPT_VERSION = "ozon-image-v2"
+LEGACY_PROMPT_VERSION = "ozon-image-v2"
+CURRENT_PROMPT_VERSION = "ozon-image-v3"
 REQUIRED_ACCEPTANCE_FLAGS = (
     "product_truth",
     "slot_role_satisfied",
@@ -18,6 +20,12 @@ REQUIRED_ACCEPTANCE_FLAGS = (
     "not_plain_or_near_white_product_only",
     "distinct_from_accepted_slots",
     "copy_not_used_as_visual_evidence",
+)
+V3_VISUAL_FLAGS = (
+    "visual_design_passed",
+    "russian_copy_passed",
+    "safe_area_passed",
+    "mobile_readability_passed",
 )
 
 
@@ -203,16 +211,28 @@ class SlotResultReceipt:
         )
 
     def acceptance_contract_errors(self) -> list[str]:
-        if not self.accepted:
-            return []
         errors: list[str] = []
-        if self.prompt_version != CURRENT_PROMPT_VERSION:
-            errors.append(f"prompt_version must be {CURRENT_PROMPT_VERSION}")
+        if self.prompt_version not in {LEGACY_PROMPT_VERSION, CURRENT_PROMPT_VERSION}:
+            errors.append(
+                f"prompt_version must be {LEGACY_PROMPT_VERSION} or {CURRENT_PROMPT_VERSION}"
+            )
+        if not self.accepted:
+            return errors
         if not str(self.validation.get("slot_role") or "").strip():
             errors.append("slot_role is required")
         for key in REQUIRED_ACCEPTANCE_FLAGS:
             if self.validation.get(key) is not True:
                 errors.append(f"{key} must be true")
+        if self.prompt_version == CURRENT_PROMPT_VERSION:
+            for key in V3_VISUAL_FLAGS:
+                if self.validation.get(key) is not True:
+                    errors.append(f"{key} must be true")
+            if not isinstance(self.validation.get("visual_spec"), dict):
+                errors.append("visual_spec is required")
+            if self.validation.get("visual_contract_version") != CURRENT_VISUAL_CONTRACT_VERSION:
+                errors.append(
+                    f"visual_contract_version must be {CURRENT_VISUAL_CONTRACT_VERSION}"
+                )
         try:
             if looks_plain_or_near_white_product_only(self.output_path):
                 errors.append("output contains near-white product-only pixels")

@@ -10,6 +10,11 @@ from ozon_v2.domain.supplier_sku import SupplierSkuOption, SupplierSkuSelectionR
 from ozon_v2.images.contracts import SubjectMasterSelection
 from ozon_v2.images.queue import ImageGenerationQueue
 from ozon_v2.images.worker import SlotResultReceipt, crop_grid
+from ozon_v2.images.visual_design import (
+    CURRENT_VISUAL_CONTRACT_VERSION,
+    VisualFact,
+    VisualSpec,
+)
 
 
 def _receipt(product_id: str = "ozon-image-product") -> SupplierSkuSelectionReceipt:
@@ -67,6 +72,7 @@ def _slot_receipt(
     accepted: bool,
     source_kind: str | None = None,
     validation: dict | None = None,
+    prompt_version: str = "ozon-image-v2",
 ) -> SlotResultReceipt:
     return SlotResultReceipt.create(
         job_id=job["job_id"],
@@ -75,7 +81,7 @@ def _slot_receipt(
         lease_epoch=job["lease_epoch"],
         selection_sha256=job["selection_sha256"],
         subject_master_sha256=job["subject_master_sha256"],
-        prompt_version="ozon-image-v2",
+        prompt_version=prompt_version,
         source_kind=source_kind or slot["source_grid"],
         source_path=source_path,
         output_path=output_path,
@@ -92,6 +98,61 @@ def _slot_receipt(
         },
         created_at="2026-07-14T01:02:00+00:00",
     )
+
+
+def _v3_validation(
+    slot_id: str,
+    evidence_sha256: str,
+    *,
+    repeated_scene: bool = False,
+) -> dict:
+    recipes = {
+        "main_01": "clean_hero",
+        "main_02": "integrated_rail",
+        "detail_01": "context_caption",
+        "detail_02": "feature_callout",
+        "detail_03": "feature_callout",
+        "detail_04": "context_caption",
+        "detail_05": "context_caption",
+        "detail_06": "integrated_rail",
+    }
+    fact = VisualFact(
+        headline="\u041a\u0420\u0415\u041f\u041b\u0415\u041d\u0418\u0415",
+        detail="\u041a\u0430\u0431\u0435\u043b\u044c \u043f\u0440\u043e\u0445\u043e\u0434\u0438\u0442 \u0441\u0432\u043e\u0431\u043e\u0434\u043d\u043e",
+        evidence_sha256=evidence_sha256,
+    )
+    scene_suffix = "same" if repeated_scene else slot_id
+    spec = VisualSpec(
+        contract_version=CURRENT_VISUAL_CONTRACT_VERSION,
+        slot_id=slot_id,
+        recipe=recipes[slot_id],
+        facts=() if slot_id == "main_01" else (fact,),
+        scene_signature={
+            "environment": f"environment_{scene_suffix}",
+            "lighting": f"lighting_{scene_suffix}",
+            "camera": f"camera_{scene_suffix}",
+            "shot_scale": f"shot_scale_{scene_suffix}",
+            "buyer_question": slot_id,
+        },
+        callout_points=((0.5, 0.5),)
+        if slot_id in {"detail_02", "detail_03"}
+        else (),
+    )
+    return {
+        "product_truth": True,
+        "slot_role": slot_id,
+        "slot_role_satisfied": True,
+        "role_visually_demonstrated": True,
+        "not_plain_or_near_white_product_only": True,
+        "distinct_from_accepted_slots": True,
+        "copy_not_used_as_visual_evidence": True,
+        "visual_design_passed": True,
+        "russian_copy_passed": True,
+        "safe_area_passed": True,
+        "mobile_readability_passed": True,
+        "visual_contract_version": CURRENT_VISUAL_CONTRACT_VERSION,
+        "visual_spec": spec.to_dict(),
+    }
 
 
 def test_accepted_slot_rejects_white_anchor_style_without_visual_role_evidence(
@@ -383,3 +444,149 @@ def test_ready_for_review_rechecks_unique_roles_and_frozen_output_files(tmp_path
     Image.new("RGB", (120, 90), "blue").save(outputs[0])
     with pytest.raises(ValueError, match="receipt failed final verification"):
         queue.mark_ready_for_review(job["job_id"], job["worker_id"], job["lease_epoch"])
+
+
+def test_v2_accepted_receipt_remains_valid_but_v3_requires_visual_metadata(tmp_path: Path) -> None:
+    receipt = _receipt()
+    queue = ImageGenerationQueue(tmp_path / "queue.sqlite3")
+    queue.enqueue(receipt=receipt, subject_master=_master(tmp_path, receipt))
+    job = queue.claim_next("ozon-image-worker-01", now_epoch=100, lease_seconds=30)
+    assert job
+    slot = queue.list_slots(job["job_id"])[0]
+    source = tmp_path / "source.png"
+    output = tmp_path / "output.png"
+    _solid_grid(source, ["red", "green"])
+    Image.new("RGB", (120, 90), "red").save(output)
+    legacy = _slot_receipt(
+        job=job, slot=slot, source_path=source, output_path=output, accepted=True
+    )
+
+    assert legacy.acceptance_contract_errors() == []
+    errors = replace(legacy, prompt_version="ozon-image-v3").acceptance_contract_errors()
+    for field in (
+        "visual_design_passed",
+        "russian_copy_passed",
+        "safe_area_passed",
+        "mobile_readability_passed",
+        "visual_spec is required",
+    ):
+        assert any(field in error for error in errors)
+
+
+def test_v3_accepted_slot_rejects_unlocked_supplier_evidence(tmp_path: Path) -> None:
+    receipt = _receipt()
+    queue = ImageGenerationQueue(tmp_path / "queue.sqlite3")
+    master = _master(tmp_path, receipt)
+    queue.enqueue(receipt=receipt, subject_master=master)
+    job = queue.claim_next("ozon-image-worker-01", now_epoch=100, lease_seconds=30)
+    assert job
+    slot = queue.list_slots(job["job_id"])[1]
+    source = tmp_path / "source.png"
+    output = tmp_path / "output.png"
+    _solid_grid(source, ["red", "green"])
+    Image.new("RGB", (120, 90), "red").save(output)
+
+    with pytest.raises(ValueError, match="locked supplier evidence"):
+        queue.record_slot_result(
+            _slot_receipt(
+                job=job,
+                slot=slot,
+                source_path=source,
+                output_path=output,
+                accepted=True,
+                prompt_version="ozon-image-v3",
+                validation=_v3_validation(slot["slot_id"], "f" * 64),
+            )
+        )
+
+
+def _record_eight_v3_slots(
+    tmp_path: Path,
+    *,
+    repeated_scene: bool = False,
+    mixed_v2: bool = False,
+) -> tuple[ImageGenerationQueue, dict]:
+    receipt = _receipt()
+    queue = ImageGenerationQueue(tmp_path / "queue.sqlite3")
+    master = _master(tmp_path, receipt)
+    queue.enqueue(receipt=receipt, subject_master=master)
+    job = queue.claim_next("ozon-image-worker-01", now_epoch=100, lease_seconds=30)
+    assert job
+    source = tmp_path / "source.png"
+    output = tmp_path / "output.png"
+    _solid_grid(source, ["red", "green", "blue"])
+    Image.new("RGB", (120, 90), "red").save(output)
+    for index, slot in enumerate(queue.list_slots(job["job_id"])):
+        prompt_version = "ozon-image-v2" if mixed_v2 and index == 0 else "ozon-image-v3"
+        validation = None if prompt_version == "ozon-image-v2" else _v3_validation(
+            slot["slot_id"], master.source_sha256, repeated_scene=repeated_scene
+        )
+        queue.record_slot_result(
+            _slot_receipt(
+                job=job,
+                slot=slot,
+                source_path=source,
+                output_path=output,
+                accepted=True,
+                prompt_version=prompt_version,
+                validation=validation,
+            )
+        )
+    return queue, job
+
+
+def test_ready_for_review_rejects_mixed_v2_and_v3_receipts(tmp_path: Path) -> None:
+    queue, job = _record_eight_v3_slots(tmp_path, mixed_v2=True)
+
+    with pytest.raises(ValueError, match="mixed prompt versions are not allowed"):
+        queue.mark_ready_for_review(job["job_id"], job["worker_id"], job["lease_epoch"])
+    assert queue.get_job(job["job_id"])["status"] == "in_progress"
+
+
+def test_ready_for_review_rejects_repeated_v3_scenes(tmp_path: Path) -> None:
+    queue, job = _record_eight_v3_slots(tmp_path, repeated_scene=True)
+
+    with pytest.raises(ValueError, match="visual set validation failed"):
+        queue.mark_ready_for_review(job["job_id"], job["worker_id"], job["lease_epoch"])
+    assert queue.get_job(job["job_id"])["status"] == "in_progress"
+
+
+def test_v3_spec_slot_mismatch_and_unknown_prompt_version_are_rejected(tmp_path: Path) -> None:
+    receipt = _receipt()
+    queue = ImageGenerationQueue(tmp_path / "queue.sqlite3")
+    master = _master(tmp_path, receipt)
+    queue.enqueue(receipt=receipt, subject_master=master)
+    job = queue.claim_next("ozon-image-worker-01", now_epoch=100, lease_seconds=30)
+    assert job
+    slot = queue.list_slots(job["job_id"])[1]
+    source = tmp_path / "source.png"
+    output = tmp_path / "output.png"
+    _solid_grid(source, ["red", "green"])
+    Image.new("RGB", (120, 90), "red").save(output)
+    bad_validation = _v3_validation(slot["slot_id"], master.source_sha256)
+    bad_validation["visual_spec"]["slot_id"] = "detail_01"
+
+    with pytest.raises(ValueError, match="slot_id"):
+        queue.record_slot_result(
+            _slot_receipt(
+                job=job, slot=slot, source_path=source, output_path=output,
+                accepted=True, prompt_version="ozon-image-v3", validation=bad_validation,
+            )
+        )
+    with pytest.raises(ValueError, match="prompt_version"):
+        queue.record_slot_result(
+            _slot_receipt(
+                job=job, slot=slot, source_path=source, output_path=output,
+                accepted=True, prompt_version="unknown", validation=_v3_validation(
+                    slot["slot_id"], master.source_sha256
+                ),
+            )
+        )
+
+
+def test_all_valid_v3_slots_can_be_ready_for_review(tmp_path: Path) -> None:
+    queue, job = _record_eight_v3_slots(tmp_path)
+
+    reviewed = queue.mark_ready_for_review(job["job_id"], job["worker_id"], job["lease_epoch"])
+
+    assert reviewed["status"] == "manual_review_required"

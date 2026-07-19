@@ -8,7 +8,8 @@ from typing import Any
 
 from ozon_v2.domain.supplier_sku import SupplierSkuSelectionReceipt, stable_sha256
 from ozon_v2.images.contracts import SubjectMasterSelection
-from ozon_v2.images.worker import SlotResultReceipt
+from ozon_v2.images.visual_design import VisualSpec, validate_visual_set, validate_visual_spec
+from ozon_v2.images.worker import CURRENT_PROMPT_VERSION, LEGACY_PROMPT_VERSION, SlotResultReceipt
 
 
 REGULAR_IMAGE_WORKER_IDS = tuple(
@@ -356,6 +357,31 @@ class ImageGenerationQueue:
                 connection.rollback()
                 raise ValueError("accepted slot is frozen")
 
+            if receipt.accepted and receipt.prompt_version == CURRENT_PROMPT_VERSION:
+                try:
+                    subject_master = SubjectMasterSelection.from_dict(
+                        json.loads(job["subject_master_json"])
+                    )
+                    spec = VisualSpec.from_dict(receipt.validation["visual_spec"])
+                    errors = []
+                    if spec.slot_id != receipt.slot_id:
+                        errors.append("visual_spec.slot_id does not match receipt.slot_id")
+                    errors.extend(
+                        validate_visual_spec(spec, set(subject_master.source_sha256s))
+                    )
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                    connection.rollback()
+                    raise ValueError(
+                        "accepted slot failed locked supplier evidence validation: "
+                        f"invalid visual_spec ({error})"
+                    ) from None
+                if errors:
+                    connection.rollback()
+                    raise ValueError(
+                        "accepted slot failed locked supplier evidence validation: "
+                        + "; ".join(errors)
+                    )
+
             is_repair = receipt.source_kind == "repair_single"
             repair_count = int(slot["repair_count"])
             if is_repair and repair_count >= 2:
@@ -438,10 +464,11 @@ class ImageGenerationQueue:
                 connection.rollback()
                 raise ValueError("all eight image slots must be accepted before review")
             accepted_receipts = connection.execute(
-                "SELECT receipt_json FROM image_slots WHERE job_id = ? ORDER BY rowid",
+                "SELECT slot_id, receipt_json FROM image_slots WHERE job_id = ? ORDER BY rowid",
                 (job_id,),
             ).fetchall()
             slot_roles: list[str] = []
+            receipts: list[SlotResultReceipt] = []
             for stored in accepted_receipts:
                 try:
                     receipt = SlotResultReceipt.from_dict(json.loads(stored["receipt_json"]))
@@ -459,9 +486,35 @@ class ImageGenerationQueue:
                         + "; ".join(acceptance_errors)
                     )
                 slot_roles.append(str(receipt.validation["slot_role"]).strip().casefold())
+                receipts.append(receipt)
             if len(set(slot_roles)) != len(slot_roles):
                 connection.rollback()
                 raise ValueError("all eight accepted slot roles must be distinct")
+            prompt_versions = {receipt.prompt_version for receipt in receipts}
+            if len(prompt_versions) != 1:
+                connection.rollback()
+                raise ValueError("mixed prompt versions are not allowed")
+            prompt_version = prompt_versions.pop()
+            if prompt_version == CURRENT_PROMPT_VERSION:
+                specs: list[VisualSpec] = []
+                errors: list[str] = []
+                for stored, receipt in zip(accepted_receipts, receipts, strict=True):
+                    try:
+                        spec = VisualSpec.from_dict(receipt.validation["visual_spec"])
+                    except (KeyError, TypeError, ValueError) as error:
+                        errors.append(f"invalid visual_spec ({error})")
+                        continue
+                    if receipt.slot_id != stored["slot_id"] or spec.slot_id != receipt.slot_id:
+                        errors.append("visual_spec.slot_id does not match receipt.slot_id")
+                    specs.append(spec)
+                if not errors:
+                    errors.extend(validate_visual_set(tuple(specs)))
+                if errors:
+                    connection.rollback()
+                    raise ValueError("visual set validation failed: " + "; ".join(errors))
+            elif prompt_version != LEGACY_PROMPT_VERSION:
+                connection.rollback()
+                raise ValueError("accepted slot receipt has an unknown prompt version")
             connection.execute(
                 """
                 UPDATE image_jobs
