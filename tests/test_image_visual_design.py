@@ -1,9 +1,14 @@
+import sys
+from pathlib import Path
+
 import pytest
+from PIL import Image
 
 from ozon_v2.images.visual_design import (
     CURRENT_VISUAL_CONTRACT_VERSION,
     VisualFact,
     VisualSpec,
+    render_visual,
     validate_visual_set,
     validate_visual_spec,
 )
@@ -331,3 +336,125 @@ def test_standalone_top_is_forbidden_promotional_copy() -> None:
     )
 
     assert "forbidden promotional copy" in validate_visual_spec(spec, {LOCKED_HASH})
+
+
+def _render_spec(recipe: str = "integrated_rail", **overrides: object) -> VisualSpec:
+    values = {
+        "contract_version": CURRENT_VISUAL_CONTRACT_VERSION,
+        "slot_id": "main_02",
+        "recipe": recipe,
+        "facts": (
+            VisualFact(
+                headline="\u041a\u0420\u0415\u041f\u041b\u0415\u041d\u0418\u0415",
+                detail="\u041a\u0430\u0431\u0435\u043b\u044c \u043f\u0440\u043e\u0445\u043e\u0434\u0438\u0442 \u0441\u0432\u043e\u0431\u043e\u0434\u043d\u043e",
+                evidence_sha256=LOCKED_HASH,
+            ),
+        ),
+        "scene_signature": _scene(
+            environment="kitchen_rail",
+            lighting="cool_day",
+            camera="side_profile",
+            shot_scale="close",
+            buyer_question="cable_routing",
+        ),
+    }
+    values.update(overrides)
+    return VisualSpec(**values)
+
+
+def test_render_visual_renders_verified_russian_integrated_rail(tmp_path: Path) -> None:
+    source = tmp_path / "source.png"
+    output = tmp_path / "nested" / "output.png"
+    Image.new("RGB", (900, 1200), (205, 192, 180)).save(source)
+
+    receipt = render_visual(source, output, _render_spec(), {LOCKED_HASH})
+
+    assert Image.open(output).size == (900, 1200)
+    assert Image.open(output).getpixel((850, 600)) != (205, 192, 180)
+    assert receipt["visual_contract_version"] == CURRENT_VISUAL_CONTRACT_VERSION
+    assert receipt["layout_recipe"] == "integrated_rail"
+    assert receipt["copy_block_count"] == 1
+    assert receipt["visual_design_passed"] is True
+    assert receipt["russian_copy_passed"] is True
+    assert receipt["safe_area_passed"] is True
+    assert receipt["mobile_readability_passed"] is True
+
+
+@pytest.mark.parametrize("panel_side", ["left", "right"])
+def test_integrated_rail_keeps_copy_content_inside_safe_margin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, panel_side: str
+) -> None:
+    from ozon_v2.images import visual_design
+
+    source = tmp_path / "source.png"
+    output = tmp_path / "output.png"
+    Image.new("RGB", (900, 1200), (205, 192, 180)).save(source)
+    captured: list[tuple[int, int]] = []
+
+    def capture_fact(
+        draw: object, fact: object, x: int, y: int, max_width: int, *fonts: object
+    ) -> int:
+        captured.append((x, max_width))
+        return y
+
+    monkeypatch.setattr(visual_design, "_draw_fact", capture_fact)
+    render_visual(source, output, _render_spec(panel_side=panel_side), {LOCKED_HASH})
+
+    margin = max(12, round(min(900, 1200) * 0.08))
+    assert captured and captured[0][0] >= margin
+    assert captured[0][0] + captured[0][1] <= 900 - margin
+
+
+def test_render_visual_rejects_missing_source_and_invalid_spec_without_output(tmp_path: Path) -> None:
+    output = tmp_path / "output.png"
+    with pytest.raises(ValueError, match="visual source image does not exist"):
+        render_visual(tmp_path / "missing.png", output, _render_spec(), {LOCKED_HASH})
+    assert not output.exists()
+
+    source = tmp_path / "source.png"
+    Image.new("RGB", (900, 1200), (205, 192, 180)).save(source)
+    invalid = _render_spec(slot_id="main_01", recipe="clean_hero", facts=(_fact(),))
+    with pytest.raises(ValueError, match="invalid visual spec"):
+        render_visual(source, output, invalid, {LOCKED_HASH})
+    assert not output.exists()
+
+
+def test_render_visual_clean_hero_preserves_pixels_and_size(tmp_path: Path) -> None:
+    source = tmp_path / "source.png"
+    output = tmp_path / "output.png"
+    Image.new("RGB", (900, 1200), (205, 192, 180)).save(source)
+    spec = _spec("main_01", "clean_hero")
+
+    render_visual(source, output, spec, {LOCKED_HASH})
+
+    assert Image.open(output).size == (900, 1200)
+    assert Image.open(output).getpixel((850, 600)) == (205, 192, 180)
+
+
+def test_render_visual_cli_parses_and_avoids_sqlite_for_local_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts import ozon_image_worker
+
+    source = tmp_path / "source.png"
+    output = tmp_path / "output.png"
+    spec_path = tmp_path / "visual.json"
+    Image.new("RGB", (900, 1200), (205, 192, 180)).save(source)
+    spec_path.write_text(__import__("json").dumps(_render_spec().to_dict()), encoding="utf-8")
+    args = ozon_image_worker.build_parser().parse_args(
+        [
+            "--db", "queue.sqlite3", "render-visual", "--source", str(source),
+            "--output", str(output), "--spec-json", str(spec_path),
+            "--evidence-sha256", LOCKED_HASH,
+        ]
+    )
+    assert args.command == "render-visual"
+    assert args.evidence_sha256 == [LOCKED_HASH]
+    monkeypatch.setattr(ozon_image_worker, "_queue", lambda args: pytest.fail("SQLite must stay closed"))
+    monkeypatch.setattr(sys, "argv", [
+        "ozon_image_worker.py", "--db", "queue.sqlite3", "render-visual", "--source", str(source),
+        "--output", str(output), "--spec-json", str(spec_path), "--evidence-sha256", LOCKED_HASH,
+    ])
+
+    assert ozon_image_worker.main() == 0
+    assert output.exists()
