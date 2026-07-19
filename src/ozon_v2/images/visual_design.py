@@ -510,6 +510,7 @@ def _draw_callouts(
 ) -> None:
     box_width = round(width * 0.42)
     box_height = max(round(height * 0.16), 100)
+    marker_radius = 5
     radius = max(12, round(min(width, height) * 0.02))
     available_height = height - margin * 2
     if len(spec.facts) * box_height > available_height:
@@ -521,7 +522,8 @@ def _draw_callouts(
         lane_tops = tuple(margin + index * (box_height + lane_gap) for index in range(len(spec.facts)))
 
     for fact, (point_x, point_y), lane_top in zip(spec.facts, spec.callout_points, lane_tops):
-        anchor_x, anchor_y = round(point_x * width), round(point_y * height)
+        anchor_x = min(max(round(point_x * width), marker_radius), width - marker_radius)
+        anchor_y = min(max(round(point_y * height), marker_radius), height - marker_radius)
         left = margin if anchor_x > width // 2 else width - margin - box_width
         top = lane_top if lane_top is not None else min(
             max(margin, anchor_y - box_height // 2), height - margin - box_height
@@ -529,7 +531,15 @@ def _draw_callouts(
         edge_x = left if left > anchor_x else left + box_width
         edge_y = min(max(anchor_y, top + radius), top + box_height - radius)
         draw.line((anchor_x, anchor_y, edge_x, edge_y), fill=(*spec.accent_rgb, 255), width=max(2, round(width * 0.004)))
-        draw.ellipse((anchor_x - 5, anchor_y - 5, anchor_x + 5, anchor_y + 5), fill=(*spec.accent_rgb, 255))
+        draw.ellipse(
+            (
+                anchor_x - marker_radius,
+                anchor_y - marker_radius,
+                anchor_x + marker_radius,
+                anchor_y + marker_radius,
+            ),
+            fill=(*spec.accent_rgb, 255),
+        )
         draw.rounded_rectangle((left, top, left + box_width, top + box_height), radius=radius, fill=(250, 250, 250, 232))
         _draw_fact(
             draw, fact, left + margin // 2, top + margin // 2, box_width - margin,

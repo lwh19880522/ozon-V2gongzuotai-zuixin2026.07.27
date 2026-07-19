@@ -471,6 +471,40 @@ def test_feature_callout_uses_non_overlapping_boxes_for_same_anchor(
     assert first[4] <= second[2] or second[4] <= first[2]
 
 
+@pytest.mark.parametrize("point", [(0.0, 0.0), (1.0, 1.0)])
+def test_feature_callout_keeps_corner_marker_inside_canvas(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, point: tuple[float, float]
+) -> None:
+    from ozon_v2.images import visual_design
+
+    source = tmp_path / "source.png"
+    output = tmp_path / "callout.png"
+    Image.new("RGB", (900, 1200), (205, 192, 180)).save(source)
+    captured_ellipses: list[tuple[int, int, int, int]] = []
+
+    def capture_ellipse(
+        draw: object, box: tuple[int, int, int, int], **kwargs: object
+    ) -> None:
+        captured_ellipses.append(box)
+
+    monkeypatch.setattr(visual_design.ImageDraw.ImageDraw, "ellipse", capture_ellipse)
+
+    render_visual(
+        source,
+        output,
+        _render_spec(
+            slot_id="detail_02",
+            recipe="feature_callout",
+            callout_points=(point,),
+        ),
+        {LOCKED_HASH},
+    )
+
+    left, top, right, bottom = captured_ellipses[0]
+    assert 0 <= left <= right <= 900
+    assert 0 <= top <= bottom <= 1200
+
+
 @pytest.mark.parametrize("panel_side", ["left", "right"])
 def test_integrated_rail_keeps_copy_content_inside_safe_margin(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, panel_side: str
