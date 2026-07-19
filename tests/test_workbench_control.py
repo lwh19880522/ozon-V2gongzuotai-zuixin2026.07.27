@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -16,6 +17,7 @@ from urllib.request import Request, urlopen
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONTROL_SCRIPT = PROJECT_ROOT / "scripts" / "workbench_control.ps1"
+START_SCRIPT = PROJECT_ROOT / "scripts" / "start_workbench.py"
 LAUNCHER_SCRIPT = PROJECT_ROOT / "scripts" / "launch_workbench.ps1"
 RESTART_HELPER_SCRIPT = PROJECT_ROOT / "scripts" / "workbench_restart_helper.ps1"
 SHORTCUT_SCRIPT = PROJECT_ROOT / "scripts" / "create_workbench_shortcut.ps1"
@@ -25,6 +27,31 @@ def unused_local_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+class StopFailureHandler(BaseHTTPRequestHandler):
+    def send_json(self, status: int, payload: dict[str, object]) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        if self.path == "/api/health":
+            self.send_json(200, {"ok": True, "code": "health.ok"})
+            return
+        self.send_json(404, {"ok": False})
+
+    def do_POST(self) -> None:
+        if self.path == "/api/runtime/stop":
+            self.send_json(503, {"ok": False, "code": "stop.unavailable"})
+            return
+        self.send_json(404, {"ok": False})
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
 
 
 class WorkbenchControlScriptTests(unittest.TestCase):
@@ -38,7 +65,9 @@ class WorkbenchControlScriptTests(unittest.TestCase):
         self.run_control("Stop", check=False)
         self.temp_dir.cleanup()
 
-    def run_control(self, action: str, *, check: bool = True) -> subprocess.CompletedProcess[str]:
+    def run_control(
+        self, action: str, *, check: bool = True, timeout: float = 25
+    ) -> subprocess.CompletedProcess[str]:
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         command = [
             "powershell.exe",
@@ -62,7 +91,7 @@ class WorkbenchControlScriptTests(unittest.TestCase):
                 cwd=PROJECT_ROOT,
                 stdout=stdout_file,
                 stderr=stderr_file,
-                timeout=25,
+                timeout=timeout,
             )
         result = subprocess.CompletedProcess(
             completed.args,
@@ -290,30 +319,6 @@ class WorkbenchControlScriptTests(unittest.TestCase):
         self.assertEqual(0, state["pid"])
 
     def test_stop_fails_when_health_remains_online_after_stop_api_failure(self) -> None:
-        class StopFailureHandler(BaseHTTPRequestHandler):
-            def send_json(self, status: int, payload: dict[str, object]) -> None:
-                body = json.dumps(payload).encode("utf-8")
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def do_GET(self) -> None:
-                if self.path == "/api/health":
-                    self.send_json(200, {"ok": True, "code": "health.ok"})
-                    return
-                self.send_json(404, {"ok": False})
-
-            def do_POST(self) -> None:
-                if self.path == "/api/runtime/stop":
-                    self.send_json(503, {"ok": False, "code": "stop.unavailable"})
-                    return
-                self.send_json(404, {"ok": False})
-
-            def log_message(self, format: str, *args: object) -> None:
-                return
-
         server = ThreadingHTTPServer(("127.0.0.1", self.port), StopFailureHandler)
         server_thread = threading.Thread(target=server.serve_forever, daemon=True)
         server_thread.start()
@@ -347,6 +352,62 @@ class WorkbenchControlScriptTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             server_thread.join(timeout=5)
+
+    def test_forced_stop_fails_when_health_remains_online(self) -> None:
+        server = ThreadingHTTPServer(("127.0.0.1", self.port), StopFailureHandler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        dummy = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import time; time.sleep(60)",
+                str(START_SCRIPT),
+                "--port",
+                str(self.port),
+            ],
+            cwd=PROJECT_ROOT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        server_thread.start()
+        try:
+            deadline = time.time() + 2
+            while time.time() < deadline and not self.health_ok():
+                time.sleep(0.05)
+            self.assertTrue(self.health_ok())
+            self.runtime_dir.mkdir(parents=True)
+            self.state_file.write_text(
+                json.dumps(
+                    {
+                        "pid": dummy.pid,
+                        "port": self.port,
+                        "project_root": str(PROJECT_ROOT.resolve()),
+                        "status": "running",
+                        "updated_at": "sentinel",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = self.run_control("Stop", check=False, timeout=60)
+            state = json.loads(self.state_file.read_text(encoding="utf-8-sig"))
+
+            self.assertNotEqual(0, result.returncode, msg=f"{result.stdout}\n{result.stderr}")
+            self.assertIn("STOP_FAILED HEALTH_STILL_ONLINE", result.stdout)
+            self.assertEqual("sentinel", state["updated_at"])
+            self.assertEqual("running", state["status"])
+            self.assertTrue(self.health_ok())
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=5)
+            if dummy.poll() is None:
+                dummy.terminate()
+                try:
+                    dummy.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    dummy.kill()
+                    dummy.wait(timeout=5)
 
 
 if __name__ == "__main__":

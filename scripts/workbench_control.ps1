@@ -301,6 +301,12 @@ function Stop-Workbench {
 
     Stop-Process -Id $recordedPid -Force
     Wait-Process -Id $recordedPid -Timeout 5 -ErrorAction SilentlyContinue
+    if (-not (Wait-ForStop -Seconds 5)) {
+        Write-LifecycleLog 'stop.failed reason=health_still_online mode=validated_process'
+        Write-Output "STOP_FAILED HEALTH_STILL_ONLINE URL=$HealthUrl"
+        $script:ResultCode = 1
+        return
+    }
     Write-WorkbenchState -Status 'stopped' -ProcessId $recordedPid -StartedAt ([string]$state.started_at)
     Write-LifecycleLog "stop.succeeded pid=$recordedPid mode=validated_process"
     Write-Output "STOPPED PID=$recordedPid"
