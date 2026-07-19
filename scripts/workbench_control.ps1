@@ -155,10 +155,7 @@ function Start-Workbench {
     Initialize-RuntimeState
     $staleState = Read-WorkbenchState
     if ($null -ne $staleState) {
-        $staleProcess = Get-RecordedProcessInfo $staleState
-        if ($null -ne $staleProcess) {
-            Write-LifecycleLog "state.stale_ignored pid=$($staleState.pid) recorded_project=$($staleState.project_root)"
-        }
+        Write-LifecycleLog "state.stale_ignored pid=$($staleState.pid) recorded_project=$($staleState.project_root)"
     }
 
     $pythonCommand = Get-Command 'python.exe' -ErrorAction SilentlyContinue
@@ -233,7 +230,8 @@ function Start-Workbench {
 
 function Stop-Workbench {
     $state = Read-WorkbenchState
-    if (Test-WorkbenchHealth) {
+    $healthIsOnline = Test-WorkbenchHealth
+    if ($healthIsOnline) {
         try {
             Invoke-RestMethod -Uri $StopUrl -Method Post -ContentType 'application/json' -Body '{}' -TimeoutSec 3 | Out-Null
         }
@@ -247,8 +245,17 @@ function Stop-Workbench {
             Write-LifecycleLog "stop.succeeded pid=$stoppedPid mode=api"
             Write-Output "STOPPED PID=$stoppedPid"
             $script:ResultCode = 0
-        return
+            return
         }
+    }
+
+    if ($null -ne $state -and
+        [string]$state.project_root -ieq $ProjectRoot -and
+        [int]$state.port -eq $Port -and
+        [string]$state.status -ieq 'stopped') {
+        Write-Output "NOT_RUNNING URL=$HealthUrl"
+        $script:ResultCode = 0
+        return
     }
 
     $processInfo = Get-RecordedProcessInfo $state

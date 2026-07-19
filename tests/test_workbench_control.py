@@ -223,6 +223,27 @@ class WorkbenchControlScriptTests(unittest.TestCase):
 
         self.assertNotEqual(0, result.returncode)
         self.assertIn("STOP_BLOCKED_UNEXPECTED_PROCESS", result.stdout)
+        self.state_file.unlink(missing_ok=True)
+
+    def test_stop_with_stopped_state_does_not_inspect_reused_pid(self) -> None:
+        self.runtime_dir.mkdir(parents=True)
+        self.state_file.write_text(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "port": self.port,
+                    "project_root": str(PROJECT_ROOT.resolve()),
+                    "started_at": "2026-07-19T00:00:00.0000000Z",
+                    "status": "stopped",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.run_control("Stop", check=False)
+
+        self.assertEqual(0, result.returncode, msg=f"{result.stdout}\n{result.stderr}")
+        self.assertIn("NOT_RUNNING", result.stdout)
 
 
 if __name__ == "__main__":
