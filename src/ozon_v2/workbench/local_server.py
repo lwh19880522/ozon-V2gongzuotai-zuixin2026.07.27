@@ -2591,6 +2591,15 @@ def create_handler(
                 self._send_result(result, run_id=parts[2])
                 return
             if len(parts) == 6 and parts[:2] == ["api", "batches"] and parts[3] == "image-job":
+                if parts[5] == "repair":
+                    repairs = payload.get("repairs")
+                    if not isinstance(repairs, list):
+                        repairs = []
+                    self._send_result(
+                        service.request_image_repairs(parts[2], parts[4], repairs),
+                        run_id=parts[2],
+                    )
+                    return
                 if parts[5] == "stop":
                     self._send_result(service.stop_image_job(parts[2], parts[4]), run_id=parts[2])
                     return

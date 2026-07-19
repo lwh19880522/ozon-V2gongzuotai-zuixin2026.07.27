@@ -13,6 +13,9 @@ from urllib.request import Request, urlopen
 from ozon_v2.adapters.fs_repo import FsRepo
 from ozon_v2.domain.models import SeedProduct
 from ozon_v2.domain.models import WorkbenchAction, WorkbenchState
+from ozon_v2.domain.supplier_sku import SupplierSkuOption, SupplierSkuSelectionReceipt
+from ozon_v2.images.contracts import SubjectMasterSelection
+from ozon_v2.images.queue import ImageGenerationQueue
 from ozon_v2.services.collection_contract_service import CollectionContractService
 from ozon_v2.services.workbench_service import WorkbenchService
 from ozon_v2.workbench.local_server import create_handler
@@ -71,6 +74,75 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.server.server_close()
         self.thread.join(timeout=5)
         super().tearDown()
+
+    def prepare_reviewable_image_job(self) -> tuple[str, str, ImageGenerationQueue]:
+        run = self.repo.create_workbench_batch_record(target_count=1)
+        run_id = run["run_id"]
+        run["status"] = WorkbenchState.IMAGE_PROCESSING.value
+        self.repo.save_run(run)
+        sku = SupplierSkuOption(
+            supplier_sku_id="supplier-review-sku",
+            combination_key="white>single",
+            raw_label="white / single",
+            selected_options={"color": "white", "quantity": "1"},
+            set_quantity=1,
+            set_composition=["single unit"],
+            price={"currency": "CNY", "amount": "19.90"},
+            stock={"status": "in_stock", "quantity": 10},
+            image_urls=["https://cbu01.alicdn.com/img/ibank/review-sku.jpg"],
+            evidence_source="embedded_sku_map",
+            complete=True,
+        )
+        receipt = SupplierSkuSelectionReceipt.confirmed(
+            run_id=run_id,
+            product_id="review-product",
+            supplier_offer_id="review-offer",
+            supplier_sku=sku,
+            ozon_target_sku={"sku_id": "ozon-review-sku", "selected_options": {}},
+            differences=[],
+            confirmed_at="2026-07-19T00:00:00+00:00",
+        )
+        subject_path = self.tmpdir / "review-subject.bin"
+        subject_path.write_bytes(b"locked-review-subject")
+        subject = SubjectMasterSelection.create(
+            receipt=receipt,
+            source_path=subject_path,
+            source_image_url=sku.image_urls[0],
+            visible_subject_quantity=1,
+            white_background_confirmed=False,
+            confirmed_at="2026-07-19T00:01:00+00:00",
+        )
+        queue = ImageGenerationQueue(
+            self.context.runtime_root / "image_generation" / "ozon_image_jobs.sqlite3"
+        )
+        job = queue.enqueue(receipt=receipt, subject_master=subject)
+        with queue._connect() as connection:
+            for slot in queue.list_slots(job["job_id"]):
+                output = self.tmpdir / f"{slot['slot_id']}.png"
+                output.write_bytes(f"accepted-{slot['slot_id']}".encode("utf-8"))
+                connection.execute(
+                    """
+                    UPDATE image_slots
+                    SET status = 'accepted', accepted_path = ?, receipt_json = ?
+                    WHERE job_id = ? AND slot_id = ?
+                    """,
+                    (
+                        str(output.resolve()),
+                        json.dumps({"slot_id": slot["slot_id"]}),
+                        job["job_id"],
+                        slot["slot_id"],
+                    ),
+                )
+            connection.execute(
+                """
+                UPDATE image_jobs
+                SET status = 'manual_review_required', worker_id = NULL,
+                    lease_expires = NULL, heartbeat_at = NULL
+                WHERE job_id = ?
+                """,
+                (job["job_id"],),
+            )
+        return run_id, job["job_id"], queue
 
     def test_home_page_loads(self) -> None:
         body = self.get_text("/")
@@ -1330,6 +1402,62 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual("waiting_for_supplier_sku", item["generation_status"])
         self.assertFalse(workspace["data"]["image_gate"]["ready"])
         self.assertEqual("supplier_sku_selection_required", workspace["data"]["image_gate"]["code"])
+
+    def test_image_repair_api_requeues_only_selected_slots_and_records_event(self) -> None:
+        run_id, job_id, queue = self.prepare_reviewable_image_job()
+
+        result = self.post_json(
+            f"/api/batches/{run_id}/image-job/{job_id}/repair",
+            {
+                "repairs": [
+                    {
+                        "slot_id": "detail_02",
+                        "issue_code": "composition",
+                        "note": "主体被遮挡",
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual("image_job.repair_requested", result["code"])
+        image_job = result["data"]["image_job"]
+        self.assertEqual("pending", image_job["status"])
+        slots = {slot["slot_id"]: slot for slot in image_job["slots"]}
+        self.assertEqual("repair_pending", slots["detail_02"]["status"])
+        self.assertEqual("composition", slots["detail_02"]["review_issue_code"])
+        self.assertEqual("accepted", slots["detail_03"]["status"])
+        self.assertEqual("pending", queue.get_job(job_id)["status"])
+        event = self.repo.load_run_events(run_id)[-1]
+        self.assertEqual("image_job.repair_requested", event.event_type)
+        self.assertEqual(["detail_02"], event.data["slot_ids"])
+
+    def test_image_repair_api_rejects_wrong_batch_and_invalid_feedback_atomically(self) -> None:
+        run_id, job_id, queue = self.prepare_reviewable_image_job()
+        other_run_id = self.repo.create_workbench_batch_record(target_count=1)["run_id"]
+        before = queue.snapshot(job_id)
+
+        wrong_batch = self.post_json(
+            f"/api/batches/{other_run_id}/image-job/{job_id}/repair",
+            {
+                "repairs": [
+                    {"slot_id": "main_01", "issue_code": "composition", "note": ""}
+                ]
+            },
+            ok=False,
+        )
+        invalid_feedback = self.post_json(
+            f"/api/batches/{run_id}/image-job/{job_id}/repair",
+            {
+                "repairs": [
+                    {"slot_id": "main_01", "issue_code": "other", "note": "   "}
+                ]
+            },
+            ok=False,
+        )
+
+        self.assertEqual("image_job.not_found", wrong_batch["code"])
+        self.assertEqual("image_job.repair_feedback_invalid", invalid_feedback["code"])
+        self.assertEqual(before, queue.snapshot(job_id))
 
     def test_upload_workspace_page_and_api_show_prefill_plan_and_locked_gate(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()

@@ -18,7 +18,7 @@ from ozon_v2.domain.supplier_sku import SupplierSkuOption, SupplierSkuSelectionR
 from ozon_v2.domain.state_machine import allowed_workbench_actions, transition_workbench_state
 from ozon_v2.domain.validators import validate_attribute_template_result, validate_ozon_collection_result, validate_seed_ready_for_ozon
 from ozon_v2.images.contracts import SubjectMasterSelection
-from ozon_v2.images.queue import ImageGenerationQueue
+from ozon_v2.images.queue import ImageGenerationQueue, ImageRepairRequestError
 from ozon_v2.services.collection_contract_service import (
     CREATIVE_FIELDS_REQUIRING_REWRITE,
     CollectionContractService,
@@ -1780,6 +1780,57 @@ class WorkbenchService:
             "image_job.resumed",
             "Image generation was resumed.",
             self._response_payload(self.repo.load_run(run_id), event, {"image_job": image_job}),
+        )
+
+    def request_image_repairs(
+        self,
+        run_id: str,
+        job_id: str,
+        repairs: list[dict[str, Any]],
+    ) -> Result:
+        queue = self._image_generation_queue()
+        job = queue.get_job(job_id)
+        if job is None or str(job.get("run_id") or "") != run_id:
+            return Result.failure(
+                "image_job.not_found",
+                "The image job was not found in this batch.",
+            )
+        try:
+            requested = queue.request_repairs(job_id, repairs)
+        except ImageRepairRequestError as error:
+            return Result.failure(
+                error.code,
+                str(error),
+                data={"run_id": run_id, "image_job_id": job_id},
+            )
+        image_job = self._image_job_payload(job_id)
+        feedback = [
+            {
+                "slot_id": str(slot["slot_id"]),
+                "issue_code": str(slot["review_issue_code"]),
+                "note": str(slot["review_note"] or ""),
+                "requested_at": slot["review_requested_at"],
+            }
+            for slot in requested["slots"]
+        ]
+        event = self.repo.append_run_event(
+            run_id,
+            "image_job.repair_requested",
+            "Selected image slots were returned to the repair queue.",
+            {
+                "image_job_id": job_id,
+                "slot_ids": [item["slot_id"] for item in feedback],
+                "repairs": feedback,
+            },
+        )
+        return Result.success(
+            "image_job.repair_requested",
+            "Selected image slots were queued for repair.",
+            self._response_payload(
+                self.repo.load_run(run_id),
+                event,
+                {"image_job": image_job, "repairs": feedback},
+            ),
         )
 
     def image_slot_asset(self, run_id: str, job_id: str, slot_id: str) -> Result:
