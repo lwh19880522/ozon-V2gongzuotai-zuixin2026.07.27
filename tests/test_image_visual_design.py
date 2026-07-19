@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 
@@ -399,6 +400,7 @@ def test_feature_callout_uses_dark_copy_on_its_light_panel(
         headline_font: object,
         detail_font: object,
         accent_rgb: object,
+        bottom: object = None,
         headline_fill: object = None,
         detail_fill: object = None,
     ) -> int:
@@ -419,6 +421,54 @@ def test_feature_callout_uses_dark_copy_on_its_light_panel(
     )
 
     assert captured_fills == [((25, 32, 51), (70, 75, 85))]
+
+
+def test_feature_callout_uses_non_overlapping_boxes_for_same_anchor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ozon_v2.images import visual_design
+
+    source = tmp_path / "source.png"
+    output = tmp_path / "callout.png"
+    Image.new("RGB", (900, 1200), (205, 192, 180)).save(source)
+    captured_boxes: list[tuple[str, int, int, int, int]] = []
+
+    def capture_fact(
+        draw: object,
+        fact: VisualFact,
+        x: int,
+        y: int,
+        max_width: int,
+        headline_font: object,
+        detail_font: object,
+        accent_rgb: object,
+        bottom: int,
+        **fills: object,
+    ) -> int:
+        margin = max(12, round(min(900, 1200) * 0.08))
+        captured_boxes.append(
+            (fact.headline, x - margin // 2, y - margin // 2, x - margin // 2 + max_width + margin, bottom + margin // 2)
+        )
+        return y
+
+    monkeypatch.setattr(visual_design, "_draw_fact", capture_fact)
+    second_fact = VisualFact("УСТАНОВКА", "Надежно держит форму", LOCKED_HASH)
+
+    render_visual(
+        source,
+        output,
+        _render_spec(
+            slot_id="detail_02",
+            recipe="feature_callout",
+            facts=(_render_spec().facts[0], second_fact),
+            callout_points=((0.2, 0.5), (0.2, 0.5)),
+        ),
+        {LOCKED_HASH},
+    )
+
+    assert [box[0] for box in captured_boxes] == ["КРЕПЛЕНИЕ", "УСТАНОВКА"]
+    first, second = captured_boxes
+    assert first[4] <= second[2] or second[4] <= first[2]
 
 
 @pytest.mark.parametrize("panel_side", ["left", "right"])
@@ -470,6 +520,81 @@ def test_render_visual_clean_hero_preserves_pixels_and_size(tmp_path: Path) -> N
 
     assert Image.open(output).size == (900, 1200)
     assert Image.open(output).getpixel((850, 600)) == (205, 192, 180)
+
+
+def test_wrap_splits_a_single_overlong_russian_word_by_character() -> None:
+    from ozon_v2.images import visual_design
+
+    draw = visual_design.ImageDraw.Draw(Image.new("RGB", (900, 200)))
+    font = visual_design._font(24)
+    word = "А" * 200
+
+    lines = visual_design._wrap(draw, word, font, 100)
+
+    assert "".join(lines) == word
+    assert len(lines) > 1
+    assert all(visual_design._text_width(draw, line, font) <= 100 for line in lines)
+
+
+def test_render_visual_rejects_long_copy_that_cannot_fit_its_safe_area(tmp_path: Path) -> None:
+    source = tmp_path / "source.png"
+    output = tmp_path / "output.png"
+    Image.new("RGB", (900, 1200), (205, 192, 180)).save(source)
+    spec = _render_spec(
+        slot_id="detail_02",
+        recipe="feature_callout",
+        callout_points=((0.2, 0.5),),
+        facts=(
+            VisualFact(
+                headline="КРЕПЛЕНИЕ",
+                detail="А" * 200,
+                evidence_sha256=LOCKED_HASH,
+            ),
+        )
+    )
+
+    with pytest.raises(ValueError, match="visual copy does not fit its safe area"):
+        render_visual(source, output, spec, {LOCKED_HASH})
+
+    assert not output.exists()
+
+
+def test_render_visual_preserves_existing_output_when_atomic_replace_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ozon_v2.images import visual_design
+
+    source = tmp_path / "source.png"
+    output = tmp_path / "output.png"
+    known_good = b"known-good-output"
+    Image.new("RGB", (900, 1200), (205, 192, 180)).save(source)
+    output.write_bytes(known_good)
+
+    def fail_replace(source_path: object, target_path: object) -> None:
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(visual_design, "os", os, raising=False)
+    monkeypatch.setattr(visual_design.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        render_visual(source, output, _render_spec(), {LOCKED_HASH})
+
+    assert output.read_bytes() == known_good
+    assert list(tmp_path.glob(".output.png.*.tmp")) == []
+
+
+@pytest.mark.parametrize("size", [(16, 16), (20, 1000)])
+def test_render_visual_rejects_sources_too_small_for_safe_typography(
+    tmp_path: Path, size: tuple[int, int]
+) -> None:
+    source = tmp_path / "source.png"
+    output = tmp_path / "output.png"
+    Image.new("RGB", size, (205, 192, 180)).save(source)
+
+    with pytest.raises(ValueError, match="visual source image is too small for safe typography"):
+        render_visual(source, output, _render_spec(), {LOCKED_HASH})
+
+    assert not output.exists()
 
 
 def test_render_visual_cli_parses_and_avoids_sqlite_for_local_command(

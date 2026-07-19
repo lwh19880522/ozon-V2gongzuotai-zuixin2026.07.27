@@ -3,15 +3,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from io import BytesIO
 import math
+import os
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
 import re
+import uuid
 
 from PIL import Image, ImageDraw, ImageFont
 
 
 CURRENT_VISUAL_CONTRACT_VERSION = "ozon-visual-v1"
+MIN_VISUAL_DIMENSION = 320
 SCENE_FIELDS = ("environment", "lighting", "camera", "shot_scale", "buyer_question")
 SCENE_SLOTS = ("main_01", "main_02", "detail_01", "detail_04", "detail_05", "detail_06")
 FORBIDDEN_PROMOTIONAL_COPY = (
@@ -323,6 +326,8 @@ def render_visual(
     with Image.open(source) as image:
         base = image.convert("RGBA")
     width, height = base.size
+    if min(width, height) < MIN_VISUAL_DIMENSION:
+        raise ValueError("visual source image is too small for safe typography")
     safe_margin = max(12, round(min(width, height) * 0.08))
     headline_font = _font(max(18, round(height * 0.030)))
     detail_font = _font(max(14, round(height * 0.019)))
@@ -342,7 +347,7 @@ def render_visual(
     encoded = BytesIO()
     rendered.save(encoded, format="PNG")
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_bytes(encoded.getvalue())
+    _write_atomically(output, encoded.getvalue())
     return {
         "visual_contract_version": CURRENT_VISUAL_CONTRACT_VERSION,
         "layout_recipe": spec.recipe,
@@ -355,6 +360,22 @@ def render_visual(
         "safe_area_passed": True,
         "mobile_readability_passed": True,
     }
+
+
+def _write_atomically(output: Path, content: bytes) -> None:
+    temporary = output.with_name(f".{output.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, output)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _font(size: int) -> ImageFont.FreeTypeFont:
@@ -371,12 +392,33 @@ def _wrap(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, ma
         proposed = word if not current else f"{current} {word}"
         if current and _text_width(draw, proposed, font) > max_width:
             lines.append(current)
-            current = word
+            current = ""
+        if not current:
+            chunks = _split_word(draw, word, font, max_width)
+            lines.extend(chunks[:-1])
+            current = chunks[-1]
         else:
             current = proposed
     if current:
         lines.append(current)
     return lines
+
+
+def _split_word(
+    draw: ImageDraw.ImageDraw, word: str, font: ImageFont.FreeTypeFont, max_width: int
+) -> list[str]:
+    chunks: list[str] = []
+    current = ""
+    for character in word:
+        proposed = f"{current}{character}"
+        if current and _text_width(draw, proposed, font) > max_width:
+            chunks.append(current)
+            current = character
+        else:
+            current = proposed
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 def _draw_fact(
@@ -388,19 +430,32 @@ def _draw_fact(
     headline_font: ImageFont.FreeTypeFont,
     detail_font: ImageFont.FreeTypeFont,
     accent_rgb: tuple[int, int, int],
+    bottom: int,
     headline_fill: tuple[int, int, int] | None = None,
     detail_fill: tuple[int, int, int] | None = None,
 ) -> int:
     headline_fill = headline_fill or accent_rgb
     detail_fill = detail_fill or (244, 244, 244)
+    measured_lines: list[tuple[str, ImageFont.FreeTypeFont, tuple[int, int, int], int]] = []
+    cursor = y
     for line in _wrap(draw, fact.headline.upper(), headline_font, max_width):
-        draw.text((x, y), line, font=headline_font, fill=(*headline_fill, 255))
-        y += _line_height(draw, line, headline_font) + 2
-    y += 3
+        measured_lines.append((line, headline_font, headline_fill, cursor))
+        cursor += _line_height(draw, line, headline_font) + 2
+    cursor += 3
     for line in _wrap(draw, fact.detail, detail_font, max_width):
-        draw.text((x, y), line, font=detail_font, fill=(*detail_fill, 255))
-        y += _line_height(draw, line, detail_font) + 2
-    return y + 12
+        measured_lines.append((line, detail_font, detail_fill, cursor))
+        cursor += _line_height(draw, line, detail_font) + 2
+
+    if cursor + 12 > bottom or any(
+        (box := draw.textbbox((x, line_y), line, font=font))[2] - box[0] > max_width
+        or box[3] > bottom
+        for line, font, _, line_y in measured_lines
+    ):
+        raise ValueError("visual copy does not fit its safe area")
+
+    for line, font, fill, line_y in measured_lines:
+        draw.text((x, line_y), line, font=font, fill=(*fill, 255))
+    return cursor + 12
 
 
 def _draw_rail(
@@ -421,7 +476,7 @@ def _draw_rail(
     for fact in spec.facts:
         y = _draw_fact(
             draw, fact, max(margin, left + margin), y, rail_width - margin * 2,
-            headline_font, detail_font, spec.accent_rgb,
+            headline_font, detail_font, spec.accent_rgb, bottom - margin,
         )
 
 
@@ -440,7 +495,7 @@ def _draw_caption(
     draw.rounded_rectangle((margin, top, width - margin, height - margin), radius=radius, fill=(16, 41, 69, 205))
     _draw_fact(
         draw, spec.facts[0], margin * 2, top + margin // 2, width - margin * 4,
-        headline_font, detail_font, spec.accent_rgb,
+        headline_font, detail_font, spec.accent_rgb, height - margin - margin // 2,
     )
 
 
@@ -456,10 +511,21 @@ def _draw_callouts(
     box_width = round(width * 0.42)
     box_height = max(round(height * 0.16), 100)
     radius = max(12, round(min(width, height) * 0.02))
-    for fact, (point_x, point_y) in zip(spec.facts, spec.callout_points):
+    available_height = height - margin * 2
+    if len(spec.facts) * box_height > available_height:
+        raise ValueError("visual callouts do not fit their safe area")
+    if len(spec.facts) == 1:
+        lane_tops = (None,)
+    else:
+        lane_gap = (available_height - len(spec.facts) * box_height) // (len(spec.facts) - 1)
+        lane_tops = tuple(margin + index * (box_height + lane_gap) for index in range(len(spec.facts)))
+
+    for fact, (point_x, point_y), lane_top in zip(spec.facts, spec.callout_points, lane_tops):
         anchor_x, anchor_y = round(point_x * width), round(point_y * height)
         left = margin if anchor_x > width // 2 else width - margin - box_width
-        top = min(max(margin, anchor_y - box_height // 2), height - margin - box_height)
+        top = lane_top if lane_top is not None else min(
+            max(margin, anchor_y - box_height // 2), height - margin - box_height
+        )
         edge_x = left if left > anchor_x else left + box_width
         edge_y = min(max(anchor_y, top + radius), top + box_height - radius)
         draw.line((anchor_x, anchor_y, edge_x, edge_y), fill=(*spec.accent_rgb, 255), width=max(2, round(width * 0.004)))
@@ -467,7 +533,7 @@ def _draw_callouts(
         draw.rounded_rectangle((left, top, left + box_width, top + box_height), radius=radius, fill=(250, 250, 250, 232))
         _draw_fact(
             draw, fact, left + margin // 2, top + margin // 2, box_width - margin,
-            headline_font, detail_font, spec.accent_rgb,
+            headline_font, detail_font, spec.accent_rgb, top + box_height - margin // 2,
             headline_fill=(25, 32, 51), detail_fill=(70, 75, 85),
         )
 
