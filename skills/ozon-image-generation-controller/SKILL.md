@@ -26,6 +26,10 @@ Read queued products from that batch. The controller supervises subagents; it do
 7. Continue with every subagent that spawned successfully; fewer than five available slots is normal, not a batch failure. If the active image-subagent pool is empty and zero internal subagent slots are available, do not claim image work; report that the controller is waiting for capacity. Existing workers continue even when no new slot is free. Never fall back to `create_thread` or user-visible tasks.
 8. Recompute demand and free capacity each dispatch cycle. Do not shrink or stop existing workers merely because no new slot is free. Grow the pool only when unassigned products and free internal slots require it, then dispatch the next product to whichever existing subagent becomes idle.
 
+## User-Selected Repair Dispatch
+
+When a queued product contains `repair_pending` slots, dispatch it through the same whole-product lease, but require the worker to read each selected slot's `review_issue_code` and `review_note`. The worker processes only the explicitly selected slots. Never reopen or regenerate an unselected `accepted` slot, and never repeat the first-attempt grid workflow for a repair-only claim.
+
 ## Stop Gates
 
 Stop dispatching when the queue is empty, a product requires manual review, a blocking gate is reached, or the user stops the batch.

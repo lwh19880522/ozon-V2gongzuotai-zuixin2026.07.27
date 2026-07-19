@@ -43,3 +43,13 @@ def test_image_controller_skill_has_bounded_stop_gates() -> None:
     assert "user stops" in text
     assert "Never upload" in text
     assert "Never modify business source code" in text
+
+
+def test_image_controller_dispatches_user_selected_repairs_without_reopening_frozen_slots() -> None:
+    text = SKILL_PATH.read_text(encoding="utf-8")
+
+    assert "repair_pending" in text
+    assert "review_issue_code" in text
+    assert "review_note" in text
+    assert "only the explicitly selected slots" in text
+    assert "Never reopen or regenerate an unselected `accepted` slot" in text

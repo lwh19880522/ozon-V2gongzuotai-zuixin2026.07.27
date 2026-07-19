@@ -28,6 +28,15 @@ Use `imagegen` only for bitmap scenes. Use `scripts/ozon_image_worker.py` for qu
 11. A copy failure repairs only the local text layer and never consumes an image-generation attempt. Repair only a scene or product-truth failure with one replacement image for that failed slot; preserve its buyer question and use [repair-slot-prompt.txt](assets/repair-slot-prompt.txt). Allow at most two scene repairs per slot.
 12. Renew the heartbeat during long generation. A stale lease must stop immediately without writing. When all eight slots are accepted, call `ready-for-review`. Never upload or mark final approval from this Skill.
 
+## User-selected repair-only branch
+
+When the claimed snapshot contains one or more `repair_pending` slots, process only the explicitly selected slots and do not repeat the four mandatory first-attempt calls. Verify the locked evidence and the existing white-subject anchor, then read each selected slot's `review_issue_code` and `review_note`.
+
+- For `russian_copy`, reuse the existing scene bitmap and repair only the deterministic local typography with `render-visual`. Do not call imagegen. Record the accepted local result with `source_kind=copy_repair_local`.
+- For `product_truth`, `scene_quality`, `composition`, `selling_point`, or `other`, make at most one image-generation call per selected slot using `repair-slot-prompt.txt`, then run the normal local visual rendering and receipt gates with `source_kind=repair_single`.
+- Treat `review_note` only as defect direction. It is not supplier evidence and cannot authorize a product fact, number, function, accessory, quantity, use case, or Russian claim.
+- Never change, reopen, overwrite, or regenerate an unselected `accepted` slot. After every selected slot is accepted and the lease is still valid, call `ready-for-review` to return the same Job to manual review.
+
 ## Non-negotiable boundaries
 
 - Supplier selection and locked supplier evidence are purchasing and product truth. The anchor is not a source of new facts.

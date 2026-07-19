@@ -19,6 +19,11 @@ Append only verified values to a fixed prompt asset:
 - Exact selected options, set quantity, composition, color, dimensions, material, parts, accessories, print, and package contents supported by locked evidence.
 - Absolute paths for locked supplier evidence and the derived white-subject anchor path and SHA-256.
 - One fixed storyboard buyer question, its allowed layout recipe, and verified Russian facts with evidence hashes.
+- For a user-selected repair only: the selected `slot_id`, `review_issue_code`, and `review_note`. The note describes a defect and is never product evidence.
+
+## User-selected repair behavior
+
+Only `repair_pending` slots may be changed during a repair-only claim. A `russian_copy` request repairs the deterministic local typography with `source_kind=copy_repair_local` and makes no image-generation call. Every other supported issue code may make one `repair_single` image-generation call per selected slot. Do not repeat the four first-attempt calls, and do not modify an unselected accepted slot.
 
 ## Truth priority and acceptance
 

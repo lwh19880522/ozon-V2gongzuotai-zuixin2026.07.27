@@ -125,3 +125,25 @@ def test_product_media_skill_uses_visual_contract_v3_storyboard_and_local_copy_r
     assert diversity_contract in main_prompt
     assert diversity_contract in detail_a_prompt
     assert diversity_contract in detail_b_prompt
+
+
+def test_product_media_skill_uses_structured_user_feedback_for_selected_repairs() -> None:
+    skill_root = ROOT / "skills" / "ozon-product-media-generator"
+    skill = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+    prompt_contract = (skill_root / "references" / "prompt-contract.md").read_text(
+        encoding="utf-8"
+    )
+    repair_prompt = (skill_root / "assets" / "repair-slot-prompt.txt").read_text(
+        encoding="utf-8"
+    )
+    combined = "\n".join((skill, prompt_contract, repair_prompt))
+
+    assert "repair_pending" in skill
+    assert "review_issue_code" in combined
+    assert "review_note" in combined
+    assert "only the explicitly selected slots" in skill
+    assert "do not repeat the four mandatory first-attempt calls" in skill
+    assert "russian_copy" in skill
+    assert "copy_repair_local" in skill
+    assert "must not be treated as product evidence" in repair_prompt
+    assert "one image-generation call per selected slot" in skill
