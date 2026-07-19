@@ -249,7 +249,8 @@ function Stop-Workbench {
         }
     }
 
-    if ($null -ne $state -and
+    if (-not $healthIsOnline -and
+        $null -ne $state -and
         [string]$state.project_root -ieq $ProjectRoot -and
         [int]$state.port -eq $Port -and
         [string]$state.status -ieq 'stopped') {

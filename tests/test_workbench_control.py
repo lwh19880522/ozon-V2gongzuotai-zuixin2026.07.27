@@ -245,6 +245,15 @@ class WorkbenchControlScriptTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, msg=f"{result.stdout}\n{result.stderr}")
         self.assertIn("NOT_RUNNING", result.stdout)
 
+    def test_stop_fast_path_requires_offline_health(self) -> None:
+        control = CONTROL_SCRIPT.read_text(encoding="utf-8-sig")
+        stop_function = control.index("function Stop-Workbench")
+        fast_path_end = control.index("    $processInfo = Get-RecordedProcessInfo $state", stop_function)
+        fast_path_start = control.rfind("    if (", stop_function, fast_path_end)
+        fast_path = control[fast_path_start:fast_path_end]
+
+        self.assertIn("-not $healthIsOnline", fast_path)
+
 
 if __name__ == "__main__":
     unittest.main()
