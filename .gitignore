@@ -31,6 +31,7 @@ venv/
 /.codex/
 /.codex_spreadsheet_probe/
 /.superpowers/
+/.worktrees/
 
 # Collected marketplace evidence and temporary image experiments
 /ozon-v2-run-*
