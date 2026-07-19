@@ -1,3 +1,5 @@
+import pytest
+
 from ozon_v2.images.visual_design import (
     CURRENT_VISUAL_CONTRACT_VERSION,
     VisualFact,
@@ -153,9 +155,40 @@ def test_feature_callout_rejects_extra_points_for_one_fact() -> None:
     assert "feature_callout requires one point per fact" in validate_visual_spec(spec, {LOCKED_HASH})
 
 
+def test_visual_spec_copies_scene_signature_from_caller() -> None:
+    scene = _scene()
+    spec = _spec("main_01", "clean_hero", scene_signature=scene)
+
+    scene["environment"] = "kitchen"
+
+    assert spec.scene_signature["environment"] == "warm_bedside"
+
+
+def test_visual_spec_scene_signature_is_read_only() -> None:
+    spec = _spec("main_01", "clean_hero")
+
+    with pytest.raises(TypeError):
+        spec.scene_signature["environment"] = "kitchen"
+
+
+def test_scene_whitespace_cannot_create_fake_dimension_difference() -> None:
+    first = _spec("main_01", "clean_hero")
+    second = _spec(
+        "main_02",
+        "integrated_rail",
+        facts=(_fact(),),
+        scene_signature={key: f" {value} " for key, value in _scene().items()},
+    )
+
+    assert any(
+        "differ in fewer than three" in error
+        for error in validate_visual_set((first, second))
+    )
+
+
 def test_fact_and_spec_from_dict_normalize_values() -> None:
     fact = VisualFact.from_dict(
-        {"headline": " ОТКРЫТЫЙ НИЗ ", "detail": " кабель ", "evidence_sha256": " a ", "numeric_verified": 1}
+        {"headline": " ОТКРЫТЫЙ НИЗ ", "detail": " кабель ", "evidence_sha256": " a ", "numeric_verified": True}
     )
     spec = VisualSpec.from_dict(
         {
@@ -205,3 +238,96 @@ def test_visual_set_rejects_duplicate_slots_and_buyer_questions() -> None:
 
     assert "duplicate visual slot main_01" in errors
     assert "duplicate buyer_question where_used" in errors
+
+
+@pytest.mark.parametrize("value", ["false", 1])
+def test_fact_from_dict_rejects_non_boolean_numeric_verified(value: object) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        VisualFact.from_dict(
+            {
+                "headline": "ОТКРЫТЫЙ НИЗ",
+                "detail": "кабель проходит свободно",
+                "evidence_sha256": LOCKED_HASH,
+                "numeric_verified": value,
+            }
+        )
+
+
+def test_from_dict_normalizes_none_scene_value_to_empty() -> None:
+    spec = VisualSpec.from_dict(
+        {
+            "contract_version": CURRENT_VISUAL_CONTRACT_VERSION,
+            "slot_id": "main_01",
+            "recipe": "clean_hero",
+            "facts": (),
+            "scene_signature": _scene(environment=None),
+        }
+    )
+
+    assert "scene_signature is missing environment" in validate_visual_spec(spec, {LOCKED_HASH})
+
+
+def test_from_dict_rejects_non_string_copy_fields() -> None:
+    with pytest.raises((TypeError, ValueError)):
+        VisualFact.from_dict(
+            {"headline": 4, "detail": "кабель", "evidence_sha256": LOCKED_HASH}
+        )
+
+
+def test_from_dict_rejects_coercible_rgb_components() -> None:
+    with pytest.raises((TypeError, ValueError)):
+        VisualSpec.from_dict(
+            {
+                "contract_version": CURRENT_VISUAL_CONTRACT_VERSION,
+                "slot_id": "main_01",
+                "recipe": "clean_hero",
+                "facts": (),
+                "scene_signature": _scene(),
+                "accent_rgb": [True, 2.9, "3"],
+            }
+        )
+
+
+@pytest.mark.parametrize("point", [[True, "0.5"], [0.5, float("inf")]])
+def test_from_dict_rejects_coercible_or_nonfinite_points(point: list[object]) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        VisualSpec.from_dict(
+            {
+                "contract_version": CURRENT_VISUAL_CONTRACT_VERSION,
+                "slot_id": "main_01",
+                "recipe": "clean_hero",
+                "facts": (),
+                "scene_signature": _scene(),
+                "callout_points": [point],
+            }
+        )
+
+
+def test_numeric_copy_needs_literal_true_verification() -> None:
+    spec = _spec(
+        "detail_05",
+        "metric_panel",
+        facts=(_fact(detail="кабель проходит свободно 7 см", numeric_verified=1),),
+    )
+
+    assert "numeric copy requires numeric_verified" in validate_visual_spec(spec, {LOCKED_HASH})
+
+
+def test_promotional_word_boundaries_do_not_reject_stopor() -> None:
+    spec = _spec(
+        "detail_01",
+        "context_caption",
+        facts=(_fact(headline="НАДЁЖНЫЙ СТОПОР"),),
+    )
+
+    assert validate_visual_spec(spec, {LOCKED_HASH}) == []
+
+
+def test_standalone_top_is_forbidden_promotional_copy() -> None:
+    spec = _spec(
+        "detail_01",
+        "context_caption",
+        facts=(_fact(headline="ТОП ВЫБОР"),),
+    )
+
+    assert "forbidden promotional copy" in validate_visual_spec(spec, {LOCKED_HASH})

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
+import math
+from types import MappingProxyType
 from typing import Any, Mapping
 import re
 
@@ -21,6 +23,11 @@ FORBIDDEN_PROMOTIONAL_COPY = (
     "http",
 )
 _CYRILLIC = re.compile(r"[А-Яа-яЁё]")
+_PROMOTIONAL_WORDS = FORBIDDEN_PROMOTIONAL_COPY[:7]
+_PROMOTIONAL_MARKERS = FORBIDDEN_PROMOTIONAL_COPY[7:]
+_PROMOTIONAL_WORD_PATTERN = re.compile(
+    rf"(?<!\w)(?:{'|'.join(_PROMOTIONAL_WORDS)})(?!\w)"
+)
 
 
 @dataclass(frozen=True)
@@ -49,13 +56,29 @@ class VisualFact:
     evidence_sha256: str
     numeric_verified: bool = False
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "headline", _string_value(self.headline, "headline"))
+        object.__setattr__(self, "detail", _string_value(self.detail, "detail"))
+        object.__setattr__(
+            self,
+            "evidence_sha256",
+            _string_value(self.evidence_sha256, "evidence_sha256"),
+        )
+
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> VisualFact:
+        numeric_verified = value.get("numeric_verified", False)
+        if numeric_verified is None:
+            numeric_verified = False
+        if type(numeric_verified) is not bool:
+            raise ValueError("numeric_verified must be a boolean")
         return cls(
-            headline=str(value.get("headline", "")).strip(),
-            detail=str(value.get("detail", "")).strip(),
-            evidence_sha256=str(value.get("evidence_sha256", "")).strip(),
-            numeric_verified=bool(value.get("numeric_verified", False)),
+            headline=_string_value(value.get("headline", ""), "headline"),
+            detail=_string_value(value.get("detail", ""), "detail"),
+            evidence_sha256=_string_value(
+                value.get("evidence_sha256", ""), "evidence_sha256"
+            ),
+            numeric_verified=numeric_verified,
         )
 
 
@@ -65,34 +88,84 @@ class VisualSpec:
     slot_id: str
     recipe: str
     facts: tuple[VisualFact, ...]
-    scene_signature: dict[str, str]
+    scene_signature: Mapping[str, str]
     panel_side: str = "right"
     accent_rgb: tuple[int, int, int] = (239, 177, 156)
     callout_points: tuple[tuple[float, float], ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "contract_version",
+            _string_value(self.contract_version, "contract_version"),
+        )
+        object.__setattr__(self, "slot_id", _string_value(self.slot_id, "slot_id"))
+        object.__setattr__(self, "recipe", _string_value(self.recipe, "recipe"))
+        object.__setattr__(self, "panel_side", _string_value(self.panel_side, "panel_side"))
+        object.__setattr__(
+            self,
+            "scene_signature",
+            MappingProxyType(
+                {
+                    _string_value(key, "scene field"): _string_value(
+                        item, "scene_signature value"
+                    )
+                    for key, item in self.scene_signature.items()
+                }
+            ),
+        )
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> VisualSpec:
         raw_facts = value.get("facts", ())
         raw_scene = value.get("scene_signature", {})
+        if raw_scene is None:
+            raw_scene = {}
+        if not isinstance(raw_scene, Mapping):
+            raise TypeError("scene_signature must be a mapping")
         return cls(
-            contract_version=str(value.get("contract_version", "")).strip(),
-            slot_id=str(value.get("slot_id", "")).strip(),
-            recipe=str(value.get("recipe", "")).strip(),
+            contract_version=_string_value(
+                value.get("contract_version", ""), "contract_version"
+            ),
+            slot_id=_string_value(value.get("slot_id", ""), "slot_id"),
+            recipe=_string_value(value.get("recipe", ""), "recipe"),
             facts=tuple(
                 fact if isinstance(fact, VisualFact) else VisualFact.from_dict(fact)
                 for fact in raw_facts
             ),
-            scene_signature={str(key).strip(): str(item).strip() for key, item in raw_scene.items()},
-            panel_side=str(value.get("panel_side", "right")).strip(),
-            accent_rgb=tuple(int(component) for component in value.get("accent_rgb", (239, 177, 156))),
+            scene_signature={
+                _string_value(key, "scene field"): _string_value(
+                    item, "scene_signature value"
+                )
+                for key, item in raw_scene.items()
+            },
+            panel_side=_string_value(value.get("panel_side", "right"), "panel_side"),
+            accent_rgb=_parse_rgb(value.get("accent_rgb", (239, 177, 156))),
             callout_points=tuple(
-                tuple(float(component) for component in point)
+                _parse_point(point)
                 for point in value.get("callout_points", ())
             ),
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return {
+            "contract_version": self.contract_version,
+            "slot_id": self.slot_id,
+            "recipe": self.recipe,
+            "facts": tuple(
+                {
+                    "headline": fact.headline,
+                    "detail": fact.detail,
+                    "evidence_sha256": fact.evidence_sha256,
+                    "numeric_verified": fact.numeric_verified,
+                }
+                for fact in self.facts
+            ),
+            "scene_signature": dict(self.scene_signature),
+            "panel_side": self.panel_side,
+            "accent_rgb": self.accent_rgb,
+            "callout_points": self.callout_points,
+        }
 
 
 def validate_visual_spec(
@@ -151,10 +224,42 @@ def _validate_fact(
         errors.append("copy must contain Russian Cyrillic text")
     if len(fact.headline.split()) > 5 or len(fact.detail.split()) > 9:
         errors.append("Russian copy exceeds the short-copy limit")
-    if any(token in copy.casefold() for token in FORBIDDEN_PROMOTIONAL_COPY):
+    folded_copy = copy.casefold()
+    if _PROMOTIONAL_WORD_PATTERN.search(folded_copy) or any(
+        marker in folded_copy for marker in _PROMOTIONAL_MARKERS
+    ):
         errors.append("forbidden promotional copy")
-    if any(character.isdigit() for character in copy) and not fact.numeric_verified:
+    if any(character.isdigit() for character in copy) and fact.numeric_verified is not True:
         errors.append("numeric copy requires numeric_verified")
+
+
+def _string_value(value: object, field: str) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise TypeError(f"{field} must be a string")
+    return value.strip()
+
+
+def _parse_rgb(value: object) -> tuple[int, ...]:
+    if not isinstance(value, (list, tuple)):
+        raise TypeError("accent_rgb must be a sequence")
+    if any(not isinstance(component, int) or isinstance(component, bool) for component in value):
+        raise TypeError("accent_rgb components must be integers")
+    return tuple(value)
+
+
+def _parse_point(value: object) -> tuple[float, ...]:
+    if not isinstance(value, (list, tuple)):
+        raise TypeError("callout point must be a sequence")
+    if any(
+        not isinstance(component, (int, float))
+        or isinstance(component, bool)
+        or not math.isfinite(component)
+        for component in value
+    ):
+        raise TypeError("callout point components must be finite numbers")
+    return tuple(float(component) for component in value)
 
 
 def _is_normalized_point(point: object) -> bool:
