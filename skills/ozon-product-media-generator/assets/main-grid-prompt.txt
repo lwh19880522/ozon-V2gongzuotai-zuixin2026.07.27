@@ -2,6 +2,6 @@ Create one horizontal 1x2 ecommerce grid for the exact locked product sales unit
 
 Panel 1 is `main_01`: a text-free clean hero in a real evidence-safe scene. Make it the most compelling presentation, with the complete product dominant, naturally integrated, unobstructed, and recognizable on mobile. It has zero copy.
 
-Panel 2 is `main_02`: a materially different scene that proves the value overview. Reserve a natural dark or clean side area for a local integrated information rail with at most two verified Russian facts. The panels must differ in environment, lighting, camera, shot scale, and buyer question, not merely angle or background color. Neither finished panel may be a plain or near-white product-only catalog view.
+Panel 2 is `main_02`: a materially different scene that proves the value overview. Reserve a natural dark or clean side area for a local integrated information rail with at most two verified Russian facts. The two panels must differ in at least three of environment, lighting, camera, shot scale, and buyer question, not merely angle or background color. Neither finished panel may be a plain or near-white product-only catalog view.
 
 Do not render text, numbers, icons, logos, badges, watermarks, prices, discounts, extra products, invented claims or parts, duplicate subjects, cutout edges, collage borders, or panel labels. Keep an equal vertical split. Use `ozon-image-v3` and `ozon-visual-v1`.

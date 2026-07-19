@@ -119,3 +119,9 @@ def test_product_media_skill_uses_visual_contract_v3_storyboard_and_local_copy_r
     assert "invented claims" in main_prompt
     assert "second structure or verified metric" in detail_a_prompt
     assert "detail, material" not in detail_a_prompt
+    diversity_contract = (
+        "differ in at least three of environment, lighting, camera, shot scale, and buyer question"
+    )
+    assert diversity_contract in main_prompt
+    assert diversity_contract in detail_a_prompt
+    assert diversity_contract in detail_b_prompt
