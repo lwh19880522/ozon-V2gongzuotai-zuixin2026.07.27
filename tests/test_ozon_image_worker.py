@@ -757,6 +757,104 @@ def test_user_review_requeues_only_selected_slots_and_preserves_old_outputs(
         assert after[slot_id] == before[slot_id]
 
 
+def test_user_requested_repair_rejects_legacy_receipt_without_state_change(
+    tmp_path: Path,
+) -> None:
+    queue, claimed = _record_eight_v3_slots(tmp_path)
+    queue.mark_ready_for_review(
+        claimed["job_id"], claimed["worker_id"], claimed["lease_epoch"]
+    )
+    queue.request_repairs(
+        claimed["job_id"],
+        [{"slot_id": "main_02", "issue_code": "scene_quality", "note": ""}],
+        now_epoch=500,
+    )
+    repair_job = queue.claim_next(
+        "ozon-image-worker-02", now_epoch=501, lease_seconds=30
+    )
+    assert repair_job
+    repair_slot = next(
+        slot
+        for slot in queue.list_slots(claimed["job_id"])
+        if slot["slot_id"] == "main_02"
+    )
+    source = tmp_path / "legacy-repair-source.png"
+    output = tmp_path / "legacy-repair-output.png"
+    _solid_grid(source, ["red", "green"])
+    Image.new("RGB", (120, 90), "red").save(output)
+    legacy_repair = _slot_receipt(
+        job=repair_job,
+        slot=repair_slot,
+        source_path=source,
+        output_path=output,
+        accepted=True,
+        source_kind="repair_single",
+        prompt_version="ozon-image-v2",
+    )
+    before = queue.snapshot(claimed["job_id"])
+
+    with pytest.raises(ValueError, match="user-selected repair.*ozon-image-v3"):
+        queue.record_slot_result(legacy_repair)
+
+    assert queue.snapshot(claimed["job_id"]) == before
+
+
+def test_rejected_user_requested_repair_preserves_previous_accepted_artifact(
+    tmp_path: Path,
+) -> None:
+    queue, claimed = _record_eight_v3_slots(tmp_path)
+    queue.mark_ready_for_review(
+        claimed["job_id"], claimed["worker_id"], claimed["lease_epoch"]
+    )
+    before_request = next(
+        slot
+        for slot in queue.list_slots(claimed["job_id"])
+        if slot["slot_id"] == "detail_03"
+    )
+    queue.request_repairs(
+        claimed["job_id"],
+        [{"slot_id": "detail_03", "issue_code": "scene_quality", "note": ""}],
+        now_epoch=500,
+    )
+    repair_job = queue.claim_next(
+        "ozon-image-worker-02", now_epoch=501, lease_seconds=30
+    )
+    assert repair_job
+    repair_slot = next(
+        slot
+        for slot in queue.list_slots(claimed["job_id"])
+        if slot["slot_id"] == "detail_03"
+    )
+    master = SubjectMasterSelection.from_dict(
+        json.loads(repair_job["subject_master_json"])
+    )
+    source = tmp_path / "rejected-repair-source.png"
+    output = tmp_path / "rejected-repair-output.png"
+    _solid_grid(source, ["red", "green"])
+    Image.new("RGB", (120, 90), "red").save(output)
+    rejected = _slot_receipt(
+        job=repair_job,
+        slot=repair_slot,
+        source_path=source,
+        output_path=output,
+        accepted=False,
+        source_kind="repair_single",
+        prompt_version="ozon-image-v3",
+        validation=_v3_validation("detail_03", master.source_sha256),
+    )
+
+    updated = queue.record_slot_result(rejected)
+
+    assert updated["status"] == "repair_pending"
+    assert updated["attempt_count"] == before_request["attempt_count"] + 1
+    assert updated["repair_count"] == before_request["repair_count"] + 1
+    assert updated["accepted_path"] == before_request["accepted_path"]
+    assert updated["receipt_json"] == before_request["receipt_json"]
+    attempt = queue.list_attempts(claimed["job_id"])[-1]
+    assert attempt["accepted"] == 0
+    assert json.loads(attempt["receipt_json"])["receipt_sha256"] == rejected.receipt_sha256
+
+
 @pytest.mark.parametrize(
     ("repairs", "expected_code"),
     [

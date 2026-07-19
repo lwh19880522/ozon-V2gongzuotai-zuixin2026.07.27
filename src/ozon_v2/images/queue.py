@@ -536,6 +536,17 @@ class ImageGenerationQueue:
                 connection.rollback()
                 raise ValueError("accepted slot is frozen")
 
+            is_user_requested_repair = slot["review_requested_at"] is not None
+            if (
+                is_user_requested_repair
+                and receipt.prompt_version != CURRENT_PROMPT_VERSION
+            ):
+                connection.rollback()
+                raise ValueError(
+                    "user-selected repair receipts must use "
+                    f"{CURRENT_PROMPT_VERSION}"
+                )
+
             if receipt.accepted and receipt.prompt_version == CURRENT_PROMPT_VERSION:
                 try:
                     subject_master = SubjectMasterSelection.from_dict(
@@ -575,6 +586,15 @@ class ImageGenerationQueue:
                 next_status = "repair_pending"
 
             payload = json.dumps(receipt.to_dict(), ensure_ascii=False, sort_keys=True)
+            preserve_previous_accepted = is_user_requested_repair and not receipt.accepted
+            accepted_path = (
+                slot["accepted_path"]
+                if preserve_previous_accepted
+                else receipt.output_path if receipt.accepted else None
+            )
+            stored_receipt_json = (
+                slot["receipt_json"] if preserve_previous_accepted else payload
+            )
             connection.execute(
                 """
                 INSERT INTO image_attempts (
@@ -603,8 +623,8 @@ class ImageGenerationQueue:
                 (
                     next_status,
                     next_repair_count,
-                    receipt.output_path if receipt.accepted else None,
-                    payload,
+                    accepted_path,
+                    stored_receipt_json,
                     receipt.job_id,
                     receipt.slot_id,
                 ),
