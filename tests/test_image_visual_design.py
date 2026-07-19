@@ -501,8 +501,8 @@ def test_feature_callout_keeps_corner_marker_inside_canvas(
     )
 
     left, top, right, bottom = captured_ellipses[0]
-    assert 0 <= left <= right <= 900
-    assert 0 <= top <= bottom <= 1200
+    assert 0 <= left <= right < 900
+    assert 0 <= top <= bottom < 1200
 
 
 @pytest.mark.parametrize("panel_side", ["left", "right"])

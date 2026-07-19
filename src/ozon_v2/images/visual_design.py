@@ -522,8 +522,8 @@ def _draw_callouts(
         lane_tops = tuple(margin + index * (box_height + lane_gap) for index in range(len(spec.facts)))
 
     for fact, (point_x, point_y), lane_top in zip(spec.facts, spec.callout_points, lane_tops):
-        anchor_x = min(max(round(point_x * width), marker_radius), width - marker_radius)
-        anchor_y = min(max(round(point_y * height), marker_radius), height - marker_radius)
+        anchor_x = min(max(round(point_x * width), marker_radius), width - 1 - marker_radius)
+        anchor_y = min(max(round(point_y * height), marker_radius), height - 1 - marker_radius)
         left = margin if anchor_x > width // 2 else width - margin - box_width
         top = lane_top if lane_top is not None else min(
             max(margin, anchor_y - box_height // 2), height - margin - box_height
