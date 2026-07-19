@@ -6,8 +6,10 @@ from pathlib import Path
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
@@ -245,14 +247,83 @@ class WorkbenchControlScriptTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, msg=f"{result.stdout}\n{result.stderr}")
         self.assertIn("NOT_RUNNING", result.stdout)
 
-    def test_stop_fast_path_requires_offline_health(self) -> None:
-        control = CONTROL_SCRIPT.read_text(encoding="utf-8-sig")
-        stop_function = control.index("function Stop-Workbench")
-        fast_path_end = control.index("    $processInfo = Get-RecordedProcessInfo $state", stop_function)
-        fast_path_start = control.rfind("    if (", stop_function, fast_path_end)
-        fast_path = control[fast_path_start:fast_path_end]
+    def test_stop_with_invalid_state_port_is_not_blocked(self) -> None:
+        self.runtime_dir.mkdir(parents=True)
+        self.state_file.write_text(
+            json.dumps(
+                {
+                    "pid": 0,
+                    "port": "not-a-port",
+                    "project_root": str(PROJECT_ROOT.resolve()),
+                    "status": "stopped",
+                }
+            ),
+            encoding="utf-8",
+        )
 
-        self.assertIn("-not $healthIsOnline", fast_path)
+        result = self.run_control("Stop", check=False)
+
+        self.assertEqual(0, result.returncode, msg=f"{result.stdout}\n{result.stderr}")
+        self.assertIn("NOT_RUNNING", result.stdout)
+        self.assertNotIn("Cannot convert value", result.stderr)
+
+    def test_stop_does_not_fast_path_after_online_stop_api_failure(self) -> None:
+        class StopFailureHandler(BaseHTTPRequestHandler):
+            def send_json(self, status: int, payload: dict[str, object]) -> None:
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self) -> None:
+                if self.path == "/api/health":
+                    self.send_json(200, {"ok": True, "code": "health.ok"})
+                    return
+                self.send_json(404, {"ok": False})
+
+            def do_POST(self) -> None:
+                if self.path == "/api/runtime/stop":
+                    self.send_json(503, {"ok": False, "code": "stop.unavailable"})
+                    return
+                self.send_json(404, {"ok": False})
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", self.port), StopFailureHandler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        try:
+            deadline = time.time() + 2
+            while time.time() < deadline and not self.health_ok():
+                time.sleep(0.05)
+            self.assertTrue(self.health_ok())
+            self.runtime_dir.mkdir(parents=True)
+            self.state_file.write_text(
+                json.dumps(
+                    {
+                        "pid": 0,
+                        "port": self.port,
+                        "project_root": str(PROJECT_ROOT.resolve()),
+                        "status": "stopped",
+                        "updated_at": "sentinel",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = self.run_control("Stop", check=False)
+            state = json.loads(self.state_file.read_text(encoding="utf-8-sig"))
+
+            self.assertEqual(0, result.returncode, msg=f"{result.stdout}\n{result.stderr}")
+            self.assertNotEqual("sentinel", state["updated_at"])
+            self.assertTrue(self.health_ok())
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=5)
 
 
 if __name__ == "__main__":

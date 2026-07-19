@@ -102,12 +102,21 @@ function Get-RecordedProcessInfo {
     }
 }
 
+function Test-RecordedStateMatchesEndpoint {
+    param($State)
+    if ($null -eq $State -or [string]$State.project_root -ine $ProjectRoot) {
+        return $false
+    }
+    $recordedPort = 0
+    return [int]::TryParse([string]$State.port, [ref]$recordedPort) -and $recordedPort -eq $Port
+}
+
 function Test-RecordedProcessBelongsToWorkbench {
     param($State, $ProcessInfo)
     if ($null -eq $State -or $null -eq $ProcessInfo) {
         return $false
     }
-    if ([string]$State.project_root -ine $ProjectRoot -or [int]$State.port -ne $Port) {
+    if (-not (Test-RecordedStateMatchesEndpoint $State)) {
         return $false
     }
     $executableName = [IO.Path]::GetFileName([string]$ProcessInfo.ExecutablePath)
@@ -250,9 +259,7 @@ function Stop-Workbench {
     }
 
     if (-not $healthIsOnline -and
-        $null -ne $state -and
-        [string]$state.project_root -ieq $ProjectRoot -and
-        [int]$state.port -eq $Port -and
+        (Test-RecordedStateMatchesEndpoint $state) -and
         [string]$state.status -ieq 'stopped') {
         Write-Output "NOT_RUNNING URL=$HealthUrl"
         $script:ResultCode = 0
