@@ -26,6 +26,9 @@ REPAIR_ISSUE_CODES = frozenset(
     }
 )
 MAX_REVIEW_NOTE_LENGTH = 500
+HISTORICAL_PROMPT_VERSIONS = frozenset(
+    {"ozon-image-v1", LEGACY_PROMPT_VERSION}
+)
 
 SLOT_DEFINITIONS = (
     ("main_01", "main", "main_1x2", 1),
@@ -640,9 +643,16 @@ class ImageGenerationQueue:
                 connection.rollback()
                 raise ValueError("all eight image slots must be accepted before review")
             accepted_receipts = connection.execute(
-                "SELECT slot_id, receipt_json FROM image_slots WHERE job_id = ? ORDER BY rowid",
+                """
+                SELECT slot_id, receipt_json, review_requested_at
+                FROM image_slots WHERE job_id = ? ORDER BY rowid
+                """,
                 (job_id,),
             ).fetchall()
+            migration_requested = any(
+                stored["review_requested_at"] is not None
+                for stored in accepted_receipts
+            )
             slot_roles: list[str] = []
             receipts: list[SlotResultReceipt] = []
             for stored in accepted_receipts:
@@ -656,27 +666,68 @@ class ImageGenerationQueue:
                 if not receipt.verify():
                     connection.rollback()
                     raise ValueError("accepted slot receipt failed final verification")
+                if (
+                    receipt.selection_sha256 != job["selection_sha256"]
+                    or receipt.subject_master_sha256 != job["subject_master_sha256"]
+                ):
+                    connection.rollback()
+                    raise ValueError(
+                        "accepted slot receipt does not match the active image contract"
+                    )
+                preserved_historical = (
+                    migration_requested
+                    and receipt.prompt_version in HISTORICAL_PROMPT_VERSIONS
+                    and stored["review_requested_at"] is None
+                )
                 acceptance_errors = receipt.acceptance_contract_errors()
-                if acceptance_errors:
+                if acceptance_errors and not (
+                    preserved_historical
+                    and receipt.prompt_version == "ozon-image-v1"
+                ):
                     connection.rollback()
                     raise ValueError(
                         "accepted slot failed marketing-scene validation: "
                         + "; ".join(acceptance_errors)
                     )
-                slot_roles.append(str(receipt.validation["slot_role"]).strip().casefold())
+                slot_roles.append(
+                    str(
+                        stored["slot_id"]
+                        if receipt.prompt_version == "ozon-image-v1"
+                        else receipt.validation["slot_role"]
+                    )
+                    .strip()
+                    .casefold()
+                )
                 receipts.append(receipt)
             if len(set(slot_roles)) != len(slot_roles):
                 connection.rollback()
                 raise ValueError("all eight accepted slot roles must be distinct")
             prompt_versions = {receipt.prompt_version for receipt in receipts}
-            if len(prompt_versions) != 1:
+            migration_allowed = (
+                migration_requested
+                and CURRENT_PROMPT_VERSION in prompt_versions
+                and prompt_versions
+                <= HISTORICAL_PROMPT_VERSIONS | {CURRENT_PROMPT_VERSION}
+                and all(
+                    receipt.prompt_version == CURRENT_PROMPT_VERSION
+                    or stored["review_requested_at"] is None
+                    for stored, receipt in zip(
+                        accepted_receipts, receipts, strict=True
+                    )
+                )
+            )
+            if len(prompt_versions) != 1 and not migration_allowed:
                 connection.rollback()
                 raise ValueError("mixed prompt versions are not allowed")
-            prompt_version = prompt_versions.pop()
-            if prompt_version == CURRENT_PROMPT_VERSION:
+            if prompt_versions == {"ozon-image-v1"}:
+                connection.rollback()
+                raise ValueError("accepted slot receipt has an unknown prompt version")
+            if prompt_versions == {CURRENT_PROMPT_VERSION} or migration_allowed:
                 specs: list[VisualSpec] = []
                 errors: list[str] = []
                 for stored, receipt in zip(accepted_receipts, receipts, strict=True):
+                    if receipt.prompt_version != CURRENT_PROMPT_VERSION:
+                        continue
                     try:
                         spec = VisualSpec.from_dict(receipt.validation["visual_spec"])
                     except (KeyError, TypeError, ValueError) as error:
@@ -690,7 +741,7 @@ class ImageGenerationQueue:
                 if errors:
                     connection.rollback()
                     raise ValueError("visual set validation failed: " + "; ".join(errors))
-            elif prompt_version != LEGACY_PROMPT_VERSION:
+            elif prompt_versions != {LEGACY_PROMPT_VERSION}:
                 connection.rollback()
                 raise ValueError("accepted slot receipt has an unknown prompt version")
             connection.execute(

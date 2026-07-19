@@ -546,12 +546,115 @@ def _record_eight_v3_slots(
     return queue, job
 
 
+def _force_manual_review_job(queue: ImageGenerationQueue, job_id: str) -> None:
+    with queue._connect() as connection:
+        connection.execute(
+            """
+            UPDATE image_jobs
+            SET status = 'manual_review_required', worker_id = NULL,
+                lease_expires = NULL, heartbeat_at = NULL
+            WHERE job_id = ?
+            """,
+            (job_id,),
+        )
+
+
+def _record_user_requested_v3_repair(
+    tmp_path: Path,
+    queue: ImageGenerationQueue,
+    claimed: dict,
+    *,
+    slot_id: str = "main_02",
+) -> dict:
+    queue.request_repairs(
+        claimed["job_id"],
+        [{"slot_id": slot_id, "issue_code": "scene_quality", "note": "场景不真实"}],
+        now_epoch=500,
+    )
+    repair_job = queue.claim_next(
+        "ozon-image-worker-02", now_epoch=501, lease_seconds=30
+    )
+    assert repair_job and repair_job["job_id"] == claimed["job_id"]
+    repair_slot = next(
+        slot for slot in queue.list_slots(claimed["job_id"])
+        if slot["slot_id"] == slot_id
+    )
+    master = SubjectMasterSelection.from_dict(
+        json.loads(repair_job["subject_master_json"])
+    )
+    source = tmp_path / f"{slot_id}-repair-source.png"
+    output = tmp_path / f"{slot_id}-repair-output.png"
+    _solid_grid(source, ["red", "green"])
+    Image.new("RGB", (120, 90), "red").save(output)
+    queue.record_slot_result(
+        _slot_receipt(
+            job=repair_job,
+            slot=repair_slot,
+            source_path=source,
+            output_path=output,
+            accepted=True,
+            source_kind="repair_single",
+            prompt_version="ozon-image-v3",
+            validation=_v3_validation(slot_id, master.source_sha256),
+        )
+    )
+    return repair_job
+
+
 def test_ready_for_review_rejects_mixed_v2_and_v3_receipts(tmp_path: Path) -> None:
     queue, job = _record_eight_v3_slots(tmp_path, mixed_v2=True)
 
     with pytest.raises(ValueError, match="mixed prompt versions are not allowed"):
         queue.mark_ready_for_review(job["job_id"], job["worker_id"], job["lease_epoch"])
     assert queue.get_job(job["job_id"])["status"] == "in_progress"
+
+
+def test_user_requested_v3_repair_can_coexist_with_frozen_legacy_slots(
+    tmp_path: Path,
+) -> None:
+    queue, claimed = _record_eight_v3_slots(tmp_path, mixed_v2=True)
+    _force_manual_review_job(queue, claimed["job_id"])
+    repair_job = _record_user_requested_v3_repair(tmp_path, queue, claimed)
+
+    reviewed = queue.mark_ready_for_review(
+        repair_job["job_id"], repair_job["worker_id"], repair_job["lease_epoch"]
+    )
+
+    assert reviewed["status"] == "manual_review_required"
+    frozen = queue.list_slots(claimed["job_id"])[0]
+    assert json.loads(frozen["receipt_json"])["prompt_version"] == "ozon-image-v2"
+    assert frozen["review_requested_at"] is None
+
+
+def test_user_requested_v3_repair_can_preserve_historical_v1_receipt(
+    tmp_path: Path,
+) -> None:
+    queue, claimed = _record_eight_v3_slots(tmp_path, mixed_v2=True)
+    first_slot = queue.list_slots(claimed["job_id"])[0]
+    historical = _rehash_receipt(
+        SlotResultReceipt.from_dict(json.loads(first_slot["receipt_json"])),
+        prompt_version="ozon-image-v1",
+    )
+    with queue._connect() as connection:
+        connection.execute(
+            "UPDATE image_slots SET receipt_json = ? WHERE job_id = ? AND slot_id = ?",
+            (
+                json.dumps(historical.to_dict(), ensure_ascii=False, sort_keys=True),
+                claimed["job_id"],
+                first_slot["slot_id"],
+            ),
+        )
+    _force_manual_review_job(queue, claimed["job_id"])
+    repair_job = _record_user_requested_v3_repair(tmp_path, queue, claimed)
+
+    reviewed = queue.mark_ready_for_review(
+        repair_job["job_id"], repair_job["worker_id"], repair_job["lease_epoch"]
+    )
+
+    assert reviewed["status"] == "manual_review_required"
+    frozen = queue.list_slots(claimed["job_id"])[0]
+    assert json.loads(frozen["receipt_json"])["prompt_version"] == "ozon-image-v1"
+    assert frozen["review_requested_at"] is None
 
 
 def test_ready_for_review_rejects_repeated_v3_scenes(tmp_path: Path) -> None:
