@@ -267,7 +267,7 @@ class WorkbenchControlScriptTests(unittest.TestCase):
         self.assertIn("NOT_RUNNING", result.stdout)
         self.assertNotIn("Cannot convert value", result.stderr)
 
-    def test_stop_does_not_fast_path_after_online_stop_api_failure(self) -> None:
+    def test_stop_fails_when_health_remains_online_after_stop_api_failure(self) -> None:
         class StopFailureHandler(BaseHTTPRequestHandler):
             def send_json(self, status: int, payload: dict[str, object]) -> None:
                 body = json.dumps(payload).encode("utf-8")
@@ -317,8 +317,9 @@ class WorkbenchControlScriptTests(unittest.TestCase):
             result = self.run_control("Stop", check=False)
             state = json.loads(self.state_file.read_text(encoding="utf-8-sig"))
 
-            self.assertEqual(0, result.returncode, msg=f"{result.stdout}\n{result.stderr}")
-            self.assertNotEqual("sentinel", state["updated_at"])
+            self.assertNotEqual(0, result.returncode, msg=f"{result.stdout}\n{result.stderr}")
+            self.assertIn("STOP_FAILED HEALTH_STILL_ONLINE", result.stdout)
+            self.assertEqual("sentinel", state["updated_at"])
             self.assertTrue(self.health_ok())
         finally:
             server.shutdown()

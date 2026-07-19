@@ -268,6 +268,12 @@ function Stop-Workbench {
 
     $processInfo = Get-RecordedProcessInfo $state
     if ($null -eq $processInfo) {
+        if ($healthIsOnline -and (Test-WorkbenchHealth)) {
+            Write-LifecycleLog 'stop.failed reason=health_still_online'
+            Write-Output "STOP_FAILED HEALTH_STILL_ONLINE URL=$HealthUrl"
+            $script:ResultCode = 1
+            return
+        }
         $stoppedPid = if ($null -ne $state) { [int]$state.pid } else { 0 }
         $startedAt = if ($null -ne $state) { [string]$state.started_at } else { '' }
         Write-WorkbenchState -Status 'stopped' -ProcessId $stoppedPid -StartedAt $startedAt
