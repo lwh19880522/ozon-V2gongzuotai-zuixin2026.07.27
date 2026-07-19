@@ -267,6 +267,28 @@ class WorkbenchControlScriptTests(unittest.TestCase):
         self.assertIn("NOT_RUNNING", result.stdout)
         self.assertNotIn("Cannot convert value", result.stderr)
 
+    def test_stop_with_invalid_state_pid_normalizes_to_zero(self) -> None:
+        self.runtime_dir.mkdir(parents=True)
+        self.state_file.write_text(
+            json.dumps(
+                {
+                    "pid": "not-a-pid",
+                    "port": self.port,
+                    "project_root": str(PROJECT_ROOT.resolve()),
+                    "status": "running",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.run_control("Stop", check=False)
+        state = json.loads(self.state_file.read_text(encoding="utf-8-sig"))
+
+        self.assertEqual(0, result.returncode, msg=f"{result.stdout}\n{result.stderr}")
+        self.assertIn("NOT_RUNNING", result.stdout)
+        self.assertNotIn("Cannot convert value", result.stderr)
+        self.assertEqual(0, state["pid"])
+
     def test_stop_fails_when_health_remains_online_after_stop_api_failure(self) -> None:
         class StopFailureHandler(BaseHTTPRequestHandler):
             def send_json(self, status: int, payload: dict[str, object]) -> None:

@@ -77,13 +77,22 @@ function Test-WorkbenchHealth {
     }
 }
 
-function Get-RecordedProcessInfo {
+function Get-RecordedProcessId {
     param($State)
     if ($null -eq $State) {
-        return $null
+        return 0
     }
     $recordedPid = 0
     if (-not [int]::TryParse([string]$State.pid, [ref]$recordedPid) -or $recordedPid -le 0) {
+        return 0
+    }
+    return $recordedPid
+}
+
+function Get-RecordedProcessInfo {
+    param($State)
+    $recordedPid = Get-RecordedProcessId $State
+    if ($recordedPid -le 0) {
         return $null
     }
     try {
@@ -155,7 +164,8 @@ function Wait-ForStop {
 function Start-Workbench {
     if (Test-WorkbenchHealth) {
         $state = Read-WorkbenchState
-        $pidText = if ($null -ne $state -and [int]$state.pid -gt 0) { " PID=$($state.pid)" } else { '' }
+        $recordedPid = Get-RecordedProcessId $state
+        $pidText = if ($recordedPid -gt 0) { " PID=$recordedPid" } else { '' }
         Write-Output "ALREADY_RUNNING$pidText URL=$HealthUrl"
         $script:ResultCode = 0
         return
@@ -239,6 +249,7 @@ function Start-Workbench {
 
 function Stop-Workbench {
     $state = Read-WorkbenchState
+    $recordedPid = Get-RecordedProcessId $state
     $healthIsOnline = Test-WorkbenchHealth
     if ($healthIsOnline) {
         try {
@@ -248,7 +259,7 @@ function Stop-Workbench {
             Write-LifecycleLog "stop.api_unavailable error=$($_.Exception.Message)"
         }
         if (Wait-ForStop -Seconds 5) {
-            $stoppedPid = if ($null -ne $state) { [int]$state.pid } else { 0 }
+            $stoppedPid = $recordedPid
             $startedAt = if ($null -ne $state) { [string]$state.started_at } else { '' }
             Write-WorkbenchState -Status 'stopped' -ProcessId $stoppedPid -StartedAt $startedAt
             Write-LifecycleLog "stop.succeeded pid=$stoppedPid mode=api"
@@ -274,7 +285,7 @@ function Stop-Workbench {
             $script:ResultCode = 1
             return
         }
-        $stoppedPid = if ($null -ne $state) { [int]$state.pid } else { 0 }
+        $stoppedPid = $recordedPid
         $startedAt = if ($null -ne $state) { [string]$state.started_at } else { '' }
         Write-WorkbenchState -Status 'stopped' -ProcessId $stoppedPid -StartedAt $startedAt
         Write-Output "NOT_RUNNING URL=$HealthUrl"
@@ -288,26 +299,27 @@ function Stop-Workbench {
         return
     }
 
-    Stop-Process -Id ([int]$state.pid) -Force
-    Wait-Process -Id ([int]$state.pid) -Timeout 5 -ErrorAction SilentlyContinue
-    Write-WorkbenchState -Status 'stopped' -ProcessId ([int]$state.pid) -StartedAt ([string]$state.started_at)
-    Write-LifecycleLog "stop.succeeded pid=$($state.pid) mode=validated_process"
-    Write-Output "STOPPED PID=$($state.pid)"
+    Stop-Process -Id $recordedPid -Force
+    Wait-Process -Id $recordedPid -Timeout 5 -ErrorAction SilentlyContinue
+    Write-WorkbenchState -Status 'stopped' -ProcessId $recordedPid -StartedAt ([string]$state.started_at)
+    Write-LifecycleLog "stop.succeeded pid=$recordedPid mode=validated_process"
+    Write-Output "STOPPED PID=$recordedPid"
     $script:ResultCode = 0
     return
 }
 
 function Show-WorkbenchStatus {
     $state = Read-WorkbenchState
+    $recordedPid = Get-RecordedProcessId $state
     if (Test-WorkbenchHealth) {
-        $pidText = if ($null -ne $state -and [int]$state.pid -gt 0) { " PID=$($state.pid)" } else { '' }
+        $pidText = if ($recordedPid -gt 0) { " PID=$recordedPid" } else { '' }
         Write-Output "RUNNING$pidText URL=$HealthUrl"
         $script:ResultCode = 0
         return
     }
     $processInfo = Get-RecordedProcessInfo $state
     if (Test-RecordedProcessBelongsToWorkbench $state $processInfo) {
-        Write-Output "UNHEALTHY PID=$($state.pid) URL=$HealthUrl"
+        Write-Output "UNHEALTHY PID=$recordedPid URL=$HealthUrl"
         $script:ResultCode = 1
         return
     }
