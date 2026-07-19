@@ -126,7 +126,7 @@ def validate_visual_spec(
     for fact in spec.facts:
         _validate_fact(fact, locked_evidence_sha256s, errors)
 
-    if spec.recipe == "feature_callout" and len(spec.callout_points) < len(spec.facts):
+    if spec.recipe == "feature_callout" and len(spec.callout_points) != len(spec.facts):
         errors.append("feature_callout requires one point per fact")
     if any(not _is_normalized_point(point) for point in spec.callout_points):
         errors.append("callout points must use normalized coordinates")

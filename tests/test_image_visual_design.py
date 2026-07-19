@@ -142,6 +142,17 @@ def test_layout_and_callouts_are_bounded() -> None:
     assert "callout points must use normalized coordinates" in validate_visual_spec(bad_points, {LOCKED_HASH})
 
 
+def test_feature_callout_rejects_extra_points_for_one_fact() -> None:
+    spec = _spec(
+        "detail_02",
+        "feature_callout",
+        facts=(_fact(),),
+        callout_points=((0.2, 0.8), (0.8, 0.2)),
+    )
+
+    assert "feature_callout requires one point per fact" in validate_visual_spec(spec, {LOCKED_HASH})
+
+
 def test_fact_and_spec_from_dict_normalize_values() -> None:
     fact = VisualFact.from_dict(
         {"headline": " ОТКРЫТЫЙ НИЗ ", "detail": " кабель ", "evidence_sha256": " a ", "numeric_verified": 1}
