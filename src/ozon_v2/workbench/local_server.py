@@ -1857,6 +1857,24 @@ def build_image_workspace_html(run_id: str) -> str:
     .source-title {{ display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:9px; font-size:11px; font-weight:700; }} .source-title span {{ color:var(--muted); font-weight:400; }}
     .gallery {{ min-height:0; display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); grid-auto-rows:minmax(150px,190px); align-content:start; gap:8px; padding-right:4px; overflow-y:auto; overscroll-behavior:contain; scrollbar-gutter:stable; }}
     .gallery img {{ width:100%; height:100%; min-height:150px; max-height:190px; object-fit:contain; border:1px solid var(--line); border-radius:4px; background:#fff; }}
+    .generated-review-panel {{ grid-template-rows:auto minmax(0,1fr); }}
+    .generated-review-grid {{ min-height:0; display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); align-content:start; gap:8px; padding-right:4px; overflow-y:auto; overscroll-behavior:contain; scrollbar-gutter:stable; }}
+    .generated-review-card {{ min-width:0; padding:7px; border:1px solid var(--line); border-radius:5px; background:#fff; transition:border-color .15s ease,box-shadow .15s ease; }}
+    .generated-review-card.selected {{ border-color:#e07b83; box-shadow:0 0 0 2px rgba(180,35,44,.08); }}
+    .generated-review-card.repairing {{ border-color:#e4b862; background:#fffaf0; }}
+    .generated-review-head {{ display:flex; align-items:center; justify-content:space-between; gap:6px; margin-bottom:6px; font:10px Consolas,"Courier New",monospace; }}
+    .generated-review-head strong {{ color:var(--text); }}
+    .repair-badge {{ padding:2px 5px; border-radius:3px; color:var(--green); background:var(--green-soft); font:9px "Segoe UI","Microsoft YaHei",sans-serif; }}
+    .repairing .repair-badge {{ color:var(--amber); background:var(--amber-soft); }}
+    .generated-review-card img {{ width:100%; height:108px; display:block; object-fit:contain; border:1px solid var(--line); border-radius:4px; background:#fff; }}
+    .repair-check {{ display:flex; align-items:flex-start; gap:6px; margin-top:7px; color:var(--text); font-size:10px; cursor:pointer; }}
+    .repair-check input {{ margin:2px 0 0; accent-color:var(--red); }}
+    .repair-fields {{ display:grid; gap:5px; margin-top:7px; }}
+    .repair-fields[hidden] {{ display:none; }}
+    .repair-issue,.repair-note {{ width:100%; border:1px solid var(--line); border-radius:4px; color:var(--text); background:#fff; font:10px/1.35 "Segoe UI","Microsoft YaHei",sans-serif; }}
+    .repair-issue {{ min-height:30px; padding:0 6px; }}
+    .repair-note {{ min-height:56px; padding:6px; resize:vertical; }}
+    .repair-feedback-summary {{ margin-top:7px; padding:6px; border-radius:4px; color:#74410a; background:var(--amber-soft); font-size:9px; overflow-wrap:anywhere; }}
     .empty {{ min-height:0; height:100%; display:grid; place-items:center; padding:18px; border:1px dashed #c9d1dc; border-radius:4px; color:var(--muted); background:var(--soft); text-align:center; font-size:11px; }}
     .generation-empty {{ color:var(--amber); background:#fffaf0; border-color:#e8c98f; }}
     .gate-list {{ padding:6px 14px 14px; }} .gate-row {{ display:grid; grid-template-columns:22px minmax(0,1fr); gap:9px; padding:11px 0; border-bottom:1px solid #edf0f4; }}
@@ -1873,6 +1891,10 @@ def build_image_workspace_html(run_id: str) -> str:
     .job-controls {{ display:grid; grid-template-columns:1fr 1fr; gap:8px; padding:0 14px 14px; }}
     .job-controls button {{ min-height:36px; border:1px solid var(--line); border-radius:5px; background:#fff; cursor:pointer; }}
     .job-controls button:disabled {{ opacity:.45; cursor:not-allowed; }}
+    .job-controls .repair-submit {{ grid-column:1/-1; border-color:var(--red); color:#fff; background:var(--red); font-weight:650; }}
+    .repair-selection-status {{ grid-column:1/-1; min-height:16px; color:var(--muted); font-size:10px; }}
+    .repair-selection-status.error {{ color:var(--red); }}
+    .repair-selection-status.success {{ color:var(--green); }}
     .job-status {{ grid-column:1/-1; color:var(--muted); font:11px Consolas,"Courier New",monospace; overflow-wrap:anywhere; }}
     .error {{ color:var(--red); }}
     @media(max-width:1050px) {{ .image-layout {{ grid-template-columns:1fr; }} .source-grid {{ grid-template-columns:1fr 1fr; }} .source-panel:last-child {{ grid-column:1/-1; }} }}
@@ -1926,7 +1948,7 @@ def build_image_workspace_html(run_id: str) -> str:
               <span id="imageControllerCopyStatus" class="copy-status" aria-live="polite"></span>
             </div>
           </div>
-          </div><div class="gate-callout">最多 5 个动态 Codex 生图子智能体在总控任务内部按整件商品领取任务，可用几个就调动几个；当运行时提供第 6 个子智能体并发位时，保留 1 个子智能体位置用于失败恢复、诊断或人工介入。只回传通过真实性校验的 2 张主图与 6 张副图。</div><button id="startGeneration" class="primary" disabled>等待 Codex 生图子智能体 (Waiting for Codex Subagents)</button><div id="imageJobControls" class="job-controls"><div id="imageJobStatus" class="job-status">当前商品尚未入队</div><button id="stopImageJob" type="button" disabled>停止生图 (Stop Generation)</button><button id="resumeImageJob" type="button" disabled>继续生图 (Resume Generation)</button></div></aside>
+          </div><div class="gate-callout">最多 5 个动态 Codex 生图子智能体在总控任务内部按整件商品领取任务，可用几个就调动几个；当运行时提供第 6 个子智能体并发位时，保留 1 个子智能体位置用于失败恢复、诊断或人工介入。只回传通过真实性校验的 2 张主图与 6 张副图。</div><button id="startGeneration" class="primary" disabled>等待 Codex 生图子智能体 (Waiting for Codex Subagents)</button><div id="imageJobControls" class="job-controls"><div id="imageJobStatus" class="job-status">当前商品尚未入队</div><button id="submitImageRepairs" class="repair-submit" type="button" disabled>提交选中图片返修 (Repair Selected)</button><div id="repairSelectionStatus" class="repair-selection-status" aria-live="polite"></div><button id="stopImageJob" type="button" disabled>停止生图 (Stop Generation)</button><button id="resumeImageJob" type="button" disabled>继续生图 (Resume Generation)</button></div></aside>
         </div>
       </main>
     </div>
@@ -1974,21 +1996,78 @@ def build_image_workspace_html(run_id: str) -> str:
       const heading = document.createElement("div"); heading.className = "source-title"; heading.innerHTML = `<strong>${{title}}</strong><span>${{images.length}} 张</span>`;
       panel.append(heading); renderImages(panel, images, emptyText); return panel;
     }}
-    function generatedImageUrls(item) {{
+    const repairIssueOptions = [
+      ["product_truth", "主体、数量、颜色或结构错误"],
+      ["scene_quality", "场景不真实、不美观或融合差"],
+      ["composition", "构图、裁切、遮挡或比例问题"],
+      ["selling_point", "卖点不清楚或用途证明不足"],
+      ["russian_copy", "俄文标签错误、不清晰或排版不佳"],
+      ["other", "其他问题"],
+    ];
+    function generatedImageUrl(job, slot) {{
+      const version = `${{slot.attempt_count || 0}}-${{slot.repair_count || 0}}`;
+      return `/api/batches/${{encodeURIComponent(runId)}}/image-job/${{encodeURIComponent(job.job_id)}}/slot/${{encodeURIComponent(slot.slot_id)}}/file?v=${{version}}`;
+    }}
+    function updateRepairSubmitState() {{
+      const button = $("submitImageRepairs");
+      const selected = [...document.querySelectorAll(".generated-review-card")].filter((card) => card.querySelector('input[type="checkbox"]')?.checked);
+      const valid = selected.length > 0 && selected.every((card) => {{
+        const issue = card.querySelector(".repair-issue");
+        const note = card.querySelector(".repair-note");
+        return issue && issue.value && (issue.value !== "other" || note.value.trim());
+      }});
+      button.disabled = !valid;
+      button.textContent = selected.length ? `提交选中 ${{selected.length}} 张图片返修 (Repair Selected)` : "提交选中图片返修 (Repair Selected)";
+    }}
+    function generatedReviewPanel(item) {{
+      const panel = document.createElement("div"); panel.className = "source-panel generated-review-panel";
       const job = item.image_job || {{}};
-      return (job.slots || []).filter((slot) => slot.accepted_path).map((slot) => `/api/batches/${{encodeURIComponent(runId)}}/image-job/${{encodeURIComponent(job.job_id)}}/slot/${{encodeURIComponent(slot.slot_id)}}/file`);
+      const slots = (job.slots || []).filter((slot) => slot.accepted_path);
+      const heading = document.createElement("div"); heading.className = "source-title"; heading.innerHTML = `<strong>生成结果 (Generated)</strong><span>${{slots.length}} 张</span>`;
+      panel.append(heading);
+      if (!slots.length) {{ const empty = document.createElement("div"); empty.className = "empty generation-empty"; empty.textContent = "等待 Codex 生图子智能体回传真实结果"; panel.append(empty); return panel; }}
+      const grid = document.createElement("div"); grid.className = "generated-review-grid";
+      slots.forEach((slot) => {{
+        const card = document.createElement("article"); card.className = "generated-review-card"; card.dataset.slotId = slot.slot_id;
+        if (slot.status === "repair_pending") card.classList.add("repairing");
+        const cardHead = document.createElement("div"); cardHead.className = "generated-review-head";
+        const slotName = document.createElement("strong"); slotName.textContent = slot.slot_id;
+        const badge = document.createElement("span"); badge.className = "repair-badge"; badge.textContent = slot.status === "repair_pending" ? "等待返修" : slot.status === "accepted" ? "待审核" : slot.status;
+        cardHead.append(slotName, badge);
+        const image = document.createElement("img"); image.src = generatedImageUrl(job, slot); image.alt = `${{slot.slot_id}} generated product image`; image.loading = "lazy";
+        const checkLabel = document.createElement("label"); checkLabel.className = "repair-check";
+        const checkbox = document.createElement("input"); checkbox.type = "checkbox"; checkbox.disabled = job.status !== "manual_review_required" || slot.status !== "accepted" || Number(slot.repair_count || 0) >= 2;
+        const checkText = document.createElement("span"); checkText.textContent = Number(slot.repair_count || 0) >= 2 ? "已达到返修上限" : "不合格，申请返修";
+        checkLabel.append(checkbox, checkText);
+        const fields = document.createElement("div"); fields.className = "repair-fields"; fields.hidden = true;
+        const select = document.createElement("select"); select.className = "repair-issue"; select.setAttribute("aria-label", `${{slot.slot_id}} 问题类型`);
+        const placeholder = document.createElement("option"); placeholder.value = ""; placeholder.textContent = "请选择问题类型"; select.append(placeholder);
+        repairIssueOptions.forEach(([value, label]) => {{ const option = document.createElement("option"); option.value = value; option.textContent = label; select.append(option); }});
+        const textarea = document.createElement("textarea"); textarea.className = "repair-note"; textarea.maxLength = 500; textarea.placeholder = "补充说明（可选；选择其他时必填）"; textarea.setAttribute("aria-label", `${{slot.slot_id}} 补充说明`);
+        fields.append(select, textarea);
+        checkbox.addEventListener("change", () => {{ card.classList.toggle("selected", checkbox.checked); fields.hidden = !checkbox.checked; if (!checkbox.checked) {{ select.value = ""; textarea.value = ""; }} $("repairSelectionStatus").textContent = ""; $("repairSelectionStatus").className = "repair-selection-status"; updateRepairSubmitState(); }});
+        select.addEventListener("change", updateRepairSubmitState); textarea.addEventListener("input", updateRepairSubmitState);
+        card.append(cardHead, image, checkLabel, fields);
+        if (slot.status === "repair_pending") {{ const feedback = document.createElement("div"); feedback.className = "repair-feedback-summary"; feedback.textContent = `${{slot.review_issue_code || "返修"}}${{slot.review_note ? ` · ${{slot.review_note}}` : ""}}`; card.append(feedback); }}
+        grid.append(card);
+      }});
+      panel.append(grid); return panel;
     }}
     function renderImageJobControls(item) {{
       const job = item && item.image_job ? item.image_job : null;
       const status = job ? String(job.status || "pending") : String((item && item.generation_status) || "not_queued");
-      $("imageJobStatus").textContent = job ? `${{job.job_id}} · ${{status}}` : status;
+      const repairPending = job ? (job.slots || []).filter((slot) => slot.status === "repair_pending").length : 0;
+      $("imageJobStatus").textContent = job ? `${{job.job_id}} · ${{status}}${{repairPending ? ` · ${{repairPending}} 张等待返修` : ""}}` : status;
       $("stopImageJob").disabled = !job || ["stopped","manual_review_required","completed","failed"].includes(status);
       $("resumeImageJob").disabled = !job || status !== "stopped";
-      $("startGeneration").textContent = status === "manual_review_required" ? "等待用户审核 8 张图 (Review Required)" : status === "in_progress" ? "Codex 正在生成 (Generating)" : status === "pending" ? "已进入 Codex 队列 (Queued)" : "等待 Codex 生图子智能体 (Waiting for Codex Subagents)";
+      $("startGeneration").textContent = repairPending ? "返修已入队，请重新启动生图总控" : status === "manual_review_required" ? "等待用户审核 8 张图 (Review Required)" : status === "in_progress" ? "Codex 正在生成 (Generating)" : status === "pending" ? "已进入 Codex 队列 (Queued)" : "等待 Codex 生图子智能体 (Waiting for Codex Subagents)";
+      updateRepairSubmitState();
     }}
     function renderImageItemAt(index) {{
       const container = $("imageItems");
       container.replaceChildren();
+      $("repairSelectionStatus").textContent = "";
+      $("repairSelectionStatus").className = "repair-selection-status";
       const total = imageWorkspaceItems.length;
       imageWorkspaceIndex = total ? Math.max(0, Math.min(index, total - 1)) : 0;
       $("imageItemPosition").textContent = total ? `${{imageWorkspaceIndex + 1}} / ${{total}}` : "0 / 0";
@@ -2001,7 +2080,7 @@ def build_image_workspace_html(run_id: str) -> str:
       const sources = document.createElement("div"); sources.className = "source-grid";
       sources.append(sourcePanel("Ozon 参考图 (Ozon Reference)", item.ozon_reference_images || [], "没有 Ozon 参考图"));
       sources.append(sourcePanel("供应商原图 (Supplier Source)", item.supplier_source_images || [], "等待用户核实并采集 1688 商品"));
-      sources.append(sourcePanel("生成结果 (Generated)", generatedImageUrls(item), "等待 Codex 生图子智能体回传真实结果"));
+      sources.append(generatedReviewPanel(item));
       card.append(head, sources); container.append(card); container.scrollTop = 0;
       renderImageJobControls(item);
     }}
@@ -2013,7 +2092,7 @@ def build_image_workspace_html(run_id: str) -> str:
       renderImageItemAt(preserveIndex ? imageWorkspaceIndex : 0);
     }}
     function workspaceSignature(data) {{
-      return JSON.stringify((data.items || []).map((item) => [item.seed_id, item.generation_status, (item.image_job || {{}}).status, ((item.image_job || {{}}).slots || []).map((slot) => [slot.slot_id, slot.status, slot.accepted_path])]));
+      return JSON.stringify((data.items || []).map((item) => [item.seed_id, item.generation_status, (item.image_job || {{}}).status, ((item.image_job || {{}}).slots || []).map((slot) => [slot.slot_id, slot.status, slot.accepted_path, slot.attempt_count, slot.repair_count, slot.review_issue_code, slot.review_requested_at])]));
     }}
     async function loadWorkspace(force = false) {{
       const result = await api(`/api/batches/${{encodeURIComponent(runId)}}/images`);
@@ -2038,10 +2117,43 @@ def build_image_workspace_html(run_id: str) -> str:
         renderImageJobControls(item);
       }}
     }}
+    function collectRepairRequests() {{
+      const selected = [...document.querySelectorAll(".generated-review-card")].filter((card) => card.querySelector('input[type="checkbox"]')?.checked);
+      if (!selected.length) throw new Error("请先勾选至少一张不合格图片");
+      return selected.map((card) => {{
+        const issue = card.querySelector(".repair-issue");
+        const note = card.querySelector(".repair-note");
+        if (!issue.value) throw new Error(`${{card.dataset.slotId}}：请选择问题类型`);
+        if (issue.value === "other" && !note.value.trim()) throw new Error(`${{card.dataset.slotId}}：其他问题必须填写说明`);
+        return {{ slot_id: card.dataset.slotId, issue_code: issue.value, note: note.value.trim() }};
+      }});
+    }}
+    async function submitSelectedRepairs() {{
+      const item = imageWorkspaceItems[imageWorkspaceIndex];
+      const job = item && item.image_job;
+      if (!job || job.status !== "manual_review_required") return;
+      const button = $("submitImageRepairs");
+      const status = $("repairSelectionStatus");
+      try {{
+        const repairs = collectRepairRequests();
+        button.disabled = true;
+        status.className = "repair-selection-status";
+        status.textContent = `正在提交 ${{repairs.length}} 张图片返修…`;
+        await api(`/api/batches/${{encodeURIComponent(runId)}}/image-job/${{encodeURIComponent(job.job_id)}}/repair`, {{ method:"POST", body:JSON.stringify({{ repairs }}) }});
+        await loadWorkspace(true);
+        status.className = "repair-selection-status success";
+        status.textContent = "返修已入队，请重新启动生图总控";
+      }} catch (error) {{
+        status.className = "repair-selection-status error";
+        status.textContent = error.message || "提交返修失败 (Repair Request Failed)";
+        updateRepairSubmitState();
+      }}
+    }}
     $("previousImageItem").addEventListener("click", () => renderImageItemAt(imageWorkspaceIndex - 1));
     $("nextImageItem").addEventListener("click", () => renderImageItemAt(imageWorkspaceIndex + 1));
     $("stopImageJob").addEventListener("click", () => updateImageJob("stop"));
     $("resumeImageJob").addEventListener("click", () => updateImageJob("resume"));
+    $("submitImageRepairs").addEventListener("click", submitSelectedRepairs);
     loadWorkspace(true).catch((error) => {{ $("workspaceStatus").textContent = "加载失败 (Failed)"; $("workspaceStatus").className = "pill error"; $("gateMessage").textContent = error.message || String(error); }});
     setInterval(() => loadWorkspace(false).catch(() => undefined), 2000);
   </script>

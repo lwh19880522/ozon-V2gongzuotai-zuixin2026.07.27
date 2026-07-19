@@ -1367,6 +1367,21 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn("Ozon 参考图 (Ozon Reference)", page)
         self.assertIn("供应商原图 (Supplier Source)", page)
         self.assertIn('id="imageJobControls"', page)
+        self.assertIn(".generated-review-card", page)
+        self.assertIn('checkbox.type = "checkbox"', page)
+        self.assertIn('select.className = "repair-issue"', page)
+        self.assertIn('textarea.className = "repair-note"', page)
+        self.assertIn('id="submitImageRepairs"', page)
+        self.assertIn("提交选中图片返修 (Repair Selected)", page)
+        self.assertIn("issue_code: issue.value", page)
+        self.assertIn("review_issue_code", page)
+        self.assertIn("/repair`,", page)
+        self.assertIn("slot.attempt_count", page)
+        self.assertIn("slot.review_requested_at", page)
+        self.assertNotIn(
+            'sources.append(sourcePanel("生成结果 (Generated)", generatedImageUrls(item)',
+            page,
+        )
         self.assertIn('id="imageControllerCommand"', page)
         self.assertIn('id="copyImageControllerCommand"', page)
         self.assertIn("skills/ozon-image-generation-controller/SKILL.md", page)
