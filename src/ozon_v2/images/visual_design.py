@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from io import BytesIO
 import math
 import os
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any
 import re
 import uuid
 
@@ -74,6 +75,8 @@ class VisualFact:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> VisualFact:
+        if not isinstance(value, Mapping):
+            raise TypeError("visual fact must be a mapping")
         numeric_verified = value.get("numeric_verified", False)
         if numeric_verified is None:
             numeric_verified = False
@@ -124,7 +127,13 @@ class VisualSpec:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> VisualSpec:
+        if not isinstance(value, Mapping):
+            raise TypeError("visual spec must be a mapping")
         raw_facts = value.get("facts", ())
+        if not isinstance(raw_facts, Sequence) or isinstance(
+            raw_facts, (str, bytes, bytearray)
+        ):
+            raise TypeError("facts must be a non-string sequence")
         raw_scene = value.get("scene_signature", {})
         if raw_scene is None:
             raw_scene = {}

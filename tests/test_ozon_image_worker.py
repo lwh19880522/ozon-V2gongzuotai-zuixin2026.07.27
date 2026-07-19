@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from PIL import Image
 
-from ozon_v2.domain.supplier_sku import SupplierSkuOption, SupplierSkuSelectionReceipt
+from ozon_v2.domain.supplier_sku import (
+    SupplierSkuOption,
+    SupplierSkuSelectionReceipt,
+    stable_sha256,
+)
 from ozon_v2.images.contracts import SubjectMasterSelection
 from ozon_v2.images.queue import ImageGenerationQueue
 from ozon_v2.images.worker import SlotResultReceipt, crop_grid
@@ -116,6 +121,7 @@ def _v3_validation(
         "detail_05": "context_caption",
         "detail_06": "integrated_rail",
     }
+
     fact = VisualFact(
         headline="\u041a\u0420\u0415\u041f\u041b\u0415\u041d\u0418\u0415",
         detail="\u041a\u0430\u0431\u0435\u043b\u044c \u043f\u0440\u043e\u0445\u043e\u0434\u0438\u0442 \u0441\u0432\u043e\u0431\u043e\u0434\u043d\u043e",
@@ -153,6 +159,11 @@ def _v3_validation(
         "visual_contract_version": CURRENT_VISUAL_CONTRACT_VERSION,
         "visual_spec": spec.to_dict(),
     }
+
+
+def _rehash_receipt(receipt: SlotResultReceipt, **changes: object) -> SlotResultReceipt:
+    changed = replace(receipt, **changes)
+    return replace(changed, receipt_sha256=stable_sha256(changed.hash_payload()))
 
 
 def test_accepted_slot_rejects_white_anchor_style_without_visual_role_evidence(
@@ -590,3 +601,70 @@ def test_all_valid_v3_slots_can_be_ready_for_review(tmp_path: Path) -> None:
     reviewed = queue.mark_ready_for_review(job["job_id"], job["worker_id"], job["lease_epoch"])
 
     assert reviewed["status"] == "manual_review_required"
+
+
+def test_receipt_payload_parser_and_acceptance_reject_non_mapping_validation_and_prompt_shape(
+    tmp_path: Path,
+) -> None:
+    receipt = _receipt()
+    queue = ImageGenerationQueue(tmp_path / "queue.sqlite3")
+    queue.enqueue(receipt=receipt, subject_master=_master(tmp_path, receipt))
+    job = queue.claim_next("ozon-image-worker-01", now_epoch=100, lease_seconds=30)
+    assert job
+    slot = queue.list_slots(job["job_id"])[0]
+    source = tmp_path / "source.png"
+    output = tmp_path / "output.png"
+    _solid_grid(source, ["red", "green"])
+    Image.new("RGB", (120, 90), "red").save(output)
+    valid = _slot_receipt(
+        job=job, slot=slot, source_path=source, output_path=output, accepted=True
+    )
+    null_validation = _rehash_receipt(valid, validation=None)
+    list_prompt_version = _rehash_receipt(valid, prompt_version=[])
+
+    for malformed, message in (
+        (null_validation, "validation must be a mapping"),
+        (list_prompt_version, "prompt_version must be a string"),
+    ):
+        with pytest.raises(TypeError, match=message):
+            SlotResultReceipt.from_dict(malformed.to_dict())
+        assert any(message in error for error in malformed.acceptance_contract_errors())
+
+    baseline = queue.snapshot(job["job_id"])
+    with pytest.raises(ValueError, match="validation must be a mapping"):
+        queue.record_slot_result(null_validation)
+    assert queue.snapshot(job["job_id"]) == baseline
+    with pytest.raises(ValueError, match="prompt_version must be a string"):
+        queue.record_slot_result(list_prompt_version)
+    assert queue.snapshot(job["job_id"]) == baseline
+
+
+def test_finalization_rejects_persisted_null_validation_without_state_change(tmp_path: Path) -> None:
+    receipt = _receipt()
+    queue = ImageGenerationQueue(tmp_path / "queue.sqlite3")
+    queue.enqueue(receipt=receipt, subject_master=_master(tmp_path, receipt))
+    job = queue.claim_next("ozon-image-worker-01", now_epoch=100, lease_seconds=30)
+    assert job
+    source = tmp_path / "source.png"
+    output = tmp_path / "output.png"
+    _solid_grid(source, ["red", "green", "blue"])
+    Image.new("RGB", (120, 90), "red").save(output)
+    receipts: list[SlotResultReceipt] = []
+    for slot in queue.list_slots(job["job_id"]):
+        result = _slot_receipt(
+            job=job, slot=slot, source_path=source, output_path=output, accepted=True
+        )
+        queue.record_slot_result(result)
+        receipts.append(result)
+    malformed = _rehash_receipt(receipts[0], validation=None)
+    with queue._connect() as connection:
+        connection.execute(
+            "UPDATE image_slots SET receipt_json = ? WHERE job_id = ? AND slot_id = ?",
+            (json.dumps(malformed.to_dict()), job["job_id"], malformed.slot_id),
+        )
+    baseline = queue.snapshot(job["job_id"])
+
+    with pytest.raises(ValueError, match="validation must be a mapping"):
+        queue.mark_ready_for_review(job["job_id"], job["worker_id"], job["lease_epoch"])
+
+    assert queue.snapshot(job["job_id"]) == baseline

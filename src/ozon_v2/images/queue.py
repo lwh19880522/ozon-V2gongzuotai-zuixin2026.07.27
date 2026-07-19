@@ -472,9 +472,11 @@ class ImageGenerationQueue:
             for stored in accepted_receipts:
                 try:
                     receipt = SlotResultReceipt.from_dict(json.loads(stored["receipt_json"]))
-                except (TypeError, ValueError, json.JSONDecodeError):
+                except (TypeError, ValueError, json.JSONDecodeError) as error:
                     connection.rollback()
-                    raise ValueError("accepted slot receipt is missing or invalid") from None
+                    raise ValueError(
+                        f"accepted slot receipt is missing or invalid: {error}"
+                    ) from None
                 if not receipt.verify():
                     connection.rollback()
                     raise ValueError("accepted slot receipt failed final verification")

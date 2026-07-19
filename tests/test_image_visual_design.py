@@ -215,6 +215,39 @@ def test_fact_and_spec_from_dict_normalize_values() -> None:
     assert spec.to_dict()["slot_id"] == "detail_02"
 
 
+@pytest.mark.parametrize(
+    "payload, message",
+    [
+        ([], "visual spec must be a mapping"),
+        (
+            {
+                "contract_version": CURRENT_VISUAL_CONTRACT_VERSION,
+                "slot_id": "main_01",
+                "recipe": "clean_hero",
+                "facts": [None],
+                "scene_signature": _scene(),
+            },
+            "visual fact must be a mapping",
+        ),
+        (
+            {
+                "contract_version": CURRENT_VISUAL_CONTRACT_VERSION,
+                "slot_id": "main_01",
+                "recipe": "clean_hero",
+                "facts": "not-a-sequence",
+                "scene_signature": _scene(),
+            },
+            "facts must be a non-string sequence",
+        ),
+    ],
+)
+def test_visual_spec_from_dict_rejects_non_json_object_shapes(
+    payload: object, message: str
+) -> None:
+    with pytest.raises(TypeError, match=message):
+        VisualSpec.from_dict(payload)
+
+
 def test_visual_set_rejects_duplicate_slots_and_buyer_questions() -> None:
     first = _spec("main_01", "clean_hero")
     duplicate_slot = _spec(

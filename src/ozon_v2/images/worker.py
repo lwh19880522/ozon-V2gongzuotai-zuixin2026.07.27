@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -190,7 +191,16 @@ class SlotResultReceipt:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "SlotResultReceipt":
-        return cls(**payload)
+        if not isinstance(payload, Mapping):
+            raise TypeError("slot result receipt must be a mapping")
+        normalized = dict(payload)
+        validation = normalized.get("validation", {})
+        if not isinstance(validation, Mapping):
+            raise TypeError("validation must be a mapping")
+        if not isinstance(normalized.get("prompt_version"), str):
+            raise TypeError("prompt_version must be a string")
+        normalized["validation"] = dict(validation)
+        return cls(**normalized)
 
     def hash_payload(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -212,10 +222,15 @@ class SlotResultReceipt:
 
     def acceptance_contract_errors(self) -> list[str]:
         errors: list[str] = []
-        if self.prompt_version not in {LEGACY_PROMPT_VERSION, CURRENT_PROMPT_VERSION}:
+        if not isinstance(self.prompt_version, str):
+            errors.append("prompt_version must be a string")
+        elif self.prompt_version not in {LEGACY_PROMPT_VERSION, CURRENT_PROMPT_VERSION}:
             errors.append(
                 f"prompt_version must be {LEGACY_PROMPT_VERSION} or {CURRENT_PROMPT_VERSION}"
             )
+        if not isinstance(self.validation, Mapping):
+            errors.append("validation must be a mapping")
+            return errors
         if not self.accepted:
             return errors
         if not str(self.validation.get("slot_role") or "").strip():
