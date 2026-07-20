@@ -2812,6 +2812,9 @@ def create_handler(
                     runner.start(parts[2], max_steps=int(payload.get("max_steps", 20) or 20))
                 self._send_result(result, run_id=parts[2])
                 return
+            if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "ozon-collection-progress":
+                self._send_result(service.save_ozon_collection_progress(parts[2], payload), run_id=parts[2])
+                return
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "ozon-collection":
                 result = service.ingest_ozon_collection_result(parts[2], payload)
                 if result.ok:

@@ -389,6 +389,229 @@ class WorkbenchService:
             return ["Seller category attribute template result is missing."]
         return validate_attribute_template_result(payload, expected_seed_ids, require_seller_schema=True)
 
+    def ozon_collection_checkpoint(self, run_id: str) -> Result:
+        try:
+            contract = self.repo.load_ozon_collection_contract(run_id)
+            contract_payload = contract.get("payload")
+            if not isinstance(contract_payload, dict):
+                raise TypeError("Ozon collection contract payload must be an object")
+            raw_seeds = contract_payload.get("seeds")
+            if not isinstance(raw_seeds, list) or not raw_seeds:
+                raise ValueError("Ozon collection contract must include seeds")
+            contract_seed_ids = [
+                str(seed.get("seed_id") or "").strip()
+                for seed in raw_seeds
+                if isinstance(seed, dict)
+            ]
+            if (
+                len(contract_seed_ids) != len(raw_seeds)
+                or any(not seed_id for seed_id in contract_seed_ids)
+                or len(set(contract_seed_ids)) != len(contract_seed_ids)
+            ):
+                raise ValueError("Ozon collection contract has invalid seed ids")
+        except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+            return Result.failure(
+                "ozon_collection.checkpoint_invalid",
+                "The frozen Ozon collection contract is missing or invalid.",
+                errors=[str(exc)],
+                data={"run_id": run_id},
+            )
+
+        excluded_product_ids = {
+            str(product_id).strip()
+            for product_id in contract_payload.get("excluded_ozon_product_ids", [])
+            if str(product_id).strip()
+        }
+        excluded_product_ids.update(self.repo.load_blacklisted_ozon_product_ids())
+        draft_path = self.repo.run_dir(run_id) / "ozon_collection_draft.json"
+        if not draft_path.exists():
+            return Result.success(
+                "ozon_collection.checkpoint_empty",
+                "No Ozon collection checkpoint has been saved yet.",
+                {
+                    "run_id": run_id,
+                    "contract_seed_ids": contract_seed_ids,
+                    "excluded_ozon_product_ids": sorted(excluded_product_ids),
+                    "ozon_candidates": [],
+                    "created_at": None,
+                    "updated_at": None,
+                },
+            )
+
+        try:
+            draft = self.repo.load_ozon_collection_draft(run_id)
+            if not isinstance(draft, dict):
+                raise TypeError("Ozon collection checkpoint must be an object")
+            if str(draft.get("run_id") or "") != run_id:
+                raise ValueError("Ozon collection checkpoint run_id does not match the batch")
+            candidates = draft.get("ozon_candidates")
+            if not isinstance(candidates, list):
+                raise TypeError("Ozon collection checkpoint candidates must be a list")
+            worker = str(draft.get("worker") or "")
+            errors: list[str] = []
+            candidate_seed_ids: list[str] = []
+            candidate_product_ids: list[str] = []
+            for index, candidate in enumerate(candidates, start=1):
+                if not isinstance(candidate, dict):
+                    errors.append(f"Ozon checkpoint candidate {index} must be an object")
+                    continue
+                seed_id = str(candidate.get("seed_id") or "").strip()
+                product_id = str(candidate.get("ozon_product_id") or "").strip()
+                candidate_seed_ids.append(seed_id)
+                candidate_product_ids.append(product_id)
+                if seed_id not in contract_seed_ids:
+                    errors.append(f"Ozon checkpoint candidate has unexpected seed_id: {seed_id}")
+                    continue
+                errors.extend(
+                    validate_ozon_collection_result(
+                        {"worker": worker, "ozon_candidates": [candidate]},
+                        [seed_id],
+                    )
+                )
+                if product_id in excluded_product_ids:
+                    errors.append(f"Ozon checkpoint candidate uses excluded product id: {product_id}")
+            if len(candidate_seed_ids) != len(set(candidate_seed_ids)):
+                errors.append("Ozon collection checkpoint has duplicate seed ids")
+            if len(candidate_product_ids) != len(set(candidate_product_ids)):
+                errors.append("Ozon collection checkpoint has duplicate product ids")
+            captured_seed_ids = set(candidate_seed_ids)
+            expected_order = [seed_id for seed_id in contract_seed_ids if seed_id in captured_seed_ids]
+            if candidate_seed_ids != expected_order:
+                errors.append("Ozon collection checkpoint candidates are not in frozen contract order")
+            if errors:
+                raise ValueError("; ".join(errors))
+        except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+            return Result.failure(
+                "ozon_collection.checkpoint_invalid",
+                "The saved Ozon collection checkpoint is invalid and was not overwritten.",
+                errors=[str(exc)],
+                data={"run_id": run_id, "checkpoint_path": str(draft_path)},
+            )
+
+        return Result.success(
+            "ozon_collection.checkpoint_loaded",
+            "The verified Ozon collection checkpoint was loaded.",
+            {
+                "run_id": run_id,
+                "contract_seed_ids": contract_seed_ids,
+                "excluded_ozon_product_ids": sorted(excluded_product_ids),
+                "ozon_candidates": candidates,
+                "created_at": draft.get("created_at"),
+                "updated_at": draft.get("updated_at"),
+                "checkpoint_path": str(draft_path),
+            },
+        )
+
+    def save_ozon_collection_progress(self, run_id: str, payload: dict[str, Any]) -> Result:
+        run = self.repo.load_run(run_id)
+        if WorkbenchState(run["status"]) != WorkbenchState.OZON_COLLECTING:
+            return Result.failure(
+                "ozon_collection.progress_not_expected",
+                "Ozon collection progress is only accepted while Ozon collection is active.",
+                data={"run_id": run_id, "status": run["status"]},
+            )
+        if str(payload.get("run_id") or "") != run_id:
+            return Result.failure(
+                "ozon_collection.progress_run_mismatch",
+                "Ozon collection progress belongs to a different batch.",
+                data={"run_id": run_id, "payload_run_id": payload.get("run_id")},
+            )
+        candidate = payload.get("ozon_candidate")
+        if not isinstance(candidate, dict):
+            return Result.failure(
+                "ozon_collection.progress_invalid",
+                "Ozon collection progress must include one candidate object.",
+                data={"run_id": run_id},
+            )
+
+        checkpoint = self.ozon_collection_checkpoint(run_id)
+        if not checkpoint.ok:
+            return checkpoint
+        contract_seed_ids = list(checkpoint.data["contract_seed_ids"])
+        excluded_product_ids = set(checkpoint.data["excluded_ozon_product_ids"])
+        seed_id = str(candidate.get("seed_id") or "").strip()
+        if seed_id not in contract_seed_ids:
+            return Result.failure(
+                "ozon_collection.progress_seed_not_expected",
+                "The Ozon candidate seed does not belong to the frozen collection contract.",
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+        errors = validate_ozon_collection_result(
+            {
+                "worker": payload.get("worker"),
+                "source": payload.get("source"),
+                "ozon_candidates": [candidate],
+            },
+            [seed_id],
+        )
+        product_id = str(candidate.get("ozon_product_id") or "").strip()
+        if product_id in excluded_product_ids:
+            errors.append(f"Ozon product id is excluded from collection: {product_id}")
+        if errors:
+            return Result.failure(
+                "ozon_collection.progress_invalid",
+                "The Ozon collection checkpoint candidate failed validation.",
+                errors=errors,
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+
+        candidate_by_seed = {
+            str(item.get("seed_id") or ""): item
+            for item in checkpoint.data["ozon_candidates"]
+        }
+        existing = candidate_by_seed.get(seed_id)
+        if existing is not None and existing != candidate:
+            return Result.failure(
+                "ozon_collection.progress_conflict",
+                "This Ozon seed already has a different verified checkpoint candidate.",
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+        for other_seed_id, other in candidate_by_seed.items():
+            if (
+                other_seed_id != seed_id
+                and str(other.get("ozon_product_id") or "").strip() == product_id
+            ):
+                return Result.failure(
+                    "ozon_collection.progress_duplicate_product",
+                    "The Ozon product is already checkpointed for another seed.",
+                    data={
+                        "run_id": run_id,
+                        "seed_id": seed_id,
+                        "ozon_product_id": product_id,
+                    },
+                )
+
+        candidate_by_seed[seed_id] = candidate
+        ordered_candidates = [
+            candidate_by_seed[item_id]
+            for item_id in contract_seed_ids
+            if item_id in candidate_by_seed
+        ]
+        now = utc_now_iso()
+        draft = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "worker": str(payload.get("worker") or ""),
+            "source": str(payload.get("source") or ""),
+            "ozon_candidates": ordered_candidates,
+            "created_at": checkpoint.data.get("created_at") or now,
+            "updated_at": now,
+        }
+        draft_path = self.repo.save_ozon_collection_draft(run_id, draft)
+        return Result.success(
+            "ozon_collection.progress_saved",
+            "The verified Ozon candidate checkpoint was saved.",
+            {
+                "run_id": run_id,
+                "status": run["status"],
+                "seed_id": seed_id,
+                "completed_count": len(ordered_candidates),
+                "total_count": len(contract_seed_ids),
+                "checkpoint_path": str(draft_path),
+                "ozon_candidates": ordered_candidates,
+            },
+        )
+
     def ingest_ozon_collection_result(self, run_id: str, payload: dict[str, Any]) -> Result:
         run = self.repo.load_run(run_id)
         if WorkbenchState(run["status"]) != WorkbenchState.OZON_COLLECTING:

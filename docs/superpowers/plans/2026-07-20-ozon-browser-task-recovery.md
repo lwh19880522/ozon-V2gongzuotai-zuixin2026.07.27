@@ -38,7 +38,7 @@
 - Modify: `src/ozon_v2/services/workbench_service.py`
 - Modify: `src/ozon_v2/workbench/local_server.py`
 
-- [ ] **Step 1: 写检查点 API 的失败测试**
+- [x] **Step 1: 写检查点 API 的失败测试**
 
 在 `tests/test_workbench_local_server.py` 增加以下夹具，创建带俄文查询的冻结 seed、保存 Ozon 合同，并把批次固定在 `ozon_collecting`：
 
@@ -120,7 +120,7 @@ ozon_collection.progress_invalid
 ozon_collection.checkpoint_invalid
 ```
 
-- [ ] **Step 2: 运行检查点测试并确认 RED**
+- [x] **Step 2: 运行检查点测试并确认 RED**
 
 ```powershell
 python -m pytest tests/test_workbench_local_server.py -k "ozon_collection_progress" -q
@@ -128,7 +128,7 @@ python -m pytest tests/test_workbench_local_server.py -k "ozon_collection_progre
 
 Expected: FAIL；POST 路由尚不存在，且 `FsRepo` 没有 `save_ozon_collection_draft` / `load_ozon_collection_draft`。
 
-- [ ] **Step 3: 增加原子文件仓库方法**
+- [x] **Step 3: 增加原子文件仓库方法**
 
 在 `src/ozon_v2/adapters/fs_repo.py` 的 Ozon 合同/结果方法旁加入：
 
@@ -144,7 +144,7 @@ def load_ozon_collection_draft(self, run_id: str) -> dict[str, Any]:
 
 必须复用现有 `_write_json()` 的临时文件替换，不另写非原子 I/O。
 
-- [ ] **Step 4: 实现检查点读取校验和单件合并**
+- [x] **Step 4: 实现检查点读取校验和单件合并**
 
 在 `src/ozon_v2/services/workbench_service.py` 增加 `ozon_collection_checkpoint()` 与 `save_ozon_collection_progress()`。单件候选仍使用现有终态校验器，不创建第二套模型：
 
@@ -205,7 +205,7 @@ draft_path = self.repo.save_ozon_collection_draft(run_id, draft)
 
 相同 seed、相同候选的重复提交必须幂等成功，不增加候选数；批次状态不是 `ozon_collecting` 时返回 `ozon_collection.progress_not_expected`。
 
-- [ ] **Step 5: 接入固定进度路由**
+- [x] **Step 5: 接入固定进度路由**
 
 在 `src/ozon_v2/workbench/local_server.py::_handle_POST()` 中、正式 Ozon 结果入口之前加入：
 
@@ -217,7 +217,7 @@ if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "ozon-col
 
 该路由只保存检查点，不启动 runner、不推进状态机、不生成 `ozon_collection_result.json`。
 
-- [ ] **Step 6: 运行检查点测试并确认 GREEN**
+- [x] **Step 6: 运行检查点测试并确认 GREEN**
 
 ```powershell
 python -m pytest tests/test_workbench_local_server.py -k "ozon_collection_progress" -q
@@ -225,7 +225,7 @@ python -m pytest tests/test_workbench_local_server.py -k "ozon_collection_progre
 
 Expected: 新增检查点测试全部通过；损坏草稿仍保留原内容。
 
-- [ ] **Step 7: 提交 Task 1**
+- [x] **Step 7: 提交 Task 1**
 
 ```powershell
 git add src/ozon_v2/adapters/fs_repo.py src/ozon_v2/services/workbench_service.py src/ozon_v2/workbench/local_server.py tests/test_workbench_local_server.py

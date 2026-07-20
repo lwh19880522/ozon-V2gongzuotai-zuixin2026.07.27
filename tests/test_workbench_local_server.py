@@ -660,6 +660,161 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual("ozon_collection", task["data"]["task_type"])
         self.assertEqual(f"/api/batches/{run_id}/ozon-collection", task["data"]["ingest_url"])
 
+    def test_ozon_collection_progress_persists_candidates_in_contract_order(self) -> None:
+        run_id, seeds = self.prepare_ozon_collecting_run(count=2)
+        first = self.ozon_candidate_for_seed(seeds[0], "ozon-progress-1")
+        second = self.ozon_candidate_for_seed(seeds[1], "ozon-progress-2")
+        second["attributes"] = {"Материал": "сталь", "Цвет": "черный"}
+        second["content_score_evidence"]["attribute_table"] = dict(second["attributes"])
+
+        for candidate in (second, first, first):
+            result = self.post_json(
+                f"/api/batches/{run_id}/ozon-collection-progress",
+                {
+                    "run_id": run_id,
+                    "worker": "workbench_browser_bridge",
+                    "source": "test_browser_checkpoint",
+                    "ozon_candidate": candidate,
+                },
+            )
+            self.assertTrue(result["ok"])
+
+        draft = self.repo.load_ozon_collection_draft(run_id)
+        self.assertEqual(
+            [seed.seed_id for seed in seeds],
+            [item["seed_id"] for item in draft["ozon_candidates"]],
+        )
+        self.assertEqual(2, len(draft["ozon_candidates"]))
+        self.assertEqual(second["attributes"], draft["ozon_candidates"][1]["attributes"])
+        self.assertEqual(
+            second["content_score_evidence"]["attribute_table"],
+            draft["ozon_candidates"][1]["content_score_evidence"]["attribute_table"],
+        )
+
+    def test_ozon_collection_progress_rejects_run_seed_and_candidate_conflicts(self) -> None:
+        run_id, seeds = self.prepare_ozon_collecting_run(count=2)
+        first = self.ozon_candidate_for_seed(seeds[0], "ozon-progress-1")
+        saved = self.post_json(
+            f"/api/batches/{run_id}/ozon-collection-progress",
+            {
+                "run_id": run_id,
+                "worker": "workbench_browser_bridge",
+                "source": "test_browser_checkpoint",
+                "ozon_candidate": first,
+            },
+        )
+        self.assertTrue(saved["ok"])
+
+        wrong_run = self.post_json(
+            f"/api/batches/{run_id}/ozon-collection-progress",
+            {
+                "run_id": "wb-other",
+                "worker": "workbench_browser_bridge",
+                "source": "test_browser_checkpoint",
+                "ozon_candidate": first,
+            },
+            ok=False,
+        )
+        unexpected = self.ozon_candidate_for_seed(seeds[1], "ozon-progress-2")
+        unexpected["seed_id"] = "seed-not-in-contract"
+        wrong_seed = self.post_json(
+            f"/api/batches/{run_id}/ozon-collection-progress",
+            {
+                "run_id": run_id,
+                "worker": "workbench_browser_bridge",
+                "source": "test_browser_checkpoint",
+                "ozon_candidate": unexpected,
+            },
+            ok=False,
+        )
+        conflicting = self.ozon_candidate_for_seed(seeds[0], "ozon-progress-conflict")
+        conflict = self.post_json(
+            f"/api/batches/{run_id}/ozon-collection-progress",
+            {
+                "run_id": run_id,
+                "worker": "workbench_browser_bridge",
+                "source": "test_browser_checkpoint",
+                "ozon_candidate": conflicting,
+            },
+            ok=False,
+        )
+        duplicate_product = self.ozon_candidate_for_seed(seeds[1], "ozon-progress-1")
+        duplicate = self.post_json(
+            f"/api/batches/{run_id}/ozon-collection-progress",
+            {
+                "run_id": run_id,
+                "worker": "workbench_browser_bridge",
+                "source": "test_browser_checkpoint",
+                "ozon_candidate": duplicate_product,
+            },
+            ok=False,
+        )
+
+        self.assertEqual("ozon_collection.progress_run_mismatch", wrong_run["code"])
+        self.assertEqual("ozon_collection.progress_seed_not_expected", wrong_seed["code"])
+        self.assertEqual("ozon_collection.progress_conflict", conflict["code"])
+        self.assertEqual("ozon_collection.progress_duplicate_product", duplicate["code"])
+        self.assertEqual([first], self.repo.load_ozon_collection_draft(run_id)["ozon_candidates"])
+
+    def test_ozon_collection_progress_rejects_invalid_public_attributes(self) -> None:
+        run_id, seeds = self.prepare_ozon_collecting_run(count=1)
+        candidate = self.ozon_candidate_for_seed(seeds[0], "ozon-progress-invalid")
+        candidate["attributes"] = {}
+        candidate["content_score_evidence"]["attribute_table"] = {}
+
+        result = self.post_json(
+            f"/api/batches/{run_id}/ozon-collection-progress",
+            {
+                "run_id": run_id,
+                "worker": "workbench_browser_bridge",
+                "source": "test_browser_checkpoint",
+                "ozon_candidate": candidate,
+            },
+            ok=False,
+        )
+
+        self.assertEqual("ozon_collection.progress_invalid", result["code"])
+        self.assertFalse((self.repo.run_dir(run_id) / "ozon_collection_draft.json").exists())
+
+    def test_ozon_collection_progress_reports_corrupt_existing_draft(self) -> None:
+        run_id, seeds = self.prepare_ozon_collecting_run(count=1)
+        draft_path = self.repo.run_dir(run_id) / "ozon_collection_draft.json"
+        draft_path.write_text("{not-json", encoding="utf-8")
+        original_bytes = draft_path.read_bytes()
+
+        result = self.post_json(
+            f"/api/batches/{run_id}/ozon-collection-progress",
+            {
+                "run_id": run_id,
+                "worker": "workbench_browser_bridge",
+                "source": "test_browser_checkpoint",
+                "ozon_candidate": self.ozon_candidate_for_seed(seeds[0], "ozon-progress-1"),
+            },
+            ok=False,
+        )
+
+        self.assertEqual("ozon_collection.checkpoint_invalid", result["code"])
+        self.assertEqual(original_bytes, draft_path.read_bytes())
+
+    def test_ozon_collection_progress_rejects_other_batch_stage(self) -> None:
+        run_id, seeds = self.prepare_ozon_collecting_run(count=1)
+        run = self.repo.load_run(run_id)
+        run["status"] = WorkbenchState.SUPPLIER_REVIEW.value
+        self.repo.save_run(run)
+
+        result = self.post_json(
+            f"/api/batches/{run_id}/ozon-collection-progress",
+            {
+                "run_id": run_id,
+                "worker": "workbench_browser_bridge",
+                "source": "test_browser_checkpoint",
+                "ozon_candidate": self.ozon_candidate_for_seed(seeds[0], "ozon-progress-1"),
+            },
+            ok=False,
+        )
+
+        self.assertEqual("ozon_collection.progress_not_expected", result["code"])
+
     def test_browser_task_endpoint_returns_supplier_collection_contract(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
         saved = WorkbenchService(self.repo).save_supplier_review_links(
@@ -2256,6 +2411,44 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
                 ],
             },
         }
+
+    def ozon_candidate_for_seed(self, seed: SeedProduct, product_id: str) -> dict:
+        candidate = self.ozon_candidate_payload(seed)
+        image_url = f"https://img.example/{product_id}.jpg"
+        candidate["ozon_product_id"] = product_id
+        candidate["ozon_url"] = f"https://www.ozon.ru/product/{product_id}/"
+        candidate["title"] = f"Test product {product_id}"
+        candidate["target_sku"]["sku_id"] = f"sku-{product_id}"
+        candidate["selected_sku_media"]["main_gallery_images"] = [image_url]
+        candidate["selected_sku_media"]["selected_sku_images"] = [image_url]
+        candidate["content_score_evidence"]["title_raw"] = candidate["title"]
+        candidate["content_score_evidence"]["main_gallery_images"] = [image_url]
+        return candidate
+
+    def prepare_ozon_collecting_run(self, count: int = 2) -> tuple[str, list[SeedProduct]]:
+        seeds = [
+            SeedProduct(
+                seed_id=f"seed-progress-{index}",
+                title_or_keyword=f"test product {index}",
+                product_clue=f"test product {index}",
+                ozon_query_terms_ru=[f"тестовый товар {index}"],
+                query_generation_status="generated",
+            )
+            for index in range(1, count + 1)
+        ]
+        run = self.repo.create_workbench_batch_record(target_count=count)
+        run_id = run["run_id"]
+        self.repo.save_sampled_seeds(run_id, seeds)
+        contract = CollectionContractService(self.repo).build_ozon_collection_contract(run_id)
+        self.assertTrue(contract.ok)
+        self.repo.save_ozon_collection_contract(run_id, contract.data)
+        run["status"] = WorkbenchState.OZON_COLLECTING.value
+        run["ozon_collection_contract_ready"] = True
+        run["ozon_collection_contract_path"] = str(
+            self.repo.run_dir(run_id) / "ozon_collection_contract.json"
+        )
+        self.repo.save_run(run)
+        return run_id, seeds
 
     def prepare_supplier_review_run(self) -> tuple[str, SeedProduct]:
         seed = SeedProduct(

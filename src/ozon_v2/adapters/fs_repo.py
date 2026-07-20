@@ -406,6 +406,14 @@ class FsRepo:
     def load_ozon_collection_contract(self, run_id: str) -> dict[str, Any]:
         return self._read_json(self.run_dir(run_id) / "ozon_collection_contract.json")
 
+    def save_ozon_collection_draft(self, run_id: str, payload: dict[str, Any]) -> Path:
+        path = self.run_dir(run_id) / "ozon_collection_draft.json"
+        self._write_json(path, payload)
+        return path
+
+    def load_ozon_collection_draft(self, run_id: str) -> dict[str, Any]:
+        return self._read_json(self.run_dir(run_id) / "ozon_collection_draft.json")
+
     def save_ozon_collection_result(self, run_id: str, payload: dict[str, Any]) -> Path:
         path = self.run_dir(run_id) / "ozon_collection_result.json"
         self._write_json(path, payload)
