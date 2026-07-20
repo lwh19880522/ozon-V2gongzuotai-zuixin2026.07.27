@@ -2,7 +2,7 @@
 
 const BASE_URL = "http://127.0.0.1:8765";
 const STATE_KEY = "ozon_v2_browser_bridge_state";
-const STATE_SCHEMA_VERSION = 5;
+const STATE_SCHEMA_VERSION = 6;
 const EXTENSION_VERSION = chrome.runtime.getManifest().version;
 const API_TIMEOUT_MS = Number(globalThis.OZON_V2_API_TIMEOUT_MS) || 15000;
 let activeRunPromise = null;
@@ -898,21 +898,91 @@ async function submitOzonCollection(runId, ingestUrl, state, totalCount) {
   return result;
 }
 
+function reconcileOzonCollectionState(task, currentState = null) {
+  const seeds = task.data.contract.payload.seeds || [];
+  const excluded = new Set(
+    (task.data.contract.payload.excluded_ozon_product_ids || []).map(String),
+  );
+  const expectedSeedIds = new Set(seeds.map((seed) => String(seed.seed_id || "")));
+  const bySeed = new Map();
+  const usedProductIds = new Set();
+  const sourceCandidates = [
+    ...(Array.isArray(task.data.resume_candidates) ? task.data.resume_candidates : []),
+    ...(
+      currentState && Array.isArray(currentState.candidates)
+        ? currentState.candidates
+        : []
+    ),
+  ];
+  for (const candidate of sourceCandidates) {
+    if (!candidate || typeof candidate !== "object") continue;
+    const seedId = String(candidate.seed_id || "");
+    const productId = String(candidate.ozon_product_id || "");
+    if (!expectedSeedIds.has(seedId) || !productId || excluded.has(productId)) continue;
+    const previous = bySeed.get(seedId);
+    const previousProductId = String((previous && previous.ozon_product_id) || "");
+    if (usedProductIds.has(productId) && previousProductId !== productId) continue;
+    if (previousProductId) usedProductIds.delete(previousProductId);
+    bySeed.set(seedId, candidate);
+    usedProductIds.add(productId);
+  }
+  const candidates = seeds
+    .map((seed) => bySeed.get(String(seed.seed_id || "")))
+    .filter(Boolean);
+  const seedIndex = seeds.findIndex(
+    (seed) => !bySeed.has(String(seed.seed_id || "")),
+  );
+  const normalizedSeedIndex = seedIndex < 0 ? seeds.length : seedIndex;
+  const preserveNavigation = currentState && currentState.seedIndex === normalizedSeedIndex;
+  return {
+    ...(currentState || {}),
+    runId: task.data.run_id,
+    taskType: "ozon_collection",
+    dispatchToken: task.data.dispatch_token,
+    candidates,
+    seedIndex: normalizedSeedIndex,
+    stage: preserveNavigation ? (currentState.stage || "search") : "search",
+    searchEvidence: preserveNavigation ? (currentState.searchEvidence || null) : null,
+    productLinkIndex: preserveNavigation ? (currentState.productLinkIndex || 0) : 0,
+    rejectedCandidates: preserveNavigation ? (currentState.rejectedCandidates || []) : [],
+  };
+}
+
+async function checkpointOzonCandidate(task, candidate) {
+  return await api(task.data.progress_url, {
+    method: "POST",
+    body: JSON.stringify({
+      run_id: task.data.run_id,
+      worker: "workbench_browser_bridge",
+      source: "ozon_browser_extension_content_script",
+      ozon_candidate: candidate,
+    }),
+  });
+}
+
+function advanceOzonCollectionState(state, seeds, candidate) {
+  const bySeed = new Map(
+    state.candidates.map((item) => [String(item.seed_id || ""), item]),
+  );
+  bySeed.set(String(candidate.seed_id || ""), candidate);
+  state.candidates = seeds
+    .map((seed) => bySeed.get(String(seed.seed_id || "")))
+    .filter(Boolean);
+  const nextIndex = seeds.findIndex(
+    (seed) => !bySeed.has(String(seed.seed_id || "")),
+  );
+  state.seedIndex = nextIndex < 0 ? seeds.length : nextIndex;
+  state.stage = "search";
+  state.searchEvidence = null;
+  state.productLinkIndex = 0;
+}
+
 async function runOzonCollection(task) {
   const runId = task.data.run_id;
   const seeds = task.data.contract.payload.seeds || [];
   const excludedProductIds = task.data.contract.payload.excluded_ozon_product_ids || [];
-  let state = loadState(runId, "ozon_collection", task.data.dispatch_token) || {
-    runId,
-    taskType: "ozon_collection",
-    dispatchToken: task.data.dispatch_token,
-    seedIndex: 0,
-    stage: "search",
-    candidates: [],
-    searchEvidence: null,
-    productLinkIndex: 0,
-    rejectedCandidates: [],
-  };
+  const sessionState = loadState(runId, "ozon_collection", task.data.dispatch_token);
+  let state = reconcileOzonCollectionState(task, sessionState);
   while (state.stage === "search" && state.seedIndex < seeds.length) {
     const reusableSeed = seeds[state.seedIndex];
     const snapshot = reusableSeed.public_product_snapshot;
@@ -928,16 +998,17 @@ async function runOzonCollection(task) {
       || (evidence && evidence.isExcludedProductId(excludedProductIds, snapshot.product_id))
       || (evidence && !evidence.matchesQueryIntent([reusableQuery], snapshot))
     ) break;
-    state.candidates.push(
-      buildOzonCandidate(
-        reusableSeed,
-        reusableQuery,
-        { productLinks: [{ href: snapshot.url }] },
-        { snapshot, url: snapshot.url, title: snapshot.title },
-        decision,
-      ),
+    const candidate = buildOzonCandidate(
+      reusableSeed,
+      reusableQuery,
+      { productLinks: [{ href: snapshot.url }] },
+      { snapshot, url: snapshot.url, title: snapshot.title },
+      decision,
     );
-    state.seedIndex += 1;
+    saveState(state);
+    await checkpointOzonCandidate(task, candidate);
+    advanceOzonCollectionState(state, seeds, candidate);
+    saveState(state);
     await heartbeat({
       run_id: runId,
       task_type: "ozon_collection",
@@ -1069,13 +1140,16 @@ async function runOzonCollection(task) {
         : "bridge.ozon_collection_no_cross_border_candidate",
     };
   }
-  state.candidates.push(
-    buildOzonCandidate(seed, query, state.searchEvidence || {}, detailEvidence, sellerCheck.decision),
+  const candidate = buildOzonCandidate(
+    seed,
+    query,
+    state.searchEvidence || {},
+    detailEvidence,
+    sellerCheck.decision,
   );
-  state.seedIndex += 1;
-  state.stage = "search";
-  state.searchEvidence = null;
-  state.productLinkIndex = 0;
+  saveState(state);
+  await checkpointOzonCandidate(task, candidate);
+  advanceOzonCollectionState(state, seeds, candidate);
   saveState(state);
   if (state.seedIndex < seeds.length) {
     const next = seeds[state.seedIndex];

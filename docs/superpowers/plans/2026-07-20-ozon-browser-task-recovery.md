@@ -445,7 +445,7 @@ git commit -m "feat: redispatch incomplete browser collection tasks"
 - Modify: `browser_extension/ozon_v2_bridge/content.js`
 - Modify: `browser_extension/ozon_v2_bridge/manifest.json`
 
-- [ ] **Step 1: 写服务端检查点恢复的失败 Node 测试**
+- [x] **Step 1: 写服务端检查点恢复的失败 Node 测试**
 
 在 `tests/test_browser_collection_progress.js` 的 fetch fixture 中分别记录进度请求和最终请求：
 
@@ -486,7 +486,7 @@ assert.deepEqual(
 
 再设置 `failNextCheckpoint = true`，直接调用 `runOzonCollection()` 并断言 Promise 被拒绝、最终请求没有增加、session state 的 `seedIndex` 未推进且候选没有加入。更新现有快照复用和正常详情任务夹具，使它们都带 `progress_url`。
 
-- [ ] **Step 2: 运行 Node 测试并确认 RED**
+- [x] **Step 2: 运行 Node 测试并确认 RED**
 
 ```powershell
 node tests/test_browser_collection_progress.js
@@ -494,7 +494,7 @@ node tests/test_browser_collection_progress.js
 
 Expected: FAIL；当前扩展忽略 `resume_candidates`，也不会 POST 单件检查点。
 
-- [ ] **Step 3: 实现合同顺序的状态重建**
+- [x] **Step 3: 实现合同顺序的状态重建**
 
 在 `browser_extension/ozon_v2_bridge/content.js` 增加以下纯函数。它同时合并服务端已验证候选和同一派发令牌下已经成功落盘的 session 候选，按合同排序，并把游标定位到第一件未完成 seed：
 
@@ -548,7 +548,7 @@ let state = reconcileOzonCollectionState(task, sessionState);
 
 新令牌不会接纳旧令牌的 session state；服务端检查点是跨关页恢复的唯一来源。
 
-- [ ] **Step 4: 每件候选先持久化再推进游标**
+- [x] **Step 4: 每件候选先持久化再推进游标**
 
 增加：
 
@@ -611,7 +611,7 @@ saveState(state);
 
 检查点 POST 失败时让错误继续抛出；不得把候选放进 `state.candidates`，不得增加 `seedIndex`，不得提交最终结果。
 
-- [ ] **Step 5: 运行 Node 测试和语法检查并确认 GREEN**
+- [x] **Step 5: 运行 Node 测试和语法检查并确认 GREEN**
 
 ```powershell
 node tests/test_browser_collection_progress.js
@@ -620,7 +620,7 @@ node --check browser_extension/ozon_v2_bridge/content.js
 
 Expected: 输出 `browser Ozon collection progress: OK`，语法检查退出码为 0。
 
-- [ ] **Step 6: 升级扩展版本并验证清单**
+- [x] **Step 6: 升级扩展版本并验证清单**
 
 把 `browser_extension/ozon_v2_bridge/manifest.json` 的版本从 `0.1.52` 改为 `0.1.53`，然后运行：
 
@@ -630,7 +630,7 @@ python -m json.tool browser_extension/ozon_v2_bridge/manifest.json > $null
 
 Expected: 退出码为 0。版本升级确保仍运行旧内容脚本的 Edge 扩展不能通过现有版本门禁。
 
-- [ ] **Step 7: 提交 Task 3**
+- [x] **Step 7: 提交 Task 3**
 
 ```powershell
 git add browser_extension/ozon_v2_bridge/content.js browser_extension/ozon_v2_bridge/manifest.json tests/test_browser_collection_progress.js

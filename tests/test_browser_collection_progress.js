@@ -6,7 +6,10 @@ const path = require("path");
 const vm = require("vm");
 
 const heartbeats = [];
+const checkpointRequests = [];
+const finalRequests = [];
 const sessionValues = new Map();
+let failNextCheckpoint = false;
 
 const chrome = {
   runtime: {
@@ -51,6 +54,20 @@ const context = vm.createContext({
   fetch: async (url, options = {}) => {
     if (String(url).endsWith("/api/browser-bridge/heartbeat")) {
       heartbeats.push(JSON.parse(options.body));
+    }
+    if (String(url).endsWith("/ozon-collection-progress")) {
+      const body = JSON.parse(options.body);
+      checkpointRequests.push(body);
+      if (failNextCheckpoint) {
+        failNextCheckpoint = false;
+        return {
+          ok: false,
+          json: async () => ({ ok: false, code: "checkpoint.failed", message: "checkpoint failed" }),
+        };
+      }
+    }
+    if (String(url).endsWith("/ozon-collection")) {
+      finalRequests.push(JSON.parse(options.body));
     }
     return { ok: true, json: async () => ({ ok: true, code: "ok", data: {} }) };
   },
@@ -111,6 +128,22 @@ function assertProgress(value, expected) {
 }
 
 (async () => {
+  sessionStorage.setItem("ozon_v2_browser_bridge_state", JSON.stringify({
+    schemaVersion: 5,
+    runId: "wb-old-schema",
+    taskType: "ozon_collection",
+    dispatchToken: "dispatch-old-schema",
+    seedIndex: 1,
+    stage: "search",
+    candidates: [{ seed_id: "unsafe-old-candidate", ozon_product_id: "old-product" }],
+  }));
+  assert.equal(
+    context.loadState("wb-old-schema", "ozon_collection", "dispatch-old-schema"),
+    null,
+    "pre-checkpoint session state must be invalidated after the schema upgrade",
+  );
+  sessionStorage.removeItem("ozon_v2_browser_bridge_state");
+
   assertProgress(context.collectionProgress({ candidates: [{}, {}] }, 5), {
     total_count: 5,
     processed_count: 2,
@@ -134,6 +167,7 @@ function assertProgress(value, expected) {
       run_id: "wb-reusable",
       dispatch_token: "dispatch-reusable",
       ingest_url: "/api/batches/wb-reusable/ozon-collection",
+      progress_url: "/api/batches/wb-reusable/ozon-collection-progress",
       contract: { payload: { excluded_ozon_product_ids: [], seeds: [{
         seed_id: "seed-reusable",
         source_text_zh: "测试商品",
@@ -222,7 +256,7 @@ function assertProgress(value, expected) {
 
   heartbeats.length = 0;
   sessionStorage.setItem("ozon_v2_browser_bridge_state", JSON.stringify({
-    schemaVersion: 5,
+    schemaVersion: 6,
     runId: "wb-normal",
     taskType: "ozon_collection",
     dispatchToken: "dispatch-normal",
@@ -246,6 +280,7 @@ function assertProgress(value, expected) {
       run_id: "wb-normal",
       dispatch_token: "dispatch-normal",
       ingest_url: "/api/batches/wb-normal/ozon-collection",
+      progress_url: "/api/batches/wb-normal/ozon-collection-progress",
       contract: { payload: { excluded_ozon_product_ids: [], seeds: [{
         seed_id: "seed-normal",
         source_text_zh: "正常商品",
@@ -261,6 +296,104 @@ function assertProgress(value, expected) {
     replacement_count: 0,
     pending_count: 0,
   });
+
+  checkpointRequests.length = 0;
+  finalRequests.length = 0;
+  const completeCandidate = {
+    seed_id: "seed-complete",
+    ozon_product_id: "103",
+    attributes: { Material: "Steel" },
+  };
+  sessionStorage.setItem("ozon_v2_browser_bridge_state", JSON.stringify({
+    schemaVersion: 6,
+    runId: "wb-resume",
+    taskType: "ozon_collection",
+    dispatchToken: "dispatch-resume",
+    seedIndex: 1,
+    stage: "detail",
+    candidates: [],
+    searchEvidence: { url: "https://www.ozon.ru/search/", title: "search", productLinks: [] },
+    productLinkIndex: 0,
+    rejectedCandidates: [],
+  }));
+  context.waitForDetailEvidence = async () => ({
+    snapshot: snapshot("104"),
+    url: "https://www.ozon.ru/product/test-104/",
+    title: "Product 104",
+    sellerDecision: { is_chinese_domestic_seller: true, confidence: "high", signals: [] },
+    missingFields: [],
+    hasChallenge: false,
+  });
+  await context.runOzonCollection({
+    data: {
+      run_id: "wb-resume",
+      dispatch_token: "dispatch-resume",
+      ingest_url: "/api/batches/wb-resume/ozon-collection",
+      progress_url: "/api/batches/wb-resume/ozon-collection-progress",
+      resume_candidates: [completeCandidate],
+      contract: { payload: { excluded_ozon_product_ids: [], seeds: [
+        { seed_id: "seed-complete", source_text_zh: "complete", ozon_query_terms_ru: ["complete"] },
+        { seed_id: "seed-pending", source_text_zh: "pending", ozon_query_terms_ru: ["pending"] },
+      ] } },
+    },
+  });
+  assert.equal(checkpointRequests.length, 1, "only the unfinished seed must create a checkpoint request");
+  assert.equal(checkpointRequests[0].ozon_candidate.seed_id, "seed-pending");
+  assert.equal(finalRequests.length, 1);
+  assert.deepEqual(
+    finalRequests[0].ozon_candidates.map((item) => item.seed_id),
+    ["seed-complete", "seed-pending"],
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(finalRequests[0].ozon_candidates[0].attributes)),
+    { Material: "Steel" },
+    "original Ozon attributes from the durable checkpoint must survive final submission",
+  );
+
+  checkpointRequests.length = 0;
+  const finalCountBeforeFailure = finalRequests.length;
+  sessionStorage.setItem("ozon_v2_browser_bridge_state", JSON.stringify({
+    schemaVersion: 6,
+    runId: "wb-checkpoint-failure",
+    taskType: "ozon_collection",
+    dispatchToken: "dispatch-checkpoint-failure",
+    seedIndex: 0,
+    stage: "detail",
+    candidates: [],
+    searchEvidence: { url: "https://www.ozon.ru/search/", title: "search", productLinks: [] },
+    productLinkIndex: 0,
+    rejectedCandidates: [],
+  }));
+  context.waitForDetailEvidence = async () => ({
+    snapshot: snapshot("105"),
+    url: "https://www.ozon.ru/product/test-105/",
+    title: "Product 105",
+    sellerDecision: { is_chinese_domestic_seller: true, confidence: "high", signals: [] },
+    missingFields: [],
+    hasChallenge: false,
+  });
+  failNextCheckpoint = true;
+  await assert.rejects(
+    context.runOzonCollection({
+      data: {
+        run_id: "wb-checkpoint-failure",
+        dispatch_token: "dispatch-checkpoint-failure",
+        ingest_url: "/api/batches/wb-checkpoint-failure/ozon-collection",
+        progress_url: "/api/batches/wb-checkpoint-failure/ozon-collection-progress",
+        resume_candidates: [],
+        contract: { payload: { excluded_ozon_product_ids: [], seeds: [{
+          seed_id: "seed-checkpoint-failure",
+          source_text_zh: "failure",
+          ozon_query_terms_ru: ["failure"],
+        }] } },
+      },
+    }),
+    /checkpoint failed/,
+  );
+  const safeState = JSON.parse(sessionStorage.getItem("ozon_v2_browser_bridge_state"));
+  assert.equal(safeState.seedIndex, 0, "a failed checkpoint must not advance the seed cursor");
+  assert.deepEqual(safeState.candidates, [], "a failed checkpoint must not count the candidate as durable");
+  assert.equal(finalRequests.length, finalCountBeforeFailure, "a failed checkpoint must block final submission");
 
   process.stdout.write("browser Ozon collection progress: OK\n");
 })().catch((error) => {
