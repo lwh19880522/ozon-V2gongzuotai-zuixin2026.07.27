@@ -39,6 +39,7 @@ const document = {
   title: "1688 首页",
   body,
   createElement() { return node(); },
+  addEventListener() {},
   getElementById(id) { return elements.get(id) || null; },
   querySelector(selector) {
     if (selector.includes("input[type='file']")) return inputVisible ? input : null;

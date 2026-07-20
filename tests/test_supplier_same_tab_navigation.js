@@ -7,7 +7,9 @@ const vm = require("vm");
 
 const elements = new Map();
 let clickCapture = null;
+let pointerDownCapture = null;
 let assignedUrl = "";
+const runtimeMessages = [];
 
 function node(text = "") {
   return {
@@ -36,6 +38,7 @@ const document = {
   querySelectorAll() { return []; },
   addEventListener(type, listener, capture) {
     if (type === "click" && capture === true) clickCapture = listener;
+    if (type === "pointerdown" && capture === true) pointerDownCapture = listener;
   },
 };
 
@@ -54,6 +57,7 @@ const chrome = {
   runtime: {
     getManifest() { return { version: "9.8.7" }; },
     async sendMessage(message) {
+      runtimeMessages.push(message);
       if (message.type === "ozon_v2_get_current_task") {
         return { ok: true, task: { code: "browser_task.supplier_selection_ready" } };
       }
@@ -97,30 +101,69 @@ vm.runInContext(fs.readFileSync(scriptPath, "utf8"), context, { filename: script
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   assert.ok(clickCapture, "a managed 1688 page must capture detail-link clicks for same-tab navigation");
+  assert.ok(pointerDownCapture, "a managed 1688 page must mark explicit native new-tab intent");
 
   const detailUrl = "https://detail.1688.com/offer/123456789012.html";
-  const anchor = {
-    href: detailUrl,
-    getAttribute(name) { return name === "href" ? detailUrl : null; },
-    closest(selector) { return selector === "a[href]" ? this : null; },
-  };
-  let prevented = false;
-  let stopped = false;
-  clickCapture({
-    target: { closest() { return anchor; } },
-    button: 0,
-    ctrlKey: false,
-    metaKey: false,
-    shiftKey: false,
-    altKey: false,
-    defaultPrevented: false,
-    preventDefault() { prevented = true; },
-    stopImmediatePropagation() { stopped = true; },
-  });
+  function dispatch(listener, {
+    href = detailUrl,
+    button = 0,
+    ctrlKey = false,
+    metaKey = false,
+    shiftKey = false,
+    altKey = false,
+  } = {}) {
+    const anchor = {
+      href,
+      getAttribute(name) { return name === "href" ? href : null; },
+      closest(selector) { return selector === "a[href]" ? this : null; },
+    };
+    let prevented = false;
+    let stopped = false;
+    listener({
+      target: { closest() { return anchor; } },
+      button,
+      ctrlKey,
+      metaKey,
+      shiftKey,
+      altKey,
+      defaultPrevented: false,
+      preventDefault() { prevented = true; },
+      stopImmediatePropagation() { stopped = true; },
+    });
+    return { prevented, stopped };
+  }
+
+  const normal = dispatch(clickCapture);
 
   assert.equal(assignedUrl, detailUrl, "the exact 1688 detail URL must replace the current managed lane page");
-  assert.equal(prevented, true);
-  assert.equal(stopped, true);
+  assert.deepEqual(normal, { prevented: true, stopped: true });
+
+  assignedUrl = "";
+  for (const explicit of [
+    { ctrlKey: true },
+    { metaKey: true },
+    { shiftKey: true },
+    { altKey: true },
+    { button: 1 },
+  ]) {
+    assert.deepEqual(dispatch(clickCapture, explicit), { prevented: false, stopped: false });
+    assert.equal(assignedUrl, "", "explicit new-tab clicks must keep native browser behavior");
+    const before = runtimeMessages.length;
+    assert.deepEqual(dispatch(pointerDownCapture, explicit), { prevented: false, stopped: false });
+    assert.equal(runtimeMessages.length, before + 1);
+    assert.deepEqual(runtimeMessages.at(-1), {
+      type: "ozon_v2_supplier_native_new_tab_intent",
+      url: detailUrl,
+    });
+  }
+
+  const beforeNonDetail = runtimeMessages.length;
+  assert.deepEqual(
+    dispatch(clickCapture, { href: "https://www.1688.com/" }),
+    { prevented: false, stopped: false },
+  );
+  dispatch(pointerDownCapture, { href: "https://www.1688.com/", ctrlKey: true });
+  assert.equal(runtimeMessages.length, beforeNonDetail, "non-detail links must remain untouched");
   process.stdout.write("supplier same-tab detail navigation: OK\n");
 })().catch((error) => {
   console.error(error);

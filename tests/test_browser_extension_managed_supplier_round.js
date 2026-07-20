@@ -157,6 +157,32 @@ function sendMessage(message, tab) {
 
   const firstChannel = entry.channels[0];
   const originalTabId = firstChannel.tabId;
+  const intent = await sendMessage(
+    {
+      type: "ozon_v2_supplier_native_new_tab_intent",
+      url: "https://detail.1688.com/offer/999999999999.html",
+    },
+    tabs.get(originalTabId),
+  );
+  assert.equal(intent.ok, true, "a bound channel may mark one explicit native new-tab intent");
+  const explicitNativeTab = {
+    id: 199,
+    windowId: entry.windowId,
+    openerTabId: originalTabId,
+    url: "https://detail.1688.com/offer/999999999999.html",
+    active: false,
+  };
+  tabs.set(explicitNativeTab.id, explicitNativeTab);
+  const skipped = await context.handleSupplierTabCreated(explicitNativeTab);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(skipped)),
+    { adopted: false, nativeIntent: true },
+    "an explicit Ctrl/middle-click tab must never be adopted",
+  );
+  assert.equal(firstChannel.tabId, originalTabId, "native new-tab intent must not rebind its channel");
+  assert.equal(tabs.has(originalTabId), true, "native new-tab intent must not close the managed lane");
+  tabs.delete(explicitNativeTab.id);
+
   const searchResultTab = {
     id: 200,
     windowId: entry.windowId,

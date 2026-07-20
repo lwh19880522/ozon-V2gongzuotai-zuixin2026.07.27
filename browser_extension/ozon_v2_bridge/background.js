@@ -6,7 +6,9 @@ const EXTENSION_VERSION = chrome.runtime.getManifest().version;
 const MAX_SUPPLIER_LANES = 5;
 const MANAGED_TAB_QUERY_ATTEMPTS = 30;
 const MANAGED_TAB_QUERY_DELAY_MS = 100;
+const NATIVE_NEW_TAB_INTENT_MS = 2500;
 const SUPPLIER_TERMINAL_STATES = new Set(["collected", "user_skipped"]);
+const supplierNativeNewTabIntents = new Map();
 let openTaskQueue = Promise.resolve();
 let pollingStarted = false;
 
@@ -211,6 +213,24 @@ async function managedSupplierEntryForTab(tabId) {
   return null;
 }
 
+async function recordSupplierNativeNewTabIntent(tabId, url) {
+  const binding = await supplierChannelForTab(tabId);
+  if (!binding) return { ok: false, code: "supplier_selection.channel_missing" };
+  supplierNativeNewTabIntents.set(tabId, {
+    url: String(url || ""),
+    expiresAt: Date.now() + NATIVE_NEW_TAB_INTENT_MS,
+  });
+  return { ok: true };
+}
+
+async function consumeSupplierNativeNewTabIntent(openerTabId) {
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const intent = supplierNativeNewTabIntents.get(openerTabId);
+  if (!intent) return false;
+  supplierNativeNewTabIntents.delete(openerTabId);
+  return intent.expiresAt >= Date.now();
+}
+
 async function handleSupplierTabCreated(tab) {
   if (!tab || !Number.isInteger(tab.id) || !Number.isInteger(tab.openerTabId)) {
     return { adopted: false };
@@ -218,6 +238,9 @@ async function handleSupplierTabCreated(tab) {
   const match = await managedSupplierEntryForTab(tab.openerTabId);
   if (!match || tab.windowId !== match.entry.windowId) {
     return { adopted: false };
+  }
+  if (await consumeSupplierNativeNewTabIntent(tab.openerTabId)) {
+    return { adopted: false, nativeIntent: true };
   }
 
   const replacedTabId = match.channel.tabId;
@@ -941,6 +964,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const tabId = sender && sender.tab ? sender.tab.id : null;
     supplierChannelForTab(tabId)
       .then((binding) => sendResponse({ ok: !!binding, binding }))
+      .catch((error) => sendResponse({ ok: false, error: String(error) }));
+    return true;
+  }
+  if (message.type === "ozon_v2_supplier_native_new_tab_intent") {
+    const tabId = sender && sender.tab ? sender.tab.id : null;
+    recordSupplierNativeNewTabIntent(tabId, message.url)
+      .then((result) => sendResponse(result))
       .catch((error) => sendResponse({ ok: false, error: String(error) }));
     return true;
   }

@@ -36,7 +36,7 @@
 - Modify: `browser_extension/ozon_v2_bridge/supplier_content.js`
 - Modify: `browser_extension/ozon_v2_bridge/background.js`
 
-- [ ] **Step 1: Add a failing pytest wrapper for every existing Node contract**
+- [x] **Step 1: Add a failing pytest wrapper for every existing Node contract**
 
 Create `tests/test_browser_extension_node_contracts.py`:
 
@@ -84,7 +84,7 @@ def test_browser_extension_node_contract(script_name: str) -> None:
     assert completed.returncode == 0, completed.stdout + completed.stderr
 ```
 
-- [ ] **Step 2: Run the wrapper and verify the existing production defect is RED**
+- [x] **Step 2: Run the wrapper and verify the existing production defect is RED**
 
 Run:
 
@@ -94,7 +94,7 @@ python -m pytest tests/test_browser_extension_node_contracts.py -q
 
 Expected: only `test_supplier_same_tab_navigation.js` fails with `a managed 1688 page must capture detail-link clicks for same-tab navigation`; the other Node contracts pass.
 
-- [ ] **Step 3: Extend the Node contract for allowed and native browser clicks**
+- [x] **Step 3: Extend the Node contract for allowed and native browser clicks**
 
 Add a helper to `tests/test_supplier_same_tab_navigation.js` and assert ordinary detail clicks are captured while explicit new-tab and non-detail clicks are untouched:
 
@@ -136,7 +136,7 @@ The content-script contract must also assert that Ctrl/Shift/Alt/Meta or middle-
 
 Extend `tests/test_browser_extension_managed_supplier_round.js` with a RED backend contract: send that intent from a currently bound opener tab, create one same-window child tab with its `openerTabId`, and assert `handleSupplierTabCreated()` returns `{ adopted: false, nativeIntent: true }`; the channel `tabId` and original tab remain unchanged. A child tab without a recorded intent continues through the existing popup compatibility adoption path.
 
-- [ ] **Step 4: Implement the smallest managed same-tab click capture**
+- [x] **Step 4: Implement the smallest managed same-tab click capture**
 
 Add these functions inside the existing supplier content-script closure:
 
@@ -188,7 +188,7 @@ Factor anchor/host/path validation into `detailUrlFromEvent(event)` so both hand
 
 In `background.js`, keep a short-lived in-memory native-intent map keyed by the verified bound sender tab ID. The runtime message handler must reject unbound senders. Before popup adoption, `handleSupplierTabCreated()` waits only a small bounded turn, consumes at most one unexpired intent for its `openerTabId`, and skips adoption when it matches. Do not persist the intent and do not close or rebind either tab on the skip path. This preserves explicit native new-tab behavior while leaving the existing no-intent popup fallback available.
 
-- [ ] **Step 5: Run the Node gate and supplier-focused Python contracts**
+- [x] **Step 5: Run the Node gate and supplier-focused Python contracts**
 
 Run:
 
@@ -198,7 +198,7 @@ python -m pytest tests/test_browser_extension_node_contracts.py tests/test_workb
 
 Expected: all selected tests pass; no browser starts.
 
-- [ ] **Step 6: Commit Task 1**
+- [x] **Step 6: Commit Task 1**
 
 ```powershell
 git add tests/test_browser_extension_node_contracts.py tests/test_supplier_same_tab_navigation.js tests/test_browser_extension_managed_supplier_round.js browser_extension/ozon_v2_bridge/supplier_content.js browser_extension/ozon_v2_bridge/background.js

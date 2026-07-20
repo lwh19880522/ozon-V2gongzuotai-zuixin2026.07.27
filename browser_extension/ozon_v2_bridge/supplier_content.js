@@ -10,6 +10,7 @@
   const REFERENCE_UPLOAD_ATTEMPTS = 3;
   const REFERENCE_UPLOAD_INPUT_WAIT_MS = 5000;
   let activeRunPromise = null;
+  let managedNavigationInstalled = false;
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -707,6 +708,49 @@
     });
   }
 
+  function detailUrlFromEvent(event) {
+    const anchor = event && event.target && typeof event.target.closest === "function"
+      ? event.target.closest("a[href]")
+      : null;
+    if (!anchor) return "";
+    try {
+      const target = new URL(anchor.href || anchor.getAttribute("href"), location.href);
+      if (!/(^|\.)1688\.com$/i.test(target.hostname)) return "";
+      if (!/^\/offer\/\d+\.html$/i.test(target.pathname)) return "";
+      return target.href;
+    } catch (_) {
+      return "";
+    }
+  }
+
+  function managedDetailUrl(event) {
+    if (!event || event.defaultPrevented || event.button !== 0) return "";
+    if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return "";
+    return detailUrlFromEvent(event);
+  }
+
+  function installManagedSameTabNavigation() {
+    if (managedNavigationInstalled) return;
+    managedNavigationInstalled = true;
+    document.addEventListener("pointerdown", (event) => {
+      const detailUrl = detailUrlFromEvent(event);
+      const explicitNewTab = event.button === 1
+        || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey;
+      if (!detailUrl || !explicitNewTab) return;
+      chrome.runtime.sendMessage({
+        type: "ozon_v2_supplier_native_new_tab_intent",
+        url: detailUrl,
+      }).catch(() => null);
+    }, true);
+    document.addEventListener("click", (event) => {
+      const detailUrl = managedDetailUrl(event);
+      if (!detailUrl) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      location.assign(detailUrl);
+    }, true);
+  }
+
   function managedPanel(binding) {
     const existing = document.getElementById("ozon-v2-supplier-panel");
     if (existing) return existing;
@@ -930,6 +974,7 @@
       return true;
     }
     managedPanel(binding);
+    installManagedSameTabNavigation();
     prepareReferenceImage(binding).catch(() => null);
     await heartbeat({
       run_id: binding.run_id,
