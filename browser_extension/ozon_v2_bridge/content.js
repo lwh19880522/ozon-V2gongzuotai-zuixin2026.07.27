@@ -99,6 +99,33 @@ async function heartbeat(payload = {}) {
   }
 }
 
+function collectionProgress(state, totalCount) {
+  const total = Math.max(0, Number.parseInt(totalCount, 10) || 0);
+  const success = Math.max(0, Array.isArray(state && state.candidates) ? state.candidates.length : 0);
+  const processed = Math.min(total, success);
+  return {
+    total_count: total,
+    processed_count: processed,
+    success_count: Math.min(success, total),
+    failure_count: 0,
+    replacement_count: 0,
+    pending_count: Math.max(total - processed, 0),
+  };
+}
+
+function collectionProgressDetails(state, totalCount, details = {}) {
+  return {
+    ...details,
+    collection_progress: collectionProgress(state, totalCount),
+  };
+}
+
+function taskProgressDetails(state, taskType, totalCount, details = {}) {
+  return taskType === "ozon_collection" && totalCount !== null && totalCount !== undefined
+    ? collectionProgressDetails(state, totalCount, details)
+    : details;
+}
+
 function normalizeUrl(value) {
   try {
     const url = new URL(value, "https://www.ozon.ru");
@@ -165,7 +192,15 @@ function searchProductLinks(limit = 24) {
   return { all, qualified };
 }
 
-async function requireChineseCrossBorderDetail(state, runId, taskType, codePrefix, detailEvidence, seedId) {
+async function requireChineseCrossBorderDetail(
+  state,
+  runId,
+  taskType,
+  codePrefix,
+  detailEvidence,
+  seedId,
+  totalCount = null,
+) {
   const decision = detailEvidence.sellerDecision || {
     is_chinese_domestic_seller: null,
     confidence: "unknown",
@@ -214,7 +249,7 @@ async function requireChineseCrossBorderDetail(state, runId, taskType, codePrefi
       stage: "candidate_rejected",
       code: `${codePrefix}.candidate_rejected`,
       message: `Candidate ${state.productLinkIndex} was not a complete verified Chinese cross-border product; checking the next result.`,
-      details: rejectionDetails,
+      details: taskProgressDetails(state, taskType, totalCount, rejectionDetails),
     });
     location.href = nextLink.href;
     return { accepted: false, navigating: true, decision };
@@ -226,11 +261,11 @@ async function requireChineseCrossBorderDetail(state, runId, taskType, codePrefi
     stage: "no_cross_border_candidate",
     code: `${codePrefix}.no_cross_border_candidate`,
     message: "No complete verified Chinese cross-border product was found in the visible Ozon search candidates.",
-    details: {
+    details: taskProgressDetails(state, taskType, totalCount, {
       seed_id: seedId,
       rejected_candidate_count: state.rejectedCandidates.length,
       rejected_candidates: state.rejectedCandidates,
-    },
+    }),
   });
   return { accepted: false, navigating: false, decision };
 }
@@ -833,13 +868,14 @@ async function submit(runId, ingestUrl, templates) {
   return result;
 }
 
-async function submitOzonCollection(runId, ingestUrl, candidates) {
+async function submitOzonCollection(runId, ingestUrl, state, totalCount) {
   await heartbeat({
     run_id: runId,
     task_type: "ozon_collection",
     stage: "submitting",
     code: "bridge.ozon_collection_submitting",
     message: "Submitting Ozon product collection evidence to workbench.",
+    details: collectionProgressDetails(state, totalCount),
   });
   const result = await api(ingestUrl, {
     method: "POST",
@@ -847,7 +883,7 @@ async function submitOzonCollection(runId, ingestUrl, candidates) {
       run_id: runId,
       worker: "workbench_browser_bridge",
       source: "ozon_browser_extension_content_script",
-      ozon_candidates: candidates,
+      ozon_candidates: state.candidates,
     }),
   });
   sessionStorage.removeItem(STATE_KEY);
@@ -857,6 +893,7 @@ async function submitOzonCollection(runId, ingestUrl, candidates) {
     stage: "submitted",
     code: "bridge.ozon_collection_submitted",
     message: "Ozon product collection evidence submitted to workbench.",
+    details: collectionProgressDetails(state, totalCount),
   });
   return result;
 }
@@ -907,12 +944,13 @@ async function runOzonCollection(task) {
       stage: "snapshot_reused",
       code: "bridge.ozon_collection_snapshot_reused",
       message: `Reused the complete verified public snapshot for seed ${state.seedIndex} of ${seeds.length}.`,
+      details: collectionProgressDetails(state, seeds.length),
     });
   }
   saveState(state);
   const seed = seeds[state.seedIndex];
   if (!seed) {
-    return await submitOzonCollection(runId, task.data.ingest_url, state.candidates);
+    return await submitOzonCollection(runId, task.data.ingest_url, state, seeds.length);
   }
   const query = (seed.ozon_query_terms_ru || [])[0] || seed.source_text_zh || "";
   await heartbeat({
@@ -921,6 +959,7 @@ async function runOzonCollection(task) {
     stage: state.stage,
     code: "bridge.ozon_collection_running",
     message: `Collecting Ozon product seed ${state.seedIndex + 1} of ${seeds.length}.`,
+    details: collectionProgressDetails(state, seeds.length),
   });
   if (state.stage === "search") {
     if (!isSearchEvidencePage()) {
@@ -970,6 +1009,7 @@ async function runOzonCollection(task) {
       "bridge.ozon_collection",
       { ...detailEvidence, missingFields: ["query_intent_mismatch"] },
       seed.seed_id,
+      seeds.length,
     );
     return {
       ok: relevanceCheck.navigating,
@@ -986,6 +1026,7 @@ async function runOzonCollection(task) {
       "bridge.ozon_collection",
       { ...detailEvidence, missingFields: ["excluded_ozon_product_id"] },
       seed.seed_id,
+      seeds.length,
     );
     return {
       ok: excludedCheck.navigating,
@@ -1002,6 +1043,7 @@ async function runOzonCollection(task) {
       "bridge.ozon_collection",
       { ...detailEvidence, missingFields: ["duplicate_ozon_product_id"] },
       seed.seed_id,
+      seeds.length,
     );
     return {
       ok: duplicateCheck.navigating,
@@ -1017,6 +1059,7 @@ async function runOzonCollection(task) {
     "bridge.ozon_collection",
     detailEvidence,
     seed.seed_id,
+    seeds.length,
   );
   if (!sellerCheck.accepted) {
     return {
@@ -1039,7 +1082,7 @@ async function runOzonCollection(task) {
     location.href = searchUrl((next.ozon_query_terms_ru || [])[0] || next.source_text_zh || "");
     return { ok: true, code: "bridge.ozon_collection_next_seed" };
   }
-  return await submitOzonCollection(runId, task.data.ingest_url, state.candidates);
+  return await submitOzonCollection(runId, task.data.ingest_url, state, seeds.length);
 }
 
 async function run() {

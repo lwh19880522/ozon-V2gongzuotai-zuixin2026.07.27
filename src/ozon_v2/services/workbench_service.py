@@ -2683,6 +2683,57 @@ class WorkbenchService:
             "existing_store_dedupe": self.repo.existing_store_dedupe_status(),
         }
 
+    def _ozon_collection_progress(self, run: dict, seeds: list[SeedProduct]) -> dict[str, int]:
+        total = len(seeds)
+        bridge = self.repo.load_browser_bridge_status()
+        live: dict[str, Any] = {}
+        if (
+            str(bridge.get("run_id") or "") == str(run["run_id"])
+            and bridge.get("task_type") == "ozon_collection"
+        ):
+            details = bridge.get("details") if isinstance(bridge.get("details"), dict) else {}
+            candidate = details.get("collection_progress")
+            if isinstance(candidate, dict):
+                live = candidate
+
+        events = self.repo.load_run_events(run["run_id"])
+        replaced = {
+            str(event.data.get("seed_id") or "")
+            for event in events
+            if (
+                event.event_type == "browser_candidate.replaced"
+                and event.data.get("task_type") == "ozon_collection"
+            )
+        } - {""}
+        failed = ({
+            str(event.data.get("seed_id") or "")
+            for event in events
+            if (
+                event.event_type == "browser_candidate.failed"
+                and event.data.get("task_type") == "ozon_collection"
+            )
+        } - {""}) - replaced
+
+        final_path = self.repo.run_dir(run["run_id"]) / "ozon_collection_result.json"
+        if final_path.exists():
+            success = len(self.repo.load_ozon_collection_result(run["run_id"]).get("ozon_candidates", []))
+        else:
+            try:
+                success = int(live.get("success_count", 0) or 0)
+            except (TypeError, ValueError):
+                success = 0
+        success = min(total, max(0, success))
+        failure = min(len(failed), max(total - success, 0))
+        processed = min(total, success + failure)
+        return {
+            "total_count": total,
+            "processed_count": processed,
+            "success_count": success,
+            "failure_count": failure,
+            "replacement_count": len(replaced),
+            "pending_count": max(total - processed, 0),
+        }
+
     def _run_progress(self, run: dict) -> dict:
         seeds = self._safe_load_sampled_seeds(run["run_id"])
         return {
@@ -2693,6 +2744,7 @@ class WorkbenchService:
             ],
             "attribute_template_contract_ready": bool(run.get("attribute_template_contract_ready")),
             "attribute_template_collected": bool(run.get("attribute_template_collected")),
+            "ozon_collection_progress": self._ozon_collection_progress(run, seeds),
         }
 
     def _supplier_sku_selection_status(self, run_id: str) -> dict[str, Any]:

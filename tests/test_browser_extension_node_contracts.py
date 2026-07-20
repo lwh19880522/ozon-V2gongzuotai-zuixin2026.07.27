@@ -8,6 +8,7 @@ import pytest
 
 
 NODE_CONTRACTS = (
+    "test_browser_collection_progress.js",
     "test_browser_content_recovery.js",
     "test_browser_content_timeout_recovery.js",
     "test_browser_extension_background.js",

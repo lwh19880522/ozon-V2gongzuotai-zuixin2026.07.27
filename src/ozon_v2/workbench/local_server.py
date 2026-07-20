@@ -2585,15 +2585,56 @@ def create_handler(
                     )
                     rejected_seed_id = str(details.get("seed_id") or "").strip()
                     if payload.get("task_type") in {"ozon_attribute_template", "ozon_collection"} and rejected_seed_id:
-                        replacement = service.replace_exhausted_attribute_template_seed(
-                            run_id,
-                            rejected_seed_id,
-                            str(payload.get("message") or "No verified Chinese cross-border candidate was found."),
+                        task_type = str(payload.get("task_type") or "")
+                        existing_outcome = next(
+                            (
+                                event
+                                for event in selected_repo.load_run_events(run_id)
+                                if event.event_type in {"browser_candidate.replaced", "browser_candidate.failed"}
+                                and str(event.data.get("seed_id") or "") == rejected_seed_id
+                                and str(event.data.get("task_type") or "") == task_type
+                            ),
+                            None,
                         )
-                        if replacement.ok:
-                            runner.start(run_id, max_steps=20)
-                            response_code = "browser_bridge.exhausted_seed_replaced"
-                            response_message = "The exhausted Ozon seed was replaced and the batch resumed."
+                        if existing_outcome is not None:
+                            response_code = "browser_bridge.exhausted_seed_outcome_recorded"
+                            response_message = "The exhausted seed outcome was already recorded."
+                        else:
+                            replacement = service.replace_exhausted_attribute_template_seed(
+                                run_id,
+                                rejected_seed_id,
+                                str(payload.get("message") or "No verified Chinese cross-border candidate was found."),
+                            )
+                            if replacement.ok:
+                                selected_repo.append_run_event(
+                                    run_id,
+                                    "browser_candidate.replaced",
+                                    "The exhausted Ozon seed was replaced.",
+                                    {
+                                        "seed_id": rejected_seed_id,
+                                        "task_type": task_type,
+                                        "replacement": replacement.data,
+                                    },
+                                )
+                                runner.start(run_id, max_steps=20)
+                                response_code = "browser_bridge.exhausted_seed_replaced"
+                                response_message = "The exhausted Ozon seed was replaced and the batch resumed."
+                            elif (
+                                task_type == "ozon_collection"
+                                and replacement.code == "workbench.exhausted_seed_no_replacement"
+                            ):
+                                selected_repo.append_run_event(
+                                    run_id,
+                                    "browser_candidate.failed",
+                                    "The exhausted Ozon seed could not be replaced.",
+                                    {
+                                        "seed_id": rejected_seed_id,
+                                        "task_type": task_type,
+                                        "result_code": replacement.code,
+                                    },
+                                )
+                                response_code = "browser_bridge.exhausted_seed_no_replacement"
+                                response_message = "No eligible replacement seed remains; manual review is required."
                 self._send_json(
                     {
                         "ok": True,

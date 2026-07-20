@@ -1858,6 +1858,9 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn("browser_candidate.exhausted", event_types)
         self.assertIn("seed_sampling.replaced_after_exhaustion", event_types)
         self.assertEqual(2000, len(self.repo.load_active_seeds()))
+        progress = self.get_json(f"/api/batches/{run_id}")["data"]["progress"]["ozon_collection_progress"]
+        self.assertEqual(0, progress["replacement_count"])
+        self.assertEqual(0, progress["failure_count"])
 
     def test_exhausted_ozon_collection_heartbeat_replaces_seed_and_continues(self) -> None:
         self.repo.initialize_runtime()
@@ -1897,7 +1900,176 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertFalse(loaded["ozon_collection_contract_ready"])
         self.assertIn("browser_candidate.exhausted", event_types)
         self.assertIn("seed_sampling.replaced_after_exhaustion", event_types)
+        self.assertEqual(1, event_types.count("browser_candidate.replaced"))
+        self.assertNotIn("browser_candidate.failed", event_types)
         self.assertEqual(2000, len(self.repo.load_active_seeds()))
+
+        self.post_json(
+            "/api/browser-bridge/heartbeat",
+            {
+                "source": "ozon_content_script",
+                "run_id": run_id,
+                "task_type": "ozon_collection",
+                "stage": "no_cross_border_candidate",
+                "code": "bridge.ozon_collection.no_cross_border_candidate",
+                "message": "Duplicate stale exhausted heartbeat.",
+                "details": {"seed_id": rejected_seed.seed_id, "rejected_candidate_count": 8},
+                "extension_version": self.required_extension_version(),
+            },
+        )
+        outcomes = [
+            event
+            for event in self.repo.load_run_events(run_id)
+            if event.event_type in {"browser_candidate.replaced", "browser_candidate.failed"}
+        ]
+        self.assertEqual(1, len(outcomes))
+        self.assertEqual("browser_candidate.replaced", outcomes[0].event_type)
+        self.assertEqual("ozon_collection", outcomes[0].data["task_type"])
+
+    def test_exhausted_ozon_seed_without_replacement_is_one_final_failure(self) -> None:
+        self.repo.initialize_runtime()
+        active = self.repo.load_active_seeds()
+        rejected_seed = active[0]
+        self.repo.append_used_seeds("wb-other", active, "used")
+        run = self.repo.create_workbench_batch_record(target_count=1)
+        run_id = run["run_id"]
+        self.repo.save_sampled_seeds(run_id, [rejected_seed])
+        run = self.repo.load_run(run_id)
+        run["status"] = WorkbenchState.OZON_COLLECTING.value
+        run["sampled_seed_ids"] = [rejected_seed.seed_id]
+        run["attribute_template_collected"] = True
+        run["ozon_collection_contract_ready"] = True
+        self.repo.save_run(run)
+        heartbeat = {
+            "source": "ozon_content_script",
+            "run_id": run_id,
+            "task_type": "ozon_collection",
+            "stage": "no_cross_border_candidate",
+            "code": "bridge.ozon_collection.no_cross_border_candidate",
+            "message": "No verified Chinese cross-border product was found.",
+            "details": {"seed_id": rejected_seed.seed_id, "rejected_candidate_count": 8},
+            "extension_version": self.required_extension_version(),
+        }
+
+        self.post_json("/api/browser-bridge/heartbeat", heartbeat)
+        self.post_json("/api/browser-bridge/heartbeat", heartbeat)
+
+        failures = [
+            event
+            for event in self.repo.load_run_events(run_id)
+            if event.event_type == "browser_candidate.failed"
+        ]
+        self.assertEqual(1, len(failures))
+        self.assertEqual("ozon_collection", failures[0].data["task_type"])
+        self.assertEqual("workbench.exhausted_seed_no_replacement", failures[0].data["result_code"])
+        progress = self.get_json(f"/api/batches/{run_id}")["data"]["progress"]["ozon_collection_progress"]
+        self.assertEqual(1, progress["failure_count"])
+        self.assertEqual(1, progress["processed_count"])
+
+    def test_ozon_collection_progress_merges_live_and_scoped_outcomes(self) -> None:
+        self.repo.initialize_runtime()
+        seeds = self.repo.load_active_seeds()[:5]
+        run = self.repo.create_workbench_batch_record(target_count=5)
+        run_id = run["run_id"]
+        self.repo.save_sampled_seeds(run_id, seeds)
+        self.repo.save_browser_bridge_status(
+            {
+                "source": "ozon_content_script",
+                "run_id": run_id,
+                "task_type": "ozon_collection",
+                "details": {
+                    "collection_progress": {
+                        "total_count": 5,
+                        "processed_count": 2,
+                        "success_count": 2,
+                        "failure_count": 0,
+                        "replacement_count": 0,
+                        "pending_count": 3,
+                    }
+                },
+            }
+        )
+        self.repo.append_run_event(
+            run_id,
+            "browser_candidate.replaced",
+            "replaced",
+            {"seed_id": "old-1", "task_type": "ozon_collection"},
+        )
+        self.repo.append_run_event(
+            run_id,
+            "browser_candidate.replaced",
+            "duplicate",
+            {"seed_id": "old-1", "task_type": "ozon_collection"},
+        )
+        self.repo.append_run_event(
+            run_id,
+            "browser_candidate.failed",
+            "stale opposite",
+            {"seed_id": "old-1", "task_type": "ozon_collection"},
+        )
+        self.repo.append_run_event(
+            run_id,
+            "browser_candidate.replaced",
+            "attribute replacement",
+            {"seed_id": "attribute-old", "task_type": "ozon_attribute_template"},
+        )
+
+        progress = self.get_json(f"/api/batches/{run_id}")["data"]["progress"]["ozon_collection_progress"]
+
+        self.assertEqual(
+            {
+                "total_count": 5,
+                "processed_count": 2,
+                "success_count": 2,
+                "failure_count": 0,
+                "replacement_count": 1,
+                "pending_count": 3,
+            },
+            progress,
+        )
+
+    def test_ozon_collection_progress_ignores_stale_status_and_final_result_wins(self) -> None:
+        self.repo.initialize_runtime()
+        seeds = self.repo.load_active_seeds()[:3]
+        run = self.repo.create_workbench_batch_record(target_count=3)
+        run_id = run["run_id"]
+        self.repo.save_sampled_seeds(run_id, seeds)
+        self.repo.save_browser_bridge_status(
+            {
+                "source": "ozon_content_script",
+                "run_id": "wb-stale",
+                "task_type": "ozon_collection",
+                "details": {"collection_progress": {"success_count": 99}},
+            }
+        )
+        progress = self.get_json(f"/api/batches/{run_id}")["data"]["progress"]["ozon_collection_progress"]
+        self.assertEqual(0, progress["success_count"])
+        self.assertEqual(3, progress["pending_count"])
+
+        self.repo.save_browser_bridge_status(
+            {
+                "source": "ozon_content_script",
+                "run_id": run_id,
+                "task_type": "ozon_attribute_template",
+                "details": {"collection_progress": {"success_count": 99}},
+            }
+        )
+        progress = self.get_json(f"/api/batches/{run_id}")["data"]["progress"]["ozon_collection_progress"]
+        self.assertEqual(0, progress["success_count"])
+
+        self.repo.save_browser_bridge_status(
+            {
+                "source": "ozon_content_script",
+                "run_id": run_id,
+                "task_type": "ozon_collection",
+                "details": {"collection_progress": {"success_count": 99}},
+            }
+        )
+        self.repo.save_ozon_collection_result(run_id, {"run_id": run_id, "ozon_candidates": [{}, {}]})
+        progress = self.get_json(f"/api/batches/{run_id}")["data"]["progress"]["ozon_collection_progress"]
+        self.assertEqual(2, progress["success_count"])
+        self.assertEqual(2, progress["processed_count"])
+        self.assertEqual(1, progress["pending_count"])
 
     def test_store_binding_api_saves_credentials_without_echoing_secret(self) -> None:
         secret = "seller-api-key-super-secret"

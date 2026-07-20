@@ -457,7 +457,7 @@ git commit -m "fix: restore supplier controls across navigation"
 - Modify: `src/ozon_v2/workbench/local_server.py`
 - Modify: `tests/test_workbench_local_server.py`
 
-- [ ] **Step 1: Add RED Node arithmetic and heartbeat contracts**
+- [x] **Step 1: Add RED Node arithmetic and heartbeat contracts**
 
 Create `tests/test_browser_collection_progress.js`. Load `content.js` in the existing VM style and assert the exposed top-level helper:
 
@@ -500,7 +500,7 @@ Use the real VM entry points, not manually invented state fields, for four heart
 
 Every captured heartbeat must contain the same six non-negative fields, with processed clamped to total. The attribute-template form of `requireChineseCrossBorderDetail()` must not receive collection progress. Add the script to `NODE_CONTRACTS`.
 
-- [ ] **Step 2: Add RED Python service progress tests**
+- [x] **Step 2: Add RED Python service progress tests**
 
 In `tests/test_workbench_local_server.py`, create a target-5 batch, save a matching live bridge status, append replacement/final-failure events, and assert the batch API returns normalized progress:
 
@@ -549,7 +549,7 @@ Extend the existing exhausted-seed heartbeat test with two route-level RED cases
 
 Failures such as `workbench.exhausted_seed_invalid_state` and `workbench.exhausted_seed_not_sampled` are stale/technical heartbeats, not final product failures.
 
-- [ ] **Step 3: Run both new contracts and verify RED**
+- [x] **Step 3: Run both new contracts and verify RED**
 
 Run:
 
@@ -560,7 +560,7 @@ python -m pytest tests/test_workbench_local_server.py -q -k "ozon_collection_pro
 
 Expected: missing helper and missing `ozon_collection_progress` failures.
 
-- [ ] **Step 4: Implement the pure browser progress helper and attach it to Ozon heartbeats**
+- [x] **Step 4: Implement the pure browser progress helper and attach it to Ozon heartbeats**
 
 Add to `content.js`:
 
@@ -591,7 +591,7 @@ Pass `seeds.length` from `runOzonCollection()` into every Ozon `running` and `sn
 
 Change `submitOzonCollection(runId, ingestUrl, state, totalCount)` to send `state.candidates` and attach progress to both final heartbeats; update both Ozon call sites to pass the real state and `seeds.length`. Use `collectionProgressDetails()` on Ozon `running`, `snapshot_reused`, `candidate_rejected`, `no_cross_border_candidate`, `submitting` and `submitted`. Do not attach collection progress to supplier or attribute-template heartbeats.
 
-- [ ] **Step 5: Record replacement/final-failure outcomes as structured events**
+- [x] **Step 5: Record replacement/final-failure outcomes as structured events**
 
 In the `.no_cross_border_candidate` heartbeat route, after `replace_exhausted_attribute_template_seed()`:
 
@@ -628,7 +628,7 @@ Before calling replacement, find any existing `browser_candidate.replaced` or `b
 
 Keep the existing `browser_candidate.exhausted` event for diagnostics. Never turn candidate-level rejection into seed failure. Only the exact `workbench.exhausted_seed_no_replacement` result is a final failure; invalid state or a no-longer-sampled seed remains diagnostic and does not affect product failure counts.
 
-- [ ] **Step 6: Normalize progress in WorkbenchService**
+- [x] **Step 6: Normalize progress in WorkbenchService**
 
 Add `_ozon_collection_progress(run, seeds)` and call it from `_run_progress()`:
 
@@ -683,7 +683,7 @@ def _ozon_collection_progress(self, run: dict, seeds: list) -> dict[str, int]:
 
 `_run_progress()` must expose this under `ozon_collection_progress`. Keep existing seed/query fields unchanged.
 
-- [ ] **Step 7: Run the focused progress regression**
+- [x] **Step 7: Run the focused progress regression**
 
 Run:
 
@@ -693,7 +693,7 @@ python -m pytest tests/test_browser_extension_node_contracts.py tests/test_workb
 
 Expected: all selected tests pass.
 
-- [ ] **Step 8: Commit Task 3**
+- [x] **Step 8: Commit Task 3**
 
 ```powershell
 git add browser_extension/ozon_v2_bridge/content.js src/ozon_v2/services/workbench_service.py src/ozon_v2/workbench/local_server.py tests/test_browser_collection_progress.js tests/test_browser_extension_node_contracts.py tests/test_workbench_local_server.py
