@@ -1131,6 +1131,7 @@
       `ozon-${binding.ozon_product_id || binding.seed_id}.jpg`,
       { type: response.contentType || "image/jpeg" },
     ));
+    await chrome.runtime.sendMessage({ type: "ozon_v2_supplier_navigation_intent" }).catch(() => null);
     input.files = transfer.files;
     input.dispatchEvent(new Event("input", { bubbles: true }));
     input.dispatchEvent(new Event("change", { bubbles: true }));

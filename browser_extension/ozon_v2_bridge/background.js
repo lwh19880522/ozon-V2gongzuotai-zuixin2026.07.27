@@ -7,6 +7,7 @@ const MAX_SUPPLIER_LANES = 5;
 const MANAGED_TAB_QUERY_ATTEMPTS = 30;
 const MANAGED_TAB_QUERY_DELAY_MS = 100;
 const NATIVE_NEW_TAB_INTENT_MS = 2500;
+const SUPPLIER_NAVIGATION_INTENT_MS = 15000;
 const SUPPLIER_TERMINAL_STATES = new Set(["collected", "user_skipped"]);
 const supplierNativeNewTabIntents = new Map();
 let openTaskQueue = Promise.resolve();
@@ -144,11 +145,20 @@ async function saveOpenedTasks(openedTasks) {
 
 async function handleTaskTabRemoved(tabId) {
   const openedTasks = await loadOpenedTasks();
+  let protectionChanged = false;
+  for (const entry of Object.values(openedTasks)) {
+    if (!entry || !Array.isArray(entry.protectedTabIds) || !entry.protectedTabIds.includes(tabId)) continue;
+    entry.protectedTabIds = entry.protectedTabIds.filter((value) => value !== tabId);
+    protectionChanged = true;
+  }
   const matches = Object.entries(openedTasks).filter(([, entry]) => entry && (
     entry.tabId === tabId ||
     (Array.isArray(entry.channels) && entry.channels.some((channel) => channel.tabId === tabId))
   ));
-  if (!matches.length) return { stopped: false };
+  if (!matches.length) {
+    if (protectionChanged) await saveOpenedTasks(openedTasks);
+    return { stopped: false };
+  }
   const closedAt = new Date().toISOString();
   let stopped = false;
   for (const [key, entry] of matches) {
@@ -240,10 +250,11 @@ function managedSupplierTaskForChannel(channel) {
 }
 
 async function recordSupplierNativeNewTabIntent(tabId, url) {
-  const binding = await supplierChannelForTab(tabId);
-  if (!binding) return { ok: false, code: "supplier_selection.channel_missing" };
+  const match = await managedSupplierEntryForTab(tabId);
+  if (!match) return { ok: false, code: "supplier_selection.channel_missing" };
   supplierNativeNewTabIntents.set(tabId, {
     url: String(url || ""),
+    windowId: match.entry.windowId,
     expiresAt: Date.now() + NATIVE_NEW_TAB_INTENT_MS,
   });
   return { ok: true };
@@ -257,21 +268,113 @@ async function consumeSupplierNativeNewTabIntent(openerTabId) {
   return intent.expiresAt >= Date.now();
 }
 
-async function handleSupplierTabCreated(tab) {
-  if (!tab || !Number.isInteger(tab.id) || !Number.isInteger(tab.openerTabId)) {
-    return { adopted: false };
+async function consumeSupplierNativeNewTabIntentForWindow(windowId) {
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  for (const [sourceTabId, intent] of supplierNativeNewTabIntents.entries()) {
+    if (intent.expiresAt < Date.now()) {
+      supplierNativeNewTabIntents.delete(sourceTabId);
+      continue;
+    }
+    if (intent.windowId !== windowId) continue;
+    supplierNativeNewTabIntents.delete(sourceTabId);
+    return sourceTabId;
   }
-  const match = await managedSupplierEntryForTab(tab.openerTabId);
-  if (!match || tab.windowId !== match.entry.windowId) {
-    return { adopted: false };
-  }
-  if (await consumeSupplierNativeNewTabIntent(tab.openerTabId)) {
-    return { adopted: false, nativeIntent: true };
-  }
+  return null;
+}
 
+async function protectSupplierTab(sourceTabId, tab) {
+  const match = await managedSupplierEntryForTab(sourceTabId);
+  if (!match || !tab || tab.windowId !== match.entry.windowId) return false;
+  match.entry.protectedTabIds = Array.from(new Set([
+    ...(Array.isArray(match.entry.protectedTabIds) ? match.entry.protectedTabIds : []),
+    tab.id,
+  ]));
+  await saveOpenedTasks(match.openedTasks);
+  return true;
+}
+
+async function isProtectedSupplierTab(tab) {
+  if (!tab || !Number.isInteger(tab.id) || !Number.isInteger(tab.windowId)) return false;
+  const openedTasks = await loadOpenedTasks();
+  return Object.values(openedTasks).some((entry) => (
+    entry
+    && entry.windowId === tab.windowId
+    && Array.isArray(entry.protectedTabIds)
+    && entry.protectedTabIds.includes(tab.id)
+  ));
+}
+
+async function recordSupplierNavigationIntent(tabId) {
+  const match = await managedSupplierEntryForTab(tabId);
+  if (!match) return { ok: false, code: "supplier_selection.channel_missing" };
+  const now = Date.now();
+  const pendingNavigations = Array.isArray(match.entry.pendingNavigations)
+    ? match.entry.pendingNavigations.filter((intent) => (
+      Number(intent.expiresAt || 0) >= now && intent.sourceTabId !== tabId
+    ))
+    : [];
+  pendingNavigations.push({
+    sourceTabId: tabId,
+    channel_index: match.channel.channel_index,
+    seed_id: match.channel.seed_id,
+    ozon_product_id: match.channel.ozon_product_id,
+    createdAt: now,
+    expiresAt: now + SUPPLIER_NAVIGATION_INTENT_MS,
+  });
+  match.entry.pendingNavigations = pendingNavigations;
+  delete match.entry.pendingNavigation;
+  match.entry.lastUpdatedAt = new Date().toISOString();
+  await saveOpenedTasks(match.openedTasks);
+  return { ok: true };
+}
+
+async function managedSupplierEntryForNavigation(tab) {
+  if (!tab || !Number.isInteger(tab.windowId)) return null;
+  const openedTasks = await loadOpenedTasks();
+  for (const [key, entry] of Object.entries(openedTasks)) {
+    if (!entry || entry.windowId !== tab.windowId || !Array.isArray(entry.channels)) continue;
+    const now = Date.now();
+    const pendingNavigations = [
+      ...(Array.isArray(entry.pendingNavigations) ? entry.pendingNavigations : []),
+      ...(entry.pendingNavigation ? [entry.pendingNavigation] : []),
+    ].filter((intent) => Number(intent.expiresAt || 0) >= now)
+      .sort((left, right) => Number(left.createdAt || 0) - Number(right.createdAt || 0));
+    for (const intent of pendingNavigations) {
+      const channel = entry.channels.find((item) => (
+        item.channel_index === intent.channel_index
+        && String(item.seed_id || "") === String(intent.seed_id || "")
+        && String(item.ozon_product_id || "") === String(intent.ozon_product_id || "")
+      ));
+      if (!channel) continue;
+      entry.pendingNavigations = pendingNavigations.filter((candidate) => candidate !== intent);
+      delete entry.pendingNavigation;
+      await saveOpenedTasks(openedTasks);
+      return { key, entry, channel, openedTasks };
+    }
+  }
+  return null;
+}
+
+async function uniqueManagedSupplierEntryForTab(tab) {
+  if (!tab || !Number.isInteger(tab.windowId) || !isSupplierTab(tab)) return null;
+  const openedTasks = await loadOpenedTasks();
+  const matches = [];
+  for (const [key, entry] of Object.entries(openedTasks)) {
+    if (!entry || entry.windowId !== tab.windowId || !Array.isArray(entry.channels)) continue;
+    for (const channel of entry.channels) {
+      if (!SUPPLIER_TERMINAL_STATES.has(channel.state)) {
+        matches.push({ key, entry, channel, openedTasks });
+      }
+    }
+  }
+  return matches.length === 1 ? matches[0] : null;
+}
+
+async function adoptSupplierTab(match, tab) {
   const replacedTabId = match.channel.tabId;
   match.channel.tabId = tab.id;
   match.channel.windowId = tab.windowId;
+  delete match.entry.pendingNavigation;
   match.entry.lastUpdatedAt = new Date().toISOString();
   await saveOpenedTasks(match.openedTasks);
 
@@ -296,6 +399,40 @@ async function handleSupplierTabCreated(tab) {
     replacedTabId,
     channelIndex: match.channel.channel_index,
   };
+}
+
+async function resolveSupplierChannelForTab(tab) {
+  if (!tab || !Number.isInteger(tab.id)) return null;
+  const exact = await managedSupplierEntryForTab(tab.id);
+  if (exact) return exact.channel;
+  if (await isProtectedSupplierTab(tab)) return null;
+  if (!isSupplierTab(tab)) return null;
+  const recoverable = await managedSupplierEntryForNavigation(tab)
+    || await uniqueManagedSupplierEntryForTab(tab);
+  if (!recoverable) return null;
+  await adoptSupplierTab(recoverable, tab);
+  return recoverable.channel;
+}
+
+async function handleSupplierTabCreated(tab) {
+  if (!tab || !Number.isInteger(tab.id)) {
+    return { adopted: false };
+  }
+  const nativeSourceTabId = Number.isInteger(tab.openerTabId)
+    ? (await consumeSupplierNativeNewTabIntent(tab.openerTabId) ? tab.openerTabId : null)
+    : await consumeSupplierNativeNewTabIntentForWindow(tab.windowId);
+  if (Number.isInteger(nativeSourceTabId)) {
+    await protectSupplierTab(nativeSourceTabId, tab);
+    return { adopted: false, nativeIntent: true };
+  }
+  let match = Number.isInteger(tab.openerTabId)
+    ? await managedSupplierEntryForTab(tab.openerTabId)
+    : null;
+  if (!match) match = await managedSupplierEntryForNavigation(tab);
+  if (!match || tab.windowId !== match.entry.windowId) {
+    return { adopted: false };
+  }
+  return await adoptSupplierTab(match, tab);
 }
 
 async function handleSupplierTabUpdated(tabId, changeInfo, tab) {
@@ -436,6 +573,25 @@ function sameSupplierChannel(channel, item, fallbackIndex) {
     && String(channel.ozon_product_id || "") === String(item.ozon_product_id || "");
 }
 
+async function recoverActiveManagedSupplierTab(openedTasks, key, entry, items, windowTabs) {
+  const channels = Array.isArray(entry.channels) ? entry.channels : [];
+  const boundTabIds = new Set(channels.map((channel) => channel.tabId).filter(Number.isInteger));
+  const protectedTabIds = new Set(Array.isArray(entry.protectedTabIds) ? entry.protectedTabIds : []);
+  const activeOrphans = windowTabs.filter((tab) => (
+    tab
+    && tab.active === true
+    && isSupplierTab(tab)
+    && !boundTabIds.has(tab.id)
+    && !protectedTabIds.has(tab.id)
+  ));
+  const recoverableChannels = items.map((item, index) => (
+    channels.find((channel) => sameSupplierChannel(channel, item, index)) || null
+  )).filter((channel) => channel && !SUPPLIER_TERMINAL_STATES.has(channel.state));
+  if (activeOrphans.length !== 1 || recoverableChannels.length !== 1) return null;
+  await adoptSupplierTab({ key, entry, channel: recoverableChannels[0], openedTasks }, activeOrphans[0]);
+  return activeOrphans[0];
+}
+
 function managedSupplierChannels(task, items, dispatchToken, tabs, windowId, previousChannels = []) {
   return items.map((item, index) => {
     const previous = previousChannels.find((channel) => sameSupplierChannel(channel, item, index)) || {};
@@ -511,6 +667,7 @@ async function openManagedSupplierTask(task, source, openedTasks, key, previous,
   const sameDispatch = previous.dispatchToken === dispatchToken;
   const existingWindowTabs = await managedWindowTabs(previous.windowId);
   if (existingWindowTabs.length) {
+    await recoverActiveManagedSupplierTab(openedTasks, key, previous, items, existingWindowTabs);
     const tabsById = new Map(existingWindowTabs.map((tab) => [tab.id, tab]));
     const alignedTabs = items.map((item, index) => {
       const matched = previousChannels.find((channel) => sameSupplierChannel(channel, item, index));
@@ -1022,8 +1179,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message.type === "ozon_v2_get_supplier_channel") {
     const senderTab = sender && sender.tab ? sender.tab : {};
-    const tabId = senderTab.id;
-    supplierChannelForTab(tabId)
+    resolveSupplierChannelForTab(senderTab)
       .then((binding) => sendResponse({
         ok: true,
         binding,
@@ -1040,6 +1196,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "ozon_v2_supplier_native_new_tab_intent") {
     const tabId = sender && sender.tab ? sender.tab.id : null;
     recordSupplierNativeNewTabIntent(tabId, message.url)
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ ok: false, error: String(error) }));
+    return true;
+  }
+  if (message.type === "ozon_v2_supplier_navigation_intent") {
+    const tabId = sender && sender.tab ? sender.tab.id : null;
+    const operation = openTaskQueue.then(() => recordSupplierNavigationIntent(tabId));
+    openTaskQueue = operation.catch(() => null);
+    operation
       .then((result) => sendResponse(result))
       .catch((error) => sendResponse({ ok: false, error: String(error) }));
     return true;

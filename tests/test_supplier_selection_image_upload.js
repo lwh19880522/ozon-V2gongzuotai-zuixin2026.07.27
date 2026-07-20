@@ -10,6 +10,7 @@ let triggerClicks = 0;
 let uploadChanges = 0;
 let uploadedFile = null;
 let inputVisible = false;
+let navigationIntents = 0;
 
 function node(text = "") {
   return {
@@ -103,6 +104,10 @@ const chrome = {
         return { ok: true, task: { code: "browser_task.supplier_selection_ready" } };
       }
       if (message.type === "ozon_v2_get_supplier_channel") return { ok: true, binding };
+      if (message.type === "ozon_v2_supplier_navigation_intent") {
+        navigationIntents += 1;
+        return { ok: true };
+      }
       if (message.type === "ozon_v2_fetch_reference_image") {
         return { ok: true, bytes: [1, 2, 3], contentType: "image/jpeg" };
       }
@@ -142,6 +147,7 @@ vm.runInContext(fs.readFileSync(scriptPath, "utf8"), context, { filename: script
 setTimeout(() => {
   assert.equal(triggerClicks, 1, "the visible 1688 image-search control must be activated");
   assert.equal(uploadChanges, 1, "the Ozon reference image must be submitted to the 1688 file input");
+  assert.equal(navigationIntents, 1, "the image upload must reserve this lane before 1688 creates a result tab");
   assert.ok(uploadedFile, "a browser File must be created for the reference image");
   assert.equal(uploadedFile.name, "ozon-ozon-1.jpg");
   process.stdout.write("supplier managed reference upload: OK\n");

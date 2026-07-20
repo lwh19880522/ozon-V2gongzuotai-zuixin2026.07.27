@@ -280,6 +280,48 @@ function sendMessage(message, tab) {
   });
   tabs.delete(orphanTab.id);
 
+  const intentChannel = entry.channels[3];
+  const intentSourceTab = tabs.get(intentChannel.tabId);
+  const navigationIntent = await sendMessage(
+    { type: "ozon_v2_supplier_navigation_intent" },
+    intentSourceTab,
+  );
+  assert.equal(navigationIntent.ok, true, "a managed lane must persist its pending navigation ownership");
+  const openerlessSearchTab = {
+    id: 299,
+    windowId: entry.windowId,
+    url: "https://air.1688.com/kapp/1688-search/pc-image-search/?tab=imageSearch",
+    active: true,
+  };
+  tabs.set(openerlessSearchTab.id, openerlessSearchTab);
+  const intentAdoption = await context.handleSupplierTabCreated(openerlessSearchTab);
+  assert.equal(intentAdoption.adopted, true, "an opener-less 1688 page must inherit the lane's persisted navigation intent");
+  assert.equal(intentChannel.tabId, openerlessSearchTab.id);
+  assert.ok(removedTabs.includes(intentSourceTab.id));
+
+  const concurrentChannels = [entry.channels[2], entry.channels[4]];
+  const concurrentSources = concurrentChannels.map((channel) => tabs.get(channel.tabId));
+  for (const source of concurrentSources) {
+    const response = await sendMessage({ type: "ozon_v2_supplier_navigation_intent" }, source);
+    assert.equal(response.ok, true);
+  }
+  const concurrentOrphans = concurrentChannels.map((channel, index) => ({
+    id: 300 + index,
+    windowId: entry.windowId,
+    url: `https://air.1688.com/kapp/1688-search/pc-image-search/?tab=imageSearch&lane=${channel.channel_index}`,
+    active: index === 0,
+  }));
+  for (const orphan of concurrentOrphans) {
+    tabs.set(orphan.id, orphan);
+    const adoption = await context.handleSupplierTabCreated(orphan);
+    assert.equal(adoption.adopted, true, "concurrent opener-less searches must consume distinct lane intents");
+  }
+  assert.deepEqual(
+    concurrentChannels.map((channel) => channel.tabId),
+    concurrentOrphans.map((tab) => tab.id),
+    "queued navigation intents must preserve lane order without overwriting each other",
+  );
+
   browserTaskResponse = task;
   const closedChannelIndex = 2;
   const closedChannel = entry.channels[closedChannelIndex];
@@ -352,6 +394,79 @@ function sendMessage(message, tab) {
   ]);
   assert.equal(removedWindows.length, 1, "the managed window must close after every lane is terminal");
   assert.equal(entry.closedByUser, false, "extension-completed closure must never look like a user cancellation");
+
+  stored.openedTasks = {};
+  tabs.clear();
+  windows.clear();
+  removedWindows.length = 0;
+  const selfHealTask = supplierTask(1, "self-heal-token");
+  await context.performOpenTask(selfHealTask, "managed_round_test", { allowCreate: true });
+  const selfHealEntry = stored.openedTasks["wb-managed-round:supplier_selection"];
+  const staleBoundTabId = selfHealEntry.channels[0].tabId;
+  const selfHealTab = {
+    id: 401,
+    windowId: selfHealEntry.windowId,
+    url: "https://air.1688.com/kapp/1688-search/pc-image-search/?tab=imageSearch",
+    active: true,
+  };
+  tabs.set(selfHealTab.id, selfHealTab);
+  const recoveredLookup = await sendMessage({ type: "ozon_v2_get_supplier_channel" }, selfHealTab);
+  assert.equal(recoveredLookup.ok, true);
+  assert.equal(recoveredLookup.binding.seed_id, "seed-1", "a unique managed lane must self-heal after event loss or extension reload");
+  assert.equal(selfHealEntry.channels[0].tabId, selfHealTab.id);
+  assert.ok(removedTabs.includes(staleBoundTabId), "self-healing must retire the stale lane page after rebinding");
+
+  stored.openedTasks = {};
+  tabs.clear();
+  windows.clear();
+  removedWindows.length = 0;
+  const protectedTask = supplierTask(1, "protected-native-token");
+  await context.performOpenTask(protectedTask, "managed_round_test", { allowCreate: true });
+  const protectedEntry = stored.openedTasks["wb-managed-round:supplier_selection"];
+  const protectedSource = tabs.get(protectedEntry.channels[0].tabId);
+  await sendMessage(
+    {
+      type: "ozon_v2_supplier_native_new_tab_intent",
+      url: "https://detail.1688.com/offer/777777777777.html",
+    },
+    protectedSource,
+  );
+  const protectedNativeTab = {
+    id: 402,
+    windowId: protectedEntry.windowId,
+    url: "https://detail.1688.com/offer/777777777777.html",
+    active: true,
+  };
+  tabs.set(protectedNativeTab.id, protectedNativeTab);
+  const protectedCreation = await context.handleSupplierTabCreated(protectedNativeTab);
+  assert.equal(protectedCreation.nativeIntent, true, "an opener-less explicit native tab must be recognized and protected");
+  const protectedLookup = await sendMessage({ type: "ozon_v2_get_supplier_channel" }, protectedNativeTab);
+  assert.equal(protectedLookup.binding, null, "a protected native tab must never be claimed by unique-lane recovery");
+  assert.equal(protectedEntry.channels[0].tabId, protectedSource.id);
+
+  stored.openedTasks = {};
+  tabs.clear();
+  windows.clear();
+  removedWindows.length = 0;
+  const reloadRecoveryTask = supplierTask(1, "reload-recovery-token");
+  await context.performOpenTask(reloadRecoveryTask, "managed_round_test", { allowCreate: true });
+  const reloadEntry = stored.openedTasks["wb-managed-round:supplier_selection"];
+  const reloadSourceTab = tabs.get(reloadEntry.channels[0].tabId);
+  reloadSourceTab.active = false;
+  const preexistingActiveOrphan = {
+    id: 403,
+    windowId: reloadEntry.windowId,
+    url: "https://air.1688.com/kapp/1688-search/pc-image-search/?tab=imageSearch",
+    active: true,
+  };
+  tabs.set(preexistingActiveOrphan.id, preexistingActiveOrphan);
+  await context.performOpenTask(reloadRecoveryTask, "extension_reload_poll", { allowCreate: true });
+  assert.equal(
+    reloadEntry.channels[0].tabId,
+    preexistingActiveOrphan.id,
+    "polling after extension reload must recover the active opener-less page",
+  );
+  assert.ok(removedTabs.includes(reloadSourceTab.id));
 
   stored.openedTasks = {};
   tabs.clear();
