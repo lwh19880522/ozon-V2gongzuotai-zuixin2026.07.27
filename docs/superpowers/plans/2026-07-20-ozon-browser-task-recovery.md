@@ -803,7 +803,7 @@ git commit -m "feat: add stage-specific collection recovery controls"
 **Files:**
 - Modify: `tests/test_browser_extension_background.js`
 
-- [ ] **Step 1: 加强已有用户关页回归测试**
+- [x] **Step 1: 加强已有用户关页回归测试**
 
 在 `tests/test_browser_extension_background.js` 已有 `wb-close` 场景尾部，保留“旧令牌不重开”和“新令牌重开一次”断言，再对同一新令牌重复轮询：
 
@@ -819,7 +819,7 @@ assert.equal(
 
 这是对既有 background 行为的回归锁定；若该断言已通过，不修改 `background.js`。
 
-- [ ] **Step 2: 运行所有扩展 Node 合同**
+- [x] **Step 2: 运行所有扩展 Node 合同**
 
 ```powershell
 python -m pytest tests/test_browser_extension_node_contracts.py -q
@@ -827,7 +827,7 @@ python -m pytest tests/test_browser_extension_node_contracts.py -q
 
 Expected: 所有 Node 合同通过；没有真实浏览器或外部网络调用。
 
-- [ ] **Step 3: 运行后端聚焦测试**
+- [x] **Step 3: 运行后端聚焦测试**
 
 ```powershell
 python -m pytest tests/test_workbench_local_server.py tests/test_workbench_skeleton.py -q
@@ -835,7 +835,7 @@ python -m pytest tests/test_workbench_local_server.py tests/test_workbench_skele
 
 Expected: 两个测试文件全部通过，无失败和错误。
 
-- [ ] **Step 4: 运行全量测试**
+- [x] **Step 4: 运行全量测试**
 
 ```powershell
 python -m pytest -q
@@ -843,7 +843,7 @@ python -m pytest -q
 
 Expected: 退出码为 0，汇总以 `passed` 结束；不得出现任何真实采集、生图、上传、发布或审批动作。
 
-- [ ] **Step 5: 做静态差异和边界检查**
+- [x] **Step 5: 做静态差异和边界检查**
 
 ```powershell
 git diff --check
@@ -857,7 +857,7 @@ Expected:
 - `git status --short` 只列出本计划文件清单中的预期修改。
 - `rg` 不出现本次新增的占位实现；历史既有匹配必须逐条确认与本次无关。
 
-- [ ] **Step 6: 对照规格完成自审**
+- [x] **Step 6: 对照规格完成自审**
 
 逐项确认：
 
@@ -871,7 +871,7 @@ Expected:
 - 扩展离线时界面只显示等待，不显示已开始。
 - 中文事件展示保留原始 `browser_task.user_restart_requested` 机器事件。
 
-- [ ] **Step 7: 提交回归测试**
+- [x] **Step 7: 提交回归测试**
 
 ```powershell
 git add tests/test_browser_extension_background.js

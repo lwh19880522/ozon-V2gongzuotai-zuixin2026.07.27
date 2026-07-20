@@ -388,6 +388,13 @@ function sendMessageFromTab(message, tabId) {
   closeTaskResponse = task("ozon_attribute_template", "wb-close", "2026-07-10T05:41:00+00:00");
   await context.pollTask("after_explicit_resume");
   assert.equal(createCount, createsBeforeUserClose + 1, "a new resume token may reopen the task tab once");
+  const createsAfterExplicitResume = createCount;
+  await context.pollTask("repeat_same_resume_token");
+  assert.equal(
+    createCount,
+    createsAfterExplicitResume,
+    "repeated polling with the same explicit resume token must not open another tab",
+  );
 
   process.stdout.write("browser background task reuse: OK\n");
 })().catch((error) => {
