@@ -16,9 +16,22 @@ function node(text = "") {
     innerText: text,
     textContent: text,
     style: {},
+    dataset: {},
     children: [],
     appendChild(child) { this.children.push(child); if (child.id) elements.set(child.id, child); return child; },
+    addEventListener(type, handler) { this[`on${type}`] = handler; },
+    setAttribute(name, value) { if (name === "data-role") this.dataset.role = String(value); },
     getAttribute() { return null; },
+    querySelector(selector) {
+      if (selector.startsWith("#")) return elements.get(selector.slice(1)) || null;
+      const stack = [...this.children];
+      while (stack.length) {
+        const item = stack.shift();
+        if (selector === "[data-role='channel-title']" && item.dataset && item.dataset.role === "channel-title") return item;
+        stack.push(...(item.children || []));
+      }
+      return null;
+    },
     querySelectorAll() { return []; },
   };
 }
@@ -38,6 +51,7 @@ const body = node("1688 首页");
 const document = {
   title: "1688 首页",
   body,
+  documentElement: node(),
   createElement() { return node(); },
   addEventListener() {},
   getElementById(id) { return elements.get(id) || null; },
@@ -105,6 +119,11 @@ const context = vm.createContext({
   document,
   location: { href: "https://www.1688.com/", hostname: "www.1688.com" },
   fetch: async () => ({ json: async () => ({ ok: true }) }),
+  addEventListener() {},
+  history: { pushState() {}, replaceState() {} },
+  innerWidth: 1280,
+  innerHeight: 720,
+  MutationObserver: class { observe() {} },
   setTimeout,
   clearTimeout,
   URL,

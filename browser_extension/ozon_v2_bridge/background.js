@@ -213,6 +213,16 @@ async function managedSupplierEntryForTab(tabId) {
   return null;
 }
 
+function managedSupplierTaskForChannel(channel) {
+  return {
+    code: "browser_task.supplier_selection_ready",
+    data: {
+      run_id: channel.run_id,
+      task_type: channel.task_type,
+    },
+  };
+}
+
 async function recordSupplierNativeNewTabIntent(tabId, url) {
   const binding = await supplierChannelForTab(tabId);
   if (!binding) return { ok: false, code: "supplier_selection.channel_missing" };
@@ -256,8 +266,16 @@ async function handleSupplierTabCreated(tab) {
       // The old lane page may already have closed after opening its replacement.
     }
   }
+  let injected = false;
+  try {
+    const adoptedTab = await chrome.tabs.get(tab.id);
+    injected = await ensureContentScript(adoptedTab, managedSupplierTaskForChannel(match.channel));
+  } catch (_) {
+    injected = false;
+  }
   return {
     adopted: true,
+    injected,
     tabId: tab.id,
     replacedTabId,
     channelIndex: match.channel.channel_index,
@@ -265,16 +283,10 @@ async function handleSupplierTabCreated(tab) {
 }
 
 async function handleSupplierTabUpdated(tabId, changeInfo, tab) {
-  if (!changeInfo || changeInfo.status !== "complete") return { injected: false };
+  if (!changeInfo || (!changeInfo.url && changeInfo.status !== "complete")) return { injected: false };
   const match = await managedSupplierEntryForTab(tabId);
   if (!match || !tab || tab.windowId !== match.entry.windowId) return { injected: false };
-  const task = {
-    code: "browser_task.supplier_selection_ready",
-    data: {
-      run_id: match.channel.run_id,
-      task_type: match.channel.task_type,
-    },
-  };
+  const task = managedSupplierTaskForChannel(match.channel);
   return { injected: await ensureContentScript(tab, task) };
 }
 
@@ -637,7 +649,16 @@ async function ensureContentScript(tab, task) {
   if (!tab || !tab.id || !tabMatchesTask(tab, task)) return false;
   try {
     const response = await chrome.tabs.sendMessage(tab.id, { type: "ozon_v2_content_ping" });
-    if (response && response.ok) return true;
+    if (response && response.ok) {
+      if (isManagedSupplierTask(task)) {
+        try {
+          await chrome.tabs.sendMessage(tab.id, { type: "ozon_v2_supplier_channel_refresh" });
+        } catch (_) {
+          // A navigation may finish between ping and refresh; onUpdated will retry.
+        }
+      }
+      return true;
+    }
   } catch (_) {
     // A freshly reloaded unpacked extension does not inject into an already open page.
   }
@@ -961,15 +982,42 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message.type === "ozon_v2_get_supplier_channel") {
-    const tabId = sender && sender.tab ? sender.tab.id : null;
+    const senderTab = sender && sender.tab ? sender.tab : {};
+    const tabId = senderTab.id;
     supplierChannelForTab(tabId)
-      .then((binding) => sendResponse({ ok: !!binding, binding }))
+      .then((binding) => sendResponse({
+        ok: true,
+        binding,
+        diagnostics: binding ? null : {
+          tab_id: Number.isInteger(senderTab.id) ? senderTab.id : null,
+          window_id: Number.isInteger(senderTab.windowId) ? senderTab.windowId : null,
+          opener_tab_id: Number.isInteger(senderTab.openerTabId) ? senderTab.openerTabId : null,
+          url: String(senderTab.url || ""),
+        },
+      }))
       .catch((error) => sendResponse({ ok: false, error: String(error) }));
     return true;
   }
   if (message.type === "ozon_v2_supplier_native_new_tab_intent") {
     const tabId = sender && sender.tab ? sender.tab.id : null;
     recordSupplierNativeNewTabIntent(tabId, message.url)
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ ok: false, error: String(error) }));
+    return true;
+  }
+  if (message.type === "ozon_v2_supplier_channel_back") {
+    const tabId = sender && sender.tab && Number.isInteger(sender.tab.id) ? sender.tab.id : null;
+    supplierChannelForTab(tabId)
+      .then(async (binding) => {
+        if (!binding) return { ok: false, code: "supplier_selection.channel_missing" };
+        try {
+          await chrome.tabs.goBack(tabId);
+          return { ok: true, mode: "history" };
+        } catch (_) {
+          await chrome.tabs.update(tabId, { url: "https://www.1688.com/", active: true });
+          return { ok: true, mode: "home" };
+        }
+      })
       .then((result) => sendResponse(result))
       .catch((error) => sendResponse({ ok: false, error: String(error) }));
     return true;

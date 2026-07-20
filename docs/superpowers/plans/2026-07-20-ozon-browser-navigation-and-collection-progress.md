@@ -217,7 +217,7 @@ git commit -m "fix: keep managed supplier navigation in one tab"
 - Modify: `browser_extension/ozon_v2_bridge/background.js`
 - Modify: `browser_extension/ozon_v2_bridge/manifest.json`
 
-- [ ] **Step 1: Add a RED panel lifecycle Node test**
+- [x] **Step 1: Add a RED panel lifecycle Node test**
 
 Create `tests/test_supplier_panel_lifecycle.js` with a small DOM/runtime mock. The assertions must be concrete:
 
@@ -257,7 +257,7 @@ Make the runtime mock return `{ ok: false }` for one back attempt and assert the
 
 Add `"test_supplier_panel_lifecycle.js"` to `NODE_CONTRACTS`.
 
-- [ ] **Step 2: Add RED background assertions for refresh and back/fallback**
+- [x] **Step 2: Add RED background assertions for refresh and back/fallback**
 
 Extend `tests/test_browser_extension_managed_supplier_round.js`:
 
@@ -289,7 +289,7 @@ Add an orphan `detail.1688.com` tab in the managed window without `openerTabId`.
 
 Ask `ozon_v2_get_supplier_channel` from that orphan sender and assert the response has no binding but includes only structured `tab_id`, `window_id`, `opener_tab_id` and `url` diagnostics. Also call `handleSupplierTabUpdated()` with `changeInfo.url` for a bound tab and assert a supplier refresh is sent after the navigation lifecycle event.
 
-- [ ] **Step 3: Run the lifecycle tests and confirm RED**
+- [x] **Step 3: Run the lifecycle tests and confirm RED**
 
 Run:
 
@@ -300,7 +300,7 @@ node tests/test_browser_extension_managed_supplier_round.js
 
 Expected: missing reconciliation/refresh/back behavior causes failures.
 
-- [ ] **Step 4: Replace one-shot panel creation with an idempotent reconciler**
+- [x] **Step 4: Replace one-shot panel creation with an idempotent reconciler**
 
 Keep the current panel styling but split creation from state refresh:
 
@@ -339,7 +339,7 @@ async function reconcileManagedPanel(binding = activeManagedBinding) {
 
 `createManagedPanel()` must add `id="ozon-v2-supplier-back"`, preserve the existing collect/reject handlers, add pointer drag handlers, and save `{left, top}` under `supplierPanelPosition` in `chrome.storage.local`. `restoreManagedPanelPosition()` clamps left/top to `0..innerWidth-panel.offsetWidth` and `0..innerHeight-panel.offsetHeight`. The async back handler must clear the current channel's reference-prepared session marker before messaging the background worker, so a home fallback re-runs the existing `prepareReferenceImage(binding)` path. If the response is not successful, keep the panel/binding and set the status text to `返回失败，请重试`.
 
-- [ ] **Step 5: Install bounded lifecycle recovery**
+- [x] **Step 5: Install bounded lifecycle recovery**
 
 After binding is obtained:
 
@@ -369,7 +369,7 @@ if (message.type === "ozon_v2_supplier_channel_refresh") {
 
 The `ozon_v2_content_ping` response must include `binding_present` and `panel_present`.
 
-- [ ] **Step 6: Refresh loaded scripts and implement managed back in background**
+- [x] **Step 6: Refresh loaded scripts and implement managed back in background**
 
 Change `ensureContentScript()` so a successful supplier ping sends refresh before returning:
 
@@ -426,7 +426,7 @@ if (message.type === "ozon_v2_supplier_channel_back") {
 
 For a content script with no binding, preserve the existing `supplier_channel_binding_missing` heartbeat and attach the safe sender diagnostics above. For an orphan tab with no opener, the background worker must leave all channel bindings unchanged; never infer a channel from tab order or window position. After `goBack` or the home fallback causes a URL/load update, `handleSupplierTabUpdated()` performs the required content-script ensure/refresh on the same channel tab.
 
-- [ ] **Step 7: Bump and verify the extension contract**
+- [x] **Step 7: Bump and verify the extension contract**
 
 Change `manifest.json` version from `0.1.51` to `0.1.52`.
 
@@ -438,7 +438,7 @@ python -m pytest tests/test_browser_extension_node_contracts.py tests/test_workb
 
 Expected: all selected tests pass.
 
-- [ ] **Step 8: Commit Task 2**
+- [x] **Step 8: Commit Task 2**
 
 ```powershell
 git add browser_extension/ozon_v2_bridge/background.js browser_extension/ozon_v2_bridge/supplier_content.js browser_extension/ozon_v2_bridge/manifest.json tests/test_browser_extension_node_contracts.py tests/test_supplier_panel_lifecycle.js tests/test_browser_extension_managed_supplier_round.js

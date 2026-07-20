@@ -17,6 +17,7 @@ NODE_CONTRACTS = (
     "test_browser_seller_evidence.js",
     "test_browser_workbench_content.js",
     "test_supplier_content_script.js",
+    "test_supplier_panel_lifecycle.js",
     "test_supplier_same_tab_navigation.js",
     "test_supplier_selection_content_script.js",
     "test_supplier_selection_image_upload.js",

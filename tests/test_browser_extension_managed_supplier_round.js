@@ -12,6 +12,10 @@ const windows = new Map();
 const removedTabs = [];
 const removedWindows = [];
 const postedPaths = [];
+const sentMessages = [];
+const backCalls = [];
+const updatedTabs = [];
+const failBackTabs = new Set();
 let nextTabId = 10;
 let nextWindowId = 70;
 
@@ -47,12 +51,23 @@ const chrome = {
       return tab;
     },
     async update(tabId, changes) {
+      updatedTabs.push({ tabId, changes });
       const tab = { ...tabs.get(tabId), ...changes };
       tabs.set(tabId, tab);
       return tab;
     },
     async reload() {},
-    async sendMessage() { return { ok: true }; },
+    async sendMessage(tabId, message) {
+      sentMessages.push({ tabId, message });
+      if (message.type === "ozon_v2_content_ping") {
+        return { ok: true, bridge: "supplier", panel_present: false };
+      }
+      return { ok: true };
+    },
+    async goBack(tabId) {
+      backCalls.push(tabId);
+      if (failBackTabs.has(tabId)) throw new Error("no history");
+    },
     async remove(tabId) {
       removedTabs.push(tabId);
       tabs.delete(tabId);
@@ -204,11 +219,62 @@ function sendMessage(message, tab) {
     active: true,
   };
   tabs.set(detailTab.id, detailTab);
+  sentMessages.length = 0;
   await context.handleSupplierTabCreated(detailTab);
   assert.equal(entry.channels[0].tabId, detailTab.id, "the product detail must keep the same lane binding");
   assert.ok(removedTabs.includes(searchResultTab.id), "the search result page must close after the detail page is adopted");
   assert.equal(tabs.size, 5, "search and detail navigation must not increase the managed lane count");
   assert.equal(postedPaths.some((value) => value.includes("/runner/stop")), false, "lane adoption must not pause the batch");
+  assert.ok(sentMessages.some((item) => (
+    item.tabId === detailTab.id && item.message.type === "ozon_v2_supplier_channel_refresh"
+  )), "an adopted detail tab must refresh its managed panel immediately");
+
+  sentMessages.length = 0;
+  await context.handleSupplierTabUpdated(detailTab.id, { url: detailTab.url }, detailTab);
+  assert.ok(sentMessages.some((item) => (
+    item.tabId === detailTab.id && item.message.type === "ozon_v2_supplier_channel_refresh"
+  )), "a bound URL update must reconcile the managed panel");
+
+  const back = await sendMessage({ type: "ozon_v2_supplier_channel_back" }, detailTab);
+  assert.equal(back.ok, true);
+  assert.equal(back.mode, "history");
+  assert.deepEqual(backCalls, [detailTab.id]);
+
+  const fallbackChannel = entry.channels[1];
+  const fallbackTab = tabs.get(fallbackChannel.tabId);
+  failBackTabs.add(fallbackTab.id);
+  const tabCountBeforeFallback = tabs.size;
+  const removedCountBeforeFallback = removedTabs.length;
+  const fallback = await sendMessage({ type: "ozon_v2_supplier_channel_back" }, fallbackTab);
+  assert.equal(fallback.ok, true);
+  assert.equal(fallback.mode, "home");
+  assert.ok(updatedTabs.some((item) => (
+    item.tabId === fallbackTab.id && item.changes.url === "https://www.1688.com/"
+  )));
+  assert.equal(tabs.size, tabCountBeforeFallback, "home fallback must not create a tab");
+  assert.equal(removedTabs.length, removedCountBeforeFallback, "home fallback must not close a channel");
+
+  const channelTabIds = entry.channels.map((channel) => channel.tabId);
+  const orphanTab = {
+    id: 298,
+    windowId: entry.windowId,
+    url: "https://detail.1688.com/offer/298298298298.html",
+    active: true,
+  };
+  tabs.set(orphanTab.id, orphanTab);
+  const orphanResult = await context.handleSupplierTabCreated(orphanTab);
+  assert.deepEqual(JSON.parse(JSON.stringify(orphanResult)), { adopted: false });
+  assert.deepEqual(entry.channels.map((channel) => channel.tabId), channelTabIds, "an orphan must never be guessed into a channel");
+  const orphanLookup = await sendMessage({ type: "ozon_v2_get_supplier_channel" }, orphanTab);
+  assert.equal(orphanLookup.ok, true);
+  assert.equal(orphanLookup.binding, null);
+  assert.deepEqual(JSON.parse(JSON.stringify(orphanLookup.diagnostics)), {
+    tab_id: orphanTab.id,
+    window_id: orphanTab.windowId,
+    opener_tab_id: null,
+    url: orphanTab.url,
+  });
+  tabs.delete(orphanTab.id);
 
   for (const channel of entry.channels.slice(0, 4)) {
     const response = await sendMessage(

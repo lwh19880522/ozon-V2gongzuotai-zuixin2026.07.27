@@ -17,10 +17,22 @@ function textNode(text = "") {
     innerText: text,
     textContent: text,
     style: {},
+    dataset: {},
     children: [],
     appendChild(child) { this.children.push(child); if (child.id) elements.set(child.id, child); return child; },
     addEventListener(type, handler) { this[`on${type}`] = handler; },
+    setAttribute(name, value) { if (name === "data-role") this.dataset.role = String(value); },
     getAttribute() { return null; },
+    querySelector(selector) {
+      if (selector.startsWith("#")) return elements.get(selector.slice(1)) || null;
+      const stack = [...this.children];
+      while (stack.length) {
+        const item = stack.shift();
+        if (selector === "[data-role='channel-title']" && item.dataset && item.dataset.role === "channel-title") return item;
+        stack.push(...(item.children || []));
+      }
+      return null;
+    },
     querySelectorAll() { return []; },
     closest() { return null; },
   };
@@ -58,7 +70,9 @@ const body = textNode("广东测试供应商有限公司 测试收纳盒 ¥12.80
 const document = {
   title: "测试收纳盒 - 1688",
   body,
+  documentElement: textNode(),
   createElement() { return textNode(); },
+  addEventListener() {},
   getElementById(id) { return elements.get(id) || null; },
   querySelector(selector) {
     if (selector.includes("og:title")) return { getAttribute: () => "测试收纳盒" };
@@ -123,6 +137,11 @@ const context = vm.createContext({
     if (String(url).includes("supplier-selection/capture")) capturedPayload = JSON.parse(options.body);
     return { json: async () => ({ ok: true, code: "supplier_selection.batch_complete", message: "saved" }) };
   },
+  addEventListener() {},
+  history: { pushState() {}, replaceState() {} },
+  innerWidth: 1280,
+  innerHeight: 720,
+  MutationObserver: class { observe() {} },
   setTimeout,
   clearTimeout,
   URL,

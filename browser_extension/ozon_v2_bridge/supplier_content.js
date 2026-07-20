@@ -11,6 +11,14 @@
   const REFERENCE_UPLOAD_INPUT_WAIT_MS = 5000;
   let activeRunPromise = null;
   let managedNavigationInstalled = false;
+  let activeManagedBinding = null;
+  let managedLifecycleInstalled = false;
+  let managedReconcileTimer = null;
+  let managedPanelObserver = null;
+  let managedDragState = null;
+  let managedDragListenersInstalled = false;
+  let referencePreparationPromise = null;
+  let referencePreparationKey = "";
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -49,9 +57,16 @@
     return response && response.ok ? response.task : null;
   }
 
-  async function currentSupplierChannel() {
+  async function currentSupplierChannelState() {
     const response = await chrome.runtime.sendMessage({ type: "ozon_v2_get_supplier_channel" });
-    return response && response.ok && response.binding ? response.binding : null;
+    return {
+      binding: response && response.ok && response.binding ? response.binding : null,
+      diagnostics: response && response.diagnostics ? response.diagnostics : null,
+    };
+  }
+
+  async function currentSupplierChannel() {
+    return (await currentSupplierChannelState()).binding;
   }
 
   function normalizedText(value, limit = 600) {
@@ -751,9 +766,72 @@
     }, true);
   }
 
-  function managedPanel(binding) {
-    const existing = document.getElementById("ozon-v2-supplier-panel");
-    if (existing) return existing;
+  function referencePreparedStateKey(binding) {
+    return `ozon_v2_reference_prepared_${binding.run_id}_${binding.seed_id}`;
+  }
+
+  function clampManagedPanelPosition(panel, position) {
+    const maxLeft = Math.max(0, Number(globalThis.innerWidth || 0) - Number(panel.offsetWidth || 0));
+    const maxTop = Math.max(0, Number(globalThis.innerHeight || 0) - Number(panel.offsetHeight || 0));
+    return {
+      left: Math.min(maxLeft, Math.max(0, Number(position && position.left) || 0)),
+      top: Math.min(maxTop, Math.max(0, Number(position && position.top) || 0)),
+    };
+  }
+
+  async function restoreManagedPanelPosition(panel) {
+    const stored = await chrome.storage.local.get({ supplierPanelPosition: null });
+    if (!stored.supplierPanelPosition || !document.getElementById(panel.id)) return;
+    const position = clampManagedPanelPosition(panel, stored.supplierPanelPosition);
+    panel.style.left = `${position.left}px`;
+    panel.style.top = `${position.top}px`;
+    panel.style.right = "auto";
+    panel.style.bottom = "auto";
+  }
+
+  function installManagedPanelDrag(panel) {
+    panel.addEventListener("pointerdown", (event) => {
+      if (event.target && String(event.target.tagName || "").toLowerCase() === "button") return;
+      const current = clampManagedPanelPosition(panel, {
+        left: Number.parseFloat(panel.style.left) || Math.max(0, globalThis.innerWidth - panel.offsetWidth - 18),
+        top: Number.parseFloat(panel.style.top) || Math.max(0, globalThis.innerHeight - panel.offsetHeight - 18),
+      });
+      managedDragState = {
+        panel,
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        left: current.left,
+        top: current.top,
+      };
+      if (typeof panel.setPointerCapture === "function") panel.setPointerCapture(event.pointerId);
+      if (typeof event.preventDefault === "function") event.preventDefault();
+    });
+    if (managedDragListenersInstalled) return;
+    managedDragListenersInstalled = true;
+    addEventListener("pointermove", (event) => {
+      if (!managedDragState || event.pointerId !== managedDragState.pointerId) return;
+      const position = clampManagedPanelPosition(managedDragState.panel, {
+        left: managedDragState.left + event.clientX - managedDragState.startX,
+        top: managedDragState.top + event.clientY - managedDragState.startY,
+      });
+      managedDragState.panel.style.left = `${position.left}px`;
+      managedDragState.panel.style.top = `${position.top}px`;
+      managedDragState.panel.style.right = "auto";
+      managedDragState.panel.style.bottom = "auto";
+    });
+    addEventListener("pointerup", (event) => {
+      if (!managedDragState || event.pointerId !== managedDragState.pointerId) return;
+      const position = {
+        left: Number.parseFloat(managedDragState.panel.style.left) || 0,
+        top: Number.parseFloat(managedDragState.panel.style.top) || 0,
+      };
+      managedDragState = null;
+      chrome.storage.local.set({ supplierPanelPosition: position }).catch(() => null);
+    });
+  }
+
+  function createManagedPanel(binding) {
     const panel = document.createElement("section");
     panel.id = "ozon-v2-supplier-panel";
     Object.assign(panel.style, {
@@ -770,7 +848,20 @@
       boxShadow: "0 12px 32px rgba(15, 23, 42, 0.2)",
       font: "13px/1.45 system-ui, sans-serif",
     });
+    const back = document.createElement("button");
+    back.id = "ozon-v2-supplier-back";
+    back.textContent = "← 返回选品";
+    Object.assign(back.style, {
+      minHeight: "30px",
+      marginRight: "8px",
+      border: "1px solid #cbd5e1",
+      borderRadius: "6px",
+      background: "#f8fafc",
+      color: "#334155",
+      cursor: "pointer",
+    });
     const title = document.createElement("strong");
+    title.setAttribute("data-role", "channel-title");
     title.textContent = `通道 ${Number(binding.channel_index) + 1} · ${binding.ozon_title || binding.seed_id}`;
     const status = document.createElement("div");
     status.id = "ozon-v2-supplier-status";
@@ -804,6 +895,17 @@
       color: "#b42318",
       cursor: "pointer",
     });
+    back.onclick = async () => {
+      const current = activeManagedBinding || binding;
+      if (globalThis.sessionStorage) {
+        globalThis.sessionStorage.removeItem(referencePreparedStateKey(current));
+      }
+      const response = await chrome.runtime.sendMessage({ type: "ozon_v2_supplier_channel_back" });
+      if (!response || response.ok !== true) {
+        status.textContent = "返回失败，请重试";
+      }
+      return response;
+    };
     collect.onclick = async () => {
       if (!is1688DetailPage()) {
         status.textContent = "请先进入 1688 商品详情页 (Detail Page Required)";
@@ -811,7 +913,8 @@
       }
       collect.disabled = true;
       status.textContent = "正在读取公开商品数据 (Collecting)";
-      const item = { seed_id: binding.seed_id, supplier_url: location.href };
+      const current = activeManagedBinding || binding;
+      const item = { seed_id: current.seed_id, supplier_url: location.href };
       const product = collectProduct(item);
       const missing = missingRequired(product, { requireSkuOptions: false });
       if (missing.length) {
@@ -819,12 +922,12 @@
         status.textContent = `采集不完整，请等待页面加载：${missing.join(", ")} (Incomplete)`;
         return;
       }
-      const result = await api(binding.capture_url, {
+      const result = await api(current.capture_url, {
         method: "POST",
         body: JSON.stringify({
-          channel_index: binding.channel_index,
-          seed_id: binding.seed_id,
-          ozon_product_id: binding.ozon_product_id,
+          channel_index: current.channel_index,
+          seed_id: current.seed_id,
+          ozon_product_id: current.ozon_product_id,
           supplier_product: product,
         }),
       });
@@ -851,12 +954,85 @@
         : "提交失败，请重试 (Retry)";
       reject.disabled = !!(response && response.ok);
     };
+    panel.appendChild(back);
     panel.appendChild(title);
     panel.appendChild(status);
     panel.appendChild(collect);
     panel.appendChild(reject);
+    installManagedPanelDrag(panel);
     document.body.appendChild(panel);
     return panel;
+  }
+
+  async function prepareReferenceImageOnce(binding) {
+    if (!is1688HomePage()) return false;
+    const key = referencePreparedStateKey(binding);
+    if (referencePreparationPromise && referencePreparationKey === key) {
+      return await referencePreparationPromise;
+    }
+    referencePreparationKey = key;
+    referencePreparationPromise = prepareReferenceImage(binding);
+    try {
+      return await referencePreparationPromise;
+    } finally {
+      referencePreparationPromise = null;
+      referencePreparationKey = "";
+    }
+  }
+
+  async function reconcileManagedPanel(binding = activeManagedBinding) {
+    const resolved = binding || await currentSupplierChannel();
+    if (!resolved) return null;
+    activeManagedBinding = resolved;
+    let panel = document.getElementById("ozon-v2-supplier-panel");
+    const created = !panel;
+    if (!panel) panel = createManagedPanel(resolved);
+    panel.dataset.channelIndex = String(resolved.channel_index);
+    const title = panel.querySelector("[data-role='channel-title']");
+    if (title) title.textContent = `通道 ${Number(resolved.channel_index) + 1} · ${resolved.ozon_title || resolved.seed_id}`;
+    const detailReady = is1688DetailPage();
+    const collect = panel.querySelector("#ozon-v2-collect-current-product");
+    const status = panel.querySelector("#ozon-v2-supplier-status");
+    if (collect) collect.disabled = !detailReady;
+    if (status) {
+      status.textContent = detailReady
+        ? "当前商品可以采集"
+        : "请选择同款商品并进入详情页";
+    }
+    if (created) await restoreManagedPanelPosition(panel);
+    if (is1688HomePage()) await prepareReferenceImageOnce(resolved);
+    return panel;
+  }
+
+  function scheduleManagedPanelReconcile(delayMs = 50) {
+    clearTimeout(managedReconcileTimer);
+    managedReconcileTimer = setTimeout(() => {
+      reconcileManagedPanel().catch(() => null);
+    }, delayMs);
+  }
+
+  function installManagedLifecycleRecovery() {
+    if (managedLifecycleInstalled) return;
+    managedLifecycleInstalled = true;
+    addEventListener("pageshow", () => scheduleManagedPanelReconcile());
+    addEventListener("popstate", () => scheduleManagedPanelReconcile());
+    for (const method of ["pushState", "replaceState"]) {
+      if (!globalThis.history || typeof globalThis.history[method] !== "function") continue;
+      const original = globalThis.history[method];
+      globalThis.history[method] = function (...args) {
+        const result = original.apply(this, args);
+        scheduleManagedPanelReconcile();
+        return result;
+      };
+    }
+    if (typeof MutationObserver === "function" && document.documentElement) {
+      managedPanelObserver = new MutationObserver(() => {
+        if (!document.getElementById("ozon-v2-supplier-panel")) {
+          scheduleManagedPanelReconcile(100);
+        }
+      });
+      managedPanelObserver.observe(document.documentElement, { childList: true, subtree: true });
+    }
   }
 
   function findUploadInput() {
@@ -961,8 +1137,11 @@
     const task = await currentTask();
     if (!task || task.code !== "browser_task.supplier_selection_ready") return false;
     let binding = null;
+    let bindingDiagnostics = null;
     for (let attempt = 0; attempt < SUPPLIER_CHANNEL_WAIT_ATTEMPTS && !binding; attempt += 1) {
-      binding = await currentSupplierChannel();
+      const state = await currentSupplierChannelState();
+      binding = state.binding;
+      bindingDiagnostics = state.diagnostics || bindingDiagnostics;
       if (!binding) await sleep(250);
     }
     if (!binding) {
@@ -970,12 +1149,14 @@
         stage: "supplier_channel_binding_missing",
         code: "browser_bridge.supplier_channel_binding_missing",
         message: "The managed 1688 tab did not receive its channel binding before the wait deadline.",
+        details: bindingDiagnostics,
       });
       return true;
     }
-    managedPanel(binding);
+    activeManagedBinding = binding;
+    installManagedLifecycleRecovery();
+    await reconcileManagedPanel(binding);
     installManagedSameTabNavigation();
-    prepareReferenceImage(binding).catch(() => null);
     await heartbeat({
       run_id: binding.run_id,
       stage: "supplier_selection_waiting_user",
@@ -1153,7 +1334,21 @@
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (!message) return false;
     if (message.type === "ozon_v2_content_ping") {
-      sendResponse({ ok: true, bridge: "supplier" });
+      sendResponse({
+        ok: true,
+        bridge: "supplier",
+        binding_present: !!activeManagedBinding,
+        panel_present: !!document.getElementById("ozon-v2-supplier-panel"),
+      });
+      return false;
+    }
+    if (message.type === "ozon_v2_supplier_channel_refresh") {
+      scheduleManagedPanelReconcile(0);
+      sendResponse({
+        ok: true,
+        binding_present: !!activeManagedBinding,
+        panel_present: !!document.getElementById("ozon-v2-supplier-panel"),
+      });
       return false;
     }
     if (message.type === "ozon_v2_run_task") {
