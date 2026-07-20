@@ -289,7 +289,8 @@ function sendMessage(message, tab) {
     .map((channel) => channel.tabId);
   const stoppedBeforeLaneClose = postedPaths.filter((value) => value.includes("/runner/stop")).length;
   tabs.delete(closedTabId);
-  await context.handleTaskTabRemoved(closedTabId);
+  const laneClose = await context.handleTaskTabRemoved(closedTabId);
+  assert.equal(laneClose.stopped, false, "closing one managed lane must not report a whole-task stop");
   assert.equal(closedChannel.tabId, null, "only the closed lane must lose its tab binding");
   assert.deepEqual(
     entry.channels

@@ -150,6 +150,7 @@ async function handleTaskTabRemoved(tabId) {
   ));
   if (!matches.length) return { stopped: false };
   const closedAt = new Date().toISOString();
+  let stopped = false;
   for (const [key, entry] of matches) {
     if (entry.closingByExtension) continue;
     const closedChannel = Array.isArray(entry.channels)
@@ -184,6 +185,7 @@ async function handleTaskTabRemoved(tabId) {
     entry.closedDispatchToken = isRunnableTask(task) && taskKey(task) === key
       ? taskDispatchToken(task)
       : entry.dispatchToken || null;
+    stopped = true;
     openedTasks[key] = entry;
     await saveOpenedTasks(openedTasks);
     if (!isRunnableTask(task) || taskKey(task) !== key) continue;
@@ -202,7 +204,7 @@ async function handleTaskTabRemoved(tabId) {
       url: "",
     });
   }
-  return { stopped: true };
+  return { stopped };
 }
 
 async function supplierChannelForTab(tabId) {
