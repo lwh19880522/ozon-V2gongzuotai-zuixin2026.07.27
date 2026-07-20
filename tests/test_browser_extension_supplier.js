@@ -52,6 +52,7 @@ const chrome = {
     },
   },
   windows: {
+    onRemoved: event("windowRemoved"),
     async create({ url }) {
       windowCreateCount += 1;
       const windowId = nextWindowId++;
@@ -182,7 +183,24 @@ function sendTask(task) {
   tabs.delete(managedTabs[0].id);
   listeners.tabRemoved(managedTabs[0].id);
   await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.ok(postedPaths.some((value) => value.includes("/api/batches/wb-managed/runner/stop")));
+  const managedEntry = stored.openedTasks["wb-managed:supplier_selection"];
+  assert.equal(
+    postedPaths.some((value) => value.includes("/api/batches/wb-managed/runner/stop")),
+    false,
+    "closing one managed lane must not pause the whole batch",
+  );
+  assert.equal(managedEntry.channels[0].tabId, null);
+  assert.equal(managedEntry.channels[1].tabId, managedTabs[1].id);
+  await sendTask(managedSupplierTask);
+  assert.equal(windowCreateCount, 1, "polling must not recreate a single user-closed lane");
+  assert.equal(tabs.size, 1);
+
+  listeners.windowRemoved(managedEntry.windowId);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.ok(
+    postedPaths.some((value) => value.includes("/api/batches/wb-managed/runner/stop")),
+    "closing the whole managed window must still pause the batch",
+  );
   await sendTask(managedSupplierTask);
   assert.equal(windowCreateCount, 1, "a user-closed managed window must stay stopped until explicit resume");
   process.stdout.write("browser supplier task routing: OK\n");

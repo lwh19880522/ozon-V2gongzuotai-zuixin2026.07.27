@@ -152,6 +152,20 @@ async function handleTaskTabRemoved(tabId) {
   const closedAt = new Date().toISOString();
   for (const [key, entry] of matches) {
     if (entry.closingByExtension) continue;
+    const closedChannel = Array.isArray(entry.channels)
+      ? entry.channels.find((channel) => channel.tabId === tabId)
+      : null;
+    if (closedChannel) {
+      closedChannel.tabId = null;
+      closedChannel.closedAt = closedAt;
+      if (!SUPPLIER_TERMINAL_STATES.has(closedChannel.state)) closedChannel.state = "waiting_user";
+      entry.launchState = "incomplete";
+      entry.closedByUser = false;
+      entry.lastUpdatedAt = closedAt;
+      openedTasks[key] = entry;
+      await saveOpenedTasks(openedTasks);
+      continue;
+    }
     const runId = key.split(":", 1)[0];
     let task = null;
     try {
@@ -413,14 +427,16 @@ async function waitForManagedWindowTabs(windowId, expectedCount, initialTabs = [
   return [...tabsById.values()].slice(0, expectedCount);
 }
 
+function sameSupplierChannel(channel, item, fallbackIndex) {
+  return !!channel
+    && channel.channel_index === (Number.isInteger(item.channel_index) ? item.channel_index : fallbackIndex)
+    && String(channel.seed_id || "") === String(item.seed_id || "")
+    && String(channel.ozon_product_id || "") === String(item.ozon_product_id || "");
+}
+
 function managedSupplierChannels(task, items, dispatchToken, tabs, windowId, previousChannels = []) {
   return items.map((item, index) => {
-    const previous = previousChannels.find((channel) => (
-      channel
-      && channel.channel_index === (Number.isInteger(item.channel_index) ? item.channel_index : index)
-      && String(channel.seed_id || "") === String(item.seed_id || "")
-      && String(channel.ozon_product_id || "") === String(item.ozon_product_id || "")
-    )) || {};
+    const previous = previousChannels.find((channel) => sameSupplierChannel(channel, item, index)) || {};
     const tab = tabs[index] || null;
     return {
       ...previous,
@@ -493,18 +509,37 @@ async function openManagedSupplierTask(task, source, openedTasks, key, previous,
   const sameDispatch = previous.dispatchToken === dispatchToken;
   const existingWindowTabs = await managedWindowTabs(previous.windowId);
   if (existingWindowTabs.length) {
+    const tabsById = new Map(existingWindowTabs.map((tab) => [tab.id, tab]));
+    const alignedTabs = items.map((item, index) => {
+      const matched = previousChannels.find((channel) => sameSupplierChannel(channel, item, index));
+      return matched && Number.isInteger(matched.tabId) ? tabsById.get(matched.tabId) || null : null;
+    });
+    let missingIndexes = alignedTabs
+      .map((tab, index) => (tab ? -1 : index))
+      .filter((index) => index >= 0);
     if (!sameDispatch) {
-      for (const [index, tab] of existingWindowTabs.slice(0, items.length).entries()) {
-        await chrome.tabs.update(tab.id, { url: "https://www.1688.com/", active: index === 0 });
+      for (const index of missingIndexes) {
+        try {
+          alignedTabs[index] = await chrome.tabs.create({
+            windowId: previous.windowId,
+            url: "https://www.1688.com/",
+            active: false,
+          });
+        } catch (_) {
+          alignedTabs[index] = null;
+        }
       }
+      missingIndexes = alignedTabs
+        .map((tab, index) => (tab ? -1 : index))
+        .filter((index) => index >= 0);
     }
     const channels = managedSupplierChannels(
       task,
       items,
       dispatchToken,
-      existingWindowTabs,
+      alignedTabs,
       previous.windowId,
-      sameDispatch ? previousChannels : [],
+      previousChannels,
     );
     openedTasks[key] = {
       ...previous,
@@ -512,18 +547,20 @@ async function openManagedSupplierTask(task, source, openedTasks, key, previous,
       channels,
       extensionVersion: EXTENSION_VERSION,
       dispatchToken,
-      launchState: "opened",
+      launchState: missingIndexes.length ? "incomplete" : "opened",
       closingByExtension: false,
       closedByUser: false,
       lastUpdatedAt: new Date().toISOString(),
     };
     await saveOpenedTasks(openedTasks);
-    for (const tab of existingWindowTabs.slice(0, items.length)) await ensureContentScript(tab, task);
+    for (const tab of alignedTabs.filter(Boolean)) await ensureContentScript(tab, task);
     return {
       opened: false,
       reused: true,
+      waiting: sameDispatch && missingIndexes.length > 0,
+      partial: missingIndexes.length > 0,
       windowId: previous.windowId,
-      tabIds: existingWindowTabs.slice(0, items.length).map((tab) => tab.id),
+      tabIds: alignedTabs.filter(Boolean).map((tab) => tab.id),
     };
   }
 
