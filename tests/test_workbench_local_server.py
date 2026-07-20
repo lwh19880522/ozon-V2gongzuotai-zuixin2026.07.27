@@ -178,6 +178,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn('id="bridgeVersionWarning"', body)
         self.assertIn('id="startBatch" class="primary" disabled', body)
         self.assertIn('id="stageNavigation"', body)
+
         self.assertIn('id="ozonCollectionProgress"', body)
         self.assertIn('id="ozonProgressBar"', body)
         self.assertIn('role="progressbar"', body)
@@ -210,6 +211,15 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn("请在 Edge 扩展页面重新加载", body)
         self.assertNotIn("宸ュ叿", body)
         self.assertNotIn("鍏嶈垂", body)
+
+    def test_home_page_contains_stage_specific_ozon_restart_control(self) -> None:
+        page = self.get_text("/")
+
+        self.assertIn('id="restartOzonCollection"', page)
+        self.assertIn("重新启动 Ozon 原商品采集", page)
+        self.assertIn("已完成商品及其原始属性字段不会重复采集", page)
+        self.assertIn("/browser-task/restart", page)
+        self.assertIn('status === "ozon_collecting"', page)
 
     def test_runtime_status_reports_service_extension_and_task(self) -> None:
         result = self.get_json("/api/runtime/status")
@@ -1140,6 +1150,17 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn("找不到供应商 (No Supplier Found)", page)
         self.assertIn('["supplier_review", "supplier_collecting"].includes(state.status)', page)
 
+    def test_supplier_review_contains_stage_specific_1688_restart_control(self) -> None:
+        run_id, _seed = self.prepare_supplier_review_run()
+
+        page = self.get_text(f"/batches/{run_id}/supplier-review")
+
+        self.assertIn('id="collect"', page)
+        self.assertIn("重新启动 1688 采集", page)
+        self.assertIn("只重新打开未完成通道", page)
+        self.assertIn("/browser-task/restart", page)
+        self.assertIn('["supplier_review", "supplier_collecting"].includes(state.status)', page)
+
     def test_supplier_selection_capture_rejects_wrong_channel_binding(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
 
@@ -1316,7 +1337,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
     def test_extension_manifest_registers_1688_supplier_content_script(self) -> None:
         manifest_path = self.project_root / "browser_extension" / "ozon_v2_bridge" / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self.assertEqual("0.1.52", manifest["version"])
+        self.assertEqual("0.1.53", manifest["version"])
 
         supplier_scripts = [
             item
@@ -1437,8 +1458,8 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         row = review["data"]["items"][0]
 
         self.assertIn("供应商审核 (Supplier Review)", page)
-        self.assertIn('state.status === "supplier_collecting"', page)
-        self.assertIn("采集正在由浏览器桥接执行", page)
+        self.assertIn('["supplier_review", "supplier_collecting"].includes(state.status)', page)
+        self.assertIn("只重新打开未完成通道；已回传的 1688 商品保持完成", page)
         self.assertIn("1688 采集反馈 (Collection Feedback)", page)
         self.assertIn("collection_progress", page)
         self.assertIn("setInterval(poll, 1500)", page)
@@ -1453,7 +1474,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn('class="topbar"', page)
         self.assertIn('class="workspace"', page)
         self.assertIn("运营驾驶舱 (Operations Cockpit)", page)
-        self.assertIn("五通道由扩展执行 (Extension Managed)", page)
+        self.assertIn("重新启动 1688 采集", page)
         self.assertIn('.join("\\n");', page)
         self.assertNotIn('.join("\n");', page)
         self.assertIn('$("status").textContent = "加载失败 (Load Failed)";', page)

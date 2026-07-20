@@ -687,6 +687,10 @@ def build_home_html() -> str:
             <h2>Ozon 采集进度</h2>
             <p id="ozonProcessed" class="hint">等待采集数据</p>
           </div>
+          <div>
+            <button id="restartOzonCollection" type="button" hidden>重新启动 Ozon 原商品采集</button>
+            <p id="ozonRestartMessage" class="hint" hidden>已完成商品及其原始属性字段不会重复采集。</p>
+          </div>
         </div>
         <div class="collection-progress-body">
           <div id="ozonProgressBar" class="collection-progress-track" role="progressbar"
@@ -780,6 +784,7 @@ def build_home_html() -> str:
     const state = {
       runId: requestedRunId || localStorage.getItem("ozon_v2_workbench_run_id") || "",
       pollTimer: null,
+      restartPending: false,
     };
     if (requestedRunId) localStorage.setItem("ozon_v2_workbench_run_id", requestedRunId);
     const $ = (id) => document.getElementById(id);
@@ -948,6 +953,16 @@ def build_home_html() -> str:
       $("status").textContent = run.status || data.status || "-";
       updateStageNavigation(runId);
       renderStageProgress(run.status || data.status || "created");
+      const status = run.status || data.status || "";
+      const ozonRestartable = status === "ozon_collecting" && run.ozon_collected !== true;
+      const ozonComplete = run.ozon_collected === true;
+      const restartButton = $("restartOzonCollection");
+      restartButton.hidden = !(ozonRestartable || ozonComplete);
+      restartButton.disabled = state.restartPending || !ozonRestartable;
+      restartButton.textContent = ozonComplete
+        ? "Ozon 原商品采集已完成"
+        : "重新启动 Ozon 原商品采集";
+      $("ozonRestartMessage").hidden = restartButton.hidden;
       const runner = data.runner || {};
       $("runnerState").textContent = runner.state
         ? `${runner.state}${runner.blocked_reason ? " / " + runner.blocked_reason : ""}`
@@ -1086,6 +1101,29 @@ def build_home_html() -> str:
       $("raw").textContent = JSON.stringify(result, null, 2);
     }
 
+    async function restartOzonCollection() {
+      if (!state.runId || state.restartPending) return;
+      state.restartPending = true;
+      $("restartOzonCollection").disabled = true;
+      const message = $("ozonRestartMessage");
+      message.className = "hint";
+      try {
+        const result = await api(`/api/batches/${encodeURIComponent(state.runId)}/browser-task/restart`, {
+          method: "POST",
+          body: JSON.stringify({})
+        });
+        message.textContent = result.data.dispatch_state === "waiting_for_extension"
+          ? "恢复请求已保存，正在等待浏览器扩展上线。"
+          : `已保留 ${result.data.completed_count} 件，继续 ${result.data.pending_count} 件。`;
+      } catch (error) {
+        message.className = "hint error";
+        message.textContent = error.message || "Ozon 采集恢复失败。";
+      } finally {
+        state.restartPending = false;
+        await loadRun().catch(() => {});
+      }
+    }
+
     async function stopCurrentTask() {
       if (!state.runId) return;
       localStorage.removeItem(AUTO_ADVANCE_RUN_KEY);
@@ -1146,6 +1184,7 @@ def build_home_html() -> str:
 
     $("startBatch").onclick = startBatch;
     $("continueAuto").onclick = runUntilBlocked;
+    $("restartOzonCollection").onclick = restartOzonCollection;
     $("stopRun").onclick = stopCurrentTask;
     $("clearAllBatches").onclick = clearAllBatches;
     $("refresh").onclick = loadRun;
@@ -1407,8 +1446,8 @@ def build_supplier_review_html(run_id: str) -> str:
       </div>
       <div class="panel collection-actions">
         <div class="collection-head"><h2>采集控制 (Collection)</h2><strong id="linkProgress">0 / 0</strong></div>
-        <span id="message" class="muted">扩展将自动打开最多五个 1688 首页通道</span>
-        <button id="collect" class="primary" disabled>五通道由扩展执行 (Extension Managed)</button>
+        <span id="message" class="muted">只重新打开未完成通道；已回传的 1688 商品保持完成。</span>
+        <button id="collect" class="primary">重新启动 1688 采集</button>
         <button id="approveCollection" class="primary" disabled>逐件锁定 SKU 与主体 (Lock SKU & Subject)</button>
       </div>
       <div class="panel collection-feedback">
@@ -1422,7 +1461,7 @@ def build_supplier_review_html(run_id: str) -> str:
   </div>
   <script>
     const runId = {safe_run_id};
-    const state = {{ items: [], status: "", collectionProgress: null, canApprove: false, evidenceIndex: 0 }};
+    const state = {{ items: [], status: "", collectionProgress: null, canApprove: false, evidenceIndex: 0, restartPending: false }};
     let loading = false;
     const $ = (id) => document.getElementById(id);
     $("runId").textContent = runId;
@@ -1830,11 +1869,14 @@ def build_supplier_review_html(run_id: str) -> str:
       const completed = state.items.filter((item) => is1688ProductUrl(item.supplier_url)).length;
       $("linkProgress").textContent = `${{completed}} / ${{state.items.length}}`;
       $("approveCollection").disabled = true;
-      $("collect").disabled = true;
-      if (state.status === "supplier_collecting") {{
-        $("collect").textContent = "浏览器正在采集 (Collecting)";
+      const restartable = ["supplier_review", "supplier_collecting"].includes(state.status);
+      $("collect").disabled = state.restartPending || !restartable;
+      if (restartable) {{
+        $("collect").textContent = state.restartPending
+          ? "正在重新派发 (Restarting)"
+          : "重新启动 1688 采集";
         $("message").className = "muted";
-        $("message").textContent = "采集正在由浏览器桥接执行，请等待自动验收。";
+        $("message").textContent = "只重新打开未完成通道；已回传的 1688 商品保持完成。";
         return;
       }}
       if (state.status === "supplier_collected") {{
@@ -1900,6 +1942,30 @@ def build_supplier_review_html(run_id: str) -> str:
       }}
     }}
 
+    async function restartSupplierCollection() {{
+      if (state.restartPending) return;
+      state.restartPending = true;
+      updateButton();
+      try {{
+        const result = await api(`/api/batches/${{encodeURIComponent(runId)}}/browser-task/restart`, {{
+          method: "POST",
+          body: JSON.stringify({{}})
+        }});
+        state.restartPending = false;
+        await load();
+        $("message").className = "muted";
+        $("message").textContent = result.data.dispatch_state === "waiting_for_extension"
+          ? "恢复请求已保存，正在等待浏览器扩展上线。"
+          : `已保留 ${{result.data.completed_count}} 个通道，继续 ${{result.data.pending_count}} 个通道。`;
+      }} catch (error) {{
+        state.restartPending = false;
+        updateButton();
+        $("message").className = "error";
+        $("message").textContent = error.message || "1688 采集恢复失败。";
+      }}
+    }}
+
+    $("collect").addEventListener("click", restartSupplierCollection);
     $("lockSupplierSku").addEventListener("click", lockSupplierSku);
     $("confirmSubjectMaster").addEventListener("click", confirmSubjectMaster);
     $("ozonEvidencePrev").addEventListener("click", () => moveEvidence(-1));

@@ -643,7 +643,7 @@ git commit -m "feat: resume Ozon collection from durable checkpoints"
 - Modify: `tests/test_workbench_local_server.py`
 - Modify: `src/ozon_v2/workbench/local_server.py`
 
-- [ ] **Step 1: 写页面入口的失败测试**
+- [x] **Step 1: 写页面入口的失败测试**
 
 在 `tests/test_workbench_local_server.py` 增加：
 
@@ -666,7 +666,7 @@ def test_supplier_review_contains_stage_specific_1688_restart_control(self) -> N
     self.assertIn('["supplier_review", "supplier_collecting"].includes(state.status)', page)
 ```
 
-- [ ] **Step 2: 运行页面测试并确认 RED**
+- [x] **Step 2: 运行页面测试并确认 RED**
 
 ```powershell
 python -m pytest tests/test_workbench_local_server.py -k "stage_specific" -q
@@ -674,7 +674,7 @@ python -m pytest tests/test_workbench_local_server.py -k "stage_specific" -q
 
 Expected: FAIL；首页尚无 Ozon 恢复按钮，采集审核页的 `collect` 仍是永久禁用说明按钮。
 
-- [ ] **Step 3: 在首页 Ozon 进度卡加入恢复入口**
+- [x] **Step 3: 在首页 Ozon 进度卡加入恢复入口**
 
 在 `build_home_html()` 的 `ozonCollectionProgress` 标题区加入：
 
@@ -734,7 +734,7 @@ async function restartOzonCollection() {
 $("restartOzonCollection").onclick = restartOzonCollection;
 ```
 
-- [ ] **Step 4: 把采集审核页现有 `collect` 改成真正恢复按钮**
+- [x] **Step 4: 把采集审核页现有 `collect` 改成真正恢复按钮**
 
 保留原元素 ID，初始文案改为：
 
@@ -783,7 +783,7 @@ async function restartSupplierCollection() {
 $("collect").addEventListener("click", restartSupplierCollection);
 ```
 
-- [ ] **Step 5: 运行页面和本地服务器回归测试并确认 GREEN**
+- [x] **Step 5: 运行页面和本地服务器回归测试并确认 GREEN**
 
 ```powershell
 python -m pytest tests/test_workbench_local_server.py -q
@@ -791,7 +791,7 @@ python -m pytest tests/test_workbench_local_server.py -q
 
 Expected: 本文件全部通过；测试只请求本地 `127.0.0.1` 假数据服务器。
 
-- [ ] **Step 6: 提交 Task 4**
+- [x] **Step 6: 提交 Task 4**
 
 ```powershell
 git add src/ozon_v2/workbench/local_server.py tests/test_workbench_local_server.py
