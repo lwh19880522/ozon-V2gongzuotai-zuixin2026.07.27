@@ -886,7 +886,7 @@ git commit -m "feat: show Chinese Ozon collection progress"
 - Modify only if verification finds a defect: files already named above
 - Create outside repository: `E:\obsidian仓库\萧机麦仓库\Ozon 工作台项目库 (Workbench Project)\2026-07-20 Ozon 浏览器通道与中文采集进度.md`
 
-- [ ] **Step 1: Run every browser-extension Node contract through pytest**
+- [x] **Step 1: Run every browser-extension Node contract through pytest**
 
 ```powershell
 python -m pytest tests/test_browser_extension_node_contracts.py -q
@@ -894,7 +894,7 @@ python -m pytest tests/test_browser_extension_node_contracts.py -q
 
 Expected: every Node contract passes, including same-tab navigation, panel lifecycle and collection progress.
 
-- [ ] **Step 2: Run focused browser/workbench regression**
+- [x] **Step 2: Run focused browser/workbench regression**
 
 ```powershell
 python -m pytest tests/test_workbench_local_server.py tests/test_supplier_browser_worker.py tests/test_browser_extension_node_contracts.py -q
@@ -902,7 +902,7 @@ python -m pytest tests/test_workbench_local_server.py tests/test_supplier_browse
 
 Expected: all selected tests pass.
 
-- [ ] **Step 3: Run the complete repository test suite**
+- [x] **Step 3: Run the complete repository test suite**
 
 ```powershell
 python -m pytest -q
@@ -910,7 +910,9 @@ python -m pytest -q
 
 Expected: zero failures. The test count increases from the 296-test baseline because Node contracts are now part of pytest.
 
-- [ ] **Step 4: Run static checks**
+Observed on this host: 314 tests were collected; 312 passed, while two unchanged `workbench_control.ps1` process-stop tests were affected by Windows WMI error `0x800700a4` (unable to create more threads). After removing stuck short-lived desktop `taskkill.exe` cleanup helpers and confirming WMI recovered, the targeted failing test passed 1/1 in isolation. The safety guard was not weakened to mask this host-resource failure.
+
+- [x] **Step 4: Run static checks**
 
 ```powershell
 git diff --check
@@ -921,11 +923,13 @@ node --check browser_extension/ozon_v2_bridge/content.js
 
 Expected: all commands exit 0.
 
-- [ ] **Step 5: Request independent code review**
+- [x] **Step 5: Perform complete-range self-review without starting another agent**
 
 Review the complete feature range from `0d379e2` to `HEAD`. The reviewer must check channel isolation, no-opener safety, panel singleton recovery, back fallback, progress arithmetic, run-id isolation, original event API preservation, DOM text safety, and absence of real collection/upload side effects. Fix every Critical or Important issue and repeat Steps 1–4.
 
-- [ ] **Step 6: Write and verify the Obsidian record**
+User explicitly disabled further sub-agents, so the current task performed this review directly. No Critical or Important issue was found.
+
+- [x] **Step 6: Write and verify the Obsidian record**
 
 Use Chinese first with English in parentheses. Record:
 
@@ -938,7 +942,7 @@ Use Chinese first with English in parentheses. Record:
 
 Create the note with `apply_patch`, then read the exact file back from the E-drive vault.
 
-- [ ] **Step 7: Confirm final branch state**
+- [x] **Step 7: Confirm final branch state**
 
 ```powershell
 git status --short
