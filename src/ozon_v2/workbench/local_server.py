@@ -1258,6 +1258,8 @@ def build_supplier_review_html(run_id: str) -> str:
     button.primary {{ color:#fff; background:var(--blue); border-color:var(--blue); }}
     button.reject-button {{ width:100%; color:var(--red); border-color:#fecaca; background:#fff7f7; }}
     button.reject-button:hover {{ background:#fee2e2; }}
+    button.secondary-button {{ width:100%; margin-top:8px; color:var(--blue); border-color:#bfdbfe; background:var(--blue-soft); }}
+    button.secondary-button:hover {{ background:#dbeafe; }}
     button:disabled {{ opacity:.5; cursor:not-allowed; }}
     .status-pill {{ min-height:24px; display:inline-flex; align-items:center; padding:2px 9px; border-radius:4px; color:var(--amber); background:#fff4df; font-size:12px; font-weight:600; }}
     .bottom-grid {{ display:grid; grid-template-columns:minmax(0,1.7fr) minmax(300px,.9fr); gap:14px; margin-top:14px; }}
@@ -1818,7 +1820,13 @@ def build_supplier_review_html(run_id: str) -> str:
         rejectButton.textContent = "找不到供应商 (No Supplier Found)";
         rejectButton.disabled = state.status !== "supplier_review" || !!item.supplier_url;
         rejectButton.addEventListener("click", () => rejectSupplier(item, rejectButton));
-        actionCell.append(rejectButton);
+        const recaptureButton = document.createElement("button");
+        recaptureButton.type = "button";
+        recaptureButton.className = "secondary-button";
+        recaptureButton.textContent = "重新采集 (Re-collect)";
+        recaptureButton.disabled = state.status !== "supplier_review" || !item.supplier_url;
+        recaptureButton.addEventListener("click", () => recaptureSupplier(item, recaptureButton));
+        actionCell.append(rejectButton, recaptureButton);
         row.append(productCell, evidenceCell, channelCell, actionCell); $("items").append(row);
       }});
       $("evidenceProducts").textContent = String(state.items.length);
@@ -1939,6 +1947,31 @@ def build_supplier_review_html(run_id: str) -> str:
         button.disabled = false;
         $("message").className = "error";
         $("message").textContent = error.message || "补位失败 (Replacement Failed)";
+      }}
+    }}
+
+    async function recaptureSupplier(item, button) {{
+      const confirmed = window.confirm(
+        `清除当前供应商结果并重新打开该商品的 1688 采集通道？\n\n${{item.ozon_title || item.ozon_product_id}}`
+      );
+      if (!confirmed) return;
+      button.disabled = true;
+      $("message").className = "muted";
+      $("message").textContent = "正在清除错误回传并重新派发独立采集通道 (Re-collecting)";
+      try {{
+        await api(`/api/batches/${{encodeURIComponent(runId)}}/supplier-selection/reset`, {{
+          method: "POST",
+          body: JSON.stringify({{ seed_id: item.seed_id }}),
+        }});
+        await api(`/api/batches/${{encodeURIComponent(runId)}}/browser-task/restart`, {{
+          method: "POST",
+          body: JSON.stringify({{}}),
+        }});
+        await load();
+      }} catch (error) {{
+        button.disabled = false;
+        $("message").className = "error";
+        $("message").textContent = error.message || "重新采集派发失败 (Re-collect Failed)";
       }}
     }}
 
@@ -2904,6 +2937,15 @@ def create_handler(
                 return
             if len(parts) == 5 and parts[:2] == ["api", "batches"] and parts[3:] == ["supplier-selection", "capture"]:
                 self._send_result(service.capture_supplier_selection_product(parts[2], payload), run_id=parts[2])
+                return
+            if len(parts) == 5 and parts[:2] == ["api", "batches"] and parts[3:] == ["supplier-selection", "reset"]:
+                self._send_result(
+                    service.reset_supplier_selection_product(
+                        parts[2],
+                        str(payload.get("seed_id") or "").strip(),
+                    ),
+                    run_id=parts[2],
+                )
                 return
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "supplier-sku":
                 differences = payload.get("differences") if isinstance(payload.get("differences"), list) else []

@@ -11,6 +11,7 @@ let uploadChanges = 0;
 let uploadedFile = null;
 let inputVisible = false;
 let navigationIntents = 0;
+let navigationResponse = { ok: true, granted: true };
 
 function node(text = "") {
   return {
@@ -106,7 +107,7 @@ const chrome = {
       if (message.type === "ozon_v2_get_supplier_channel") return { ok: true, binding };
       if (message.type === "ozon_v2_supplier_navigation_intent") {
         navigationIntents += 1;
-        return { ok: true };
+        return navigationResponse;
       }
       if (message.type === "ozon_v2_fetch_reference_image") {
         return { ok: true, bytes: [1, 2, 3], contentType: "image/jpeg" };
@@ -142,13 +143,23 @@ const context = vm.createContext({
 });
 
 const scriptPath = path.join(__dirname, "..", "browser_extension", "ozon_v2_bridge", "supplier_content.js");
-vm.runInContext(fs.readFileSync(scriptPath, "utf8"), context, { filename: scriptPath });
+const source = fs.readFileSync(scriptPath, "utf8").replace(
+  "  initializeManagedChannel()",
+  "  globalThis.__testUploadReferenceImage = uploadReferenceImage;\n  initializeManagedChannel()",
+);
+vm.runInContext(source, context, { filename: scriptPath });
 
-setTimeout(() => {
+setTimeout(async () => {
   assert.equal(triggerClicks, 1, "the visible 1688 image-search control must be activated");
   assert.equal(uploadChanges, 1, "the Ozon reference image must be submitted to the 1688 file input");
   assert.equal(navigationIntents, 1, "the image upload must reserve this lane before 1688 creates a result tab");
   assert.ok(uploadedFile, "a browser File must be created for the reference image");
   assert.equal(uploadedFile.name, "ozon-ozon-1.jpg");
+  navigationResponse = { ok: false, granted: false, code: "supplier_selection.navigation_busy" };
+  uploadChanges = 0;
+  const blocked = await context.__testUploadReferenceImage(binding);
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.reason, "supplier_selection.navigation_busy");
+  assert.equal(uploadChanges, 0, "a lane without the navigation lease must never submit its image");
   process.stdout.write("supplier managed reference upload: OK\n");
 }, 700);

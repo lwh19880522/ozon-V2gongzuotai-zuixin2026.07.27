@@ -135,7 +135,7 @@ const context = vm.createContext({
   Date,
   Promise,
 });
-const backgroundPath = path.join(__dirname, "..", "browser_extension", "ozon_v2_bridge", "background.js");
+const backgroundPath = path.join(__dirname, "..", "browser_extension", "ozon_v2_bridge", "background_v2.js");
 vm.runInContext(fs.readFileSync(backgroundPath, "utf8"), context, { filename: backgroundPath });
 
 function task(taskType, runId = "wb-test", createdAt = "2026-07-10T04:30:00+00:00") {

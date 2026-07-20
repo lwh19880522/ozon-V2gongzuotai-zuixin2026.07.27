@@ -1131,7 +1131,21 @@
       `ozon-${binding.ozon_product_id || binding.seed_id}.jpg`,
       { type: response.contentType || "image/jpeg" },
     ));
-    await chrome.runtime.sendMessage({ type: "ozon_v2_supplier_navigation_intent" }).catch(() => null);
+    const navigationLease = await chrome.runtime.sendMessage({
+      type: "ozon_v2_supplier_navigation_intent",
+    }).catch((error) => ({
+      ok: false,
+      code: "supplier_selection.navigation_message_failed",
+      error: error && error.message ? error.message : String(error),
+    }));
+    if (!navigationLease || navigationLease.ok !== true || navigationLease.granted === false) {
+      return {
+        ok: false,
+        reason: navigationLease && (navigationLease.code || navigationLease.error)
+          ? [navigationLease.code, navigationLease.error].filter(Boolean).join(": ")
+          : "supplier_selection.navigation_lease_failed",
+      };
+    }
     input.files = transfer.files;
     input.dispatchEvent(new Event("input", { bubbles: true }));
     input.dispatchEvent(new Event("change", { bubbles: true }));
@@ -1147,7 +1161,8 @@
       return true;
     }
     let lastReason = "";
-    for (let attempt = 1; attempt <= REFERENCE_UPLOAD_ATTEMPTS && is1688HomePage(); attempt += 1) {
+    let attempt = 1;
+    while (attempt <= REFERENCE_UPLOAD_ATTEMPTS && is1688HomePage()) {
       if (status) status.textContent = `正在输入参考图 ${attempt}/${REFERENCE_UPLOAD_ATTEMPTS} (Preparing Image)`;
       try {
         const result = await uploadReferenceImage(binding);
@@ -1157,10 +1172,16 @@
           return true;
         }
         lastReason = result.reason || "upload_failed";
+        if (lastReason === "supplier_selection.navigation_busy") {
+          if (status) status.textContent = "正在等待上一通道完成图片搜索 (Waiting for Previous Lane)";
+          await sleep(500);
+          continue;
+        }
       } catch (error) {
         lastReason = error && error.message ? error.message : String(error);
       }
-      if (attempt < REFERENCE_UPLOAD_ATTEMPTS) await sleep(1000);
+      attempt += 1;
+      if (attempt <= REFERENCE_UPLOAD_ATTEMPTS) await sleep(1000);
     }
     if (status && is1688HomePage()) {
       status.textContent = "参考图输入失败，请保持本页并重试批次 (Image Upload Failed)";

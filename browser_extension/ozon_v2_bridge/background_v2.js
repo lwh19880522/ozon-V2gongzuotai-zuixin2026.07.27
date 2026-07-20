@@ -7,10 +7,11 @@ const MAX_SUPPLIER_LANES = 5;
 const MANAGED_TAB_QUERY_ATTEMPTS = 30;
 const MANAGED_TAB_QUERY_DELAY_MS = 100;
 const NATIVE_NEW_TAB_INTENT_MS = 2500;
-const SUPPLIER_NAVIGATION_INTENT_MS = 15000;
+const SUPPLIER_NAVIGATION_INTENT_MS = 300000;
 const SUPPLIER_TERMINAL_STATES = new Set(["collected", "user_skipped"]);
 const supplierNativeNewTabIntents = new Map();
 let openTaskQueue = Promise.resolve();
+let supplierNavigationQueue = Promise.resolve();
 let pollingStarted = false;
 
 function searchUrl(query) {
@@ -308,24 +309,42 @@ async function recordSupplierNavigationIntent(tabId) {
   const match = await managedSupplierEntryForTab(tabId);
   if (!match) return { ok: false, code: "supplier_selection.channel_missing" };
   const now = Date.now();
-  const pendingNavigations = Array.isArray(match.entry.pendingNavigations)
-    ? match.entry.pendingNavigations.filter((intent) => (
-      Number(intent.expiresAt || 0) >= now && intent.sourceTabId !== tabId
-    ))
-    : [];
-  pendingNavigations.push({
+  const candidates = [
+    ...(match.entry.pendingNavigation ? [match.entry.pendingNavigation] : []),
+    ...(Array.isArray(match.entry.pendingNavigations) ? match.entry.pendingNavigations : []),
+  ].filter((intent) => Number(intent.expiresAt || 0) >= now);
+  const existing = candidates.find((intent) => (
+    intent.sourceTabId === tabId
+    && intent.channel_index === match.channel.channel_index
+    && String(intent.seed_id || "") === String(match.channel.seed_id || "")
+    && String(intent.ozon_product_id || "") === String(match.channel.ozon_product_id || "")
+  ));
+  if (existing) {
+    match.entry.pendingNavigation = existing;
+    match.entry.pendingNavigations = [];
+    await saveOpenedTasks(match.openedTasks);
+    return { ok: true, granted: true };
+  }
+  if (candidates.length) {
+    return {
+      ok: false,
+      granted: false,
+      code: "supplier_selection.navigation_busy",
+      channel_index: candidates[0].channel_index,
+    };
+  }
+  match.entry.pendingNavigation = {
     sourceTabId: tabId,
     channel_index: match.channel.channel_index,
     seed_id: match.channel.seed_id,
     ozon_product_id: match.channel.ozon_product_id,
     createdAt: now,
     expiresAt: now + SUPPLIER_NAVIGATION_INTENT_MS,
-  });
-  match.entry.pendingNavigations = pendingNavigations;
-  delete match.entry.pendingNavigation;
+  };
+  match.entry.pendingNavigations = [];
   match.entry.lastUpdatedAt = new Date().toISOString();
   await saveOpenedTasks(match.openedTasks);
-  return { ok: true };
+  return { ok: true, granted: true };
 }
 
 async function managedSupplierEntryForNavigation(tab) {
@@ -334,47 +353,28 @@ async function managedSupplierEntryForNavigation(tab) {
   for (const [key, entry] of Object.entries(openedTasks)) {
     if (!entry || entry.windowId !== tab.windowId || !Array.isArray(entry.channels)) continue;
     const now = Date.now();
-    const pendingNavigations = [
-      ...(Array.isArray(entry.pendingNavigations) ? entry.pendingNavigations : []),
-      ...(entry.pendingNavigation ? [entry.pendingNavigation] : []),
-    ].filter((intent) => Number(intent.expiresAt || 0) >= now)
-      .sort((left, right) => Number(left.createdAt || 0) - Number(right.createdAt || 0));
-    for (const intent of pendingNavigations) {
-      const channel = entry.channels.find((item) => (
-        item.channel_index === intent.channel_index
-        && String(item.seed_id || "") === String(intent.seed_id || "")
-        && String(item.ozon_product_id || "") === String(intent.ozon_product_id || "")
-      ));
-      if (!channel) continue;
-      entry.pendingNavigations = pendingNavigations.filter((candidate) => candidate !== intent);
-      delete entry.pendingNavigation;
-      await saveOpenedTasks(openedTasks);
-      return { key, entry, channel, openedTasks };
-    }
+    const intent = entry.pendingNavigation;
+    if (!intent || Number(intent.expiresAt || 0) < now) continue;
+    const channel = entry.channels.find((item) => (
+      item.channel_index === intent.channel_index
+      && String(item.seed_id || "") === String(intent.seed_id || "")
+      && String(item.ozon_product_id || "") === String(intent.ozon_product_id || "")
+    ));
+    if (!channel) continue;
+    entry.pendingNavigation = null;
+    entry.pendingNavigations = [];
+    await saveOpenedTasks(openedTasks);
+    return { key, entry, channel, openedTasks };
   }
   return null;
-}
-
-async function uniqueManagedSupplierEntryForTab(tab) {
-  if (!tab || !Number.isInteger(tab.windowId) || !isSupplierTab(tab)) return null;
-  const openedTasks = await loadOpenedTasks();
-  const matches = [];
-  for (const [key, entry] of Object.entries(openedTasks)) {
-    if (!entry || entry.windowId !== tab.windowId || !Array.isArray(entry.channels)) continue;
-    for (const channel of entry.channels) {
-      if (!SUPPLIER_TERMINAL_STATES.has(channel.state)) {
-        matches.push({ key, entry, channel, openedTasks });
-      }
-    }
-  }
-  return matches.length === 1 ? matches[0] : null;
 }
 
 async function adoptSupplierTab(match, tab) {
   const replacedTabId = match.channel.tabId;
   match.channel.tabId = tab.id;
   match.channel.windowId = tab.windowId;
-  delete match.entry.pendingNavigation;
+  match.entry.pendingNavigation = null;
+  match.entry.pendingNavigations = [];
   match.entry.lastUpdatedAt = new Date().toISOString();
   await saveOpenedTasks(match.openedTasks);
 
@@ -407,8 +407,7 @@ async function resolveSupplierChannelForTab(tab) {
   if (exact) return exact.channel;
   if (await isProtectedSupplierTab(tab)) return null;
   if (!isSupplierTab(tab)) return null;
-  const recoverable = await managedSupplierEntryForNavigation(tab)
-    || await uniqueManagedSupplierEntryForTab(tab);
+  const recoverable = await managedSupplierEntryForNavigation(tab);
   if (!recoverable) return null;
   await adoptSupplierTab(recoverable, tab);
   return recoverable.channel;
@@ -602,11 +601,16 @@ async function recoverActiveManagedSupplierTab(openedTasks, key, entry, items, w
     && !boundTabIds.has(tab.id)
     && !protectedTabIds.has(tab.id)
   ));
-  const recoverableChannels = items.map((item, index) => (
-    channels.find((channel) => sameSupplierChannel(channel, item, index)) || null
-  )).filter((channel) => channel && !SUPPLIER_TERMINAL_STATES.has(channel.state));
-  if (activeOrphans.length !== 1 || recoverableChannels.length !== 1) return null;
-  await adoptSupplierTab({ key, entry, channel: recoverableChannels[0], openedTasks }, activeOrphans[0]);
+  const intent = entry.pendingNavigation;
+  if (!intent || Number(intent.expiresAt || 0) < Date.now() || activeOrphans.length !== 1) return null;
+  const recoverableChannel = channels.find((channel) => (
+    channel.channel_index === intent.channel_index
+    && String(channel.seed_id || "") === String(intent.seed_id || "")
+    && String(channel.ozon_product_id || "") === String(intent.ozon_product_id || "")
+    && !SUPPLIER_TERMINAL_STATES.has(channel.state)
+  ));
+  if (!recoverableChannel) return null;
+  await adoptSupplierTab({ key, entry, channel: recoverableChannel, openedTasks }, activeOrphans[0]);
   return activeOrphans[0];
 }
 
@@ -727,6 +731,8 @@ async function openManagedSupplierTask(task, source, openedTasks, key, previous,
       launchState: missingIndexes.length ? "incomplete" : "opened",
       closingByExtension: false,
       closedByUser: false,
+      pendingNavigation: sameDispatch ? previous.pendingNavigation || null : null,
+      pendingNavigations: [],
       lastUpdatedAt: new Date().toISOString(),
     };
     await saveOpenedTasks(openedTasks);
@@ -773,6 +779,8 @@ async function openManagedSupplierTask(task, source, openedTasks, key, previous,
     dispatchToken,
     closingByExtension: false,
     closedByUser: false,
+    pendingNavigation: null,
+    pendingNavigations: [],
   };
   await saveOpenedTasks(openedTasks);
 
@@ -1227,8 +1235,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message.type === "ozon_v2_supplier_navigation_intent") {
     const tabId = sender && sender.tab ? sender.tab.id : null;
-    const operation = openTaskQueue.then(() => recordSupplierNavigationIntent(tabId));
-    openTaskQueue = operation.catch(() => null);
+    const operation = supplierNavigationQueue.then(() => recordSupplierNavigationIntent(tabId));
+    supplierNavigationQueue = operation.catch(() => null);
     operation
       .then((result) => sendResponse(result))
       .catch((error) => sendResponse({ ok: false, error: String(error) }));

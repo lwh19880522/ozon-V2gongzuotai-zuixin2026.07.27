@@ -128,7 +128,7 @@ const context = vm.createContext({
   Date,
   Promise,
 });
-const backgroundPath = path.join(__dirname, "..", "browser_extension", "ozon_v2_bridge", "background.js");
+const backgroundPath = path.join(__dirname, "..", "browser_extension", "ozon_v2_bridge", "background_v2.js");
 vm.runInContext(fs.readFileSync(backgroundPath, "utf8"), context, { filename: backgroundPath });
 
 function supplierTask(itemCount, token = "managed-token") {
@@ -300,27 +300,40 @@ function sendMessage(message, tab) {
   assert.equal(intentChannel.tabId, openerlessSearchTab.id);
   assert.ok(removedTabs.includes(intentSourceTab.id));
 
-  const concurrentChannels = [entry.channels[2], entry.channels[4]];
-  const concurrentSources = concurrentChannels.map((channel) => tabs.get(channel.tabId));
-  for (const source of concurrentSources) {
-    const response = await sendMessage({ type: "ozon_v2_supplier_navigation_intent" }, source);
-    assert.equal(response.ok, true);
-  }
-  const concurrentOrphans = concurrentChannels.map((channel, index) => ({
+  const serializedChannels = [entry.channels[2], entry.channels[4]];
+  const serializedSources = serializedChannels.map((channel) => tabs.get(channel.tabId));
+  const firstLease = await sendMessage(
+    { type: "ozon_v2_supplier_navigation_intent" },
+    serializedSources[0],
+  );
+  assert.equal(firstLease.ok, true);
+  const blockedLease = await sendMessage(
+    { type: "ozon_v2_supplier_navigation_intent" },
+    serializedSources[1],
+  );
+  assert.equal(blockedLease.ok, false, "only one opener-less image search may be in flight per managed window");
+  assert.equal(blockedLease.code, "supplier_selection.navigation_busy");
+  const serializedOrphans = serializedChannels.map((channel, index) => ({
     id: 300 + index,
     windowId: entry.windowId,
     url: `https://air.1688.com/kapp/1688-search/pc-image-search/?tab=imageSearch&lane=${channel.channel_index}`,
     active: index === 0,
   }));
-  for (const orphan of concurrentOrphans) {
-    tabs.set(orphan.id, orphan);
-    const adoption = await context.handleSupplierTabCreated(orphan);
-    assert.equal(adoption.adopted, true, "concurrent opener-less searches must consume distinct lane intents");
-  }
+  tabs.set(serializedOrphans[0].id, serializedOrphans[0]);
+  const firstAdoption = await context.handleSupplierTabCreated(serializedOrphans[0]);
+  assert.equal(firstAdoption.adopted, true);
+  const secondLease = await sendMessage(
+    { type: "ozon_v2_supplier_navigation_intent" },
+    serializedSources[1],
+  );
+  assert.equal(secondLease.ok, true, "the next lane may navigate only after the first result is bound");
+  tabs.set(serializedOrphans[1].id, serializedOrphans[1]);
+  const secondAdoption = await context.handleSupplierTabCreated(serializedOrphans[1]);
+  assert.equal(secondAdoption.adopted, true);
   assert.deepEqual(
-    concurrentChannels.map((channel) => channel.tabId),
-    concurrentOrphans.map((tab) => tab.id),
-    "queued navigation intents must preserve lane order without overwriting each other",
+    serializedChannels.map((channel) => channel.tabId),
+    serializedOrphans.map((tab) => tab.id),
+    "serialized navigation leases must preserve exact lane ownership",
   );
 
   browserTaskResponse = task;
@@ -411,9 +424,17 @@ function sendMessage(message, tab) {
     active: true,
   };
   tabs.set(selfHealTab.id, selfHealTab);
+  const unownedLookup = await sendMessage({ type: "ozon_v2_get_supplier_channel" }, selfHealTab);
+  assert.equal(unownedLookup.ok, true);
+  assert.equal(unownedLookup.binding, null, "an orphan must never be guessed into the only remaining lane");
+  assert.equal(selfHealEntry.channels[0].tabId, staleBoundTabId);
+  const selfHealIntent = await sendMessage(
+    { type: "ozon_v2_supplier_navigation_intent" },
+    tabs.get(staleBoundTabId),
+  );
+  assert.equal(selfHealIntent.ok, true);
   const recoveredLookup = await sendMessage({ type: "ozon_v2_get_supplier_channel" }, selfHealTab);
-  assert.equal(recoveredLookup.ok, true);
-  assert.equal(recoveredLookup.binding.seed_id, "seed-1", "a unique managed lane must self-heal after event loss or extension reload");
+  assert.equal(recoveredLookup.binding.seed_id, "seed-1", "a persisted lane lease must self-heal after event loss or extension reload");
   assert.equal(selfHealEntry.channels[0].tabId, selfHealTab.id);
   assert.ok(removedTabs.includes(staleBoundTabId), "self-healing must retire the stale lane page after rebinding");
 
@@ -453,6 +474,11 @@ function sendMessage(message, tab) {
   await context.performOpenTask(reloadRecoveryTask, "managed_round_test", { allowCreate: true });
   const reloadEntry = stored.openedTasks["wb-managed-round:supplier_selection"];
   const reloadSourceTab = tabs.get(reloadEntry.channels[0].tabId);
+  const reloadIntent = await sendMessage(
+    { type: "ozon_v2_supplier_navigation_intent" },
+    reloadSourceTab,
+  );
+  assert.equal(reloadIntent.ok, true);
   reloadSourceTab.active = false;
   const preexistingActiveOrphan = {
     id: 403,
@@ -477,6 +503,11 @@ function sendMessage(message, tab) {
   await context.performOpenTask(activationRecoveryTask, "managed_round_test", { allowCreate: true });
   const activationEntry = stored.openedTasks["wb-managed-round:supplier_selection"];
   const activationSource = tabs.get(activationEntry.channels[0].tabId);
+  const activationIntent = await sendMessage(
+    { type: "ozon_v2_supplier_navigation_intent" },
+    activationSource,
+  );
+  assert.equal(activationIntent.ok, true);
   activationSource.active = false;
   const activatedOrphan = {
     id: 404,

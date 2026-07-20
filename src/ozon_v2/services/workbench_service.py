@@ -1444,6 +1444,61 @@ class WorkbenchService:
             data,
         )
 
+    def reset_supplier_selection_product(self, run_id: str, seed_id: str) -> Result:
+        run = self.repo.load_run(run_id)
+        if WorkbenchState(run["status"]) != WorkbenchState.SUPPLIER_REVIEW:
+            return Result.failure(
+                "supplier_selection.reset_not_allowed",
+                "A captured supplier can only be reset during supplier review.",
+                data={"run_id": run_id, "status": run["status"], "seed_id": seed_id},
+            )
+        review = self.repo.load_supplier_review(run_id)
+        items = [item for item in review.get("items", []) if isinstance(item, dict)]
+        selected = next((item for item in items if str(item.get("seed_id") or "") == seed_id), None)
+        if selected is None:
+            return Result.failure(
+                "supplier_selection.seed_missing",
+                "The requested supplier-selection lane is not part of this review.",
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+
+        selected["supplier_url"] = None
+        selected["user_verified_exact_match"] = False
+        selected["verified_at"] = None
+        review["items"] = items
+        review["updated_at"] = utc_now_iso()
+        self.repo.save_supplier_review(run_id, review)
+
+        draft_path = self.repo.run_dir(run_id) / "supplier_selection_draft.json"
+        retained_count = 0
+        if draft_path.exists():
+            draft = self.repo.load_supplier_selection_draft(run_id)
+            retained = [
+                product
+                for product in draft.get("supplier_products", [])
+                if isinstance(product, dict) and str(product.get("seed_id") or "") != seed_id
+            ]
+            draft["supplier_products"] = retained
+            draft["updated_at"] = utc_now_iso()
+            self.repo.save_supplier_selection_draft(run_id, draft)
+            retained_count = len(retained)
+
+        event = self.repo.append_run_event(
+            run_id,
+            "supplier_selection.recapture_requested",
+            "The saved supplier selection was cleared so its exact managed lane can be collected again.",
+            {"seed_id": seed_id, "retained_count": retained_count},
+        )
+        return Result.success(
+            "supplier_selection.recapture_requested",
+            "The saved supplier selection was cleared and is pending collection again.",
+            self._response_payload(
+                run,
+                event,
+                {"seed_id": seed_id, "retained_count": retained_count},
+            ),
+        )
+
     def reject_supplier_candidate(
         self,
         run_id: str,

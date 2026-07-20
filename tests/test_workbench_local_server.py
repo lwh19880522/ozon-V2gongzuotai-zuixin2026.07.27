@@ -1148,6 +1148,8 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertNotIn('input.type = "url"', page)
         self.assertIn("五通道采集", page)
         self.assertIn("找不到供应商 (No Supplier Found)", page)
+        self.assertIn("重新采集 (Re-collect)", page)
+        self.assertIn("/supplier-selection/reset", page)
         self.assertIn('["supplier_review", "supplier_collecting"].includes(state.status)', page)
 
     def test_supplier_review_contains_stage_specific_1688_restart_control(self) -> None:
@@ -1178,6 +1180,41 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertFalse(result["ok"])
         self.assertEqual("supplier_selection.channel_mismatch", result["code"])
         self.assertEqual(WorkbenchState.SUPPLIER_REVIEW.value, self.repo.load_run(run_id)["status"])
+
+    def test_supplier_selection_reset_removes_wrong_capture_and_reopens_lane(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        review = self.repo.load_supplier_review(run_id)
+        review["items"][0].update(
+            {
+                "supplier_url": "https://detail.1688.com/offer/123456789012.html",
+                "user_verified_exact_match": True,
+                "verified_at": "2026-07-20T00:00:00+00:00",
+            }
+        )
+        self.repo.save_supplier_review(run_id, review)
+        self.repo.save_supplier_selection_draft(
+            run_id,
+            {
+                "schema_version": 1,
+                "run_id": run_id,
+                "supplier_products": [self.supplier_product_payload(seed.seed_id)],
+            },
+        )
+
+        result = self.post_json(
+            f"/api/batches/{run_id}/supplier-selection/reset",
+            {"seed_id": seed.seed_id},
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("supplier_selection.recapture_requested", result["code"])
+        reset_item = self.repo.load_supplier_review(run_id)["items"][0]
+        self.assertIsNone(reset_item["supplier_url"])
+        self.assertFalse(reset_item["user_verified_exact_match"])
+        self.assertIsNone(reset_item["verified_at"])
+        self.assertEqual([], self.repo.load_supplier_selection_draft(run_id)["supplier_products"])
+        restarted = self.post_json(f"/api/batches/{run_id}/browser-task/restart", {})
+        self.assertEqual(1, restarted["data"]["pending_count"])
 
     def test_supplier_selection_capture_writes_back_and_finalizes_single_channel(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
@@ -1354,7 +1391,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
     def test_extension_manifest_registers_1688_supplier_content_script(self) -> None:
         manifest_path = self.project_root / "browser_extension" / "ozon_v2_bridge" / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self.assertEqual("0.1.55", manifest["version"])
+        self.assertEqual("0.1.58", manifest["version"])
 
         supplier_scripts = [
             item
