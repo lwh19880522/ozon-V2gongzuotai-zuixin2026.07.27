@@ -440,6 +440,46 @@
     }).filter((item) => item.name);
   }
 
+  function collectEmbeddedSkuGroups() {
+    const groups = [];
+    const seen = new Set();
+    for (const source of scriptSources()) {
+      const rawProps = extractJsonValue(source, "skuProps")
+        || extractJsonValue(source, "skuPropertyList");
+      if (!Array.isArray(rawProps)) continue;
+      for (const rawGroup of rawProps) {
+        const name = normalizedText(
+          rawGroup && (rawGroup.prop || rawGroup.name || rawGroup.propName || rawGroup.attributeName),
+          100,
+        );
+        const rawValues = rawGroup && (Array.isArray(rawGroup.value) ? rawGroup.value : rawGroup.values);
+        if (!name || !Array.isArray(rawValues)) continue;
+        const options = rawValues.map((rawOption, optionIndex) => {
+          const option = rawOption && typeof rawOption === "object" ? rawOption : {};
+          const label = normalizedText(option.name || option.value || option.valueName, 120);
+          if (!label) return null;
+          return {
+            label,
+            supplier_sku_id: normalizedText(
+              option.vid || option.id || option.valueId || option.propValueId,
+              160,
+            ),
+            image_url: normalizedImageUrl(option.imageUrl || option.image || option.imageURL),
+            disabled: option.disabled === true || option.canBookCount === 0,
+            selected: option.selected === true,
+            option_index: optionIndex,
+          };
+        }).filter(Boolean);
+        if (!options.length) continue;
+        const key = `${name}|${options.map((option) => option.label).join("|")}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        groups.push({ name, options });
+      }
+    }
+    return groups;
+  }
+
   function splitSkuValues(rawValue) {
     return normalizedText(rawValue, 500)
       .replace(/&gt;/gi, ">")
@@ -697,6 +737,7 @@
 
   function collectProduct(item) {
     const visibleSkuGroups = collectVisibleSkuGroups();
+    const skuGroups = visibleSkuGroups.length ? visibleSkuGroups : collectEmbeddedSkuGroups();
     return {
       seed_id: String(item.seed_id || ""),
       supplier_url: String(item.supplier_url || ""),
@@ -704,9 +745,9 @@
       offer_id: offerId(location.href),
       title: collectTitle(),
       seller: collectSeller(),
-      sku: collectSku(visibleSkuGroups),
-      sku_groups: visibleSkuGroups,
-      sku_options: collectTrustedSkuOptions(visibleSkuGroups),
+      sku: collectSku(skuGroups),
+      sku_groups: skuGroups,
+      sku_options: collectTrustedSkuOptions(skuGroups),
       images: collectImages(),
       price: collectPrice(),
       attributes: collectAttributes(),

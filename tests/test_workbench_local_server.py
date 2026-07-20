@@ -1181,6 +1181,19 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
 
     def test_supplier_selection_capture_writes_back_and_finalizes_single_channel(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
+        supplier_product = self.supplier_product_payload(seed.seed_id)
+        supplier_product["sku_groups"] = [
+            {
+                "name": "颜色",
+                "options": [
+                    {
+                        "label": "黑色",
+                        "supplier_sku_id": "color-black",
+                        "image_url": "https://cbu01.alicdn.com/img/ibank/test.jpg",
+                    }
+                ],
+            }
+        ]
 
         result = self.post_json(
             f"/api/batches/{run_id}/supplier-selection/capture",
@@ -1188,7 +1201,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
                 "channel_index": 0,
                 "seed_id": seed.seed_id,
                 "ozon_product_id": "ozon-1",
-                "supplier_product": self.supplier_product_payload(seed.seed_id),
+                "supplier_product": supplier_product,
             },
         )
 
@@ -1200,6 +1213,10 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual("collected", result["data"]["lane_terminal"])
         self.assertTrue((self.repo.run_dir(run_id) / "supplier_selection_draft.json").exists())
         self.assertTrue((self.repo.run_dir(run_id) / "supplier_collection_result.json").exists())
+        stored = self.repo.load_supplier_collection_result(run_id)["supplier_products"][0]
+        self.assertEqual(supplier_product["attributes"], stored["attributes"])
+        self.assertEqual(supplier_product["sku_groups"], stored["sku_groups"])
+        self.assertEqual(supplier_product["sku_options"], stored["sku_options"])
         self.assertEqual(WorkbenchState.SUPPLIER_COLLECTED.value, self.repo.load_run(run_id)["status"])
 
     def test_supplier_selection_capture_defers_missing_sku_matrix_to_user_review(self) -> None:

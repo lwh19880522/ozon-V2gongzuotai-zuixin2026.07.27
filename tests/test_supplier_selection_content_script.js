@@ -67,6 +67,11 @@ const skuScript = {
 };
 
 const body = textNode("广东测试供应商有限公司 测试收纳盒 ¥12.80 送至 福建泉州 包邮");
+const attributeRow = {
+  querySelectorAll(selector) {
+    return selector === "th,td" ? [textNode("材质"), textNode("不锈钢")] : [];
+  },
+};
 const document = {
   title: "测试收纳盒 - 1688",
   body,
@@ -84,6 +89,7 @@ const document = {
   querySelectorAll(selector) {
     if (selector === "img") return [imageNode("https://cbu01.alicdn.com/img/ibank/product.jpg")];
     if (selector === "script") return [skuScript];
+    if (selector === "tr") return [attributeRow];
     return [];
   },
 };
@@ -171,8 +177,21 @@ vm.runInContext(fs.readFileSync(scriptPath, "utf8"), context, { filename: script
   assert.equal(capturedPayload.channel_index, 0);
   assert.equal(capturedPayload.seed_id, "seed-1");
   assert.equal(capturedPayload.ozon_product_id, "ozon-1");
-  assert.equal(capturedPayload.supplier_product.supplier_url, supplierUrl);
-  assert.equal(capturedPayload.supplier_product.title, "测试收纳盒");
+  const product = capturedPayload.supplier_product;
+  assert.equal(product.supplier_url, supplierUrl);
+  assert.equal(product.final_url, supplierUrl);
+  assert.equal(product.offer_id, "123456789012");
+  assert.equal(product.title, "测试收纳盒");
+  assert.ok(product.seller && product.seller.shop_name);
+  assert.deepEqual(product.images, ["https://cbu01.alicdn.com/img/ibank/product.jpg"]);
+  assert.equal(product.price.currency, "CNY");
+  assert.ok(product.domestic_shipping_evidence.visible_text);
+  assert.equal(product.attributes["材质"], "不锈钢");
+  assert.equal(product.sku_groups.length, 1, "embedded SKU properties must be returned as groups");
+  assert.equal(product.sku_groups[0].name, "颜色");
+  assert.equal(product.sku_groups[0].options[0].label, "黑色");
+  assert.equal(product.sku_options.length, 1);
+  assert.equal(product.sku_options[0].supplier_sku_id, "sku-black-1");
   assert.deepEqual(
     terminalStates,
     ["collected"],
