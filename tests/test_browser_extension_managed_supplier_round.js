@@ -35,6 +35,7 @@ const chrome = {
   } },
   tabs: {
     onCreated: event("tabCreated"),
+    onActivated: event("tabActivated"),
     onUpdated: event("tabUpdated"),
     onRemoved: event("tabRemoved"),
     async get(tabId) {
@@ -467,6 +468,30 @@ function sendMessage(message, tab) {
     "polling after extension reload must recover the active opener-less page",
   );
   assert.ok(removedTabs.includes(reloadSourceTab.id));
+
+  stored.openedTasks = {};
+  tabs.clear();
+  windows.clear();
+  removedWindows.length = 0;
+  const activationRecoveryTask = supplierTask(1, "activation-recovery-token");
+  await context.performOpenTask(activationRecoveryTask, "managed_round_test", { allowCreate: true });
+  const activationEntry = stored.openedTasks["wb-managed-round:supplier_selection"];
+  const activationSource = tabs.get(activationEntry.channels[0].tabId);
+  activationSource.active = false;
+  const activatedOrphan = {
+    id: 404,
+    windowId: activationEntry.windowId,
+    url: "https://detail.1688.com/offer/404404404404.html",
+    active: true,
+  };
+  tabs.set(activatedOrphan.id, activatedOrphan);
+  const activationRecovery = await context.handleSupplierTabActivated({
+    tabId: activatedOrphan.id,
+    windowId: activatedOrphan.windowId,
+  });
+  assert.equal(activationRecovery.recovered, true, "activating an existing orphan after extension reload must restore its lane");
+  assert.equal(activationEntry.channels[0].tabId, activatedOrphan.id);
+  assert.ok(removedTabs.includes(activationSource.id));
 
   stored.openedTasks = {};
   tabs.clear();

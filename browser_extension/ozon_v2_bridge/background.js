@@ -443,6 +443,24 @@ async function handleSupplierTabUpdated(tabId, changeInfo, tab) {
   return { injected: await ensureContentScript(tab, task) };
 }
 
+async function handleSupplierTabActivated(activeInfo) {
+  if (!activeInfo || !Number.isInteger(activeInfo.tabId) || !Number.isInteger(activeInfo.windowId)) {
+    return { recovered: false };
+  }
+  let tab = null;
+  try {
+    tab = await chrome.tabs.get(activeInfo.tabId);
+  } catch (_) {
+    return { recovered: false };
+  }
+  if (!tab || tab.windowId !== activeInfo.windowId || !isSupplierTab(tab)) return { recovered: false };
+  const existing = await supplierChannelForTab(tab.id);
+  const binding = await resolveSupplierChannelForTab(tab);
+  if (!binding) return { recovered: false };
+  if (existing) await ensureContentScript(tab, managedSupplierTaskForChannel(binding));
+  return { recovered: !existing, binding };
+}
+
 async function closeManagedSupplierRound(match, reason) {
   const { entry, openedTasks } = match;
   entry.closingByExtension = true;
@@ -1102,6 +1120,13 @@ if (chrome.tabs.onCreated) {
 if (chrome.tabs.onUpdated) {
   chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     const operation = openTaskQueue.then(() => handleSupplierTabUpdated(tabId, changeInfo, tab));
+    openTaskQueue = operation.catch(() => null);
+  });
+}
+
+if (chrome.tabs.onActivated) {
+  chrome.tabs.onActivated.addListener((activeInfo) => {
+    const operation = openTaskQueue.then(() => handleSupplierTabActivated(activeInfo));
     openTaskQueue = operation.catch(() => null);
   });
 }
