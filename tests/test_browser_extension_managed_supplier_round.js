@@ -16,6 +16,7 @@ const sentMessages = [];
 const backCalls = [];
 const updatedTabs = [];
 const failBackTabs = new Set();
+let browserTaskResponse = null;
 let nextTabId = 10;
 let nextWindowId = 70;
 
@@ -114,7 +115,10 @@ const context = vm.createContext({
   console,
   fetch: async (url, options = {}) => {
     if (options.method === "POST") postedPaths.push(String(url));
-    return { ok: true, json: async () => ({ ok: true, code: "ok", data: {} }) };
+    const response = !options.method && String(url).includes("/browser-task") && browserTaskResponse
+      ? browserTaskResponse
+      : { ok: true, code: "ok", data: {} };
+    return { ok: true, json: async () => response };
   },
   setInterval() { return 1; },
   setTimeout,
@@ -165,7 +169,7 @@ function sendMessage(message, tab) {
   const result = await context.performOpenTask(task, "managed_round_test", { allowCreate: true });
   assert.equal(result.opened, true);
   assert.equal(windows.size, 1, "one managed window must be created per round");
-  const entry = stored.openedTasks["wb-managed-round:supplier_selection"];
+  let entry = stored.openedTasks["wb-managed-round:supplier_selection"];
   assert.equal(entry.channels.length, 5, "one managed round must be capped at five lanes");
   assert.equal(tabs.size, 5, "all five lane tabs must be created atomically in the managed window");
   assert.ok(entry.channels.every((channel) => channel.state === "waiting_user"));
@@ -275,6 +279,58 @@ function sendMessage(message, tab) {
     url: orphanTab.url,
   });
   tabs.delete(orphanTab.id);
+
+  browserTaskResponse = task;
+  const closedChannelIndex = 2;
+  const closedChannel = entry.channels[closedChannelIndex];
+  const closedTabId = closedChannel.tabId;
+  const healthyTabIds = entry.channels
+    .filter((channel) => channel.channel_index !== closedChannelIndex)
+    .map((channel) => channel.tabId);
+  const stoppedBeforeLaneClose = postedPaths.filter((value) => value.includes("/runner/stop")).length;
+  tabs.delete(closedTabId);
+  await context.handleTaskTabRemoved(closedTabId);
+  assert.equal(closedChannel.tabId, null, "only the closed lane must lose its tab binding");
+  assert.deepEqual(
+    entry.channels
+      .filter((channel) => channel.channel_index !== closedChannelIndex)
+      .map((channel) => channel.tabId),
+    healthyTabIds,
+    "closing one lane must preserve every healthy lane binding",
+  );
+  assert.equal(entry.launchState, "incomplete", "a single closed lane must leave the round recoverable");
+  assert.equal(entry.closedByUser, false, "a single closed lane must not mark the whole round user-closed");
+  assert.equal(
+    postedPaths.filter((value) => value.includes("/runner/stop")).length,
+    stoppedBeforeLaneClose,
+    "a single closed lane must not pause the whole batch",
+  );
+  for (const tabId of healthyTabIds) {
+    const binding = await context.supplierChannelForTab(tabId);
+    assert.ok(binding, `healthy lane ${tabId} must remain eligible for its collection panel`);
+  }
+
+  const tabCountAfterLaneClose = tabs.size;
+  const sameDispatch = await context.performOpenTask(task, "managed_round_poll", { allowCreate: true });
+  assert.equal(sameDispatch.waiting, true, "the same dispatch must wait for an explicit restart");
+  assert.equal(tabs.size, tabCountAfterLaneClose, "background polling must not reopen a user-closed lane");
+
+  const restartTask = supplierTask(5, "managed-token-restart");
+  browserTaskResponse = restartTask;
+  updatedTabs.length = 0;
+  const restarted = await context.performOpenTask(restartTask, "managed_round_restart", { allowCreate: true });
+  entry = stored.openedTasks["wb-managed-round:supplier_selection"];
+  assert.equal(restarted.reused, true);
+  assert.equal(tabs.size, tabCountAfterLaneClose + 1, "explicit restart must create exactly one missing lane tab");
+  assert.deepEqual(
+    entry.channels
+      .filter((channel) => channel.channel_index !== closedChannelIndex)
+      .map((channel) => channel.tabId),
+    healthyTabIds,
+    "explicit restart must preserve stable bindings for healthy lanes",
+  );
+  assert.ok(entry.channels[closedChannelIndex].tabId, "the missing lane must receive a replacement tab");
+  assert.equal(updatedTabs.length, 0, "restart must not navigate or reload healthy lane tabs");
 
   for (const channel of entry.channels.slice(0, 4)) {
     const response = await sendMessage(
