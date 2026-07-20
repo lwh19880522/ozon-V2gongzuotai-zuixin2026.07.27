@@ -239,7 +239,7 @@ git commit -m "feat: persist Ozon collection checkpoints"
 - Modify: `src/ozon_v2/services/workbench_service.py`
 - Modify: `src/ozon_v2/workbench/local_server.py`
 
-- [ ] **Step 1: 写恢复 API 和活动任务的失败测试**
+- [x] **Step 1: 写恢复 API 和活动任务的失败测试**
 
 在 `tests/test_workbench_local_server.py` 增加：
 
@@ -291,7 +291,7 @@ def test_restart_ozon_browser_task_preserves_checkpoint_and_refreshes_token(self
 - 损坏或不匹配的 Ozon 草稿：返回 `browser_task.restart_checkpoint_invalid`，令牌不变。
 - 用 `patch("ozon_v2.workbench.local_server.BRIDGE_HEARTBEAT_TIMEOUT_SECONDS", -1)` 模拟离线：请求仍保存新令牌，但 `dispatch_state == "waiting_for_extension"`。
 
-- [ ] **Step 2: 运行恢复测试并确认 RED**
+- [x] **Step 2: 运行恢复测试并确认 RED**
 
 ```powershell
 python -m pytest tests/test_workbench_local_server.py -k "restart_browser_task or exposes_verified_checkpoint" -q
@@ -299,7 +299,7 @@ python -m pytest tests/test_workbench_local_server.py -k "restart_browser_task o
 
 Expected: FAIL；恢复路由返回 `http.not_found`，活动 Ozon 任务缺少 `progress_url` 和 `resume_candidates`。
 
-- [ ] **Step 3: 在服务层推导唯一允许恢复的任务**
+- [x] **Step 3: 在服务层推导唯一允许恢复的任务**
 
 在 `src/ozon_v2/services/workbench_service.py` 增加：
 
@@ -364,7 +364,7 @@ return Result.success(
 
 客户端不得提交 `task_type`；服务端不得读取或信任任意任务类型参数。
 
-- [ ] **Step 4: 接入恢复路由并返回扩展等待状态**
+- [x] **Step 4: 接入恢复路由并返回扩展等待状态**
 
 在 `src/ozon_v2/workbench/local_server.py::_handle_POST()` 增加：
 
@@ -381,7 +381,7 @@ if len(parts) == 5 and parts[:2] == ["api", "batches"] and parts[3:] == ["browse
 
 此入口不调用 `runner.start()`，因为浏览器扩展通过现有任务轮询领取新令牌；正式结果回传后仍由原入口继续自动流程。
 
-- [ ] **Step 5: 把验证后草稿加入活动 Ozon 任务**
+- [x] **Step 5: 把验证后草稿加入活动 Ozon 任务**
 
 在 `_browser_task()` 的 `ozon_collecting` 分支中先加载检查点；损坏时直接返回它的失败 `Result.to_dict()`，成功时加入：
 
@@ -410,7 +410,7 @@ task_data = {
 
 保留现有 1688 `captured_seed_ids` 过滤逻辑，不重建另一套 1688 草稿。
 
-- [ ] **Step 6: 增加中文事件映射**
+- [x] **Step 6: 增加中文事件映射**
 
 在首页 `EVENT_PRESENTATIONS` 中加入：
 
@@ -423,7 +423,7 @@ task_data = {
 
 事件表仍在中文展示下方保留原始机器事件名。
 
-- [ ] **Step 7: 运行恢复 API 测试并确认 GREEN**
+- [x] **Step 7: 运行恢复 API 测试并确认 GREEN**
 
 ```powershell
 python -m pytest tests/test_workbench_local_server.py -k "restart_browser_task or exposes_verified_checkpoint" -q
@@ -431,7 +431,7 @@ python -m pytest tests/test_workbench_local_server.py -k "restart_browser_task o
 
 Expected: 全部通过；批次状态、合同内容、检查点内容和正式结果均未被恢复请求改变。
 
-- [ ] **Step 8: 提交 Task 2**
+- [x] **Step 8: 提交 Task 2**
 
 ```powershell
 git add src/ozon_v2/services/workbench_service.py src/ozon_v2/workbench/local_server.py tests/test_workbench_local_server.py

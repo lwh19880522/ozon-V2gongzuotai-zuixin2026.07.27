@@ -914,6 +914,7 @@ def build_home_html() -> str:
       "autopilot.blocked": ["自动运行等待处理", "自动运行已停在需要用户处理的门禁。"],
       "supplier_selection.product_captured": ["供应商商品已采集", "一个用户确认的 1688 商品已回传工作台。"],
       "browser_task.cancelled": ["浏览器任务已取消", "当前浏览器任务已由用户停止。"],
+      "browser_task.user_restart_requested": ["浏览器采集已请求恢复", "已保留成功结果，并重新派发当前阶段尚未完成的浏览器采集。"],
       "browser_candidate.rejected": ["候选商品未通过", "当前候选不符合采集要求，正在检查其他结果。"],
       "browser_candidate.exhausted": ["当前种子已耗尽", "当前种子没有找到合格候选，正在尝试补位。"],
       "browser_candidate.replaced": ["种子已替换", "失败种子已完成补位，批次继续运行。"],
@@ -2806,6 +2807,16 @@ def create_handler(
                 self._cancel_browser_task(parts[2])
                 self._send_result(runner.stop(parts[2]), run_id=parts[2])
                 return
+            if len(parts) == 5 and parts[:2] == ["api", "batches"] and parts[3:] == ["browser-task", "restart"]:
+                result = service.restart_browser_task(parts[2])
+                if result.ok:
+                    bridge = self._bridge_status_payload()
+                    result.data["dispatch_state"] = (
+                        "dispatched" if bridge["version_ready"] else "waiting_for_extension"
+                    )
+                    result.data["browser_bridge"] = bridge
+                self._send_result(result, run_id=parts[2])
+                return
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "attribute-template":
                 result = service.ingest_attribute_template_result(parts[2], payload)
                 if result.ok:
@@ -2979,6 +2990,14 @@ def create_handler(
                         "Ozon collection contract was restored for browser task pickup.",
                         {"contract_path": str(contract_path)},
                     )
+                checkpoint = service.ozon_collection_checkpoint(run_id)
+                if not checkpoint.ok:
+                    return Result.failure(
+                        "browser_task.restart_checkpoint_invalid",
+                        "The saved Ozon collection checkpoint is invalid and was not overwritten.",
+                        errors=checkpoint.errors,
+                        data=checkpoint.data,
+                    ).to_dict()
                 return {
                     "ok": True,
                     "code": "browser_task.ozon_collection_ready",
@@ -2991,6 +3010,8 @@ def create_handler(
                         "contract": selected_repo.load_ozon_collection_contract(run_id),
                         "result_worker": "workbench_browser_bridge",
                         "ingest_url": f"/api/batches/{run_id}/ozon-collection",
+                        "progress_url": f"/api/batches/{run_id}/ozon-collection-progress",
+                        "resume_candidates": checkpoint.data["ozon_candidates"],
                     },
                     "errors": [],
                 }

@@ -612,6 +612,128 @@ class WorkbenchService:
             },
         )
 
+    def restart_browser_task(self, run_id: str) -> Result:
+        run = self.repo.load_run(run_id)
+        status = WorkbenchState(run["status"])
+        task_type_by_status = {
+            WorkbenchState.OZON_COLLECTING: "ozon_collection",
+            WorkbenchState.SUPPLIER_REVIEW: "supplier_selection",
+            WorkbenchState.SUPPLIER_COLLECTING: "supplier_collection",
+        }
+        task_type = task_type_by_status.get(status)
+        if task_type is None:
+            return Result.failure(
+                "browser_task.restart_not_allowed",
+                "The current batch stage has no restartable browser collection task.",
+                data={"run_id": run_id, "status": run["status"]},
+            )
+
+        completed_count = 0
+        total_count = 0
+        try:
+            if task_type == "ozon_collection":
+                result_path = self.repo.run_dir(run_id) / "ozon_collection_result.json"
+                if result_path.exists() and not run.get("replacement_pending_seed_ids"):
+                    return Result.failure(
+                        "browser_task.restart_completed",
+                        "The formal Ozon collection result already exists.",
+                        data={"run_id": run_id, "status": run["status"], "task_type": task_type},
+                    )
+                checkpoint = self.ozon_collection_checkpoint(run_id)
+                if not checkpoint.ok:
+                    return Result.failure(
+                        "browser_task.restart_checkpoint_invalid",
+                        "The saved Ozon collection checkpoint is invalid and was not overwritten.",
+                        errors=checkpoint.errors,
+                        data=checkpoint.data,
+                    )
+                total_count = len(checkpoint.data["contract_seed_ids"])
+                completed_count = len(checkpoint.data["ozon_candidates"])
+            elif task_type == "supplier_selection":
+                review = self.repo.load_supplier_review(run_id)
+                items = review.get("items")
+                if not isinstance(items, list) or not items:
+                    raise ValueError("Supplier review must include collection items")
+                review_seed_ids = {
+                    str(item.get("seed_id") or "").strip()
+                    for item in items
+                    if isinstance(item, dict) and str(item.get("seed_id") or "").strip()
+                }
+                total_count = len(review_seed_ids)
+                draft_path = self.repo.run_dir(run_id) / "supplier_selection_draft.json"
+                captured_seed_ids: set[str] = set()
+                if draft_path.exists():
+                    draft = self.repo.load_supplier_selection_draft(run_id)
+                    if str(draft.get("run_id") or "") != run_id:
+                        raise ValueError("Supplier selection checkpoint belongs to another batch")
+                    products = draft.get("supplier_products")
+                    if not isinstance(products, list):
+                        raise TypeError("Supplier selection checkpoint products must be a list")
+                    captured_seed_ids = {
+                        str(product.get("seed_id") or "").strip()
+                        for product in products
+                        if isinstance(product, dict) and str(product.get("seed_id") or "").strip()
+                    }
+                completed_count = len(review_seed_ids.intersection(captured_seed_ids))
+                if completed_count >= total_count:
+                    return Result.failure(
+                        "browser_task.restart_completed",
+                        "All managed 1688 supplier-selection channels are already complete.",
+                        data={"run_id": run_id, "status": run["status"], "task_type": task_type},
+                    )
+            else:
+                result_path = self.repo.run_dir(run_id) / "supplier_collection_result.json"
+                if result_path.exists():
+                    return Result.failure(
+                        "browser_task.restart_completed",
+                        "The formal 1688 supplier collection result already exists.",
+                        data={"run_id": run_id, "status": run["status"], "task_type": task_type},
+                    )
+                contract = self.repo.load_supplier_collection_contract(run_id)
+                items = contract.get("items")
+                if not isinstance(items, list) or not items:
+                    raise ValueError("Supplier collection contract must include items")
+                total_count = len(items)
+        except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+            return Result.failure(
+                "browser_task.restart_checkpoint_invalid",
+                "The saved browser collection contract or checkpoint is invalid and was not overwritten.",
+                errors=[str(exc)],
+                data={"run_id": run_id, "status": run["status"], "task_type": task_type},
+            )
+
+        pending_count = max(total_count - completed_count, 0)
+        dispatch_token = utc_now_iso()
+        run["browser_task_cancelled"] = False
+        run.pop("browser_task_cancelled_at", None)
+        run.pop("browser_task_cancel_reason", None)
+        run["browser_task_resumed_at"] = dispatch_token
+        self.repo.save_run(run)
+        event = self.repo.append_run_event(
+            run_id,
+            "browser_task.user_restart_requested",
+            "The user requested a safe restart of the current browser collection task.",
+            {
+                "task_type": task_type,
+                "completed_count": completed_count,
+                "pending_count": pending_count,
+                "dispatch_token": dispatch_token,
+            },
+        )
+        return Result.success(
+            "browser_task.restart_requested",
+            "The current browser collection task was queued for redispatch.",
+            {
+                "run_id": run_id,
+                "status": run["status"],
+                "task_type": task_type,
+                "completed_count": completed_count,
+                "pending_count": pending_count,
+                "dispatch_token": dispatch_token,
+                "last_event": event.to_dict(),
+            },
+        )
+
     def ingest_ozon_collection_result(self, run_id: str, payload: dict[str, Any]) -> Result:
         run = self.repo.load_run(run_id)
         if WorkbenchState(run["status"]) != WorkbenchState.OZON_COLLECTING:

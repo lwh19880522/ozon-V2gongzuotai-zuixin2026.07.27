@@ -815,6 +815,206 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
 
         self.assertEqual("ozon_collection.progress_not_expected", result["code"])
 
+    def test_ozon_browser_task_exposes_verified_checkpoint_and_progress_url(self) -> None:
+        run_id, seeds = self.prepare_ozon_collecting_run(count=2)
+        candidate = self.ozon_candidate_for_seed(seeds[0], "ozon-progress-1")
+        self.post_json(
+            f"/api/batches/{run_id}/ozon-collection-progress",
+            {
+                "run_id": run_id,
+                "worker": "workbench_browser_bridge",
+                "source": "test_browser_checkpoint",
+                "ozon_candidate": candidate,
+            },
+        )
+
+        task = self.get_json(f"/api/batches/{run_id}/browser-task")
+
+        self.assertEqual(
+            f"/api/batches/{run_id}/ozon-collection-progress",
+            task["data"]["progress_url"],
+        )
+        self.assertEqual([candidate], task["data"]["resume_candidates"])
+
+    def test_restart_browser_task_preserves_ozon_checkpoint_and_refreshes_token(self) -> None:
+        run_id, seeds = self.prepare_ozon_collecting_run(count=2)
+        candidate = self.ozon_candidate_for_seed(seeds[0], "ozon-progress-1")
+        self.post_json(
+            f"/api/batches/{run_id}/ozon-collection-progress",
+            {
+                "run_id": run_id,
+                "worker": "workbench_browser_bridge",
+                "source": "test_browser_checkpoint",
+                "ozon_candidate": candidate,
+            },
+        )
+        contract_before = (self.repo.run_dir(run_id) / "ozon_collection_contract.json").read_bytes()
+        draft_before = (self.repo.run_dir(run_id) / "ozon_collection_draft.json").read_bytes()
+        token_before = self.get_json(f"/api/batches/{run_id}/browser-task")["data"]["dispatch_token"]
+        self.post_json(f"/api/batches/{run_id}/runner/stop", {})
+
+        restarted = self.post_json(
+            f"/api/batches/{run_id}/browser-task/restart",
+            {"task_type": "supplier_selection"},
+        )
+        task_after = self.get_json(f"/api/batches/{run_id}/browser-task")
+        run_after = self.repo.load_run(run_id)
+
+        self.assertEqual("browser_task.restart_requested", restarted["code"])
+        self.assertEqual("ozon_collection", restarted["data"]["task_type"])
+        self.assertEqual(1, restarted["data"]["completed_count"])
+        self.assertEqual(1, restarted["data"]["pending_count"])
+        self.assertEqual("waiting_for_extension", restarted["data"]["dispatch_state"])
+        self.assertNotEqual(token_before, task_after["data"]["dispatch_token"])
+        self.assertFalse(run_after["browser_task_cancelled"])
+        self.assertNotIn("browser_task_cancelled_at", run_after)
+        self.assertNotIn("browser_task_cancel_reason", run_after)
+        self.assertEqual(WorkbenchState.OZON_COLLECTING.value, run_after["status"])
+        self.assertEqual(contract_before, (self.repo.run_dir(run_id) / "ozon_collection_contract.json").read_bytes())
+        self.assertEqual(draft_before, (self.repo.run_dir(run_id) / "ozon_collection_draft.json").read_bytes())
+        self.assertEqual(
+            "browser_task.user_restart_requested",
+            self.repo.load_run_events(run_id)[-1].event_type,
+        )
+
+    def test_restart_browser_task_maps_supplier_review_and_keeps_only_pending_channels(self) -> None:
+        run_id, _seed = self.prepare_supplier_review_run()
+        review = self.repo.load_supplier_review(run_id)
+        base = dict(review["items"][0])
+        review["items"] = []
+        for index in range(3):
+            item = dict(base)
+            item.update(
+                {
+                    "seed_id": f"seed-supplier-{index}",
+                    "ozon_product_id": f"ozon-supplier-{index}",
+                    "ozon_title": f"Ozon supplier product {index}",
+                    "ozon_main_image": f"https://img.example/supplier-{index}.jpg",
+                    "supplier_url": None,
+                }
+            )
+            review["items"].append(item)
+        self.repo.save_supplier_review(run_id, review)
+        self.repo.save_supplier_selection_draft(
+            run_id,
+            {
+                "schema_version": 1,
+                "run_id": run_id,
+                "supplier_products": [
+                    {
+                        "seed_id": "seed-supplier-0",
+                        "supplier_url": "https://detail.1688.com/offer/100.html",
+                    }
+                ],
+            },
+        )
+        token_before = self.get_json(f"/api/batches/{run_id}/browser-task")["data"]["dispatch_token"]
+
+        restarted = self.post_json(f"/api/batches/{run_id}/browser-task/restart", {})
+        task = self.get_json(f"/api/batches/{run_id}/browser-task")
+
+        self.assertEqual("supplier_selection", restarted["data"]["task_type"])
+        self.assertEqual(1, restarted["data"]["completed_count"])
+        self.assertEqual(2, restarted["data"]["pending_count"])
+        self.assertEqual("dispatched", restarted["data"]["dispatch_state"])
+        self.assertNotEqual(token_before, task["data"]["dispatch_token"])
+        self.assertEqual(
+            ["seed-supplier-1", "seed-supplier-2"],
+            [item["seed_id"] for item in task["data"]["contract"]["items"]],
+        )
+
+    def test_restart_browser_task_maps_supplier_collecting_without_changing_contract(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        service = WorkbenchService(self.repo)
+        saved = service.save_supplier_review_links(
+            run_id,
+            [
+                {
+                    "seed_id": seed.seed_id,
+                    "supplier_url": "https://detail.1688.com/offer/123456789012.html",
+                }
+            ],
+        )
+        self.assertTrue(saved.ok)
+        started = service.start_supplier_collection(run_id)
+        self.assertTrue(started.ok)
+        contract_path = self.repo.run_dir(run_id) / "supplier_collection_contract.json"
+        contract_before = contract_path.read_bytes()
+        token_before = self.get_json(f"/api/batches/{run_id}/browser-task")["data"]["dispatch_token"]
+
+        restarted = self.post_json(f"/api/batches/{run_id}/browser-task/restart", {})
+        task = self.get_json(f"/api/batches/{run_id}/browser-task")
+
+        self.assertEqual("supplier_collection", restarted["data"]["task_type"])
+        self.assertEqual(0, restarted["data"]["completed_count"])
+        self.assertEqual(1, restarted["data"]["pending_count"])
+        self.assertEqual(WorkbenchState.SUPPLIER_COLLECTING.value, self.repo.load_run(run_id)["status"])
+        self.assertEqual(contract_before, contract_path.read_bytes())
+        self.assertNotEqual(token_before, task["data"]["dispatch_token"])
+
+    def test_restart_browser_task_rejects_completed_and_unrelated_stages(self) -> None:
+        supplier_run_id, _seed = self.prepare_supplier_review_run()
+        supplier_run = self.repo.load_run(supplier_run_id)
+        supplier_run["status"] = WorkbenchState.SUPPLIER_COLLECTED.value
+        self.repo.save_run(supplier_run)
+
+        unrelated = self.repo.create_workbench_batch_record(target_count=1)
+        unrelated_run_id = unrelated["run_id"]
+
+        ozon_run_id, seeds = self.prepare_ozon_collecting_run(count=1)
+        self.repo.save_ozon_collection_result(
+            ozon_run_id,
+            {"ozon_candidates": [self.ozon_candidate_for_seed(seeds[0], "ozon-final")]},
+        )
+
+        completed_supplier = self.post_json(
+            f"/api/batches/{supplier_run_id}/browser-task/restart",
+            {},
+            ok=False,
+        )
+        unrelated_result = self.post_json(
+            f"/api/batches/{unrelated_run_id}/browser-task/restart",
+            {},
+            ok=False,
+        )
+        completed_ozon = self.post_json(
+            f"/api/batches/{ozon_run_id}/browser-task/restart",
+            {},
+            ok=False,
+        )
+
+        self.assertEqual("browser_task.restart_not_allowed", completed_supplier["code"])
+        self.assertEqual("browser_task.restart_not_allowed", unrelated_result["code"])
+        self.assertEqual("browser_task.restart_completed", completed_ozon["code"])
+        self.assertNotIn("browser_task_resumed_at", self.repo.load_run(ozon_run_id))
+
+    def test_restart_browser_task_rejects_corrupt_ozon_checkpoint_without_new_token(self) -> None:
+        run_id, _seeds = self.prepare_ozon_collecting_run(count=1)
+        draft_path = self.repo.run_dir(run_id) / "ozon_collection_draft.json"
+        draft_path.write_text("{not-json", encoding="utf-8")
+        original_bytes = draft_path.read_bytes()
+
+        result = self.post_json(
+            f"/api/batches/{run_id}/browser-task/restart",
+            {},
+            ok=False,
+        )
+
+        self.assertEqual("browser_task.restart_checkpoint_invalid", result["code"])
+        self.assertNotIn("browser_task_resumed_at", self.repo.load_run(run_id))
+        self.assertEqual(original_bytes, draft_path.read_bytes())
+
+    def test_restart_browser_task_waits_for_offline_extension(self) -> None:
+        run_id, _seeds = self.prepare_ozon_collecting_run(count=1)
+
+        with patch("ozon_v2.workbench.local_server.BRIDGE_HEARTBEAT_TIMEOUT_SECONDS", -1):
+            result = self.post_json(f"/api/batches/{run_id}/browser-task/restart", {})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("waiting_for_extension", result["data"]["dispatch_state"])
+        self.assertFalse(result["data"]["browser_bridge"]["online"])
+        self.assertIn("browser_task_resumed_at", self.repo.load_run(run_id))
+
     def test_browser_task_endpoint_returns_supplier_collection_contract(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
         saved = WorkbenchService(self.repo).save_supplier_review_links(
