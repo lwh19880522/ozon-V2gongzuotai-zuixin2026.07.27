@@ -708,7 +708,7 @@ git commit -m "feat: expose structured Ozon collection progress"
 - Modify: `src/ozon_v2/workbench/local_server.py`
 - Modify: `tests/test_workbench_local_server.py`
 
-- [ ] **Step 1: Add RED home-page structure and presentation contracts**
+- [x] **Step 1: Add RED home-page structure and presentation contracts**
 
 Extend `test_home_page_loads()`:
 
@@ -733,7 +733,7 @@ self.assertIn("textContent", body)
 
 Add a test proving `GET /api/batches/{run_id}/events` still returns the original English machine event unchanged after the UI mapping is added.
 
-- [ ] **Step 2: Run the home-page test and verify RED**
+- [x] **Step 2: Run the home-page test and verify RED**
 
 Run:
 
@@ -743,7 +743,7 @@ python -m pytest tests/test_workbench_local_server.py::WorkbenchLocalServerTests
 
 Expected: missing progress IDs and `eventPresentation` assertions fail.
 
-- [ ] **Step 3: Add the progress card above Run Events**
+- [x] **Step 3: Add the progress card above Run Events**
 
 Add compact CSS and this semantic structure before the event section:
 
@@ -793,7 +793,7 @@ function renderOzonCollectionProgress(progress) {
 
 Call it from `render()` after existing seed/query progress.
 
-- [ ] **Step 4: Present known events in Chinese without mutating the event API**
+- [x] **Step 4: Present known events in Chinese without mutating the event API**
 
 Add a stable mapping and a safe fallback:
 
@@ -854,7 +854,7 @@ events.forEach((event) => {
 });
 ```
 
-- [ ] **Step 5: Verify generated JavaScript and focused workbench tests**
+- [x] **Step 5: Verify generated JavaScript and focused workbench tests**
 
 Run:
 
@@ -871,7 +871,7 @@ print('\n'.join(re.findall(r'<script>(.*?)</script>', html, flags=re.S)))
 
 Expected: all workbench tests pass and Node syntax check exits 0.
 
-- [ ] **Step 6: Commit Task 4**
+- [x] **Step 6: Commit Task 4**
 
 ```powershell
 git add src/ozon_v2/workbench/local_server.py tests/test_workbench_local_server.py

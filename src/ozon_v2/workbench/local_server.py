@@ -359,6 +359,50 @@ def build_home_html() -> str:
     .progress-row.done .progress-state { color: var(--green); background: #e7f6f2; }
     .progress-row.current .progress-number,
     .progress-row.current .progress-state { color: var(--amber); background: #fff4df; }
+    .collection-progress-card .section-head { border-bottom: 0; padding-bottom: 8px; }
+    .collection-progress-body { display: grid; gap: 12px; padding: 0 14px 14px; }
+    .collection-progress-track {
+      position: relative;
+      height: 12px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: #e9edf3;
+      box-shadow: inset 0 1px 2px rgba(15, 23, 42, 0.09);
+    }
+    .collection-progress-track span {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      width: 0;
+      transition: width 180ms ease, left 180ms ease;
+    }
+    .collection-progress-success { left: 0; background: #16a085; }
+    .collection-progress-failure { background: #d9485f; }
+    .collection-progress-metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .collection-progress-metrics span {
+      min-height: 48px;
+      display: grid;
+      align-content: center;
+      gap: 2px;
+      padding: 7px 10px;
+      border: 1px solid #edf0f5;
+      border-radius: 6px;
+      color: var(--muted);
+      background: #fbfcfe;
+      font-size: 11px;
+    }
+    .collection-progress-metrics strong { color: var(--text); font-size: 17px; }
+    .event-type small, .event-message small {
+      display: block;
+      margin-top: 3px;
+      color: #8b96a9;
+      font: 11px/1.35 Consolas, "Courier New", monospace;
+      overflow-wrap: anywhere;
+    }
     .hint {
       margin: 0;
       color: var(--muted);
@@ -500,6 +544,7 @@ def build_home_html() -> str:
       .event-log { max-height: 44vh; }
       .progress-row { grid-template-columns: 28px minmax(0, 1fr); }
       .progress-state { grid-column: 2; justify-self: start; }
+      .collection-progress-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
     @media (max-width: 620px) {
       .app-shell { display: block; }
@@ -635,6 +680,27 @@ def build_home_html() -> str:
           <span id="actionCount" class="pill green">0</span>
         </div>
         <div id="actions" class="actions"></div>
+      </section>
+      <section id="ozonCollectionProgress" class="collection-progress-card" aria-label="Ozon 采集进度">
+        <div class="section-head">
+          <div>
+            <h2>Ozon 采集进度</h2>
+            <p id="ozonProcessed" class="hint">等待采集数据</p>
+          </div>
+        </div>
+        <div class="collection-progress-body">
+          <div id="ozonProgressBar" class="collection-progress-track" role="progressbar"
+               aria-valuemin="0" aria-valuemax="0" aria-valuenow="0">
+            <span id="ozonProgressSuccess" class="collection-progress-success"></span>
+            <span id="ozonProgressFailure" class="collection-progress-failure"></span>
+          </div>
+          <div class="collection-progress-metrics">
+            <span>成功 (Success)<strong id="ozonSucceeded">0</strong></span>
+            <span>最终失败 (Final Failure)<strong id="ozonFailed">0</strong></span>
+            <span>已替换 (Replaced)<strong id="ozonReplaced">0</strong></span>
+            <span>待处理 (Pending)<strong id="ozonPending">0</strong></span>
+          </div>
+        </div>
       </section>
       <section>
         <div class="section-head">
@@ -814,6 +880,65 @@ def build_home_html() -> str:
       $("serverState").className = ok ? "pill green" : "pill red";
     }
 
+    function renderOzonCollectionProgress(progress) {
+      const hasProgress = !!progress;
+      const value = progress || {};
+      const total = Math.max(0, Number(value.total_count) || 0);
+      const processed = Math.min(total, Math.max(0, Number(value.processed_count) || 0));
+      const success = Math.min(total, Math.max(0, Number(value.success_count) || 0));
+      const failure = Math.min(total - success, Math.max(0, Number(value.failure_count) || 0));
+      const successPercent = total ? success / total * 100 : 0;
+      const failurePercent = total ? failure / total * 100 : 0;
+      $("ozonProcessed").textContent = hasProgress
+        ? `已处理 ${processed} / ${total}`
+        : "等待采集数据";
+      $("ozonSucceeded").textContent = String(success);
+      $("ozonFailed").textContent = String(failure);
+      $("ozonReplaced").textContent = String(Math.max(0, Number(value.replacement_count) || 0));
+      $("ozonPending").textContent = String(Math.max(total - processed, 0));
+      const bar = $("ozonProgressBar");
+      bar.setAttribute("aria-valuemax", String(total));
+      bar.setAttribute("aria-valuenow", String(processed));
+      $("ozonProgressSuccess").style.width = `${successPercent}%`;
+      $("ozonProgressFailure").style.left = `${successPercent}%`;
+      $("ozonProgressFailure").style.width = `${failurePercent}%`;
+    }
+
+    const EVENT_PRESENTATIONS = {
+      "workbench.batch_created": ["批次已创建", "批次已创建并保持发布锁定。"],
+      "ozon_collection.ingested": ["采集已入库", "Ozon 采集结果已接收，采集门禁已完成。"],
+      "runner.started": ["后台执行器已启动", "后台执行器已从工作台启动。"],
+      "runner.stopped": ["后台执行器已停止", "当前后台任务已停止。"],
+      "runner.blocked": ["后台执行器等待处理", "后台执行器已到达需要处理的门禁。"],
+      "autopilot.started": ["自动运行已启动", "系统将自动运行到下一个阻塞门禁。"],
+      "autopilot.blocked": ["自动运行等待处理", "自动运行已停在需要用户处理的门禁。"],
+      "supplier_selection.product_captured": ["供应商商品已采集", "一个用户确认的 1688 商品已回传工作台。"],
+      "browser_task.cancelled": ["浏览器任务已取消", "当前浏览器任务已由用户停止。"],
+      "browser_candidate.rejected": ["候选商品未通过", "当前候选不符合采集要求，正在检查其他结果。"],
+      "browser_candidate.exhausted": ["当前种子已耗尽", "当前种子没有找到合格候选，正在尝试补位。"],
+      "browser_candidate.replaced": ["种子已替换", "失败种子已完成补位，批次继续运行。"],
+      "browser_candidate.failed": ["种子最终失败", "失败种子无法补位，需要人工处理。"],
+    };
+
+    function eventPresentation(event) {
+      const known = EVENT_PRESENTATIONS[event.event_type];
+      return known
+        ? { title: known[0], message: known[1], raw: event.message || "" }
+        : {
+            title: "系统事件（查看原始信息）",
+            message: "该事件尚无中文模板，原始信息保留用于诊断。",
+            raw: event.message || "",
+          };
+    }
+
+    function textCell(row, value, className = "") {
+      const cell = document.createElement("td");
+      if (className) cell.className = className;
+      cell.textContent = value || "";
+      row.appendChild(cell);
+      return cell;
+    }
+
     function render(result, events = []) {
       const data = result.data || {};
       const run = data.run || {};
@@ -839,6 +964,7 @@ def build_home_html() -> str:
       const progress = data.progress || {};
       $("sampledCount").textContent = String(progress.sampled_seed_count ?? 0);
       $("queryReadyCount").textContent = `${progress.query_ready_count ?? 0} / ${progress.sampled_seed_count ?? 0}`;
+      renderOzonCollectionProgress(progress.ozon_collection_progress);
       $("raw").textContent = JSON.stringify(result, null, 2);
       const actions = data.allowed_actions || [];
       $("actionCount").textContent = String(actions.length);
@@ -849,10 +975,21 @@ def build_home_html() -> str:
         button.onclick = () => dispatch(action);
         $("actions").appendChild(button);
       });
-      $("events").innerHTML = "";
+      $("events").replaceChildren();
       events.forEach((event) => {
         const row = document.createElement("tr");
-        row.innerHTML = `<td><code>${event.created_at || ""}</code></td><td><code>${event.event_type || ""}</code></td><td>${event.message || ""}</td>`;
+        textCell(row, event.created_at || "", "event-time");
+        const presentation = eventPresentation(event);
+        const typeCell = textCell(row, presentation.title, "event-type");
+        const rawType = document.createElement("small");
+        rawType.textContent = event.event_type || "";
+        typeCell.appendChild(rawType);
+        const messageCell = textCell(row, presentation.message, "event-message");
+        if (presentation.raw) {
+          const raw = document.createElement("small");
+          raw.textContent = presentation.raw;
+          messageCell.appendChild(raw);
+        }
         $("events").appendChild(row);
       });
       const eventLog = document.querySelector(".event-log");

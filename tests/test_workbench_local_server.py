@@ -178,6 +178,22 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn('id="bridgeVersionWarning"', body)
         self.assertIn('id="startBatch" class="primary" disabled', body)
         self.assertIn('id="stageNavigation"', body)
+        self.assertIn('id="ozonCollectionProgress"', body)
+        self.assertIn('id="ozonProgressBar"', body)
+        self.assertIn('role="progressbar"', body)
+        self.assertIn('aria-valuemin="0"', body)
+        self.assertIn('id="ozonProcessed"', body)
+        self.assertIn('id="ozonSucceeded"', body)
+        self.assertIn('id="ozonFailed"', body)
+        self.assertIn('id="ozonReplaced"', body)
+        self.assertIn('id="ozonPending"', body)
+        self.assertIn("等待采集数据", body)
+        self.assertIn("function eventPresentation(event)", body)
+        self.assertIn("采集已入库", body)
+        self.assertIn("后台执行器已启动", body)
+        self.assertIn("系统事件（查看原始信息）", body)
+        self.assertIn("event.event_type", body)
+        self.assertIn("textContent", body)
         self.assertIn('id="batchOverviewNav"', body)
         self.assertIn('id="supplierReviewNav"', body)
         self.assertIn('new URLSearchParams(window.location.search).get("run_id")', body)
@@ -284,6 +300,10 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn(loaded["data"]["status"], {WorkbenchState.CREATED.value, WorkbenchState.NEEDS_CREDENTIALS.value})
         self.assertIn("runner", loaded["data"])
         self.assertEqual("workbench.batch_created", events["data"]["events"][0]["event_type"])
+        self.assertEqual(
+            "Workbench batch created with publish locked.",
+            events["data"]["events"][0]["message"],
+        )
 
     def test_supplier_review_can_reject_missing_supplier_and_auto_refill(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
