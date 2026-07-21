@@ -1673,6 +1673,18 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual({"single_sku": "visible"}, row["selected_options"])
         self.assertEqual("https://www.ozon.ru/product/test-123/", row["ozon_url"])
 
+    def test_supplier_review_poll_preserves_open_sku_details_and_current_choice(self) -> None:
+        run_id, _seed = self.prepare_supplier_review_run()
+
+        page = self.get_text(f"/batches/{run_id}/supplier-review")
+
+        self.assertIn('const previousItemSeedId = optionsRoot.dataset.seedId || "";', page)
+        self.assertIn('selectedSupplierSkuId: previousSelection ? previousSelection.value : ""', page)
+        self.assertIn('const preservedInteraction = previousItemSeedId === String(item.seed_id || "")', page)
+        self.assertIn('selectedSupplierSkuId: preservedInteraction.selectedSupplierSkuId || ""', page)
+        self.assertIn('context.selectedSupplierSkuId === option.supplier_sku_id', page)
+        self.assertIn('otherDetails.open = preservedInteraction.otherOptionsOpen === true;', page)
+
     def test_supplier_review_evidence_uses_single_item_pagers(self) -> None:
         run_id, _seed = self.prepare_supplier_review_run()
 
@@ -2074,6 +2086,32 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual(0, queue_summary["pending"])
         self.assertFalse(workspace["data"]["image_gate"]["ready"])
         self.assertEqual("supplier_sku_selection_required", workspace["data"]["image_gate"]["code"])
+
+    def test_image_workspace_final_gallery_opens_original_slot_files(self) -> None:
+        run_id, job_id, queue = self.prepare_reviewable_image_job()
+        slot = queue.list_slots(job_id)[0]
+        original_path = self.context.runtime_root / "image_generation" / "test_outputs" / f"{slot['slot_id']}.png"
+        original_path.parent.mkdir(parents=True, exist_ok=True)
+        original_path.write_bytes(f"accepted-{slot['slot_id']}".encode("utf-8"))
+        with queue._connect() as connection:
+            connection.execute(
+                "UPDATE image_slots SET accepted_path = ? WHERE job_id = ? AND slot_id = ?",
+                (str(original_path.resolve()), job_id, slot["slot_id"]),
+            )
+
+        page = self.get_text(f"/batches/{run_id}/images")
+        with urlopen(
+            f"{self.base_url}/api/batches/{run_id}/image-job/{job_id}/slot/{slot['slot_id']}/file",
+            timeout=5,
+        ) as response:
+            original_bytes = response.read()
+
+        self.assertIn("最终成图总览 (Final Gallery)", page)
+        self.assertIn("点击图片查看高清原图", page)
+        self.assertIn("const fullImageUrl = generatedImageUrl(job, slot);", page)
+        self.assertIn('imageLink.href = fullImageUrl; imageLink.target = "_blank";', page)
+        self.assertIn('fullResolutionLink.textContent = "查看高清原图";', page)
+        self.assertEqual(f"accepted-{slot['slot_id']}".encode("utf-8"), original_bytes)
 
     def test_image_repair_api_requeues_only_selected_slots_and_records_event(self) -> None:
         run_id, job_id, queue = self.prepare_reviewable_image_job()

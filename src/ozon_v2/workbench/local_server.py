@@ -1734,7 +1734,9 @@ def build_supplier_review_html(run_id: str) -> str:
       if (context.analysis.recommendedSkuId === option.supplier_sku_id) label.classList.add("recommended");
       const radio = document.createElement("input"); radio.type = "radio"; radio.name = "supplierSku"; radio.value = option.supplier_sku_id || "";
       radio.checked = (!!context.lockedSku && context.lockedSku.supplier_sku_id === option.supplier_sku_id)
-        || (!context.receipt && (context.singlePageSku || context.analysis.recommendedSkuId === option.supplier_sku_id));
+        || (!context.receipt && (context.selectedSupplierSkuId
+          ? context.selectedSupplierSkuId === option.supplier_sku_id
+          : context.singlePageSku || context.analysis.recommendedSkuId === option.supplier_sku_id));
       radio.disabled = !!context.receipt;
       radio.addEventListener("change", updateSkuLockButton);
       const main = document.createElement("div"); main.className = "sku-option-main";
@@ -1831,9 +1833,16 @@ def build_supplier_review_html(run_id: str) -> str:
     function renderSkuDecision() {{
       const optionsRoot = $("skuOptions");
       const subjectRoot = $("subjectMasterImages");
+      const previousItemSeedId = optionsRoot.dataset.seedId || "";
+      const previousSelection = document.querySelector('input[name="supplierSku"]:checked');
+      const previousInteraction = {{
+        selectedSupplierSkuId: previousSelection ? previousSelection.value : "",
+        otherOptionsOpen: document.querySelector("details.sku-other-options")?.open === true,
+      }};
       optionsRoot.replaceChildren();
       subjectRoot.replaceChildren();
       if (!state.items.length) {{
+        optionsRoot.dataset.seedId = "";
         $("skuDecisionContext").textContent = "等待 1688 采集结果";
         $("skuDecisionMessage").textContent = "尚无可审核商品。";
         $("lockSupplierSku").disabled = true;
@@ -1841,6 +1850,10 @@ def build_supplier_review_html(run_id: str) -> str:
         return;
       }}
       const item = state.items[state.evidenceIndex];
+      const preservedInteraction = previousItemSeedId === String(item.seed_id || "")
+        ? previousInteraction
+        : {{ selectedSupplierSkuId:"", otherOptionsOpen:false }};
+      optionsRoot.dataset.seedId = String(item.seed_id || "");
       const options = item.supplier_sku_options || [];
       const skuGroups = item.supplier_sku_groups || [];
       const receipt = item.supplier_sku_selection || null;
@@ -1882,7 +1895,7 @@ def build_supplier_review_html(run_id: str) -> str:
       optionsRoot.append(modeNote);
 
       const candidatesRoot = document.createElement("div"); candidatesRoot.className = "sku-candidate-list";
-      const candidateContext = {{ analysis, receipt, lockedSku, singlePageSku }};
+      const candidateContext = {{ analysis, receipt, lockedSku, singlePageSku, selectedSupplierSkuId: preservedInteraction.selectedSupplierSkuId || "" }};
       const lockedCandidate = lockedSku
         ? analysis.candidates.find((candidate) => candidate.option.supplier_sku_id === lockedSku.supplier_sku_id)
         : null;
@@ -1899,6 +1912,7 @@ def build_supplier_review_html(run_id: str) -> str:
         : analysis.candidates.filter((candidate) => candidate !== lockedCandidate);
       if (!singlePageSku && hiddenCandidates.length) {{
         const otherDetails = document.createElement("details"); otherDetails.className = "sku-other-options";
+        otherDetails.open = preservedInteraction.otherOptionsOpen === true;
         const summary = document.createElement("summary"); summary.textContent = matchingCandidates.length
           ? `查看其他规格（${{hiddenCandidates.length}}）`
           : `查看其他规格（全部 ${{hiddenCandidates.length}} 项）`;
@@ -2375,6 +2389,7 @@ def build_image_workspace_html(run_id: str) -> str:
     .source-panel {{ min-width:0; min-height:0; display:grid; grid-template-rows:auto minmax(0,1fr); padding:11px; overflow:hidden; background:#fff; }}
     .source-title {{ display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:9px; font-size:11px; font-weight:700; }} .source-title span {{ color:var(--muted); font-weight:400; }}
     .gallery {{ min-height:0; display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); grid-auto-rows:minmax(150px,190px); align-content:start; gap:8px; padding-right:4px; overflow-y:auto; overscroll-behavior:contain; scrollbar-gutter:stable; }}
+    .source-image-link {{ min-width:0; display:block; }}
     .gallery img {{ width:100%; height:100%; min-height:150px; max-height:190px; object-fit:contain; border:1px solid var(--line); border-radius:4px; background:#fff; }}
     .generated-review-panel {{ grid-template-rows:auto minmax(0,1fr); }}
     .generated-review-grid {{ min-height:0; display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); align-content:start; gap:8px; padding-right:4px; overflow-y:auto; overscroll-behavior:contain; scrollbar-gutter:stable; }}
@@ -2386,7 +2401,12 @@ def build_image_workspace_html(run_id: str) -> str:
     .generated-review-head strong {{ color:var(--text); }}
     .repair-badge {{ padding:2px 5px; border-radius:3px; color:var(--green); background:var(--green-soft); font:9px "Segoe UI","Microsoft YaHei",sans-serif; }}
     .repairing .repair-badge {{ color:var(--amber); background:var(--amber-soft); }}
+    .generated-image-link {{ position:relative; display:block; border-radius:4px; overflow:hidden; }}
+    .generated-image-link::after {{ content:"点击查看高清原图"; position:absolute; right:5px; bottom:5px; padding:3px 6px; border-radius:3px; color:#fff; background:rgba(24,34,53,.82); font-size:9px; opacity:.9; }}
+    .generated-image-link:hover::after {{ background:var(--blue); }}
     .generated-review-card img {{ width:100%; height:108px; display:block; object-fit:contain; border:1px solid var(--line); border-radius:4px; background:#fff; }}
+    .generated-original-link {{ display:block; margin-top:5px; color:var(--blue); text-align:center; font-size:10px; font-weight:650; text-decoration:none; }}
+    .generated-original-link:hover {{ text-decoration:underline; }}
     .repair-check {{ display:flex; align-items:flex-start; gap:6px; margin-top:7px; color:var(--text); font-size:10px; cursor:pointer; }}
     .repair-check input {{ margin:2px 0 0; accent-color:var(--red); }}
     .repair-fields {{ display:grid; gap:5px; margin-top:7px; }}
@@ -2518,7 +2538,11 @@ def build_image_workspace_html(run_id: str) -> str:
     function renderImages(container, images, emptyText) {{
       if (!images.length) {{ const empty = document.createElement("div"); empty.className = "empty"; empty.textContent = emptyText; container.append(empty); return; }}
       const gallery = document.createElement("div"); gallery.className = "gallery";
-      images.forEach((src) => {{ const image = document.createElement("img"); image.src = src; image.alt = "Product source image"; image.loading = "lazy"; image.referrerPolicy = "no-referrer"; gallery.append(image); }});
+      images.forEach((src) => {{
+        const imageLink = document.createElement("a"); imageLink.className = "source-image-link"; imageLink.href = src; imageLink.target = "_blank"; imageLink.rel = "noopener"; imageLink.title = "查看高清原图";
+        const image = document.createElement("img"); image.src = src; image.alt = "Product source image"; image.loading = "lazy"; image.referrerPolicy = "no-referrer";
+        imageLink.append(image); gallery.append(imageLink);
+      }});
       container.append(gallery);
     }}
     function sourcePanel(title, images, emptyText) {{
@@ -2582,7 +2606,7 @@ def build_image_workspace_html(run_id: str) -> str:
       const panel = document.createElement("div"); panel.className = "source-panel generated-review-panel";
       const job = item.image_job || {{}};
       const slots = (job.slots || []).filter((slot) => slot.accepted_path);
-      const heading = document.createElement("div"); heading.className = "source-title"; heading.innerHTML = `<strong>生成结果 (Generated)</strong><span>${{slots.length}} 张</span>`;
+      const heading = document.createElement("div"); heading.className = "source-title"; heading.innerHTML = `<strong>最终成图总览 (Final Gallery)</strong><span>${{slots.length}} 张 · 点击图片查看高清原图</span>`;
       panel.append(heading);
       if (!slots.length) {{ const empty = document.createElement("div"); empty.className = "empty generation-empty"; empty.textContent = "等待 Codex 生图子智能体回传真实结果"; panel.append(empty); return panel; }}
       const grid = document.createElement("div"); grid.className = "generated-review-grid";
@@ -2593,7 +2617,11 @@ def build_image_workspace_html(run_id: str) -> str:
         const slotName = document.createElement("strong"); slotName.textContent = slot.slot_id;
         const badge = document.createElement("span"); badge.className = "repair-badge"; badge.textContent = slot.status === "repair_pending" ? "等待返修" : slot.status === "accepted" ? "待审核" : slot.status;
         cardHead.append(slotName, badge);
-        const image = document.createElement("img"); image.src = generatedImageUrl(job, slot); image.alt = `${{slot.slot_id}} generated product image`; image.loading = "lazy";
+        const fullImageUrl = generatedImageUrl(job, slot);
+        const imageLink = document.createElement("a"); imageLink.className = "generated-image-link"; imageLink.href = fullImageUrl; imageLink.target = "_blank"; imageLink.rel = "noopener"; imageLink.title = `查看 ${{slot.slot_id}} 高清原图`;
+        const image = document.createElement("img"); image.src = fullImageUrl; image.alt = `${{slot.slot_id}} generated product image`; image.loading = "lazy";
+        imageLink.append(image);
+        const fullResolutionLink = document.createElement("a"); fullResolutionLink.className = "generated-original-link"; fullResolutionLink.href = fullImageUrl; fullResolutionLink.target = "_blank"; fullResolutionLink.rel = "noopener"; fullResolutionLink.textContent = "查看高清原图";
         const checkLabel = document.createElement("label"); checkLabel.className = "repair-check";
         const checkbox = document.createElement("input"); checkbox.type = "checkbox"; checkbox.disabled = job.status !== "manual_review_required" || slot.status !== "accepted" || Number(slot.repair_count || 0) >= 2;
         const checkText = document.createElement("span"); checkText.textContent = Number(slot.repair_count || 0) >= 2 ? "已达到返修上限" : "不合格，申请返修";
@@ -2607,7 +2635,7 @@ def build_image_workspace_html(run_id: str) -> str:
         fields.append(select, textarea, fieldError);
         checkbox.addEventListener("change", () => {{ card.classList.toggle("selected", checkbox.checked); fields.hidden = !checkbox.checked; if (!checkbox.checked) {{ select.value = ""; textarea.value = ""; card.classList.remove("repair-incomplete"); }} updateRepairSubmitState(); }});
         select.addEventListener("change", updateRepairSubmitState); textarea.addEventListener("input", updateRepairSubmitState);
-        card.append(cardHead, image, checkLabel, fields);
+        card.append(cardHead, imageLink, fullResolutionLink, checkLabel, fields);
         if (slot.status === "repair_pending") {{ const feedback = document.createElement("div"); feedback.className = "repair-feedback-summary"; feedback.textContent = `${{slot.review_issue_code || "返修"}}${{slot.review_note ? ` · ${{slot.review_note}}` : ""}}`; card.append(feedback); }}
         grid.append(card);
       }});
