@@ -16,6 +16,8 @@ from PIL import Image, ImageDraw, ImageFont
 
 CURRENT_VISUAL_CONTRACT_VERSION = "ozon-visual-v1"
 MIN_VISUAL_DIMENSION = 320
+MOBILE_PREVIEW_DIMENSION = 360
+MIN_MOBILE_COPY_PX = 13
 SCENE_FIELDS = ("environment", "lighting", "camera", "shot_scale", "buyer_question")
 SCENE_SLOTS = (
     "main_01",
@@ -347,8 +349,15 @@ def render_visual(
     if min(width, height) < MIN_VISUAL_DIMENSION:
         raise ValueError("visual source image is too small for safe typography")
     safe_margin = max(12, round(min(width, height) * 0.08))
-    headline_font = _font(max(18, round(height * 0.030)))
-    detail_font = _font(max(14, round(height * 0.019)))
+    short_edge = min(width, height)
+    headline_size = max(24, round(short_edge * 0.057))
+    detail_size = max(18, round(short_edge * 0.038))
+    headline_font = _font(headline_size)
+    detail_font = _font(detail_size)
+    mobile_scale = min(1.0, MOBILE_PREVIEW_DIMENSION / short_edge)
+    minimum_mobile_scale_px = round(detail_size * mobile_scale)
+    if spec.facts and minimum_mobile_scale_px < MIN_MOBILE_COPY_PX:
+        raise ValueError("visual copy is too small for mobile readability")
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
@@ -377,6 +386,12 @@ def render_visual(
         "russian_copy_passed": True,
         "safe_area_passed": True,
         "mobile_readability_passed": True,
+        "typography": {
+            "headline_px": headline_size,
+            "detail_px": detail_size,
+            "mobile_preview_dimension": MOBILE_PREVIEW_DIMENSION,
+            "minimum_mobile_scale_px": minimum_mobile_scale_px,
+        },
     }
 
 
@@ -476,6 +491,25 @@ def _draw_fact(
     return cursor + 12
 
 
+def _measure_fact_height(
+    draw: ImageDraw.ImageDraw,
+    fact: VisualFact,
+    max_width: int,
+    headline_font: ImageFont.FreeTypeFont,
+    detail_font: ImageFont.FreeTypeFont,
+) -> int:
+    height = sum(
+        _line_height(draw, line, headline_font) + 2
+        for line in _wrap(draw, fact.headline.upper(), headline_font, max_width)
+    )
+    height += 3
+    height += sum(
+        _line_height(draw, line, detail_font) + 2
+        for line in _wrap(draw, fact.detail, detail_font, max_width)
+    )
+    return height + 12
+
+
 def _draw_rail(
     draw: ImageDraw.ImageDraw,
     width: int,
@@ -485,17 +519,35 @@ def _draw_rail(
     headline_font: ImageFont.FreeTypeFont,
     detail_font: ImageFont.FreeTypeFont,
 ) -> None:
-    rail_width = round(width * 0.36)
-    left = 0 if spec.panel_side == "left" else width - rail_width
-    top, bottom = margin, height - margin
+    short_edge = min(width, height)
+    rail_width = min(round(width * 0.46), width - margin * 2)
+    panel_padding = max(20, round(short_edge * 0.045))
+    fact_gap = max(10, round(short_edge * 0.018))
+    content_width = rail_width - panel_padding * 2
+    content_height = sum(
+        _measure_fact_height(draw, fact, content_width, headline_font, detail_font)
+        for fact in spec.facts
+    ) + fact_gap * max(0, len(spec.facts) - 1)
+    rail_height = content_height + panel_padding * 2
+    max_rail_height = min(
+        height - margin * 2,
+        round(height * (0.62 if len(spec.facts) > 1 else 0.48)),
+    )
+    if rail_height > max_rail_height:
+        raise ValueError("visual copy does not fit its safe area")
+    left = margin if spec.panel_side == "left" else width - margin - rail_width
+    top = round((height - rail_height) / 2)
+    bottom = top + rail_height
     radius = max(12, round(min(width, height) * 0.025))
     draw.rounded_rectangle((left, top, left + rail_width, bottom), radius=radius, fill=(20, 31, 43, 190))
-    y = top + margin
-    for fact in spec.facts:
+    y = top + panel_padding
+    for index, fact in enumerate(spec.facts):
         y = _draw_fact(
-            draw, fact, max(margin, left + margin), y, rail_width - margin * 2,
-            headline_font, detail_font, spec.accent_rgb, bottom - margin,
+            draw, fact, left + panel_padding, y, content_width,
+            headline_font, detail_font, spec.accent_rgb, bottom - panel_padding,
         )
+        if index + 1 < len(spec.facts):
+            y += fact_gap
 
 
 def _draw_caption(
@@ -507,13 +559,24 @@ def _draw_caption(
     headline_font: ImageFont.FreeTypeFont,
     detail_font: ImageFont.FreeTypeFont,
 ) -> None:
-    bar_height = round(height * 0.18)
+    short_edge = min(width, height)
+    panel_padding = max(20, round(short_edge * 0.04))
+    content_width = width - margin * 2 - panel_padding * 2
+    bar_height = _measure_fact_height(
+        draw,
+        spec.facts[0],
+        content_width,
+        headline_font,
+        detail_font,
+    ) + panel_padding * 2
+    if bar_height > min(height - margin * 2, round(height * 0.32)):
+        raise ValueError("visual copy does not fit its safe area")
     top = height - margin - bar_height
     radius = max(12, round(min(width, height) * 0.025))
     draw.rounded_rectangle((margin, top, width - margin, height - margin), radius=radius, fill=(16, 41, 69, 205))
     _draw_fact(
-        draw, spec.facts[0], margin * 2, top + margin // 2, width - margin * 4,
-        headline_font, detail_font, spec.accent_rgb, height - margin - margin // 2,
+        draw, spec.facts[0], margin + panel_padding, top + panel_padding, content_width,
+        headline_font, detail_font, spec.accent_rgb, height - margin - panel_padding,
     )
 
 
@@ -526,13 +589,20 @@ def _draw_callouts(
     headline_font: ImageFont.FreeTypeFont,
     detail_font: ImageFont.FreeTypeFont,
 ) -> None:
-    box_width = round(width * 0.42)
-    box_height = max(round(height * 0.16), 100)
-    marker_radius = 5
+    short_edge = min(width, height)
+    box_width = min(round(width * 0.46), width - margin * 2)
+    panel_padding = max(18, round(short_edge * 0.035))
+    content_width = box_width - panel_padding * 2
+    fact_heights = tuple(
+        _measure_fact_height(draw, fact, content_width, headline_font, detail_font)
+        for fact in spec.facts
+    )
+    box_height = max(fact_heights) + panel_padding * 2
+    marker_radius = max(5, round(short_edge * 0.006))
     radius = max(12, round(min(width, height) * 0.02))
     available_height = height - margin * 2
-    if len(spec.facts) * box_height > available_height:
-        raise ValueError("visual callouts do not fit their safe area")
+    if box_height > round(height * 0.34) or len(spec.facts) * box_height > available_height:
+        raise ValueError("visual copy does not fit its safe area")
     if len(spec.facts) == 1:
         lane_tops = (None,)
     else:
@@ -560,8 +630,8 @@ def _draw_callouts(
         )
         draw.rounded_rectangle((left, top, left + box_width, top + box_height), radius=radius, fill=(250, 250, 250, 232))
         _draw_fact(
-            draw, fact, left + margin // 2, top + margin // 2, box_width - margin,
-            headline_font, detail_font, spec.accent_rgb, top + box_height - margin // 2,
+            draw, fact, left + panel_padding, top + panel_padding, content_width,
+            headline_font, detail_font, spec.accent_rgb, top + box_height - panel_padding,
             headline_fill=(25, 32, 51), detail_fill=(70, 75, 85),
         )
 

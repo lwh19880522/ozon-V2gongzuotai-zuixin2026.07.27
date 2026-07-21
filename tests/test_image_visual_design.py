@@ -442,7 +442,7 @@ def test_render_visual_renders_verified_russian_integrated_rail(tmp_path: Path) 
     receipt = render_visual(source, output, _render_spec(), {LOCKED_HASH})
 
     assert Image.open(output).size == (900, 1200)
-    assert Image.open(output).getpixel((850, 600)) != (205, 192, 180)
+    assert Image.open(output).getpixel((800, 600)) != (205, 192, 180)
     assert receipt["visual_contract_version"] == CURRENT_VISUAL_CONTRACT_VERSION
     assert receipt["layout_recipe"] == "integrated_rail"
     assert receipt["copy_block_count"] == 1
@@ -450,6 +450,78 @@ def test_render_visual_renders_verified_russian_integrated_rail(tmp_path: Path) 
     assert receipt["russian_copy_passed"] is True
     assert receipt["safe_area_passed"] is True
     assert receipt["mobile_readability_passed"] is True
+
+
+def test_integrated_rail_uses_mobile_prominent_russian_type(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ozon_v2.images import visual_design
+
+    source = tmp_path / "source.png"
+    output = tmp_path / "output.png"
+    Image.new("RGB", (1024, 1024), (205, 192, 180)).save(source)
+    captured_sizes: list[tuple[int, int]] = []
+    original_draw_rail = visual_design._draw_rail
+
+    def capture_draw_rail(
+        draw: object,
+        width: int,
+        height: int,
+        margin: int,
+        spec: VisualSpec,
+        headline_font: object,
+        detail_font: object,
+    ) -> None:
+        captured_sizes.append((headline_font.size, detail_font.size))
+        original_draw_rail(
+            draw,
+            width,
+            height,
+            margin,
+            spec,
+            headline_font,
+            detail_font,
+        )
+
+    monkeypatch.setattr(visual_design, "_draw_rail", capture_draw_rail)
+
+    receipt = render_visual(source, output, _render_spec(), {LOCKED_HASH})
+
+    assert captured_sizes == [(58, 39)]
+    assert receipt["typography"]["headline_px"] == 58
+    assert receipt["typography"]["detail_px"] == 39
+    assert receipt["typography"]["minimum_mobile_scale_px"] >= 13
+
+
+def test_integrated_rail_sizes_panel_to_copy_instead_of_filling_canvas(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ozon_v2.images import visual_design
+
+    source = tmp_path / "source.png"
+    output = tmp_path / "output.png"
+    Image.new("RGB", (1024, 1024), (205, 192, 180)).save(source)
+    captured_panels: list[tuple[int, int, int, int]] = []
+    original_rounded_rectangle = visual_design.ImageDraw.ImageDraw.rounded_rectangle
+
+    def capture_rounded_rectangle(
+        draw: object, box: tuple[int, int, int, int], **kwargs: object
+    ) -> None:
+        captured_panels.append(box)
+        original_rounded_rectangle(draw, box, **kwargs)
+
+    monkeypatch.setattr(
+        visual_design.ImageDraw.ImageDraw,
+        "rounded_rectangle",
+        capture_rounded_rectangle,
+    )
+
+    render_visual(source, output, _render_spec(), {LOCKED_HASH})
+
+    left, top, right, bottom = captured_panels[0]
+    assert right - left >= round(1024 * 0.42)
+    assert bottom - top <= round(1024 * 0.48)
+    assert top == round((1024 - (bottom - top)) / 2)
 
 
 def test_feature_callout_uses_dark_copy_on_its_light_panel(

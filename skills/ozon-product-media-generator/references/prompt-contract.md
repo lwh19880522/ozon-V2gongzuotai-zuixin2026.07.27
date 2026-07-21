@@ -8,6 +8,8 @@ The fixed slots are `main_01` clean_hero with zero copy; `main_02` integrated_ra
 
 After crop and any conservative upscale, run local `render-visual` and merge its validation fragment into the slot receipt. A copy failure repairs only the local text layer and never consumes an image-generation attempt. Scene or product-truth failure alone may use a single-slot image repair.
 
+The local layout must use a prominent Russian headline, supporting detail with an obvious visual hierarchy, and a content-sized panel rather than an empty full-height rail. Validate the rendered type at a 360-pixel preview: the smallest Russian copy must remain at least 13 pixels. The receipt must record the actual headline, detail, and projected mobile pixel sizes; a hard-coded pass flag without those measurements is invalid.
+
 Any two accepted scene slots differ in at least three of environment, lighting, camera, shot scale, and buyer question. An accepted v3 receipt includes its complete `visual_spec`, `visual_contract_version=ozon-visual-v1`, and these four true pass flags: `visual_design_passed`, `russian_copy_passed`, `safe_area_passed`, and `mobile_readability_passed`.
 
 ## Allowed dynamic inputs
