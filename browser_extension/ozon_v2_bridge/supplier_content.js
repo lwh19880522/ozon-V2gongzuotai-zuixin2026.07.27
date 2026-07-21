@@ -345,40 +345,59 @@
   }
 
   function collectDomSkuOptions(groups) {
-    if (!Array.isArray(groups) || groups.length !== 1) return [];
-    const group = groups[0];
+    if (!Array.isArray(groups) || !groups.length) return [];
+    const usableGroups = groups.filter((group) => Array.isArray(group && group.options) && group.options.length);
+    if (usableGroups.length !== groups.length) return [];
+    const varyingGroups = usableGroups.filter((group) => group.options.length > 1);
+    if (varyingGroups.length > 1) return [];
+    const group = varyingGroups[0] || usableGroups[0];
+    const fixedGroups = usableGroups.filter((candidate) => candidate !== group);
+    if (fixedGroups.some((candidate) => candidate.options.length !== 1)) return [];
     const price = collectPrice();
     const amount = visiblePriceAmount(price);
     if (!amount) return [];
     return group.options.map((option, index) => {
       const label = normalizedText(option.label, 120);
-      const imageUrl = normalizedImageUrl(option.image_url);
+      const fixedOptions = fixedGroups.map((candidate) => candidate.options[0]);
+      const imageUrl = [option, ...fixedOptions]
+        .map((candidate) => normalizedImageUrl(candidate.image_url))
+        .find(Boolean);
       if (!label || !imageUrl) return null;
+      const selectedOptions = { [group.name]: label };
+      fixedGroups.forEach((candidate, fixedIndex) => {
+        selectedOptions[candidate.name] = normalizedText(fixedOptions[fixedIndex].label, 120);
+      });
+      const rawValues = Object.values(selectedOptions).filter(Boolean);
+      const combinationKey = Object.entries(selectedOptions)
+        .map(([name, value]) => `${name}>${value}`)
+        .join("|");
       const supplierSkuId = normalizedText(
-        option.supplier_sku_id
-        || `visible-${offerId(location.href)}-${stableTextId(`${group.name}|${label}|${index}`)}`,
+        usableGroups.length === 1 && option.supplier_sku_id
+        || `visible-${offerId(location.href)}-${stableTextId(`${combinationKey}|${index}`)}`,
         160,
       );
-      const setQuantity = setQuantityFromValues([label]);
+      const setQuantity = setQuantityFromValues(rawValues);
       return {
         supplier_sku_id: supplierSkuId,
-        combination_key: `${group.name}>${label}`,
-        raw_label: label,
-        selected_options: { [group.name]: label },
+        combination_key: combinationKey,
+        raw_label: rawValues.join(" / "),
+        selected_options: selectedOptions,
         set_quantity: setQuantity,
-        set_composition: skuComposition(label, setQuantity),
+        set_composition: skuComposition(rawValues.join(" / "), setQuantity),
         price: { currency: "CNY", amount },
         stock: {
-          status: option.disabled ? "out_of_stock" : "in_stock",
+          status: [option, ...fixedOptions].some((candidate) => candidate.disabled) ? "out_of_stock" : "in_stock",
           quantity: null,
         },
         image_urls: [imageUrl],
-        evidence_source: "dom_single_group_sku",
+        evidence_source: usableGroups.length === 1 ? "dom_single_group_sku" : "dom_single_axis_sku",
         complete: true,
         evidence: {
-          group_name: group.name,
+          group_names: usableGroups.map((candidate) => candidate.name),
+          varying_group_name: group.name,
+          fixed_group_names: fixedGroups.map((candidate) => candidate.name),
           option_index: option.option_index,
-          native_supplier_sku_id: Boolean(option.supplier_sku_id),
+          native_supplier_sku_id: usableGroups.length === 1 && Boolean(option.supplier_sku_id),
           price_visible_text: price.visible_text,
         },
       };

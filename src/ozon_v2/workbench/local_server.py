@@ -1785,6 +1785,14 @@ def build_supplier_review_html(run_id: str) -> str:
       return (item.supplier_sku_options || []).find((option) => option.supplier_sku_id === (selected && selected.value));
     }}
 
+    function canRecaptureSupplier(item) {{
+      const stageAllowsRecapture = ["supplier_review", "supplier_collected", "image_processing"].includes(state.status);
+      return stageAllowsRecapture
+        && !!item.supplier_url
+        && !item.supplier_sku_selection
+        && !item.subject_master;
+    }}
+
     function updateSkuLockButton() {{
       const item = state.items[state.evidenceIndex];
       const button = $("lockSupplierSku");
@@ -1909,6 +1917,14 @@ def build_supplier_review_html(run_id: str) -> str:
           .filter(Boolean)
           .join("\\n");
         candidatesRoot.append(field("可见规格组 (Visible SKU Groups)", visibleGroups || null));
+        if (canRecaptureSupplier(item)) {{
+          const recaptureSkuButton = document.createElement("button");
+          recaptureSkuButton.type = "button";
+          recaptureSkuButton.className = "secondary-button";
+          recaptureSkuButton.textContent = "重新采集此商品 SKU";
+          recaptureSkuButton.addEventListener("click", () => recaptureSupplier(item, recaptureSkuButton));
+          candidatesRoot.append(recaptureSkuButton);
+        }}
       }}
       updateSkuLockButton();
       $("skuDecisionMessage").className = receipt ? "success" : "muted";
@@ -2068,7 +2084,7 @@ def build_supplier_review_html(run_id: str) -> str:
         recaptureButton.type = "button";
         recaptureButton.className = "secondary-button";
         recaptureButton.textContent = "重新采集 (Re-collect)";
-        recaptureButton.disabled = state.status !== "supplier_review" || !item.supplier_url;
+        recaptureButton.disabled = !canRecaptureSupplier(item);
         recaptureButton.addEventListener("click", () => recaptureSupplier(item, recaptureButton));
         actionCell.append(rejectButton, recaptureButton);
         row.append(productCell, evidenceCell, channelCell, actionCell); $("items").append(row);
@@ -2251,7 +2267,7 @@ def build_supplier_review_html(run_id: str) -> str:
     $("supplierEvidencePrev").addEventListener("click", () => moveEvidence(-1));
     $("supplierEvidenceNext").addEventListener("click", () => moveEvidence(1));
     async function poll() {{
-      if (!["supplier_review", "supplier_collecting"].includes(state.status)) return;
+      if (!["supplier_review", "supplier_collecting", "supplier_collected", "image_processing"].includes(state.status)) return;
       await load();
     }}
 
@@ -3485,7 +3501,15 @@ def create_handler(
                     },
                     "errors": [],
                 }
-            if run.get("status") == "supplier_review":
+            recapture_seed_ids = {
+                str(seed_id).strip()
+                for seed_id in run.get("supplier_recapture_seed_ids") or []
+                if str(seed_id).strip()
+            }
+            if run.get("status") == "supplier_review" or (
+                recapture_seed_ids
+                and run.get("status") in {"supplier_collected", "image_processing"}
+            ):
                 try:
                     review = selected_repo.load_supplier_review(run_id)
                 except FileNotFoundError:
@@ -3508,6 +3532,8 @@ def create_handler(
                 channels = []
                 for channel_index, item in enumerate(review.get("items", [])):
                     if not isinstance(item, dict):
+                        continue
+                    if recapture_seed_ids and str(item.get("seed_id") or "") not in recapture_seed_ids:
                         continue
                     if str(item.get("seed_id") or "") in captured_seed_ids:
                         continue

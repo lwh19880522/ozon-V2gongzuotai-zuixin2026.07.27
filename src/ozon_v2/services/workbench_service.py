@@ -615,12 +615,22 @@ class WorkbenchService:
     def restart_browser_task(self, run_id: str) -> Result:
         run = self.repo.load_run(run_id)
         status = WorkbenchState(run["status"])
+        recapture_seed_ids = {
+            str(seed_id).strip()
+            for seed_id in run.get("supplier_recapture_seed_ids") or []
+            if str(seed_id).strip()
+        }
         task_type_by_status = {
             WorkbenchState.OZON_COLLECTING: "ozon_collection",
             WorkbenchState.SUPPLIER_REVIEW: "supplier_selection",
             WorkbenchState.SUPPLIER_COLLECTING: "supplier_collection",
         }
-        task_type = task_type_by_status.get(status)
+        task_type = (
+            "supplier_selection"
+            if recapture_seed_ids
+            and status in {WorkbenchState.SUPPLIER_COLLECTED, WorkbenchState.IMAGE_PROCESSING}
+            else task_type_by_status.get(status)
+        )
         if task_type is None:
             return Result.failure(
                 "browser_task.restart_not_allowed",
@@ -659,7 +669,8 @@ class WorkbenchService:
                     for item in items
                     if isinstance(item, dict) and str(item.get("seed_id") or "").strip()
                 }
-                total_count = len(review_seed_ids)
+                expected_seed_ids = recapture_seed_ids or review_seed_ids
+                total_count = len(expected_seed_ids)
                 draft_path = self.repo.run_dir(run_id) / "supplier_selection_draft.json"
                 captured_seed_ids: set[str] = set()
                 if draft_path.exists():
@@ -674,7 +685,7 @@ class WorkbenchService:
                         for product in products
                         if isinstance(product, dict) and str(product.get("seed_id") or "").strip()
                     }
-                completed_count = len(review_seed_ids.intersection(captured_seed_ids))
+                completed_count = len(expected_seed_ids.intersection(captured_seed_ids))
                 if completed_count >= total_count:
                     return Result.failure(
                         "browser_task.restart_completed",
@@ -1348,7 +1359,18 @@ class WorkbenchService:
 
     def capture_supplier_selection_product(self, run_id: str, payload: dict[str, Any]) -> Result:
         run = self.repo.load_run(run_id)
-        if WorkbenchState(run["status"]) != WorkbenchState.SUPPLIER_REVIEW:
+        status = WorkbenchState(run["status"])
+        recapture_seed_ids = {
+            str(value).strip()
+            for value in run.get("supplier_recapture_seed_ids") or []
+            if str(value).strip()
+        }
+        requested_seed_id = str(payload.get("seed_id") or "").strip()
+        is_late_recapture = (
+            status in {WorkbenchState.SUPPLIER_COLLECTED, WorkbenchState.IMAGE_PROCESSING}
+            and requested_seed_id in recapture_seed_ids
+        )
+        if status != WorkbenchState.SUPPLIER_REVIEW and not is_late_recapture:
             return Result.failure(
                 "supplier_selection.not_expected",
                 "A managed 1688 product can only be captured during supplier review.",
@@ -1356,7 +1378,7 @@ class WorkbenchService:
             )
         review = self.repo.load_supplier_review(run_id)
         items = [item for item in review.get("items", []) if isinstance(item, dict)]
-        seed_id = str(payload.get("seed_id") or "").strip()
+        seed_id = requested_seed_id
         ozon_product_id = str(payload.get("ozon_product_id") or "").strip()
         try:
             channel_index = int(payload.get("channel_index"))
@@ -1395,6 +1417,19 @@ class WorkbenchService:
             )
         product["seed_id"] = seed_id
         product["supplier_url"] = supplier_url
+        if is_late_recapture:
+            missing = self._supplier_product_missing_fields(product)
+            if missing:
+                return Result.failure(
+                    "supplier_selection.product_incomplete",
+                    "The re-collected 1688 product is still missing required public fields.",
+                    errors=[f"{seed_id}: required public field is missing: {field}." for field in missing],
+                    data={"run_id": run_id, "seed_id": seed_id, "status": run["status"]},
+                )
+            product, _option_errors = self._normalize_supplier_sku_matrix(
+                product,
+                allow_deferred_sku=True,
+            )
 
         draft_path = self.repo.run_dir(run_id) / "supplier_selection_draft.json"
         draft = self.repo.load_supplier_selection_draft(run_id) if draft_path.exists() else {
@@ -1428,6 +1463,59 @@ class WorkbenchService:
             "One user-confirmed 1688 product was captured from its managed browser channel.",
             {"seed_id": seed_id, "channel_index": channel_index, "captured_count": captured_count, "total_count": total_count},
         )
+        if is_late_recapture:
+            collection = self.repo.load_supplier_collection_result(run_id)
+            products_by_seed = {
+                str(item.get("seed_id") or ""): dict(item)
+                for item in collection.get("supplier_products", [])
+                if isinstance(item, dict) and str(item.get("seed_id") or "")
+            }
+            products_by_seed[seed_id] = product
+            ordered_seed_ids = [
+                str(item.get("seed_id") or "")
+                for item in items
+                if str(item.get("seed_id") or "")
+            ]
+            ordered_products = [
+                products_by_seed[item_seed_id]
+                for item_seed_id in ordered_seed_ids
+                if item_seed_id in products_by_seed
+            ]
+            ordered_products.extend(
+                item
+                for item_seed_id, item in products_by_seed.items()
+                if item_seed_id not in ordered_seed_ids
+            )
+            collection["supplier_products"] = ordered_products
+            collection["updated_at"] = utc_now_iso()
+            self.repo.save_supplier_collection_result(run_id, collection)
+            run["supplier_recapture_seed_ids"] = sorted(recapture_seed_ids - {seed_id})
+            run["browser_task_cancelled"] = False
+            self.repo.save_run(run)
+            event = self.repo.append_run_event(
+                run_id,
+                "supplier_selection.recapture_complete",
+                "One incomplete supplier product was re-collected without rolling back the batch stage.",
+                {
+                    "seed_id": seed_id,
+                    "sku_matrix_status": product.get("sku_matrix_status"),
+                    "remaining_recapture_count": len(run["supplier_recapture_seed_ids"]),
+                },
+            )
+            return Result.success(
+                "supplier_selection.recapture_complete",
+                "The supplier product was re-collected and is ready for SKU confirmation.",
+                self._response_payload(
+                    run,
+                    event,
+                    {
+                        "seed_id": seed_id,
+                        "accepted": True,
+                        "lane_terminal": "collected",
+                        "sku_matrix_status": product.get("sku_matrix_status"),
+                    },
+                ),
+            )
         if captured_count < total_count:
             return Result.success(
                 "supplier_selection.product_captured",
@@ -1474,10 +1562,15 @@ class WorkbenchService:
 
     def reset_supplier_selection_product(self, run_id: str, seed_id: str) -> Result:
         run = self.repo.load_run(run_id)
-        if WorkbenchState(run["status"]) != WorkbenchState.SUPPLIER_REVIEW:
+        status = WorkbenchState(run["status"])
+        if status not in {
+            WorkbenchState.SUPPLIER_REVIEW,
+            WorkbenchState.SUPPLIER_COLLECTED,
+            WorkbenchState.IMAGE_PROCESSING,
+        }:
             return Result.failure(
                 "supplier_selection.reset_not_allowed",
-                "A captured supplier can only be reset during supplier review.",
+                "A captured supplier can only be reset before upload begins.",
                 data={"run_id": run_id, "status": run["status"], "seed_id": seed_id},
             )
         review = self.repo.load_supplier_review(run_id)
@@ -1489,6 +1582,24 @@ class WorkbenchService:
                 "The requested supplier-selection lane is not part of this review.",
                 data={"run_id": run_id, "seed_id": seed_id},
             )
+
+        if status in {WorkbenchState.SUPPLIER_COLLECTED, WorkbenchState.IMAGE_PROCESSING}:
+            selection_path = self.repo.run_dir(run_id) / "supplier_sku_selections.json"
+            selections = self.repo.load_supplier_sku_selections(run_id) if selection_path.exists() else {}
+            if isinstance(selections.get("selections", {}).get(seed_id), dict):
+                return Result.failure(
+                    "supplier_selection.reset_locked",
+                    "Reopen the confirmed supplier SKU before re-collecting this product.",
+                    data={"run_id": run_id, "status": run["status"], "seed_id": seed_id},
+                )
+            subject_path = self.repo.run_dir(run_id) / "subject_masters.json"
+            subjects = self.repo.load_subject_masters(run_id) if subject_path.exists() else {}
+            if isinstance(subjects.get("items", {}).get(seed_id), dict):
+                return Result.failure(
+                    "supplier_selection.reset_locked",
+                    "This product already has locked subject evidence and cannot be re-collected directly.",
+                    data={"run_id": run_id, "status": run["status"], "seed_id": seed_id},
+                )
 
         selected["supplier_url"] = None
         selected["user_verified_exact_match"] = False
@@ -1510,6 +1621,28 @@ class WorkbenchService:
             draft["updated_at"] = utc_now_iso()
             self.repo.save_supplier_selection_draft(run_id, draft)
             retained_count = len(retained)
+
+        if status in {WorkbenchState.SUPPLIER_COLLECTED, WorkbenchState.IMAGE_PROCESSING}:
+            collection_path = self.repo.run_dir(run_id) / "supplier_collection_result.json"
+            if collection_path.exists():
+                collection = self.repo.load_supplier_collection_result(run_id)
+                retained_products = [
+                    product
+                    for product in collection.get("supplier_products", [])
+                    if isinstance(product, dict) and str(product.get("seed_id") or "") != seed_id
+                ]
+                collection["supplier_products"] = retained_products
+                collection["updated_at"] = utc_now_iso()
+                self.repo.save_supplier_collection_result(run_id, collection)
+                retained_count = len(retained_products)
+            pending = {
+                str(value).strip()
+                for value in run.get("supplier_recapture_seed_ids") or []
+                if str(value).strip()
+            }
+            pending.add(seed_id)
+            run["supplier_recapture_seed_ids"] = sorted(pending)
+            self.repo.save_run(run)
 
         event = self.repo.append_run_event(
             run_id,
@@ -1790,41 +1923,11 @@ class WorkbenchService:
                 if value in (None, "", [], {}):
                     errors.append(f"{seed_id}: required public field is missing: {field}.")
 
-            raw_sku_options = product.get("sku_options") if isinstance(product.get("sku_options"), list) else []
-            valid_sku_options: list[dict[str, Any]] = []
-            sku_option_candidates: list[dict[str, Any]] = []
-            seen_supplier_sku_ids: set[str] = set()
-            for index, raw_option in enumerate(raw_sku_options):
-                if not isinstance(raw_option, dict):
-                    option_errors = ["must be an object"]
-                else:
-                    try:
-                        option = SupplierSkuOption.from_dict(raw_option)
-                    except (TypeError, ValueError) as exc:
-                        option_errors = [f"could not be parsed: {exc}"]
-                    else:
-                        option_errors = validate_supplier_sku_option(option)
-                        if option.supplier_sku_id in seen_supplier_sku_ids:
-                            option_errors = [*option_errors, f"duplicate supplier_sku_id: {option.supplier_sku_id}"]
-                        if not option_errors:
-                            seen_supplier_sku_ids.add(option.supplier_sku_id)
-                            valid_sku_options.append(option.to_dict())
-                            continue
-                if allow_deferred_sku:
-                    candidate = dict(raw_option) if isinstance(raw_option, dict) else {"raw_value": raw_option}
-                    candidate["validation_errors"] = option_errors
-                    sku_option_candidates.append(candidate)
-                else:
-                    for error in option_errors:
-                        errors.append(f"{seed_id}: sku_options[{index}] {error}.")
-
-            product["sku_options"] = valid_sku_options
-            if sku_option_candidates:
-                product["sku_option_candidates"] = sku_option_candidates
-            sku_matrix_complete = bool(valid_sku_options) and not sku_option_candidates
-            product["sku_matrix_status"] = (
-                "complete" if sku_matrix_complete else "manual_confirmation_required"
+            product, option_errors = self._normalize_supplier_sku_matrix(
+                product,
+                allow_deferred_sku=allow_deferred_sku,
             )
+            errors.extend(f"{seed_id}: {error}." for error in option_errors)
             collected[seed_id] = product
         for seed_id in expected:
             if seed_id not in collected:
@@ -3682,6 +3785,62 @@ class WorkbenchService:
             "recommended_sku_id": recommended_sku_id,
             "candidates": candidate_decisions,
         }
+
+    @staticmethod
+    def _supplier_product_missing_fields(product: dict[str, Any]) -> list[str]:
+        required = {
+            "title": product.get("title"),
+            "seller": product.get("seller"),
+            "sku": product.get("sku"),
+            "images": product.get("images"),
+            "price": product.get("price"),
+            "domestic_shipping_evidence": product.get("domestic_shipping_evidence"),
+        }
+        return [field for field, value in required.items() if value in (None, "", [], {})]
+
+    @staticmethod
+    def _normalize_supplier_sku_matrix(
+        product: dict[str, Any],
+        *,
+        allow_deferred_sku: bool,
+    ) -> tuple[dict[str, Any], list[str]]:
+        normalized = dict(product)
+        raw_options = product.get("sku_options") if isinstance(product.get("sku_options"), list) else []
+        valid_options: list[dict[str, Any]] = []
+        candidates: list[dict[str, Any]] = []
+        errors: list[str] = []
+        seen_supplier_sku_ids: set[str] = set()
+        for index, raw_option in enumerate(raw_options):
+            if not isinstance(raw_option, dict):
+                option_errors = ["must be an object"]
+            else:
+                try:
+                    option = SupplierSkuOption.from_dict(raw_option)
+                except (TypeError, ValueError) as exc:
+                    option_errors = [f"could not be parsed: {exc}"]
+                else:
+                    option_errors = validate_supplier_sku_option(option)
+                    if option.supplier_sku_id in seen_supplier_sku_ids:
+                        option_errors = [*option_errors, f"duplicate supplier_sku_id: {option.supplier_sku_id}"]
+                    if not option_errors:
+                        seen_supplier_sku_ids.add(option.supplier_sku_id)
+                        valid_options.append(option.to_dict())
+                        continue
+            if allow_deferred_sku:
+                candidate = dict(raw_option) if isinstance(raw_option, dict) else {"raw_value": raw_option}
+                candidate["validation_errors"] = option_errors
+                candidates.append(candidate)
+            else:
+                errors.extend(f"sku_options[{index}] {error}" for error in option_errors)
+        normalized["sku_options"] = valid_options
+        if candidates:
+            normalized["sku_option_candidates"] = candidates
+        else:
+            normalized.pop("sku_option_candidates", None)
+        normalized["sku_matrix_status"] = (
+            "complete" if valid_options and not candidates else "manual_confirmation_required"
+        )
+        return normalized, errors
 
     def _supplier_sku_options(self, product: dict[str, Any]) -> list[dict[str, Any]]:
         raw_options = product.get("sku_options")

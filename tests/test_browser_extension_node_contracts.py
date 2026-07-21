@@ -21,6 +21,7 @@ NODE_CONTRACTS = (
     "test_supplier_panel_lifecycle.js",
     "test_supplier_same_tab_navigation.js",
     "test_supplier_selection_content_script.js",
+    "test_supplier_selection_fixed_axis_sku.js",
     "test_supplier_selection_image_upload.js",
     "test_supplier_selection_without_sku_matrix.js",
 )

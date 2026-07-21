@@ -1216,6 +1216,97 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         restarted = self.post_json(f"/api/batches/{run_id}/browser-task/restart", {})
         self.assertEqual(1, restarted["data"]["pending_count"])
 
+    def test_incomplete_supplier_sku_can_be_recaptured_after_image_stage_without_rolling_back_batch(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        incomplete = self.supplier_product_payload(seed.seed_id)
+        incomplete["sku_options"] = []
+        incomplete["sku_groups"] = [
+            {
+                "name": "规格",
+                "options": [
+                    {
+                        "label": "儿童飞机脚踏板【黑色】",
+                        "supplier_sku_id": "",
+                        "image_url": "https://cbu01.alicdn.com/img/ibank/hammock-black.jpg",
+                    }
+                ],
+            }
+        ]
+        captured = self.post_json(
+            f"/api/batches/{run_id}/supplier-selection/capture",
+            {
+                "channel_index": 0,
+                "seed_id": seed.seed_id,
+                "ozon_product_id": "ozon-1",
+                "supplier_product": incomplete,
+            },
+        )
+        self.assertTrue(captured["ok"])
+
+        collection = self.repo.load_supplier_collection_result(run_id)
+        retained_product = self.supplier_product_payload("seed-retained")
+        retained_product["title"] = "Already completed supplier product"
+        collection["supplier_products"].append(retained_product)
+        self.repo.save_supplier_collection_result(run_id, collection)
+        run = self.repo.load_run(run_id)
+        run["status"] = WorkbenchState.IMAGE_PROCESSING.value
+        self.repo.save_run(run)
+
+        reset = self.post_json(
+            f"/api/batches/{run_id}/supplier-selection/reset",
+            {"seed_id": seed.seed_id},
+        )
+        restarted = self.post_json(f"/api/batches/{run_id}/browser-task/restart", {})
+        task = self.get_json(f"/api/batches/{run_id}/browser-task")
+
+        self.assertTrue(reset["ok"])
+        self.assertEqual(WorkbenchState.IMAGE_PROCESSING.value, self.repo.load_run(run_id)["status"])
+        self.assertEqual([seed.seed_id], self.repo.load_run(run_id)["supplier_recapture_seed_ids"])
+        self.assertEqual(
+            ["seed-retained"],
+            [item["seed_id"] for item in self.repo.load_supplier_collection_result(run_id)["supplier_products"]],
+        )
+        self.assertTrue(restarted["ok"])
+        self.assertEqual("supplier_selection", restarted["data"]["task_type"])
+        self.assertEqual(1, restarted["data"]["pending_count"])
+        self.assertEqual("supplier_selection", task["data"]["task_type"])
+        self.assertEqual([seed.seed_id], [item["seed_id"] for item in task["data"]["contract"]["items"]])
+
+        recaptured_product = self.supplier_product_payload(seed.seed_id)
+        recaptured = self.post_json(
+            f"/api/batches/{run_id}/supplier-selection/capture",
+            {
+                "channel_index": 0,
+                "seed_id": seed.seed_id,
+                "ozon_product_id": "ozon-1",
+                "supplier_product": recaptured_product,
+            },
+        )
+        review = self.get_json(f"/api/batches/{run_id}/supplier-review")
+
+        self.assertTrue(recaptured["ok"])
+        self.assertEqual("supplier_selection.recapture_complete", recaptured["code"])
+        self.assertEqual(WorkbenchState.IMAGE_PROCESSING.value, self.repo.load_run(run_id)["status"])
+        self.assertEqual([], self.repo.load_run(run_id).get("supplier_recapture_seed_ids"))
+        self.assertEqual(
+            {seed.seed_id, "seed-retained"},
+            {
+                item["seed_id"]
+                for item in self.repo.load_supplier_collection_result(run_id)["supplier_products"]
+            },
+        )
+        self.assertEqual(1, len(review["data"]["items"][0]["supplier_sku_options"]))
+
+    def test_supplier_review_page_enables_targeted_recapture_for_incomplete_late_stage_product(self) -> None:
+        run_id, _seed = self.prepare_supplier_review_run()
+
+        page = self.get_text(f"/batches/{run_id}/supplier-review")
+
+        self.assertIn("function canRecaptureSupplier(item)", page)
+        self.assertIn('["supplier_review", "supplier_collected", "image_processing"].includes(state.status)', page)
+        self.assertIn("recaptureButton.disabled = !canRecaptureSupplier(item);", page)
+        self.assertIn("重新采集此商品 SKU", page)
+
     def test_supplier_selection_capture_writes_back_and_finalizes_single_channel(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
         supplier_product = self.supplier_product_payload(seed.seed_id)
@@ -1426,7 +1517,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
     def test_extension_manifest_registers_1688_supplier_content_script(self) -> None:
         manifest_path = self.project_root / "browser_extension" / "ozon_v2_bridge" / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self.assertEqual("0.1.59", manifest["version"])
+        self.assertEqual("0.1.60", manifest["version"])
 
         supplier_scripts = [
             item
