@@ -1880,9 +1880,14 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn("images.forEach((src) =>", page)
         self.assertNotIn("images.slice(0, 6)", page)
         self.assertIn(".image-product { height:100%;", page)
-        self.assertIn("grid-template-rows:auto minmax(0,1fr)", page)
+        self.assertIn("grid-template-rows:auto auto minmax(0,1fr)", page)
         self.assertIn("grid-template-columns:repeat(2,minmax(0,1fr))", page)
         self.assertIn("overflow-y:auto", page)
+        self.assertIn('id="batchGenerationOverview"', page)
+        self.assertIn('className = "product-state-banner"', page)
+        self.assertIn("未进入生图队列：尚未锁定真实 1688 SKU", page)
+        self.assertIn("等待人工审核不会阻塞其他商品继续生图", page)
+        self.assertIn("旧任务未记录停止原因", page)
         self.assertIn('id="imageGate"', page)
         self.assertIn('aria-current="page"', page)
         self.assertIn("Ozon 参考图 (Ozon Reference)", page)
@@ -1894,6 +1899,12 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn('textarea.className = "repair-note"', page)
         self.assertIn('id="submitImageRepairs"', page)
         self.assertIn("提交选中图片返修 (Repair Selected)", page)
+        self.assertIn("还需为 ${missingIssue.length} 张图片选择问题类型", page)
+        self.assertIn("还需为 ${missingOtherNote.length} 张“其他问题”填写说明", page)
+        self.assertIn("repair-incomplete", page)
+        self.assertIn("repair-field-error", page)
+        self.assertIn("已填写完整，可以提交", page)
+        self.assertIn(".job-controls .repair-submit:disabled", page)
         self.assertIn("issue_code: issue.value", page)
         self.assertIn("review_issue_code", page)
         self.assertIn("/repair`,", page)
@@ -1940,6 +1951,12 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn("copyTrialCommand", page)
         self.assertIn("复制单件试图命令 (Copy Trial Command)", page)
         self.assertIn("整批生图命令 (Full-Batch Command)", page)
+        self.assertIn("manual_review_required 只暂停对应商品", page)
+        self.assertIn("继续派发其他 pending 或含 repair_pending 的商品", page)
+        self.assertIn("未锁定 SKU 或主体证据只阻塞对应商品", page)
+        self.assertIn("stopped 商品不阻塞其他商品", page)
+        self.assertIn("不得自动恢复 stopped 商品", page)
+        self.assertIn("直到没有可调度的 pending 或 repair_pending 商品", page)
         self.assertIn("停止生图 (Stop Generation)", page)
         self.assertIn("继续生图 (Resume Generation)", page)
         self.assertIn("/image-job/", page)
@@ -1952,6 +1969,11 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             item["supplier_source_images"],
         )
         self.assertEqual("waiting_for_supplier_sku", item["generation_status"])
+        queue_summary = workspace["data"]["image_queue_summary"]
+        self.assertEqual(1, queue_summary["total_products"])
+        self.assertEqual(1, queue_summary["waiting_for_supplier_sku"])
+        self.assertEqual(0, queue_summary["manual_review_required"])
+        self.assertEqual(0, queue_summary["pending"])
         self.assertFalse(workspace["data"]["image_gate"]["ready"])
         self.assertEqual("supplier_sku_selection_required", workspace["data"]["image_gate"]["code"])
 
@@ -1982,6 +2004,25 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         event = self.repo.load_run_events(run_id)[-1]
         self.assertEqual("image_job.repair_requested", event.event_type)
         self.assertEqual(["detail_02"], event.data["slot_ids"])
+
+    def test_image_stop_api_persists_user_visible_reason_and_event(self) -> None:
+        run_id, job_id, queue = self.prepare_reviewable_image_job()
+
+        result = self.post_json(
+            f"/api/batches/{run_id}/image-job/{job_id}/stop",
+            {},
+        )
+
+        self.assertEqual("image_job.stopped", result["code"])
+        image_job = result["data"]["image_job"]
+        self.assertEqual("stopped", image_job["status"])
+        self.assertEqual("用户在工具台手动停止生图", image_job["stop_reason"])
+        self.assertEqual("workbench_user", image_job["stopped_by"])
+        self.assertIsNotNone(image_job["stopped_at"])
+        self.assertEqual(image_job["stop_reason"], queue.get_job(job_id)["stop_reason"])
+        event = self.repo.load_run_events(run_id)[-1]
+        self.assertEqual("image_job.stopped", event.event_type)
+        self.assertEqual("用户在工具台手动停止生图", event.data["stop_reason"])
 
     def test_image_repair_api_rejects_wrong_batch_and_invalid_feedback_atomically(self) -> None:
         run_id, job_id, queue = self.prepare_reviewable_image_job()

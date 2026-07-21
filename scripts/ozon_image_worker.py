@@ -58,6 +58,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     stop = commands.add_parser("stop")
     stop.add_argument("--job", required=True)
+    stop.add_argument("--reason", required=True)
+    stop.add_argument("--stopped-by", default="image_worker")
 
     resume = commands.add_parser("resume")
     resume.add_argument("--job", required=True)
@@ -99,7 +101,7 @@ def main() -> int:
         payload = json.loads(Path(args.receipt_json).read_text(encoding="utf-8"))
         _print(queue.record_slot_result(SlotResultReceipt.from_dict(payload)))
     elif args.command == "stop":
-        queue.stop(args.job)
+        queue.stop(args.job, reason=args.reason, stopped_by=args.stopped_by)
         _print(queue.snapshot(args.job))
     elif args.command == "resume":
         queue.resume(args.job)

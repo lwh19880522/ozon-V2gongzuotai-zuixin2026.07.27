@@ -2303,7 +2303,11 @@ def build_image_workspace_html(run_id: str) -> str:
         "可用并发位少于 5 时继续使用所有成功创建的子智能体，不得停机；不得因没有新增空位而停止现有子智能体；若 spawn_agent 失败则缩小到成功数量；只有当前无可用并发位且尚无现有子智能体时才不领取任务并报告等待，不得退回 create_thread 或用户可见任务；"
         f"\u6bcf\u4e2a\u5b50\u667a\u80fd\u4f53\u53ea\u80fd\u7528\u6620\u5c04\u7684\u961f\u5217 worker ID \u9886\u53d6\u4efb\u52a1\uff1a{worker_ids}\uff1b\u5b50\u667a\u80fd\u4f53\u7a7a\u95f2\u540e\u4f7f\u7528 followup_task \u7ee7\u7eed\u6d3e\u53d1\uff1b"
         f"{visual_contract}"
-        "\u6301\u7eed\u9886\u53d6\u5f53\u524d\u6279\u6b21\u961f\u5217\u4efb\u52a1\uff0c\u76f4\u5230\u961f\u5217\u4e3a\u7a7a\u3001\u8fdb\u5165\u4eba\u5de5\u5ba1\u6838\u6216\u9047\u5230\u963b\u585e\u95e8\u7981\u3002"
+        "manual_review_required 只暂停对应商品，必须跳过该商品并继续派发其他 pending 或含 repair_pending 的商品；"
+        "未锁定 SKU 或主体证据只阻塞对应商品，不得阻塞其他已经入队的商品；"
+        "stopped 商品不阻塞其他商品，必须报告已记录的停止原因和工作台恢复入口，但不得自动恢复 stopped 商品；"
+        "持续处理当前批次，直到没有可调度的 pending 或 repair_pending 商品、发生影响全部剩余任务的系统级故障，或用户明确停止批次；"
+        "结束时分别汇报待人工审核、已停止、缺少 SKU/主体、失败和已完成的商品数量，不得把单商品等待态称为整批完成。"
         "不得上传，不得修改业务代码；不得创建第 6 个常规生图 worker；当运行时提供第 6 个子智能体并发位时，保留 1 个子智能体位置用于失败恢复、诊断或人工介入。"
     )
     trial_command_html = html.escape(trial_command)
@@ -2342,6 +2346,11 @@ def build_image_workspace_html(run_id: str) -> str:
     .summary {{ display:grid; grid-template-columns:repeat(4,minmax(120px,1fr)); margin-bottom:14px; overflow:hidden; border:1px solid var(--line); border-radius:6px; background:var(--surface); }}
     .metric {{ min-height:76px; display:flex; flex-direction:column; justify-content:center; padding:12px 15px; border-right:1px solid var(--line); }} .metric:last-child {{ border-right:0; }}
     .metric span {{ color:var(--muted); font-size:11px; }} .metric strong {{ margin-top:4px; font-size:19px; }}
+    .batch-generation-overview {{ display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin:-2px 0 14px; padding:10px 12px; border:1px solid var(--line); border-radius:6px; background:var(--surface); }}
+    .batch-generation-overview strong {{ margin-right:4px; font-size:11px; }}
+    .queue-state-chip {{ display:inline-flex; align-items:center; gap:5px; padding:4px 7px; border-radius:4px; color:var(--muted); background:var(--soft); font-size:10px; }}
+    .queue-state-chip b {{ color:var(--text); font-size:12px; }}
+    .queue-state-chip.warn {{ color:var(--amber); background:var(--amber-soft); }} .queue-state-chip.stop {{ color:var(--red); background:var(--red-soft); }} .queue-state-chip.ready {{ color:var(--green); background:var(--green-soft); }}
     .image-layout {{ display:grid; grid-template-columns:minmax(0,1fr) 280px; gap:14px; align-items:start; }}
     .panel {{ min-width:0; border:1px solid var(--line); border-radius:6px; background:var(--surface); overflow:hidden; }}
     .panel-head {{ min-height:50px; display:flex; align-items:center; justify-content:space-between; gap:10px; padding:0 14px; border-bottom:1px solid var(--line); }} .panel-head h3 {{ margin:0; font-size:14px; }}
@@ -2352,9 +2361,12 @@ def build_image_workspace_html(run_id: str) -> str:
     .image-pager button:hover:not(:disabled) {{ color:var(--blue); border-color:#9db3ef; background:var(--blue-soft); }}
     .image-pager button:disabled {{ color:#a4adbd; background:var(--soft); cursor:not-allowed; }}
     .image-position {{ min-width:54px; color:var(--muted); text-align:center; font:11px Consolas,"Courier New",monospace; }}
-    .image-product {{ height:100%; min-height:0; display:grid; grid-template-rows:auto minmax(0,1fr); border:1px solid var(--line); border-radius:5px; overflow:hidden; background:#fff; }}
+    .image-product {{ height:100%; min-height:0; display:grid; grid-template-rows:auto auto minmax(0,1fr); border:1px solid var(--line); border-radius:5px; overflow:hidden; background:#fff; }}
     .product-head {{ display:flex; align-items:center; justify-content:space-between; gap:12px; padding:10px 12px; border-bottom:1px solid var(--line); background:var(--soft); }}
     .product-head strong {{ font-size:13px; }} .product-head span {{ color:var(--muted); font-size:10px; overflow-wrap:anywhere; }}
+    .product-state-banner {{ display:flex; align-items:center; gap:8px; min-height:34px; padding:7px 12px; border-bottom:1px solid var(--line); color:var(--muted); background:#fff; font-size:10px; }}
+    .product-state-banner.warn {{ color:#74410a; background:#fffaf0; }} .product-state-banner.stop {{ color:var(--red); background:var(--red-soft); }} .product-state-banner.ready {{ color:var(--green); background:var(--green-soft); }}
+    .product-state-banner a {{ margin-left:auto; color:var(--blue); font-weight:650; text-decoration:none; }}
     .source-grid {{ min-height:0; display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); grid-template-rows:minmax(0,1fr); gap:1px; background:var(--line); }}
     .source-panel {{ min-width:0; min-height:0; display:grid; grid-template-rows:auto minmax(0,1fr); padding:11px; overflow:hidden; background:#fff; }}
     .source-title {{ display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:9px; font-size:11px; font-weight:700; }} .source-title span {{ color:var(--muted); font-weight:400; }}
@@ -2364,6 +2376,7 @@ def build_image_workspace_html(run_id: str) -> str:
     .generated-review-grid {{ min-height:0; display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); align-content:start; gap:8px; padding-right:4px; overflow-y:auto; overscroll-behavior:contain; scrollbar-gutter:stable; }}
     .generated-review-card {{ min-width:0; padding:7px; border:1px solid var(--line); border-radius:5px; background:#fff; transition:border-color .15s ease,box-shadow .15s ease; }}
     .generated-review-card.selected {{ border-color:#e07b83; box-shadow:0 0 0 2px rgba(180,35,44,.08); }}
+    .generated-review-card.repair-incomplete {{ border-color:var(--red); background:#fff9fa; box-shadow:0 0 0 2px rgba(180,35,44,.1); }}
     .generated-review-card.repairing {{ border-color:#e4b862; background:#fffaf0; }}
     .generated-review-head {{ display:flex; align-items:center; justify-content:space-between; gap:6px; margin-bottom:6px; font:10px Consolas,"Courier New",monospace; }}
     .generated-review-head strong {{ color:var(--text); }}
@@ -2377,6 +2390,7 @@ def build_image_workspace_html(run_id: str) -> str:
     .repair-issue,.repair-note {{ width:100%; border:1px solid var(--line); border-radius:4px; color:var(--text); background:#fff; font:10px/1.35 "Segoe UI","Microsoft YaHei",sans-serif; }}
     .repair-issue {{ min-height:30px; padding:0 6px; }}
     .repair-note {{ min-height:56px; padding:6px; resize:vertical; }}
+    .repair-field-error {{ color:var(--red); font-size:9px; }} .repair-field-error[hidden] {{ display:none; }}
     .repair-feedback-summary {{ margin-top:7px; padding:6px; border-radius:4px; color:#74410a; background:var(--amber-soft); font-size:9px; overflow-wrap:anywhere; }}
     .empty {{ min-height:0; height:100%; display:grid; place-items:center; padding:18px; border:1px dashed #c9d1dc; border-radius:4px; color:var(--muted); background:var(--soft); text-align:center; font-size:11px; }}
     .generation-empty {{ color:var(--amber); background:#fffaf0; border-color:#e8c98f; }}
@@ -2401,6 +2415,7 @@ def build_image_workspace_html(run_id: str) -> str:
     .job-controls button {{ min-height:36px; border:1px solid var(--line); border-radius:5px; background:#fff; cursor:pointer; }}
     .job-controls button:disabled {{ opacity:.45; cursor:not-allowed; }}
     .job-controls .repair-submit {{ grid-column:1/-1; border-color:var(--red); color:#fff; background:var(--red); font-weight:650; }}
+    .job-controls .repair-submit:disabled {{ opacity:1; border-color:#e2b9bd; border-style:dashed; color:#985a60; background:#f8e9eb; cursor:not-allowed; }}
     .repair-selection-status {{ grid-column:1/-1; min-height:16px; color:var(--muted); font-size:10px; }}
     .repair-selection-status.error {{ color:var(--red); }}
     .repair-selection-status.success {{ color:var(--green); }}
@@ -2442,6 +2457,7 @@ def build_image_workspace_html(run_id: str) -> str:
           <div class="metric"><span>供应商原图 (Supplier)</span><strong id="supplierImageCount">0</strong></div>
           <div class="metric"><span>生成结果 (Generated)</span><strong id="generatedImageCount">0</strong></div>
         </section>
+        <section id="batchGenerationOverview" class="batch-generation-overview" aria-live="polite"><strong>整批生图状态 (Batch Status)</strong><span class="queue-state-chip">正在加载…</span></section>
         <div class="image-layout">
           <section class="panel"><div class="panel-head"><h3>素材工作区 (Source Assets)</h3><div class="image-pager" aria-label="商品切换 (Product Navigation)"><button id="previousImageItem" type="button" title="上一件 (Previous)" aria-label="上一件">&#8592;</button><span id="imageItemPosition" class="image-position" aria-live="polite">0 / 0</span><button id="nextImageItem" type="button" title="下一件 (Next)" aria-label="下一件">&#8594;</button><span class="pill">单 SKU</span></div></div><div id="imageItems" class="image-items image-items-viewport"></div></section>
           <aside id="imageGate" class="panel"><div class="panel-head"><h3>图片质量门禁 (Image Gate)</h3></div><div class="gate-list">
@@ -2450,7 +2466,7 @@ def build_image_workspace_html(run_id: str) -> str:
             <div class="gate-row blocked"><span class="gate-icon">!</span><div><strong>Codex 生图队列 (Codex Image Queue)</strong><span id="gateMessage">等待真实 SKU 与主体证据确认。</span></div></div>
           <div class="controller-panel">
             <strong>生图命令 (Image Commands)</strong>
-            <p>先用单件命令验证新版俄文标签和画面效果；确认后再运行整批命令。两种模式都停在人工审核，不会上传。</p>
+            <p>单件命令生成 1 件后停在人工审核；整批命令让已完成商品各自等待审核，同时继续处理其他可调度商品。两种模式都不会上传。</p>
             <div class="controller-variant">
               <div class="controller-variant-head"><strong>单件试图命令 (Single-Product Trial Command)</strong><span class="controller-badge">推荐先试 1 件</span></div>
               <div id="imageTrialCommand" class="controller-command">{trial_command_html}</div>
@@ -2461,7 +2477,7 @@ def build_image_workspace_html(run_id: str) -> str:
             </div>
             <details>
               <summary>整批生图命令 (Full-Batch Command)</summary>
-              <p>单件效果确认后使用；按可用并发位动态调度最多 5 个内部生图子智能体。</p>
+              <p>单件效果确认后使用；按可用并发位动态调度最多 5 个内部生图子智能体，单件审核、缺 SKU 或停止状态不会阻断其他商品。</p>
               <div id="imageControllerCommand" class="controller-command">{controller_command_html}</div>
               <div class="controller-actions">
                 <button id="copyImageControllerCommand" type="button">复制整批生图命令 (Copy Batch Command)</button>
@@ -2537,14 +2553,43 @@ def build_image_workspace_html(run_id: str) -> str:
     }}
     function updateRepairSubmitState() {{
       const button = $("submitImageRepairs");
+      const status = $("repairSelectionStatus");
       const selected = [...document.querySelectorAll(".generated-review-card")].filter((card) => card.querySelector('input[type="checkbox"]')?.checked);
-      const valid = selected.length > 0 && selected.every((card) => {{
+      const missingIssue = selected.filter((card) => !card.querySelector(".repair-issue")?.value);
+      const missingOtherNote = selected.filter((card) => {{
         const issue = card.querySelector(".repair-issue");
         const note = card.querySelector(".repair-note");
-        return issue && issue.value && (issue.value !== "other" || note.value.trim());
+        return issue?.value === "other" && !note?.value.trim();
       }});
+      selected.forEach((card) => {{
+        const issueMissing = missingIssue.includes(card);
+        const noteMissing = missingOtherNote.includes(card);
+        const fieldError = card.querySelector(".repair-field-error");
+        card.classList.toggle("repair-incomplete", issueMissing || noteMissing);
+        if (fieldError) {{
+          fieldError.hidden = !(issueMissing || noteMissing);
+          fieldError.textContent = issueMissing ? "请选择这张图片的问题类型" : noteMissing ? "选择“其他问题”时必须填写说明" : "";
+        }}
+      }});
+      const valid = selected.length > 0 && !missingIssue.length && !missingOtherNote.length;
       button.disabled = !valid;
-      button.textContent = selected.length ? `提交选中 ${{selected.length}} 张图片返修 (Repair Selected)` : "提交选中图片返修 (Repair Selected)";
+      if (!selected.length) {{
+        button.textContent = "提交选中图片返修 (Repair Selected)";
+        status.className = "repair-selection-status";
+        status.textContent = "勾选不合格图片后，请逐张选择问题类型";
+      }} else if (missingIssue.length) {{
+        button.textContent = `还需填写 ${{missingIssue.length}} 张问题类型`;
+        status.className = "repair-selection-status error";
+        status.textContent = `还需为 ${{missingIssue.length}} 张图片选择问题类型：${{missingIssue.map((card) => card.dataset.slotId).join("、")}}`;
+      }} else if (missingOtherNote.length) {{
+        button.textContent = `还需填写 ${{missingOtherNote.length}} 张其他问题说明`;
+        status.className = "repair-selection-status error";
+        status.textContent = `还需为 ${{missingOtherNote.length}} 张“其他问题”填写说明：${{missingOtherNote.map((card) => card.dataset.slotId).join("、")}}`;
+      }} else {{
+        button.textContent = `提交选中 ${{selected.length}} 张图片返修 (Repair Selected)`;
+        status.className = "repair-selection-status success";
+        status.textContent = `已填写完整，可以提交 ${{selected.length}} 张返修`;
+      }}
     }}
     function generatedReviewPanel(item) {{
       const panel = document.createElement("div"); panel.className = "source-panel generated-review-panel";
@@ -2571,8 +2616,9 @@ def build_image_workspace_html(run_id: str) -> str:
         const placeholder = document.createElement("option"); placeholder.value = ""; placeholder.textContent = "请选择问题类型"; select.append(placeholder);
         repairIssueOptions.forEach(([value, label]) => {{ const option = document.createElement("option"); option.value = value; option.textContent = label; select.append(option); }});
         const textarea = document.createElement("textarea"); textarea.className = "repair-note"; textarea.maxLength = 500; textarea.placeholder = "补充说明（可选；选择其他时必填）"; textarea.setAttribute("aria-label", `${{slot.slot_id}} 补充说明`);
-        fields.append(select, textarea);
-        checkbox.addEventListener("change", () => {{ card.classList.toggle("selected", checkbox.checked); fields.hidden = !checkbox.checked; if (!checkbox.checked) {{ select.value = ""; textarea.value = ""; }} $("repairSelectionStatus").textContent = ""; $("repairSelectionStatus").className = "repair-selection-status"; updateRepairSubmitState(); }});
+        const fieldError = document.createElement("div"); fieldError.className = "repair-field-error"; fieldError.hidden = true;
+        fields.append(select, textarea, fieldError);
+        checkbox.addEventListener("change", () => {{ card.classList.toggle("selected", checkbox.checked); fields.hidden = !checkbox.checked; if (!checkbox.checked) {{ select.value = ""; textarea.value = ""; card.classList.remove("repair-incomplete"); }} updateRepairSubmitState(); }});
         select.addEventListener("change", updateRepairSubmitState); textarea.addEventListener("input", updateRepairSubmitState);
         card.append(cardHead, image, checkLabel, fields);
         if (slot.status === "repair_pending") {{ const feedback = document.createElement("div"); feedback.className = "repair-feedback-summary"; feedback.textContent = `${{slot.review_issue_code || "返修"}}${{slot.review_note ? ` · ${{slot.review_note}}` : ""}}`; card.append(feedback); }}
@@ -2580,11 +2626,52 @@ def build_image_workspace_html(run_id: str) -> str:
       }});
       panel.append(grid); return panel;
     }}
+    const imageQueueStateLabels = [
+      ["manual_review_required", "待人工审核", "ready"],
+      ["repair_pending", "返修待生成", "warn"],
+      ["pending", "待生成", "warn"],
+      ["in_progress", "生成中", "warn"],
+      ["stopped", "已停止", "stop"],
+      ["completed", "已完成", "ready"],
+      ["failed", "失败", "stop"],
+      ["waiting_for_supplier_sku", "未锁定 SKU", "stop"],
+      ["waiting_for_subject_master", "未确认主体", "stop"],
+      ["queue_missing", "未进入队列", "stop"],
+    ];
+    function renderBatchGenerationOverview(summary) {{
+      const container = $("batchGenerationOverview");
+      container.replaceChildren();
+      const heading = document.createElement("strong");
+      heading.textContent = `整批生图状态：共 ${{summary.total_products || 0}} 件`;
+      container.append(heading);
+      imageQueueStateLabels.forEach(([key, label, tone]) => {{
+        const count = Number(summary[key] || 0);
+        if (!count) return;
+        const chip = document.createElement("span");
+        chip.className = `queue-state-chip ${{tone}}`;
+        chip.innerHTML = `<span>${{label}}</span><b>${{count}}</b>`;
+        container.append(chip);
+      }});
+    }}
+    function productStatePresentation(item) {{
+      const job = item.image_job || {{}};
+      const status = String(item.generation_status || job.status || "queue_missing");
+      if (status === "waiting_for_supplier_sku") return {{ tone:"stop", text:"未进入生图队列：尚未锁定真实 1688 SKU", action:"去选择 SKU" }};
+      if (status === "waiting_for_subject_master") return {{ tone:"stop", text:"未进入生图队列：尚未确认真实商品主体证据" }};
+      if (status === "queue_missing") return {{ tone:"stop", text:"SKU 与主体已确认，但生图队列记录缺失；请检查入队流程" }};
+      if (status === "stopped") return {{ tone:"stop", text:`生图已停止：${{job.stop_reason || "旧任务未记录停止原因"}}；确认后可点右侧“继续生图”` }};
+      if (status === "manual_review_required") return {{ tone:"ready", text:"8 张图片已生成；等待人工审核不会阻塞其他商品继续生图" }};
+      if ((job.slots || []).some((slot) => slot.status === "repair_pending")) return {{ tone:"warn", text:"返修已入队，等待总控继续生成选中的槽位" }};
+      if (status === "pending") return {{ tone:"warn", text:"已进入生图队列，等待总控领取" }};
+      if (status === "in_progress") return {{ tone:"warn", text:"正在生成图片；其他商品仍按空闲并发位继续调度" }};
+      if (status === "failed") return {{ tone:"stop", text:"生图任务失败；请查看任务事件中的失败原因" }};
+      return {{ tone:"ready", text:`当前生图状态：${{status}}` }};
+    }}
     function renderImageJobControls(item) {{
       const job = item && item.image_job ? item.image_job : null;
       const status = job ? String(job.status || "pending") : String((item && item.generation_status) || "not_queued");
       const repairPending = job ? (job.slots || []).filter((slot) => slot.status === "repair_pending").length : 0;
-      $("imageJobStatus").textContent = job ? `${{job.job_id}} · ${{status}}${{repairPending ? ` · ${{repairPending}} 张等待返修` : ""}}` : status;
+      $("imageJobStatus").textContent = job ? `${{job.job_id}} · ${{status}}${{status === "stopped" ? ` · ${{job.stop_reason || "旧任务未记录停止原因"}}` : ""}}${{repairPending ? ` · ${{repairPending}} 张等待返修` : ""}}` : status;
       $("stopImageJob").disabled = !job || ["stopped","manual_review_required","completed","failed"].includes(status);
       $("resumeImageJob").disabled = !job || status !== "stopped";
       $("startGeneration").textContent = repairPending ? "返修已入队，请重新启动生图总控" : status === "manual_review_required" ? "等待用户审核 8 张图 (Review Required)" : status === "in_progress" ? "Codex 正在生成 (Generating)" : status === "pending" ? "已进入 Codex 队列 (Queued)" : "等待 Codex 生图子智能体 (Waiting for Codex Subagents)";
@@ -2604,11 +2691,14 @@ def build_image_workspace_html(run_id: str) -> str:
       const item = imageWorkspaceItems[imageWorkspaceIndex];
       const card = document.createElement("article"); card.className = "image-product";
       const head = document.createElement("div"); head.className = "product-head"; const title = document.createElement("strong"); title.textContent = item.ozon_title || item.seed_id; const sku = document.createElement("span"); sku.textContent = JSON.stringify(item.selected_options || {{}}); head.append(title, sku);
+      const presentation = productStatePresentation(item);
+      const stateBanner = document.createElement("div"); stateBanner.className = "product-state-banner"; stateBanner.classList.add(presentation.tone); stateBanner.textContent = presentation.text;
+      if (presentation.action) {{ const action = document.createElement("a"); action.href = `/batches/${{encodeURIComponent(runId)}}/supplier-review`; action.textContent = presentation.action; stateBanner.append(action); }}
       const sources = document.createElement("div"); sources.className = "source-grid";
       sources.append(sourcePanel("Ozon 参考图 (Ozon Reference)", item.ozon_reference_images || [], "没有 Ozon 参考图"));
       sources.append(sourcePanel("供应商原图 (Supplier Source)", item.supplier_source_images || [], "等待用户核实并采集 1688 商品"));
       sources.append(generatedReviewPanel(item));
-      card.append(head, sources); container.append(card); container.scrollTop = 0;
+      card.append(head, stateBanner, sources); container.append(card); container.scrollTop = 0;
       renderImageJobControls(item);
     }}
     function render(data, preserveIndex = false) {{
@@ -2616,10 +2706,11 @@ def build_image_workspace_html(run_id: str) -> str:
       $("productCount").textContent = String(imageWorkspaceItems.length); $("ozonImageCount").textContent = String(counts.ozon_reference_images || 0); $("supplierImageCount").textContent = String(counts.supplier_source_images || 0); $("generatedImageCount").textContent = String(counts.generated_images || 0);
       $("workspaceStatus").textContent = (counts.supplier_source_images || 0) > 0 ? "素材已就绪 (Sources Ready)" : "等待供应商素材 (Waiting for Supplier)";
       $("gateMessage").textContent = gate.message || "没有生成结果，禁止进入上传阶段。";
+      renderBatchGenerationOverview(data.image_queue_summary || {{ total_products:imageWorkspaceItems.length }});
       renderImageItemAt(preserveIndex ? imageWorkspaceIndex : 0);
     }}
     function workspaceSignature(data) {{
-      return JSON.stringify((data.items || []).map((item) => [item.seed_id, item.generation_status, (item.image_job || {{}}).status, ((item.image_job || {{}}).slots || []).map((slot) => [slot.slot_id, slot.status, slot.accepted_path, slot.attempt_count, slot.repair_count, slot.review_issue_code, slot.review_requested_at])]));
+      return JSON.stringify([data.image_queue_summary || {{}}, (data.items || []).map((item) => [item.seed_id, item.generation_status, (item.image_job || {{}}).status, (item.image_job || {{}}).stop_reason, ((item.image_job || {{}}).slots || []).map((slot) => [slot.slot_id, slot.status, slot.accepted_path, slot.attempt_count, slot.repair_count, slot.review_issue_code, slot.review_requested_at])])]);
     }}
     async function loadWorkspace(force = false) {{
       const result = await api(`/api/batches/${{encodeURIComponent(runId)}}/images`);

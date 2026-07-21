@@ -1000,6 +1000,33 @@ class WorkbenchService:
             )
 
         generated_count = sum(len(item["generated_images"]) for item in items)
+        queue_state_keys = (
+            "manual_review_required",
+            "repair_pending",
+            "pending",
+            "in_progress",
+            "stopped",
+            "completed",
+            "failed",
+            "waiting_for_supplier_sku",
+            "waiting_for_subject_master",
+            "queue_missing",
+        )
+        image_queue_summary = {key: 0 for key in queue_state_keys}
+        image_queue_summary["total_products"] = len(items)
+        for item in items:
+            image_job = item.get("image_job") or {}
+            has_repair_pending = any(
+                slot.get("status") == "repair_pending"
+                for slot in image_job.get("slots", [])
+            )
+            summary_state = (
+                "repair_pending"
+                if image_job.get("status") == "pending" and has_repair_pending
+                else item["generation_status"]
+            )
+            if summary_state in image_queue_summary:
+                image_queue_summary[summary_state] += 1
         all_selected = bool(items) and all(item["supplier_sku_selection"] for item in items)
         all_subjects = bool(items) and all(item["subject_master"] for item in items)
         all_jobs = bool(items) and all(item["image_job"] for item in items)
@@ -1034,6 +1061,7 @@ class WorkbenchService:
                     "supplier_source_images": sum(len(item["supplier_source_images"]) for item in items),
                     "generated_images": generated_count,
                 },
+                "image_queue_summary": image_queue_summary,
                 "image_gate": {
                     "ready": all_reviewable,
                     "code": gate_code,
@@ -2239,13 +2267,14 @@ class WorkbenchService:
         job = queue.get_job(job_id)
         if job is None or str(job.get("run_id") or "") != run_id:
             return Result.failure("image_job.not_found", "The image job was not found in this batch.")
-        queue.stop(job_id)
+        stop_reason = "用户在工具台手动停止生图"
+        queue.stop(job_id, reason=stop_reason, stopped_by="workbench_user")
         image_job = self._image_job_payload(job_id)
         event = self.repo.append_run_event(
             run_id,
             "image_job.stopped",
             "Image generation was stopped by the user.",
-            {"image_job_id": job_id},
+            {"image_job_id": job_id, "stop_reason": stop_reason},
         )
         return Result.success(
             "image_job.stopped",

@@ -32,7 +32,11 @@ When a queued product contains `repair_pending` slots, dispatch it through the s
 
 ## Stop Gates
 
-Stop dispatching when the queue is empty, a product requires manual review, a blocking gate is reached, or the user stops the batch.
+Treat every product state independently. A product waiting for manual review is a per-product waiting state, not a batch-wide stop gate. Continue dispatching other eligible `pending` or `repair_pending` products while any remain.
+
+A missing SKU or subject gate blocks only that product. Report the blocked product and its required user action, then continue every other eligible queued product. A `stopped` product does not stop other eligible products. Report its persisted stop reason and recovery action. Never auto-resume a stopped product because the stop may have been requested by the user.
+
+Stop dispatching only when no eligible `pending` or `repair_pending` products remain, a system-wide queue or evidence store failure prevents all remaining work, or the user stops the batch. When stopping, report separate counts for manual review, stopped, missing SKU/subject, failed, and completed products.
 
 ## Boundaries
 

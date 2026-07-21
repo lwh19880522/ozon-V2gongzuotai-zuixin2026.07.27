@@ -197,7 +197,16 @@ def test_expired_lease_can_be_reclaimed_and_stop_resume_is_explicit(tmp_path: Pa
     assert reclaimed and reclaimed["job_id"] == job["job_id"]
     assert reclaimed["worker_id"] == "ozon-image-worker-02"
 
-    queue.stop(job["job_id"])
+    queue.stop(
+        job["job_id"],
+        reason="用户在工具台手动停止生图",
+        stopped_by="workbench_user",
+    )
+    stopped = queue.get_job(job["job_id"])
+    assert stopped["status"] == "stopped"
+    assert stopped["stop_reason"] == "用户在工具台手动停止生图"
+    assert stopped["stopped_by"] == "workbench_user"
+    assert stopped["stopped_at"] is not None
     assert queue.claim_next("ozon-image-worker-03", now_epoch=200, lease_seconds=10) is None
     queue.resume(job["job_id"])
     assert queue.claim_next("ozon-image-worker-03", now_epoch=200, lease_seconds=10)["job_id"] == job["job_id"]

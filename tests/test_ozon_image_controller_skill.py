@@ -37,9 +37,13 @@ def test_image_controller_skill_uses_dynamic_pool_up_to_five_workers() -> None:
 def test_image_controller_skill_has_bounded_stop_gates() -> None:
     text = SKILL_PATH.read_text(encoding="utf-8")
 
-    assert "queue is empty" in text
-    assert "manual review" in text
-    assert "blocking gate" in text
+    assert "manual review is a per-product waiting state" in text
+    assert "Continue dispatching other eligible `pending` or `repair_pending` products" in text
+    assert "A missing SKU or subject gate blocks only that product" in text
+    assert "A `stopped` product does not stop other eligible products" in text
+    assert "Never auto-resume a stopped product" in text
+    assert "no eligible `pending` or `repair_pending` products remain" in text
+    assert "a product requires manual review" not in text
     assert "user stops" in text
     assert "Never upload" in text
     assert "Never modify business source code" in text

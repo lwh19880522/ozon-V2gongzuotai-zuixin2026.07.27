@@ -78,6 +78,9 @@ class ImageGenerationQueue:
                     lease_expires REAL,
                     heartbeat_at REAL,
                     lease_epoch INTEGER NOT NULL DEFAULT 0,
+                    stop_reason TEXT,
+                    stopped_by TEXT,
+                    stopped_at REAL,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     UNIQUE(run_id, product_id, selection_sha256, subject_master_sha256)
@@ -114,6 +117,7 @@ class ImageGenerationQueue:
                 """
             )
             self._ensure_lease_epoch_column(connection)
+            self._ensure_stop_metadata_columns(connection)
             self._ensure_repair_count_column(connection)
             self._ensure_review_feedback_columns(connection)
 
@@ -127,6 +131,22 @@ class ImageGenerationQueue:
                 "ALTER TABLE image_jobs "
                 "ADD COLUMN lease_epoch INTEGER NOT NULL DEFAULT 0"
             )
+
+    @staticmethod
+    def _ensure_stop_metadata_columns(connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(image_jobs)")
+        }
+        definitions = {
+            "stop_reason": "TEXT",
+            "stopped_by": "TEXT",
+            "stopped_at": "REAL",
+        }
+        for name, declaration in definitions.items():
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE image_jobs ADD COLUMN {name} {declaration}"
+                )
 
     @staticmethod
     def _ensure_repair_count_column(connection: sqlite3.Connection) -> None:
@@ -780,17 +800,22 @@ class ImageGenerationQueue:
             connection.commit()
         return dict(updated)
 
-    def stop(self, job_id: str) -> None:
+    def stop(self, job_id: str, *, reason: str, stopped_by: str) -> None:
+        reason = str(reason or "").strip()
+        stopped_by = str(stopped_by or "").strip()
+        if not reason or not stopped_by:
+            raise ValueError("stopping an image job requires a reason and actor")
         now = time.time()
         with self._connect() as connection:
             connection.execute(
                 """
                 UPDATE image_jobs
                 SET status = 'stopped', worker_id = NULL, lease_expires = NULL,
-                    heartbeat_at = NULL, updated_at = ?
+                    heartbeat_at = NULL, stop_reason = ?, stopped_by = ?,
+                    stopped_at = ?, updated_at = ?
                 WHERE job_id = ? AND status NOT IN ('completed', 'failed')
                 """,
-                (now, job_id),
+                (reason, stopped_by, now, now, job_id),
             )
 
     def stop_unstarted(self, job_id: str) -> bool:
@@ -813,10 +838,12 @@ class ImageGenerationQueue:
                 """
                 UPDATE image_jobs
                 SET status = 'stopped', worker_id = NULL, lease_expires = NULL,
-                    heartbeat_at = NULL, updated_at = ?
+                    heartbeat_at = NULL,
+                    stop_reason = '重新选择真实 1688 SKU，原未启动任务已停止',
+                    stopped_by = 'supplier_sku_reopen', stopped_at = ?, updated_at = ?
                 WHERE job_id = ?
                 """,
-                (now, job_id),
+                (now, now, job_id),
             )
             connection.commit()
         return True
