@@ -70,6 +70,33 @@ def test_detail_05_numeric_copy_requires_verified_number() -> None:
     assert "numeric copy requires numeric_verified" in validate_visual_spec(spec, {LOCKED_HASH})
 
 
+@pytest.mark.parametrize(
+    "slot_id,recipe,callout_points",
+    [
+        ("detail_02", "feature_callout", ((0.2, 0.3), (0.8, 0.7))),
+        ("detail_03", "feature_callout", ((0.2, 0.3), (0.8, 0.7))),
+        ("detail_05", "metric_panel", ()),
+        ("detail_06", "context_caption", ()),
+    ],
+)
+def test_selected_detail_slots_allow_two_verified_fact_blocks(
+    slot_id: str,
+    recipe: str,
+    callout_points: tuple[tuple[float, float], ...],
+) -> None:
+    spec = _spec(
+        slot_id,
+        recipe,
+        facts=(
+            _fact(headline="Первая особенность"),
+            _fact(headline="Вторая особенность"),
+        ),
+        callout_points=callout_points,
+    )
+
+    assert validate_visual_spec(spec, {LOCKED_HASH}) == []
+
+
 def test_detail_01_reports_unlocked_and_promotional_copy_together() -> None:
     spec = _spec(
         "detail_01",
@@ -566,6 +593,46 @@ def test_context_caption_uses_a_bottom_gradient_without_darkening_the_top(
     rendered = Image.open(output)
     assert rendered.getpixel((512, 120)) == source_rgb
     assert sum(rendered.getpixel((512, 1000))) < sum(source_rgb)
+
+
+def test_detail_06_context_caption_renders_both_verified_fact_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ozon_v2.images import visual_design
+
+    source = tmp_path / "source.png"
+    output = tmp_path / "caption.png"
+    Image.new("RGB", (1024, 1024), (205, 192, 180)).save(source)
+    rendered_headlines: list[str] = []
+
+    def capture_fact(
+        draw: object,
+        fact: VisualFact,
+        x: int,
+        y: int,
+        max_width: int,
+        headline_font: object,
+        detail_font: object,
+        accent_rgb: object,
+        bottom: int,
+        **fills: object,
+    ) -> int:
+        rendered_headlines.append(fact.headline)
+        return y + 60
+
+    monkeypatch.setattr(visual_design, "_draw_fact", capture_fact)
+    spec = _render_spec(
+        slot_id="detail_06",
+        recipe="context_caption",
+        facts=(
+            VisualFact("Первая особенность", "Проверенная деталь", LOCKED_HASH),
+            VisualFact("Вторая особенность", "Ещё одна деталь", LOCKED_HASH),
+        ),
+    )
+
+    render_visual(source, output, spec, {LOCKED_HASH})
+
+    assert rendered_headlines == ["Первая особенность", "Вторая особенность"]
 
 
 def test_russian_headline_keeps_natural_sentence_case(

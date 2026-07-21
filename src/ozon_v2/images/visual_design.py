@@ -63,7 +63,7 @@ SLOT_VISUAL_CONTRACTS = {
     "detail_02": SlotVisualContract(("feature_callout",), 2, True),
     "detail_03": SlotVisualContract(("feature_callout", "metric_panel"), 2, True),
     "detail_04": SlotVisualContract(("context_caption",), 1, True),
-    "detail_05": SlotVisualContract(("context_caption", "metric_panel"), 1, True),
+    "detail_05": SlotVisualContract(("context_caption", "metric_panel"), 2, True),
     "detail_06": SlotVisualContract(("integrated_rail", "context_caption"), 2, True),
 }
 
@@ -561,23 +561,40 @@ def _draw_caption(
 ) -> None:
     short_edge = min(width, height)
     panel_padding = max(20, round(short_edge * 0.04))
+    fact_gap = max(10, round(short_edge * 0.018))
     content_width = width - margin * 2 - panel_padding * 2
-    bar_height = _measure_fact_height(
-        draw,
-        spec.facts[0],
-        content_width,
-        headline_font,
-        detail_font,
-    ) + panel_padding * 2
-    if bar_height > min(height - margin * 2, round(height * 0.32)):
+    content_height = sum(
+        _measure_fact_height(
+            draw,
+            fact,
+            content_width,
+            headline_font,
+            detail_font,
+        )
+        for fact in spec.facts
+    ) + fact_gap * max(0, len(spec.facts) - 1)
+    bar_height = content_height + panel_padding * 2
+    max_height_ratio = 0.44 if len(spec.facts) > 1 else 0.32
+    if bar_height > min(height - margin * 2, round(height * max_height_ratio)):
         raise ValueError("visual copy does not fit its safe area")
     top = height - margin - bar_height
     gradient_coverage = max(0.34, (height - top) / height + 0.06)
     _draw_bottom_gradient(draw, width, height, coverage=gradient_coverage, max_alpha=224)
-    _draw_fact(
-        draw, spec.facts[0], margin + panel_padding, top + panel_padding, content_width,
-        headline_font, detail_font, spec.accent_rgb, height - margin - panel_padding,
-    )
+    y = top + panel_padding
+    for index, fact in enumerate(spec.facts):
+        y = _draw_fact(
+            draw,
+            fact,
+            margin + panel_padding,
+            y,
+            content_width,
+            headline_font,
+            detail_font,
+            spec.accent_rgb,
+            height - margin - panel_padding,
+        )
+        if index + 1 < len(spec.facts):
+            y += fact_gap
 
 
 def _draw_callouts(

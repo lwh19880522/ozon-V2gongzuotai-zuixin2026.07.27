@@ -10,6 +10,8 @@ After crop and any conservative upscale, run local `render-visual` and merge its
 
 The local layout must use a prominent Russian headline, supporting detail with an obvious visual hierarchy, and the approved B edge-gradient visual system. `integrated_rail` and `metric_panel` use a soft side-edge gradient; `context_caption` uses a bottom gradient; `feature_callout` uses accent anchor lines with a soft edge fade behind its text. Do not use detached rounded text cards. Validate the rendered type at a 360-pixel preview: the smallest Russian copy must remain at least 13 pixels. Preserve natural Russian sentence case except for standard abbreviations. The receipt must record the actual headline, detail, projected mobile pixel sizes, and `visual_system=ozon-edge-gradient-b1`; a hard-coded pass flag without those measurements is invalid.
 
+Copy density is slot-specific: `detail_01` and `detail_04` remain at one verified fact block. `detail_02`, `detail_03`, `detail_05`, and `detail_06` may use two verified fact blocks only when the scene visibly proves both and the local renderer keeps them non-overlapping and mobile-readable. Never add a second label merely to fill space.
+
 Any two accepted scene slots differ in at least three of environment, lighting, camera, shot scale, and buyer question. An accepted v3 receipt includes its complete `visual_spec`, `visual_contract_version=ozon-visual-v1`, and these four true pass flags: `visual_design_passed`, `russian_copy_passed`, `safe_area_passed`, and `mobile_readability_passed`.
 
 ## Allowed dynamic inputs

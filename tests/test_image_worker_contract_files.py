@@ -127,6 +127,10 @@ def test_product_media_skill_uses_visual_contract_v3_storyboard_and_local_copy_r
     assert "anchor-line callouts" in detail_a_prompt
     assert "bottom-gradient caption zone" in detail_b_prompt
     assert "edge-gradient visual system" in repair_prompt
+    assert "detail_01` and `detail_04` keep one fact block" in skill
+    assert "detail_02`, `detail_03`, `detail_05`, and `detail_06` may use two" in prompt_contract
+    assert "two verified labels" in detail_a_prompt
+    assert "up to two verified labels" in detail_b_prompt
     for prompt in (main_prompt, detail_a_prompt, detail_b_prompt, repair_prompt):
         assert "icons" in prompt
     assert "invented claims" in main_prompt
