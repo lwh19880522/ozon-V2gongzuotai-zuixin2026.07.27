@@ -1864,10 +1864,13 @@ class WorkbenchService:
                 "The confirmed supplier SKU receipt is immutable.",
                 data={"run_id": run_id, "seed_id": seed_id},
             )
-        if WorkbenchState(run["status"]) != WorkbenchState.SUPPLIER_COLLECTED:
+        if WorkbenchState(run["status"]) not in {
+            WorkbenchState.SUPPLIER_COLLECTED,
+            WorkbenchState.IMAGE_PROCESSING,
+        }:
             return Result.failure(
                 "supplier_sku_selection.not_expected",
-                "A supplier SKU can only be selected after supplier collection is complete.",
+                "A supplier SKU can only be selected after supplier collection and before upload.",
                 data={"run_id": run_id, "status": run["status"]},
             )
         supplier_product = next(
@@ -1950,6 +1953,93 @@ class WorkbenchService:
                 run,
                 event,
                 {"receipt": receipt.to_dict(), "selection_status": selection_status},
+            ),
+        )
+
+    def reopen_supplier_sku_selection(self, run_id: str, *, seed_id: str) -> Result:
+        run = self.repo.load_run(run_id)
+        if WorkbenchState(run["status"]) not in {
+            WorkbenchState.SUPPLIER_COLLECTED,
+            WorkbenchState.IMAGE_PROCESSING,
+        }:
+            return Result.failure(
+                "supplier_sku_selection.reopen_blocked",
+                "A supplier SKU can only be reopened before upload begins.",
+                data={"run_id": run_id, "seed_id": seed_id, "status": run["status"]},
+            )
+
+        selection_path = self.repo.run_dir(run_id) / "supplier_sku_selections.json"
+        if not selection_path.exists():
+            return Result.failure(
+                "supplier_sku_selection.missing",
+                "There is no confirmed supplier SKU to reopen.",
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+        selections = self.repo.load_supplier_sku_selections(run_id)
+        receipt = selections.get("selections", {}).get(seed_id)
+        if not isinstance(receipt, dict):
+            return Result.failure(
+                "supplier_sku_selection.missing",
+                "There is no confirmed supplier SKU to reopen.",
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+
+        subject_path = self.repo.run_dir(run_id) / "subject_masters.json"
+        subjects = self.repo.load_subject_masters(run_id) if subject_path.exists() else {
+            "schema_version": 1,
+            "run_id": run_id,
+            "items": {},
+        }
+        subject_entry = subjects.get("items", {}).get(seed_id)
+        job_id = str(subject_entry.get("image_job_id") or "") if isinstance(subject_entry, dict) else ""
+        if isinstance(subject_entry, dict):
+            queue = self._image_generation_queue()
+            if not job_id or not queue.stop_unstarted(job_id):
+                job = queue.get_job(job_id) if job_id else None
+                return Result.failure(
+                    "supplier_sku_selection.reopen_blocked",
+                    "The image job has already started; its locked SKU evidence cannot be reopened.",
+                    data={
+                        "run_id": run_id,
+                        "seed_id": seed_id,
+                        "image_job_id": job_id,
+                        "image_job_status": job.get("status") if job else "missing",
+                    },
+                )
+
+        reopened_at = utc_now_iso()
+        selections.setdefault("history", []).append(
+            {"seed_id": seed_id, "reopened_at": reopened_at, "receipt": receipt}
+        )
+        selections.setdefault("selections", {}).pop(seed_id, None)
+        selections["updated_at"] = reopened_at
+        self.repo.save_supplier_sku_selections(run_id, selections)
+
+        if isinstance(subject_entry, dict):
+            subjects.setdefault("history", []).append(
+                {"seed_id": seed_id, "reopened_at": reopened_at, "subject_entry": subject_entry}
+            )
+            subjects.setdefault("items", {}).pop(seed_id, None)
+            subjects["updated_at"] = reopened_at
+            self.repo.save_subject_masters(run_id, subjects)
+
+        event = self.repo.append_run_event(
+            run_id,
+            "supplier_sku_selection.reopened",
+            "The unstarted supplier SKU decision was archived and reopened for user selection.",
+            {"seed_id": seed_id, "stopped_image_job_id": job_id or None},
+        )
+        return Result.success(
+            "supplier_sku_selection.reopened",
+            "The supplier SKU was reopened for selection; prior evidence remains in audit history.",
+            self._response_payload(
+                run,
+                event,
+                {
+                    "seed_id": seed_id,
+                    "stopped_image_job_id": job_id or None,
+                    "selection_status": self._supplier_sku_selection_status(run_id),
+                },
             ),
         )
 

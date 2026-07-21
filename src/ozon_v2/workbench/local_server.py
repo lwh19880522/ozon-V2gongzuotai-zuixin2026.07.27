@@ -1439,7 +1439,7 @@ def build_supplier_review_html(run_id: str) -> str:
         <span id="skuDecisionStatus" class="status-pill">未锁定 (Unlocked)</span>
       </div>
       <div id="skuOptions" class="sku-options"></div>
-      <div class="sku-action-row"><span id="skuDecisionMessage" class="muted"></span><button id="lockSupplierSku" class="primary" disabled>锁定真实 SKU (Lock Real SKU)</button></div>
+      <div class="sku-action-row"><span id="skuDecisionMessage" class="muted"></span><button id="reopenSupplierSku" type="button" hidden>重新选择 SKU</button><button id="lockSupplierSku" class="primary" disabled>锁定真实 SKU (Lock Real SKU)</button></div>
       <div id="subjectMasterArea" class="subject-master-area" hidden>
         <h3>主体证据图 (Subject Evidence)</h3>
         <span class="muted">可从已锁定 SKU 图片和同一供应商商品图库中多选。这里只确认真实主体与套装，干净白底图由生图技能生成。</span>
@@ -1788,7 +1788,13 @@ def build_supplier_review_html(run_id: str) -> str:
     function updateSkuLockButton() {{
       const item = state.items[state.evidenceIndex];
       const button = $("lockSupplierSku");
-      if (!item) {{ button.disabled = true; return; }}
+      const reopenButton = $("reopenSupplierSku");
+      if (!item) {{
+        button.disabled = true;
+        reopenButton.hidden = true;
+        reopenButton.disabled = true;
+        return;
+      }}
       const options = item.supplier_sku_options || [];
       const receipt = item.supplier_sku_selection || null;
       const singlePageSku = options.length === 1 && options[0].evidence_source === "single_sku_detail_page";
@@ -1798,6 +1804,8 @@ def build_supplier_review_html(run_id: str) -> str:
           ? "确认页面唯一 SKU"
           : "确认所选 SKU";
       button.disabled = !!receipt || !selectedSkuOption(item);
+      reopenButton.hidden = !receipt;
+      reopenButton.disabled = !receipt;
     }}
 
     function selectedSubjectEvidenceUrls() {{
@@ -1972,6 +1980,24 @@ def build_supplier_review_html(run_id: str) -> str:
         $("skuDecisionMessage").className = "error";
         $("skuDecisionMessage").textContent = error.message || "SKU 锁定失败 (Lock Failed)";
         $("lockSupplierSku").disabled = false;
+      }}
+    }}
+
+    async function reopenSupplierSku() {{
+      const item = state.items[state.evidenceIndex];
+      if (!item || !item.supplier_sku_selection) return;
+      if (!window.confirm("会停止尚未开工的图片任务，并把旧 SKU 和主体证据保存到历史记录，是否继续？")) return;
+      $("reopenSupplierSku").disabled = true;
+      try {{
+        await api(`/api/batches/${{encodeURIComponent(runId)}}/supplier-sku/reopen`, {{
+          method:"POST",
+          body:JSON.stringify({{ seed_id:item.seed_id }})
+        }});
+        await load();
+      }} catch (error) {{
+        $("skuDecisionMessage").className = "error";
+        $("skuDecisionMessage").textContent = error.message || "SKU 重选失败 (Reopen Failed)";
+        $("reopenSupplierSku").disabled = false;
       }}
     }}
 
@@ -2218,6 +2244,7 @@ def build_supplier_review_html(run_id: str) -> str:
 
     $("collect").addEventListener("click", restartSupplierCollection);
     $("lockSupplierSku").addEventListener("click", lockSupplierSku);
+    $("reopenSupplierSku").addEventListener("click", reopenSupplierSku);
     $("confirmSubjectMaster").addEventListener("click", confirmSubjectMaster);
     $("ozonEvidencePrev").addEventListener("click", () => moveEvidence(-1));
     $("ozonEvidenceNext").addEventListener("click", () => moveEvidence(1));
@@ -3173,6 +3200,15 @@ def create_handler(
                         seed_id=str(payload.get("seed_id") or "").strip(),
                         supplier_sku_id=str(payload.get("supplier_sku_id") or "").strip(),
                         differences=differences,
+                    ),
+                    run_id=parts[2],
+                )
+                return
+            if len(parts) == 5 and parts[:2] == ["api", "batches"] and parts[3:] == ["supplier-sku", "reopen"]:
+                self._send_result(
+                    service.reopen_supplier_sku_selection(
+                        parts[2],
+                        seed_id=str(payload.get("seed_id") or "").strip(),
                     ),
                     run_id=parts[2],
                 )

@@ -1774,6 +1774,10 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             },
             ok=False,
         )
+        reopened = self.post_json(
+            f"/api/batches/{run_id}/supplier-sku/reopen",
+            {"seed_id": seed.seed_id},
+        )
 
         self.assertIn('id="skuDecisionPanel"', page)
         self.assertIn("锁定真实 SKU (Lock Real SKU)", page)
@@ -1782,6 +1786,8 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn("页面只有一个真实 SKU，无需选择规格", page)
         self.assertIn("确认页面唯一 SKU", page)
         self.assertIn("确认所选 SKU", page)
+        self.assertIn('id="reopenSupplierSku"', page)
+        self.assertIn("重新选择 SKU", page)
         self.assertIn("系统没有找到可证明的唯一对应项", page)
         self.assertIn("function analyzeSupplierSkuOptions", page)
         self.assertIn('const strongMatches = matches.filter((token) => !token.startsWith("包装数量:"));', page)
@@ -1810,12 +1816,18 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertNotIn('id="whiteBackgroundConfirmed"', page)
         self.assertNotIn("White Background Confirmed", page)
         self.assertIn("/supplier-sku", page)
+        self.assertIn("/supplier-sku/reopen", page)
         self.assertIn("/subject-master", page)
         self.assertEqual(1, len(review["data"]["items"][0]["supplier_sku_options"]))
         self.assertTrue(selected["ok"])
         self.assertEqual("supplier-sku-set-x4", selected["data"]["receipt"]["supplier_sku_id"])
         self.assertFalse(rejected_subject["ok"])
         self.assertEqual("subject_master.image_not_in_supplier", rejected_subject["code"])
+        self.assertTrue(reopened["ok"])
+        self.assertNotIn(
+            seed.seed_id,
+            self.repo.load_supplier_sku_selections(run_id)["selections"],
+        )
 
     def test_image_workspace_page_and_api_show_real_source_assets(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()

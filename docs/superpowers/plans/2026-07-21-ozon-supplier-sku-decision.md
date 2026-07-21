@@ -195,3 +195,18 @@ git commit -m "fix: make supplier SKU decisions understandable"
 - [x] **Step 3: API 输出匹配候选、其余候选和唯一推荐证据**
 - [x] **Step 4: 首屏只渲染匹配组，其余折叠，并显示 SKU 绑定图**
 - [x] **Step 5: 运行聚焦测试、内联脚本语法检查和完整安全回归**
+
+### Task 7: 为已锁错的 SKU 提供可审计重选
+
+**Files:**
+- Modify: `src/ozon_v2/images/queue.py`
+- Modify: `src/ozon_v2/services/workbench_service.py`
+- Modify: `src/ozon_v2/workbench/local_server.py`
+- Test: `tests/test_image_workflow_service.py`
+- Test: `tests/test_workbench_local_server.py`
+
+- [x] **Step 1: 写失败测试，覆盖未开工任务可退回及已开工任务必须阻止**
+- [x] **Step 2: 增加任务级 SQLite 原子门禁，不依赖批次阶段误判**
+- [x] **Step 3: 把旧 SKU 收据、主体证据和任务 ID 转入历史，保留审计链**
+- [x] **Step 4: 在已锁定状态显示“重新选择 SKU”，二次确认后调用重选 API**
+- [x] **Step 5: 运行聚焦测试、完整安全回归，然后更新功能分支、本地 main 和 PR #3**

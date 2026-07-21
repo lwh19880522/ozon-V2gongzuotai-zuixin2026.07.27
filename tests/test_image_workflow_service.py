@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 
 from PIL import Image
@@ -238,3 +239,85 @@ class ImageWorkflowServiceTests(RuntimeTestCase):
         self.assertTrue(resumed.ok)
         self.assertEqual("pending", resumed.data["image_job"]["status"])
         self.assertEqual(selection_sha256, resumed.data["image_job"]["selection_sha256"])
+
+    def test_pending_supplier_sku_can_be_reopened_with_audit_history(self) -> None:
+        supplier_result = self.repo.load_supplier_collection_result(self.run_id)
+        alternate = deepcopy(supplier_result["supplier_products"][0]["sku_options"][0])
+        alternate.update(
+            {
+                "supplier_sku_id": "supplier-sku-single",
+                "combination_key": "single",
+                "raw_label": "single item",
+                "selected_options": {"combination": "single item"},
+                "set_quantity": 1,
+                "set_composition": ["single item"],
+            }
+        )
+        supplier_result["supplier_products"][0]["sku_options"].append(alternate)
+        self.repo.save_supplier_collection_result(self.run_id, supplier_result)
+        self.assertTrue(
+            self.service.confirm_supplier_sku(
+                self.run_id,
+                seed_id=self.seed.seed_id,
+                supplier_sku_id="supplier-sku-set-x4",
+            ).ok
+        )
+        confirmed = self.service.confirm_subject_master(
+            self.run_id,
+            seed_id=self.seed.seed_id,
+            source_image_urls=[self.subject_url],
+            visible_subject_quantity=4,
+        )
+        job_id = confirmed.data["image_job"]["job_id"]
+        self.assertEqual(WorkbenchState.IMAGE_PROCESSING.value, self.repo.load_run(self.run_id)["status"])
+
+        reopened = self.service.reopen_supplier_sku_selection(
+            self.run_id,
+            seed_id=self.seed.seed_id,
+        )
+
+        self.assertTrue(reopened.ok, reopened.errors)
+        self.assertEqual("stopped", self.service._image_generation_queue().get_job(job_id)["status"])
+        selections = self.repo.load_supplier_sku_selections(self.run_id)
+        subjects = self.repo.load_subject_masters(self.run_id)
+        self.assertNotIn(self.seed.seed_id, selections["selections"])
+        self.assertNotIn(self.seed.seed_id, subjects["items"])
+        self.assertEqual("supplier-sku-set-x4", selections["history"][-1]["receipt"]["supplier_sku_id"])
+        self.assertEqual(job_id, subjects["history"][-1]["subject_entry"]["image_job_id"])
+        reselection = self.service.confirm_supplier_sku(
+            self.run_id,
+            seed_id=self.seed.seed_id,
+            supplier_sku_id="supplier-sku-single",
+        )
+        self.assertTrue(reselection.ok, reselection.errors)
+        self.assertEqual("supplier-sku-single", reselection.data["receipt"]["supplier_sku_id"])
+
+    def test_started_image_job_blocks_supplier_sku_reopen(self) -> None:
+        self.assertTrue(
+            self.service.confirm_supplier_sku(
+                self.run_id,
+                seed_id=self.seed.seed_id,
+                supplier_sku_id="supplier-sku-set-x4",
+            ).ok
+        )
+        confirmed = self.service.confirm_subject_master(
+            self.run_id,
+            seed_id=self.seed.seed_id,
+            source_image_urls=[self.subject_url],
+            visible_subject_quantity=4,
+        )
+        job_id = confirmed.data["image_job"]["job_id"]
+        queue = self.service._image_generation_queue()
+        claimed = queue.claim_next("ozon-image-worker-01")
+        self.assertEqual(job_id, claimed["job_id"])
+
+        reopened = self.service.reopen_supplier_sku_selection(
+            self.run_id,
+            seed_id=self.seed.seed_id,
+        )
+
+        self.assertFalse(reopened.ok)
+        self.assertEqual("supplier_sku_selection.reopen_blocked", reopened.code)
+        self.assertIn(self.seed.seed_id, self.repo.load_supplier_sku_selections(self.run_id)["selections"])
+        self.assertIn(self.seed.seed_id, self.repo.load_subject_masters(self.run_id)["items"])
+        self.assertEqual("in_progress", queue.get_job(job_id)["status"])

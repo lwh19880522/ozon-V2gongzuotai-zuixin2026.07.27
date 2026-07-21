@@ -793,6 +793,34 @@ class ImageGenerationQueue:
                 (now, job_id),
             )
 
+    def stop_unstarted(self, job_id: str) -> bool:
+        """Stop a pending job only when no worker attempt has started."""
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            job = connection.execute(
+                "SELECT status FROM image_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            attempt = connection.execute(
+                "SELECT 1 FROM image_attempts WHERE job_id = ? LIMIT 1",
+                (job_id,),
+            ).fetchone()
+            if job is None or job["status"] not in {"pending", "stopped"} or attempt is not None:
+                connection.commit()
+                return False
+            connection.execute(
+                """
+                UPDATE image_jobs
+                SET status = 'stopped', worker_id = NULL, lease_expires = NULL,
+                    heartbeat_at = NULL, updated_at = ?
+                WHERE job_id = ?
+                """,
+                (now, job_id),
+            )
+            connection.commit()
+        return True
+
     def resume(self, job_id: str) -> None:
         now = time.time()
         with self._connect() as connection:
