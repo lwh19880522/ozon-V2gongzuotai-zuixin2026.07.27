@@ -2284,17 +2284,6 @@ def build_image_workspace_html(run_id: str) -> str:
         "detail_01、detail_04 固定最多 1 个事实块；detail_02、detail_03、detail_05、detail_06 只有在画面明确支持两个互不重叠的已验证事实时才可增加到 2 个，否则仍为 1 个；"
         "逐张检查 360 像素预览，确保俄文标题是清晰的信息焦点且最小文字可读；只接受主体、数量、颜色、结构、俄文和排版均通过证据门禁的结果。"
     )
-    trial_command = (
-        f"启动 Ozon V2 单件试图总控：批次 {run_id}。"
-        "读取并严格执行工作区技能 skills/ozon-image-generation-controller/SKILL.md；"
-        "这是效果验证模式，本次只允许领取 1 件当前批次中尚未分派的整件商品；"
-        "只在当前 Codex 总控任务内部使用 spawn_agent 创建 1 个生图子智能体，映射为 ozon_image_worker_01 -> ozon-image-worker-01；"
-        "严禁使用 create_thread、fork_thread 或任何会创建用户可见任务或线程的接口；"
-        "不得预领、并发领取或继续领取第二件。"
-        f"{visual_contract}"
-        "完成该商品 2 张主图和 6 张副图、写回队列并进入 manual_review_required 后立即停止，报告商品、Job ID、8 个槽位状态和人工审核入口；"
-        "若遇到证据、SKU、主体、租约或质量门禁则停止并报告真实原因，不得猜测或绕过；不得上传，不得最终审批，不得修改业务代码。"
-    )
     controller_command = (
         f"\u542f\u52a8 Ozon V2 \u751f\u56fe\u603b\u63a7\uff1a\u6279\u6b21 {run_id}\u3002"
         "\u8bfb\u53d6\u5e76\u4e25\u683c\u6267\u884c\u5de5\u4f5c\u533a\u6280\u80fd skills/ozon-image-generation-controller/SKILL.md\uff1b"
@@ -2310,7 +2299,6 @@ def build_image_workspace_html(run_id: str) -> str:
         "结束时分别汇报待人工审核、已停止、缺少 SKU/主体、失败和已完成的商品数量，不得把单商品等待态称为整批完成。"
         "不得上传，不得修改业务代码；不得创建第 6 个常规生图 worker；当运行时提供第 6 个子智能体并发位时，保留 1 个子智能体位置用于失败恢复、诊断或人工介入。"
     )
-    trial_command_html = html.escape(trial_command)
     controller_command_html = html.escape(controller_command)
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -2403,14 +2391,11 @@ def build_image_workspace_html(run_id: str) -> str:
     .controller-variant {{ padding:9px; border:1px solid #b8c7ef; border-radius:5px; background:#f7f9ff; }}
     .controller-variant-head {{ display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:6px; }}
     .controller-badge {{ padding:2px 6px; border-radius:3px; color:var(--blue); background:var(--blue-soft); font-size:9px; font-weight:700; }}
-    .controller-panel details {{ margin-top:10px; padding-top:9px; border-top:1px solid var(--line); }}
-    .controller-panel summary {{ color:var(--text); font-size:11px; font-weight:700; cursor:pointer; }}
-    .controller-panel details p {{ margin-top:6px; }}
     .controller-command {{ max-height:104px; overflow:auto; padding:9px; border:1px solid var(--line); border-radius:4px; background:var(--soft); font:10px/1.45 Consolas,"Courier New",monospace; white-space:pre-wrap; overflow-wrap:anywhere; user-select:text; }}
     .controller-actions {{ display:flex; align-items:center; gap:8px; margin-top:8px; }}
     .controller-actions button {{ min-height:32px; padding:0 10px; border:1px solid var(--blue); border-radius:4px; color:#fff; background:var(--blue); cursor:pointer; }}
+    .controller-actions .production-copy {{ width:100%; min-height:38px; font-weight:700; }}
     .copy-status {{ color:var(--green); font-size:10px; }}
-    .primary {{ width:calc(100% - 28px); height:38px; margin:0 14px 14px; border:1px solid var(--blue); border-radius:5px; color:#fff; background:var(--blue); }} .primary:disabled {{ opacity:.48; cursor:not-allowed; }}
     .job-controls {{ display:grid; grid-template-columns:1fr 1fr; gap:8px; padding:0 14px 14px; }}
     .job-controls button {{ min-height:36px; border:1px solid var(--line); border-radius:5px; background:#fff; cursor:pointer; }}
     .job-controls button:disabled {{ opacity:.45; cursor:not-allowed; }}
@@ -2465,27 +2450,18 @@ def build_image_workspace_html(run_id: str) -> str:
             <div class="gate-row"><span class="gate-icon">2</span><div><strong>供应商原图 (Supplier Source)</strong><span>保持真实商品主体、颜色和结构。</span></div></div>
             <div class="gate-row blocked"><span class="gate-icon">!</span><div><strong>Codex 生图队列 (Codex Image Queue)</strong><span id="gateMessage">等待真实 SKU 与主体证据确认。</span></div></div>
           <div class="controller-panel">
-            <strong>生图命令 (Image Commands)</strong>
-            <p>单件命令生成 1 件后停在人工审核；整批命令让已完成商品各自等待审核，同时继续处理其他可调度商品。两种模式都不会上传。</p>
+            <strong>生图总控 (Production Image Controller)</strong>
+            <p>用于日常整批生图和返修续跑。已审核通过的图片会保留，只处理待生成或待返修槽位；不会上传。</p>
             <div class="controller-variant">
-              <div class="controller-variant-head"><strong>单件试图命令 (Single-Product Trial Command)</strong><span class="controller-badge">推荐先试 1 件</span></div>
-              <div id="imageTrialCommand" class="controller-command">{trial_command_html}</div>
-              <div class="controller-actions">
-                <button id="copyImageTrialCommand" type="button">复制单件试图命令 (Copy Trial Command)</button>
-                <span id="imageTrialCopyStatus" class="copy-status" aria-live="polite"></span>
-              </div>
-            </div>
-            <details>
-              <summary>整批生图命令 (Full-Batch Command)</summary>
-              <p>单件效果确认后使用；按可用并发位动态调度最多 5 个内部生图子智能体，单件审核、缺 SKU 或停止状态不会阻断其他商品。</p>
+              <div class="controller-variant-head"><strong>生图总控命令 (Production Controller Command)</strong><span class="controller-badge">整批生产 / 返修续跑</span></div>
               <div id="imageControllerCommand" class="controller-command">{controller_command_html}</div>
               <div class="controller-actions">
-                <button id="copyImageControllerCommand" type="button">复制整批生图命令 (Copy Batch Command)</button>
-                <span id="imageControllerCopyStatus" class="copy-status" aria-live="polite"></span>
+                <button id="copyImageControllerCommand" class="production-copy" type="button">复制整批生图命令 (Copy Production Command)</button>
               </div>
-            </details>
+              <span id="imageControllerCopyStatus" class="copy-status" aria-live="polite">复制后粘贴到当前 Codex 对话执行</span>
+            </div>
           </div>
-          </div><div class="gate-callout">最多 5 个动态 Codex 生图子智能体在总控任务内部按整件商品领取任务，可用几个就调动几个；当运行时提供第 6 个子智能体并发位时，保留 1 个子智能体位置用于失败恢复、诊断或人工介入。只回传通过真实性校验的 2 张主图与 6 张副图。</div><button id="startGeneration" class="primary" disabled>等待 Codex 生图子智能体 (Waiting for Codex Subagents)</button><div id="imageJobControls" class="job-controls"><div id="imageJobStatus" class="job-status">当前商品尚未入队</div><button id="submitImageRepairs" class="repair-submit" type="button" disabled>提交选中图片返修 (Repair Selected)</button><div id="repairSelectionStatus" class="repair-selection-status" aria-live="polite"></div><button id="stopImageJob" type="button" disabled>停止生图 (Stop Generation)</button><button id="resumeImageJob" type="button" disabled>继续生图 (Resume Generation)</button></div></aside>
+          </div><div class="gate-callout">最多 5 个动态 Codex 生图子智能体在总控任务内部按整件商品领取任务，可用几个就调动几个；当运行时提供第 6 个子智能体并发位时，保留 1 个子智能体位置用于失败恢复、诊断或人工介入。只回传通过真实性校验的 2 张主图与 6 张副图。</div><div id="imageJobControls" class="job-controls"><div id="imageJobStatus" class="job-status">当前商品尚未入队</div><button id="submitImageRepairs" class="repair-submit" type="button" disabled>提交选中图片返修 (Repair Selected)</button><div id="repairSelectionStatus" class="repair-selection-status" aria-live="polite"></div><button id="stopImageJob" type="button" disabled>停止生图 (Stop Generation)</button><button id="resumeImageJob" type="button" disabled>继续生图 (Resume Generation)</button></div></aside>
         </div>
       </main>
     </div>
@@ -2493,9 +2469,6 @@ def build_image_workspace_html(run_id: str) -> str:
   <script>
     const runId = {safe_run_id};
     const $ = (id) => document.getElementById(id);
-    const imageTrialCommand = $("imageTrialCommand");
-    const copyImageTrialCommand = $("copyImageTrialCommand");
-    const imageTrialCopyStatus = $("imageTrialCopyStatus");
     const imageControllerCommand = $("imageControllerCommand");
     const copyImageControllerCommand = $("copyImageControllerCommand");
     const imageControllerCopyStatus = $("imageControllerCopyStatus");
@@ -2515,14 +2488,12 @@ def build_image_workspace_html(run_id: str) -> str:
           document.execCommand("copy");
           textarea.remove();
         }}
-        statusElement.textContent = "\u5df2\u590d\u5236 (Copied)";
+        statusElement.textContent = "命令已复制，请粘贴到当前 Codex 对话执行";
       }} catch (error) {{
         statusElement.textContent = "\u590d\u5236\u5931\u8d25\uff0c\u8bf7\u624b\u52a8\u9009\u62e9 (Copy Failed)";
       }}
     }}
-    async function copyTrialCommand() {{ await copyCommand(imageTrialCommand, imageTrialCopyStatus); }}
     async function copyControllerCommand() {{ await copyCommand(imageControllerCommand, imageControllerCopyStatus); }}
-    copyImageTrialCommand.addEventListener("click", copyTrialCommand);
     copyImageControllerCommand.addEventListener("click", copyControllerCommand);
     let imageWorkspaceItems = [];
     let imageWorkspaceIndex = 0;
@@ -2661,7 +2632,7 @@ def build_image_workspace_html(run_id: str) -> str:
       if (status === "queue_missing") return {{ tone:"stop", text:"SKU 与主体已确认，但生图队列记录缺失；请检查入队流程" }};
       if (status === "stopped") return {{ tone:"stop", text:`生图已停止：${{job.stop_reason || "旧任务未记录停止原因"}}；确认后可点右侧“继续生图”` }};
       if (status === "manual_review_required") return {{ tone:"ready", text:"8 张图片已生成；等待人工审核不会阻塞其他商品继续生图" }};
-      if ((job.slots || []).some((slot) => slot.status === "repair_pending")) return {{ tone:"warn", text:"返修已入队，等待总控继续生成选中的槽位" }};
+      if ((job.slots || []).some((slot) => slot.status === "repair_pending")) return {{ tone:"warn", text:"返修已入队；点击右侧“复制继续返修生图命令”，粘贴到 Codex 执行" }};
       if (status === "pending") return {{ tone:"warn", text:"已进入生图队列，等待总控领取" }};
       if (status === "in_progress") return {{ tone:"warn", text:"正在生成图片；其他商品仍按空闲并发位继续调度" }};
       if (status === "failed") return {{ tone:"stop", text:"生图任务失败；请查看任务事件中的失败原因" }};
@@ -2674,7 +2645,8 @@ def build_image_workspace_html(run_id: str) -> str:
       $("imageJobStatus").textContent = job ? `${{job.job_id}} · ${{status}}${{status === "stopped" ? ` · ${{job.stop_reason || "旧任务未记录停止原因"}}` : ""}}${{repairPending ? ` · ${{repairPending}} 张等待返修` : ""}}` : status;
       $("stopImageJob").disabled = !job || ["stopped","manual_review_required","completed","failed"].includes(status);
       $("resumeImageJob").disabled = !job || status !== "stopped";
-      $("startGeneration").textContent = repairPending ? "返修已入队，请重新启动生图总控" : status === "manual_review_required" ? "等待用户审核 8 张图 (Review Required)" : status === "in_progress" ? "Codex 正在生成 (Generating)" : status === "pending" ? "已进入 Codex 队列 (Queued)" : "等待 Codex 生图子智能体 (Waiting for Codex Subagents)";
+      copyImageControllerCommand.textContent = repairPending ? "复制继续返修生图命令 (Copy Repair Command)" : "复制整批生图命令 (Copy Production Command)";
+      imageControllerCopyStatus.textContent = repairPending ? `当前商品有 ${{repairPending}} 张待返修；复制命令后粘贴到 Codex 执行` : "复制后粘贴到当前 Codex 对话执行";
       updateRepairSubmitState();
     }}
     function renderImageItemAt(index) {{
@@ -2760,7 +2732,7 @@ def build_image_workspace_html(run_id: str) -> str:
         await api(`/api/batches/${{encodeURIComponent(runId)}}/image-job/${{encodeURIComponent(job.job_id)}}/repair`, {{ method:"POST", body:JSON.stringify({{ repairs }}) }});
         await loadWorkspace(true);
         status.className = "repair-selection-status success";
-        status.textContent = "返修已入队，请重新启动生图总控";
+        status.textContent = "返修已入队。点击上方“复制继续返修生图命令”，粘贴到 Codex 执行";
       }} catch (error) {{
         status.className = "repair-selection-status error";
         status.textContent = error.message || "提交返修失败 (Repair Request Failed)";
