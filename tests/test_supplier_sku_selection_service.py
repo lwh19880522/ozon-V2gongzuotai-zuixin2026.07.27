@@ -181,6 +181,58 @@ class SupplierSkuSelectionServiceTests(RuntimeTestCase):
         self.assertFalse(selected.ok)
         self.assertEqual("supplier_sku_selection.option_missing", selected.code)
 
+    def test_supplier_sku_decision_uses_ozon_title_to_narrow_compound_variants(self) -> None:
+        ozon_product = {
+            "title": "Джиггер барный 25/50 мл, нержавеющая сталь",
+            "target_sku": {"selected_options": {"Цвет": "Серебристый"}},
+            "attributes": {"Материал": "Нержавеющая сталь"},
+        }
+        options = [
+            {
+                "supplier_sku_id": "sku-15-30-201",
+                "raw_label": "15/30ml直边²⁰¹",
+                "selected_options": {"颜色": "15/30ml直边²⁰¹"},
+            },
+            {
+                "supplier_sku_id": "sku-25-50-201",
+                "raw_label": "25/50ml直边²⁰¹",
+                "selected_options": {"颜色": "25/50ml直边²⁰¹"},
+            },
+            {
+                "supplier_sku_id": "sku-25-50-304",
+                "raw_label": "25/50ml直边³⁰⁴",
+                "selected_options": {"颜色": "25/50ml直边³⁰⁴"},
+            },
+            {
+                "supplier_sku_id": "sku-30-50-304",
+                "raw_label": "30/50ml卷边³⁰⁴",
+                "selected_options": {"颜色": "30/50ml卷边³⁰⁴"},
+            },
+        ]
+
+        decision = self.service._supplier_sku_decision(ozon_product, options)
+
+        self.assertEqual(["25ml", "50ml"], decision["target_measurements"])
+        self.assertEqual(
+            ["sku-25-50-201", "sku-25-50-304"],
+            decision["matching_sku_ids"],
+        )
+        self.assertEqual(
+            ["sku-15-30-201", "sku-30-50-304"],
+            decision["other_sku_ids"],
+        )
+        self.assertEqual("", decision["recommended_sku_id"])
+        self.assertEqual(
+            ["25ml", "50ml"],
+            decision["candidates"]["sku-25-50-201"]["matched_measurements"],
+        )
+
+    def test_supplier_sku_measurements_expand_multi_axis_dimensions(self) -> None:
+        self.assertEqual(
+            ["10mm", "300mm", "5mm"],
+            self.service._sku_measurement_tokens("Размеры 300x10x5 мм"),
+        )
+
     def test_tampered_selection_receipt_blocks_image_processing(self) -> None:
         ingested = self.service.ingest_supplier_collection_result(self.run_id, self.supplier_payload())
         self.assertTrue(ingested.ok, ingested.errors)

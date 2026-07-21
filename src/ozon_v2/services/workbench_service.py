@@ -3386,10 +3386,15 @@ class WorkbenchService:
             supplier_product = dict(raw_supplier_product) if raw_supplier_product else None
             if supplier_product is not None:
                 supplier_product["images"] = self._supplier_product_images(supplier_product)
+            supplier_sku_options = self._supplier_sku_options(supplier_product) if supplier_product else []
             merged = dict(stored_item)
             merged["ozon_product"] = ozon_product
             merged["supplier_product"] = supplier_product
-            merged["supplier_sku_options"] = self._supplier_sku_options(supplier_product) if supplier_product else []
+            merged["supplier_sku_options"] = supplier_sku_options
+            merged["supplier_sku_decision"] = self._supplier_sku_decision(
+                ozon_product,
+                supplier_sku_options,
+            )
             merged["supplier_sku_groups"] = supplier_product.get("sku_groups") or [] if supplier_product else []
             merged["supplier_sku_matrix_status"] = (
                 supplier_product.get("sku_matrix_status") if supplier_product else None
@@ -3457,6 +3462,107 @@ class WorkbenchService:
             return filtered
         primary_owner = max(owner_groups, key=lambda key: len(owner_groups[key]))
         return owner_groups[primary_owner]
+
+    @staticmethod
+    def _sku_measurement_tokens(value: Any) -> list[str]:
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True) if not isinstance(value, str) else value
+        normalized = text.translate(str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹", "0123456789")).lower()
+        unit_aliases = {
+            "мл": "ml",
+            "ml": "ml",
+            "мм": "mm",
+            "mm": "mm",
+            "см": "cm",
+            "cm": "cm",
+            "кг": "kg",
+            "kg": "kg",
+            "л": "l",
+            "l": "l",
+            "г": "g",
+            "g": "g",
+            "м": "m",
+            "m": "m",
+        }
+        units = "мл|ml|мм|mm|см|cm|кг|kg|л|l|г|g|м|m"
+        tokens: set[str] = set()
+
+        def number_text(raw: str) -> str:
+            number = float(raw.replace(",", "."))
+            return str(int(number)) if number.is_integer() else str(number)
+
+        series_pattern = re.compile(
+            rf"(?<!\d)((?:\d+(?:[.,]\d+)?\s*[/×xх]\s*)+\d+(?:[.,]\d+)?)\s*({units})(?![a-zа-я])",
+            re.I,
+        )
+        for match in series_pattern.finditer(normalized):
+            unit = unit_aliases[match.group(2).lower()]
+            for raw_number in re.findall(r"\d+(?:[.,]\d+)?", match.group(1)):
+                tokens.add(f"{number_text(raw_number)}{unit}")
+
+        single_pattern = re.compile(
+            rf"(?<![\d/×xх])(\d+(?:[.,]\d+)?)\s*({units})(?![a-zа-я])",
+            re.I,
+        )
+        for match in single_pattern.finditer(normalized):
+            unit = unit_aliases[match.group(2).lower()]
+            tokens.add(f"{number_text(match.group(1))}{unit}")
+        return sorted(tokens)
+
+    def _supplier_sku_decision(
+        self,
+        ozon_product: dict[str, Any],
+        options: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        target_source = {
+            "title": ozon_product.get("title"),
+            "selected_options": (ozon_product.get("target_sku") or {}).get("selected_options") or {},
+            "attributes": ozon_product.get("attributes") or {},
+        }
+        target_measurements = self._sku_measurement_tokens(target_source)
+        target_token_set = set(target_measurements)
+        candidate_decisions: dict[str, dict[str, Any]] = {}
+        ranked: list[tuple[int, str]] = []
+        ordered_sku_ids: list[str] = []
+
+        for option in options:
+            supplier_sku_id = str(option.get("supplier_sku_id") or "")
+            option_source = {
+                "raw_label": option.get("raw_label"),
+                "selected_options": option.get("selected_options") or {},
+                "set_composition": option.get("set_composition") or [],
+            }
+            measurements = self._sku_measurement_tokens(option_source)
+            matched_measurements = sorted(target_token_set.intersection(measurements))
+            candidate_decisions[supplier_sku_id] = {
+                "measurements": measurements,
+                "matched_measurements": matched_measurements,
+                "score": len(matched_measurements),
+            }
+            ordered_sku_ids.append(supplier_sku_id)
+            ranked.append((len(matched_measurements), supplier_sku_id))
+
+        ranked.sort(reverse=True)
+        best_score = ranked[0][0] if ranked else 0
+        matching_sku_ids = [
+            supplier_sku_id
+            for supplier_sku_id in ordered_sku_ids
+            if best_score > 0 and candidate_decisions[supplier_sku_id]["score"] == best_score
+        ]
+        other_sku_ids = [
+            supplier_sku_id
+            for supplier_sku_id in ordered_sku_ids
+            if supplier_sku_id not in matching_sku_ids
+        ]
+        recommended_sku_id = ""
+        if ranked and ranked[0][0] > 0 and (len(ranked) == 1 or ranked[0][0] > ranked[1][0]):
+            recommended_sku_id = ranked[0][1]
+        return {
+            "target_measurements": target_measurements,
+            "matching_sku_ids": matching_sku_ids,
+            "other_sku_ids": other_sku_ids,
+            "recommended_sku_id": recommended_sku_id,
+            "candidates": candidate_decisions,
+        }
 
     def _supplier_sku_options(self, product: dict[str, Any]) -> list[dict[str, Any]]:
         raw_options = product.get("sku_options")

@@ -181,3 +181,17 @@ git commit -m "fix: make supplier SKU decisions understandable"
 - [ ] **Step 4: 合并和推送**
 
 把 `codex/ozon-browser-task-recovery-ui` 快进合并到本地 `main`，在合并后的 `main` 再跑完整测试；随后用目标仓库专用 SSH 路径推送功能分支并确认 PR #3 仍为 OPEN。不得推送远端 `main`。
+
+### Task 6: 将大量复合 SKU 收敛为可判断候选
+
+**Files:**
+- Modify: `src/ozon_v2/services/workbench_service.py`
+- Modify: `src/ozon_v2/workbench/local_server.py`
+- Modify: `tests/test_supplier_sku_selection_service.py`
+- Modify: `tests/test_workbench_local_server.py`
+
+- [x] **Step 1: 用 `25/50 ml` 与 18 个供应商复合规格写失败测试**
+- [x] **Step 2: 从 Ozon 标题、属性和 SKU 事实提取规范化度量 token**
+- [x] **Step 3: API 输出匹配候选、其余候选和唯一推荐证据**
+- [x] **Step 4: 首屏只渲染匹配组，其余折叠，并显示 SKU 绑定图**
+- [x] **Step 5: 运行聚焦测试、内联脚本语法检查和完整安全回归**

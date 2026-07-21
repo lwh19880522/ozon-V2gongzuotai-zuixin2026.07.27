@@ -1311,11 +1311,20 @@ def build_supplier_review_html(run_id: str) -> str:
     .sku-fact span {{ color:var(--muted); }}
     .sku-mode-note {{ padding:9px 11px; border-radius:5px; background:#f8fafc; color:var(--muted); font-size:12px; }}
     .sku-mode-note.warning {{ color:var(--amber); background:#fff8e8; }}
+    .sku-candidate-section {{ display:grid; gap:8px; }}
+    .sku-candidate-section + .sku-candidate-section {{ margin-top:4px; }}
+    .sku-candidate-section-title {{ margin:0; color:var(--text); font-size:12px; }}
+    .sku-other-options {{ padding-top:0; border-top:0; }}
+    .sku-other-options summary {{ padding:8px 0; font-weight:600; }}
+    .sku-candidate-list {{ display:grid; gap:12px; }}
     .sku-candidate-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:10px; }}
     .sku-option {{ display:grid; grid-template-columns:auto minmax(0,1fr); gap:10px; min-height:96px; padding:12px; border:1px solid var(--line); border-radius:6px; background:#fbfcfe; cursor:pointer; }}
     .sku-option.recommended {{ border-color:#86b7fe; background:#f5f8ff; }}
     .sku-option:has(input:checked) {{ border-color:var(--blue); box-shadow:0 0 0 2px var(--blue-soft); }}
     .sku-option input {{ width:16px; min-width:16px; height:16px; margin-top:3px; }}
+    .sku-option-main {{ display:grid; grid-template-columns:auto minmax(0,1fr); align-items:start; gap:10px; min-width:0; }}
+    .sku-option-main.no-image {{ grid-template-columns:minmax(0,1fr); }}
+    .sku-option-image {{ width:72px; height:72px; object-fit:contain; border:1px solid var(--line); border-radius:5px; background:#fff; }}
     .sku-option strong,.sku-option span {{ display:block; overflow-wrap:anywhere; }}
     .sku-option span {{ margin-top:4px; color:var(--muted); font-size:12px; }}
     .sku-option .sku-badge {{ display:inline-flex; width:max-content; margin:0 0 6px; padding:2px 6px; border-radius:4px; color:var(--blue); background:var(--blue-soft); font-size:10px; font-weight:700; }}
@@ -1666,6 +1675,13 @@ def build_supplier_review_html(run_id: str) -> str:
       }})).filter((fact) => fact.value && fact.value !== "-");
     }}
 
+    function skuTargetFacts(item) {{
+      const facts = [];
+      const title = String(item.ozon_title || (item.ozon_product && item.ozon_product.title) || "").trim();
+      if (title) facts.push({{ key:"ozon_title", label:"Ozon 标题", value:title }});
+      return facts.concat(skuDecisionFacts(item.selected_options || {{}}));
+    }}
+
     function skuComparableTokens(facts) {{
       const tokens = new Set();
       facts.forEach((fact) => {{
@@ -1686,23 +1702,70 @@ def build_supplier_review_html(run_id: str) -> str:
     }}
 
     function analyzeSupplierSkuOptions(item, options) {{
-      const targetFacts = skuDecisionFacts(item.selected_options || {{}});
+      const targetFacts = skuTargetFacts(item);
       const targetTokens = skuComparableTokens(targetFacts);
+      const serverDecision = item.supplier_sku_decision || {{}};
+      const serverCandidates = serverDecision.candidates || {{}};
       const candidates = (options || []).map((option) => {{
         const facts = skuDecisionFacts(option.selected_options || {{}});
         if (option.set_quantity) facts.push({{ key:"set_quantity", label:"包装数量", value:`${{option.set_quantity}} 件` }});
         const tokens = skuComparableTokens(facts);
-        const matches = Array.from(tokens).filter((token) => targetTokens.has(token));
+        const serverCandidate = serverCandidates[String(option.supplier_sku_id || "")] || null;
+        const matches = serverCandidate
+          ? (serverCandidate.matched_measurements || []).map((token) => `尺寸:${{token}}`)
+          : Array.from(tokens).filter((token) => targetTokens.has(token));
         const strongMatches = matches.filter((token) => !token.startsWith("包装数量:"));
-        return {{ option, facts, matches, score:strongMatches.length }};
+        return {{ option, facts, matches, score:serverCandidate ? Number(serverCandidate.score || 0) : strongMatches.length }};
       }});
       const ranked = [...candidates].sort((left, right) => right.score - left.score);
       const best = ranked[0] || null;
       const second = ranked[1] || null;
-      const recommendedSkuId = best && best.score > 0 && (!second || best.score > second.score)
-        ? String(best.option.supplier_sku_id || "")
-        : "";
+      const recommendedSkuId = String(serverDecision.recommended_sku_id || (
+        best && best.score > 0 && (!second || best.score > second.score)
+          ? String(best.option.supplier_sku_id || "")
+          : ""
+      ));
       return {{ targetFacts, candidates, recommendedSkuId }};
+    }}
+
+    function renderSupplierSkuCandidate(candidate, context) {{
+      const option = candidate.option;
+      const label = document.createElement("label"); label.className = "sku-option";
+      if (context.analysis.recommendedSkuId === option.supplier_sku_id) label.classList.add("recommended");
+      const radio = document.createElement("input"); radio.type = "radio"; radio.name = "supplierSku"; radio.value = option.supplier_sku_id || "";
+      radio.checked = (!!context.lockedSku && context.lockedSku.supplier_sku_id === option.supplier_sku_id)
+        || (!context.receipt && (context.singlePageSku || context.analysis.recommendedSkuId === option.supplier_sku_id));
+      radio.disabled = !!context.receipt;
+      radio.addEventListener("change", updateSkuLockButton);
+      const main = document.createElement("div"); main.className = "sku-option-main";
+      const imageUrl = Array.isArray(option.image_urls) ? String(option.image_urls[0] || "") : "";
+      if (imageUrl) {{
+        const image = document.createElement("img"); image.className = "sku-option-image"; image.src = imageUrl; image.alt = option.raw_label || "1688 SKU"; image.loading = "lazy";
+        main.append(image);
+      }} else {{
+        main.classList.add("no-image");
+      }}
+      const copy = document.createElement("div");
+      if (context.analysis.recommendedSkuId === option.supplier_sku_id) {{
+        const badge = document.createElement("span"); badge.className = "sku-badge"; badge.textContent = "建议选择 (Recommended)"; copy.append(badge);
+      }}
+      const title = document.createElement("strong"); title.textContent = candidate.facts.map((fact) => `${{fact.label}}：${{fact.value}}`).join(" · ") || option.raw_label || option.combination_key || option.supplier_sku_id;
+      const composition = document.createElement("span"); composition.textContent = `套装数量 ${{option.set_quantity || "-"}} · ${{(option.set_composition || []).join(" / ") || valueText(option.selected_options)}}`;
+      const price = document.createElement("span"); price.textContent = `价格 ${{skuPriceText(option.price)}} · ${{skuStockText(option.stock)}}`;
+      const comparison = document.createElement("span"); comparison.className = "sku-comparison"; comparison.textContent = candidate.matches.length
+        ? `与 Ozon 直接重合：${{candidate.matches.map((token) => token.split(":").slice(1).join(":" )).join("、")}}`
+        : "未发现可直接核对的一致字段";
+      copy.append(title, composition, price, comparison); main.append(copy); label.append(radio, main);
+      return label;
+    }}
+
+    function renderSupplierSkuGroup(root, titleText, candidates, context) {{
+      if (!candidates.length) return;
+      const section = document.createElement("section"); section.className = "sku-candidate-section";
+      const title = document.createElement("h4"); title.className = "sku-candidate-section-title"; title.textContent = titleText;
+      const grid = document.createElement("div"); grid.className = "sku-candidate-grid";
+      candidates.forEach((candidate) => grid.append(renderSupplierSkuCandidate(candidate, context)));
+      section.append(title, grid); root.append(section);
     }}
 
     function appendSkuFacts(root, facts) {{
@@ -1786,39 +1849,47 @@ def build_supplier_review_html(run_id: str) -> str:
 
       const candidateTitle = document.createElement("h3"); candidateTitle.className = "sku-section-title"; candidateTitle.textContent = "1688 可采购规格";
       optionsRoot.append(candidateTitle);
+      const strongestScore = Math.max(0, ...analysis.candidates.map((candidate) => candidate.score));
+      const matchingCandidates = analysis.candidates.filter((candidate) => strongestScore > 0 && candidate.score === strongestScore);
+      const otherCandidates = analysis.candidates.filter((candidate) => !matchingCandidates.includes(candidate));
       const modeNote = document.createElement("div"); modeNote.className = "sku-mode-note";
       modeNote.textContent = singlePageSku
         ? "页面只有一个真实 SKU，无需选择规格；请核对商品和数量后确认。"
+        : matchingCandidates.length > 1
+          ? `已根据 Ozon 标题和属性收窄为 ${{matchingCandidates.length}} 项；只需判断剩余差异，其他 ${{otherCandidates.length}} 项已折叠。`
         : options.length > 1 && !analysis.recommendedSkuId
-          ? "系统没有找到可证明的唯一对应项，不会替你猜。请对照 Ozon 目标，选择数量、尺寸或颜色正确的规格。"
+          ? "系统没有找到可证明的唯一对应项，不会替你猜。全部候选默认折叠，请对照 Ozon 目标后再展开选择。"
           : analysis.recommendedSkuId
             ? "系统根据明确重合字段标出建议项；请核对后再确认。"
             : "等待可确认的 1688 SKU 证据。";
-      if (options.length > 1 && !analysis.recommendedSkuId) modeNote.classList.add("warning");
+      if (options.length > 1 && !analysis.recommendedSkuId && !matchingCandidates.length) modeNote.classList.add("warning");
       optionsRoot.append(modeNote);
 
-      const candidatesRoot = document.createElement("div"); candidatesRoot.className = "sku-candidate-grid";
-      analysis.candidates.forEach((candidate) => {{
-        const option = candidate.option;
-        const label = document.createElement("label"); label.className = "sku-option";
-        if (analysis.recommendedSkuId === option.supplier_sku_id) label.classList.add("recommended");
-        const radio = document.createElement("input"); radio.type = "radio"; radio.name = "supplierSku"; radio.value = option.supplier_sku_id || "";
-        radio.checked = (!!lockedSku && lockedSku.supplier_sku_id === option.supplier_sku_id)
-          || (!receipt && (singlePageSku || analysis.recommendedSkuId === option.supplier_sku_id));
-        radio.disabled = !!receipt;
-        radio.addEventListener("change", updateSkuLockButton);
-        const copy = document.createElement("div");
-        if (analysis.recommendedSkuId === option.supplier_sku_id) {{
-          const badge = document.createElement("span"); badge.className = "sku-badge"; badge.textContent = "建议选择 (Recommended)"; copy.append(badge);
-        }}
-        const title = document.createElement("strong"); title.textContent = candidate.facts.map((fact) => `${{fact.label}}：${{fact.value}}`).join(" · ") || option.raw_label || option.combination_key || option.supplier_sku_id;
-        const composition = document.createElement("span"); composition.textContent = `套装数量 ${{option.set_quantity || "-"}} · ${{(option.set_composition || []).join(" / ") || valueText(option.selected_options)}}`;
-        const price = document.createElement("span"); price.textContent = `价格 ${{skuPriceText(option.price)}} · ${{skuStockText(option.stock)}}`;
-        const comparison = document.createElement("span"); comparison.className = "sku-comparison"; comparison.textContent = candidate.matches.length
-          ? `与 Ozon 直接重合：${{candidate.matches.map((token) => token.split(":").slice(1).join(":" )).join("、")}}`
-          : "未发现可直接核对的一致字段";
-        copy.append(title, composition, price, comparison); label.append(radio, copy); candidatesRoot.append(label);
-      }});
+      const candidatesRoot = document.createElement("div"); candidatesRoot.className = "sku-candidate-list";
+      const candidateContext = {{ analysis, receipt, lockedSku, singlePageSku }};
+      const lockedCandidate = lockedSku
+        ? analysis.candidates.find((candidate) => candidate.option.supplier_sku_id === lockedSku.supplier_sku_id)
+        : null;
+      if (lockedCandidate && !matchingCandidates.includes(lockedCandidate)) {{
+        renderSupplierSkuGroup(candidatesRoot, "当前已锁定 SKU", [lockedCandidate], candidateContext);
+      }}
+      if (singlePageSku) {{
+        renderSupplierSkuGroup(candidatesRoot, "页面唯一 SKU", analysis.candidates, candidateContext);
+      }} else if (matchingCandidates.length) {{
+        renderSupplierSkuGroup(candidatesRoot, `符合 Ozon 目标（${{matchingCandidates.length}}）`, matchingCandidates, candidateContext);
+      }}
+      const hiddenCandidates = matchingCandidates.length
+        ? otherCandidates.filter((candidate) => candidate !== lockedCandidate)
+        : analysis.candidates.filter((candidate) => candidate !== lockedCandidate);
+      if (!singlePageSku && hiddenCandidates.length) {{
+        const otherDetails = document.createElement("details"); otherDetails.className = "sku-other-options";
+        const summary = document.createElement("summary"); summary.textContent = matchingCandidates.length
+          ? `查看其他规格（${{hiddenCandidates.length}}）`
+          : `查看其他规格（全部 ${{hiddenCandidates.length}} 项）`;
+        const otherRoot = document.createElement("div");
+        renderSupplierSkuGroup(otherRoot, matchingCandidates.length ? "其他未匹配规格" : "全部真实规格", hiddenCandidates, candidateContext);
+        otherDetails.append(summary, otherRoot); candidatesRoot.append(otherDetails);
+      }}
       optionsRoot.append(candidatesRoot);
       if (!options.length) {{
         const visibleGroups = skuGroups
