@@ -330,12 +330,6 @@
     return groups;
   }
 
-  function hasVisibleVariantSelector() {
-    return Boolean(document.querySelector(
-      "[data-sku-id], [data-skuId], [class*='sku'] button, [class*='sku'] [role='button'], [class*='spec'] button, [class*='prop'] button"
-    ));
-  }
-
   function visiblePriceAmount(price) {
     const match = String(price && price.visible_text || "").match(/\d+(?:\.\d+)?/);
     return match ? match[0] : "";
@@ -392,7 +386,7 @@
   }
 
   function collectSingleSkuOption(groups) {
-    if ((Array.isArray(groups) && groups.length) || hasVisibleVariantSelector()) return [];
+    if (Array.isArray(groups) && groups.length) return [];
     const currentOfferId = offerId(location.href);
     const price = collectPrice();
     const amount = visiblePriceAmount(price);

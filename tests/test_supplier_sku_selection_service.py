@@ -113,6 +113,74 @@ class SupplierSkuSelectionServiceTests(RuntimeTestCase):
         self.assertEqual(original["selection_sha256"], stored["selection_sha256"])
         self.assertEqual(original, stored)
 
+    def test_no_variant_page_recovers_one_confirmable_supplier_sku(self) -> None:
+        product = self.supplier_payload()["supplier_products"][0]
+        product["sku"] = {
+            "selected_options": {"visible_sku_labels": ["单一 SKU（页面无可选规格）"]},
+            "evidence": "no_visible_variant_selector",
+            "evidence_source": "dom_option_labels",
+            "complete": False,
+        }
+        product["sku_groups"] = []
+        product["sku_options"] = []
+        self.repo.save_supplier_collection_result(
+            self.run_id,
+            {
+                "run_id": self.run_id,
+                "network": {"mode": "direct", "proxy_disabled": True},
+                "supplier_products": [product],
+            },
+        )
+        run = self.repo.load_run(self.run_id)
+        run["status"] = WorkbenchState.SUPPLIER_COLLECTED.value
+        self.repo.save_run(run)
+
+        selected = self.service.confirm_supplier_sku(
+            self.run_id,
+            seed_id="seed-1",
+            supplier_sku_id="123456789012",
+            differences=[],
+        )
+
+        self.assertTrue(selected.ok, selected.errors)
+        self.assertEqual("single_sku_detail_page", selected.data["receipt"]["supplier_sku"]["evidence_source"])
+        self.assertEqual("unknown", selected.data["receipt"]["supplier_sku"]["stock"]["status"])
+        self.assertTrue(selected.data["selection_status"]["complete"])
+
+    def test_visible_variant_groups_do_not_become_a_fake_single_sku(self) -> None:
+        product = self.supplier_payload()["supplier_products"][0]
+        product["sku"] = {
+            "selected_options": {"visible_sku_labels": ["黑色", "白色"]},
+            "evidence": "visible_selected_or_available_sku_labels",
+            "evidence_source": "dom_option_labels",
+            "complete": False,
+        }
+        product["sku_groups"] = [
+            {"name": "颜色", "options": [{"label": "黑色"}, {"label": "白色"}]}
+        ]
+        product["sku_options"] = []
+        self.repo.save_supplier_collection_result(
+            self.run_id,
+            {
+                "run_id": self.run_id,
+                "network": {"mode": "direct", "proxy_disabled": True},
+                "supplier_products": [product],
+            },
+        )
+        run = self.repo.load_run(self.run_id)
+        run["status"] = WorkbenchState.SUPPLIER_COLLECTED.value
+        self.repo.save_run(run)
+
+        selected = self.service.confirm_supplier_sku(
+            self.run_id,
+            seed_id="seed-1",
+            supplier_sku_id="123456789012",
+            differences=[],
+        )
+
+        self.assertFalse(selected.ok)
+        self.assertEqual("supplier_sku_selection.option_missing", selected.code)
+
     def test_tampered_selection_receipt_blocks_image_processing(self) -> None:
         ingested = self.service.ingest_supplier_collection_result(self.run_id, self.supplier_payload())
         self.assertTrue(ingested.ok, ingested.errors)

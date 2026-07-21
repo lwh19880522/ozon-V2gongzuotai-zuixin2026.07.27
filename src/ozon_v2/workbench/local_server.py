@@ -1303,12 +1303,23 @@ def build_supplier_review_html(run_id: str) -> str:
     .sku-decision-panel {{ margin-top:14px; }}
     .sku-decision-head {{ display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:12px; }}
     .sku-decision-head h2 {{ margin:0; }}
-    .sku-options {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:10px; }}
+    .sku-options {{ display:grid; gap:12px; }}
+    .sku-target {{ padding:12px; border:1px solid #bfdbfe; border-radius:6px; background:#f5f8ff; }}
+    .sku-section-title {{ display:flex; align-items:center; justify-content:space-between; gap:10px; margin:0 0 8px; font-size:13px; }}
+    .sku-facts {{ display:flex; flex-wrap:wrap; gap:7px; }}
+    .sku-fact {{ display:inline-flex; align-items:center; gap:5px; padding:5px 8px; border:1px solid #dbe4f3; border-radius:5px; background:#fff; font-size:12px; }}
+    .sku-fact span {{ color:var(--muted); }}
+    .sku-mode-note {{ padding:9px 11px; border-radius:5px; background:#f8fafc; color:var(--muted); font-size:12px; }}
+    .sku-mode-note.warning {{ color:var(--amber); background:#fff8e8; }}
+    .sku-candidate-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:10px; }}
     .sku-option {{ display:grid; grid-template-columns:auto minmax(0,1fr); gap:10px; min-height:96px; padding:12px; border:1px solid var(--line); border-radius:6px; background:#fbfcfe; cursor:pointer; }}
+    .sku-option.recommended {{ border-color:#86b7fe; background:#f5f8ff; }}
     .sku-option:has(input:checked) {{ border-color:var(--blue); box-shadow:0 0 0 2px var(--blue-soft); }}
     .sku-option input {{ width:16px; min-width:16px; height:16px; margin-top:3px; }}
     .sku-option strong,.sku-option span {{ display:block; overflow-wrap:anywhere; }}
     .sku-option span {{ margin-top:4px; color:var(--muted); font-size:12px; }}
+    .sku-option .sku-badge {{ display:inline-flex; width:max-content; margin:0 0 6px; padding:2px 6px; border-radius:4px; color:var(--blue); background:var(--blue-soft); font-size:10px; font-weight:700; }}
+    .sku-option .sku-comparison {{ color:var(--green); }}
     .sku-action-row {{ display:flex; align-items:center; justify-content:flex-end; gap:10px; margin-top:12px; }}
     .subject-master-area {{ margin-top:16px; padding-top:14px; border-top:1px solid var(--line); }}
     .subject-gallery {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(112px,1fr)); gap:10px; margin-top:10px; }}
@@ -1620,9 +1631,92 @@ def build_supplier_review_html(run_id: str) -> str:
       renderEvidence({{ resetScroll: true }});
     }}
 
+    function skuFieldName(key) {{
+      const normalized = String(key || "").toLowerCase();
+      if (/количеств|упаков|quantity|count|数量|件数/.test(normalized)) return "包装数量";
+      if (/размер|длина|ширина|высота|dimension|size|length|width|height|尺寸|长度|宽度|高度/.test(normalized)) return "尺寸";
+      if (/цвет|color|colour|颜色/.test(normalized)) return "颜色";
+      if (/комплект|модель|model|configuration|套装|型号|规格/.test(normalized)) return "套装 / 型号";
+      return String(key || "规格");
+    }}
+
+    function skuDecisionFacts(source) {{
+      const payload = source && typeof source === "object" && !Array.isArray(source) ? source : {{}};
+      return Object.entries(payload).map(([key, value]) => ({{
+        key:String(key),
+        label:skuFieldName(key),
+        value:valueText(value),
+      }})).filter((fact) => fact.value && fact.value !== "-");
+    }}
+
+    function skuComparableTokens(facts) {{
+      const tokens = new Set();
+      facts.forEach((fact) => {{
+        const raw = String(fact.value || "").trim().toLowerCase();
+        const compact = raw.replace(/\\s+/g, "");
+        if (compact.length >= 2) tokens.add(`值:${{compact}}`);
+        if (fact.label === "包装数量") {{
+          const quantity = raw.match(/\\d+(?:[.,]\\d+)?/);
+          if (quantity) tokens.add(`包装数量:${{quantity[0].replace(",", ".")}}`);
+        }}
+        for (const match of raw.matchAll(/(\\d+(?:[.,]\\d+)?)\\s*(mm|cm|m|毫米|厘米|米|件|支|个|只|套)?/gi)) {{
+          const number = Number(match[1].replace(",", "."));
+          const unit = String(match[2] || "").toLowerCase();
+          if (number > 1 || unit) tokens.add(`数值:${{number}}${{unit}}`);
+        }}
+      }});
+      return tokens;
+    }}
+
+    function analyzeSupplierSkuOptions(item, options) {{
+      const targetFacts = skuDecisionFacts(item.selected_options || {{}});
+      const targetTokens = skuComparableTokens(targetFacts);
+      const candidates = (options || []).map((option) => {{
+        const facts = skuDecisionFacts(option.selected_options || {{}});
+        if (option.set_quantity) facts.push({{ key:"set_quantity", label:"包装数量", value:`${{option.set_quantity}} 件` }});
+        const tokens = skuComparableTokens(facts);
+        const matches = Array.from(tokens).filter((token) => targetTokens.has(token));
+        return {{ option, facts, matches, score:matches.length }};
+      }});
+      const ranked = [...candidates].sort((left, right) => right.score - left.score);
+      const best = ranked[0] || null;
+      const second = ranked[1] || null;
+      const recommendedSkuId = best && best.score > 0 && (!second || best.score > second.score)
+        ? String(best.option.supplier_sku_id || "")
+        : "";
+      return {{ targetFacts, candidates, recommendedSkuId }};
+    }}
+
+    function appendSkuFacts(root, facts) {{
+      const factsRoot = document.createElement("div"); factsRoot.className = "sku-facts";
+      facts.forEach((fact) => {{
+        const node = document.createElement("div"); node.className = "sku-fact";
+        const label = document.createElement("span"); label.textContent = `${{fact.label}}：`;
+        const value = document.createElement("strong"); value.textContent = fact.value;
+        node.append(label, value); factsRoot.append(node);
+      }});
+      if (!facts.length) factsRoot.append(field("Ozon 目标规格", null));
+      root.append(factsRoot);
+    }}
+
     function selectedSkuOption(item) {{
       const selected = document.querySelector('input[name="supplierSku"]:checked');
       return (item.supplier_sku_options || []).find((option) => option.supplier_sku_id === (selected && selected.value));
+    }}
+
+    function updateSkuLockButton() {{
+      const item = state.items[state.evidenceIndex];
+      const button = $("lockSupplierSku");
+      if (!item) {{ button.disabled = true; return; }}
+      const options = item.supplier_sku_options || [];
+      const receipt = item.supplier_sku_selection || null;
+      const singlePageSku = options.length === 1 && options[0].evidence_source === "single_sku_detail_page";
+      button.textContent = receipt
+        ? "SKU 已确认 (Confirmed)"
+        : singlePageSku
+          ? "确认页面唯一 SKU"
+          : "确认所选 SKU";
+      button.disabled = !!receipt || !selectedSkuOption(item);
     }}
 
     function selectedSubjectEvidenceUrls() {{
@@ -1656,6 +1750,8 @@ def build_supplier_review_html(run_id: str) -> str:
       const lockedSku = receipt && receipt.supplier_sku ? receipt.supplier_sku : null;
       const subjectMaster = item.subject_master || null;
       const skuNeedsConfirmation = !!item.supplier_product && !options.length && !receipt;
+      const singlePageSku = options.length === 1 && options[0].evidence_source === "single_sku_detail_page";
+      const analysis = analyzeSupplierSkuOptions(item, options);
       $("skuDecisionContext").textContent = `${{state.evidenceIndex + 1}} / ${{state.items.length}} · ${{item.ozon_title || item.seed_id}}`;
       $("skuDecisionStatus").textContent = subjectMaster
         ? "主体已锁定 (Subject Locked)"
@@ -1666,17 +1762,46 @@ def build_supplier_review_html(run_id: str) -> str:
             : "未锁定 (Unlocked)";
       $("skuDecisionStatus").className = `status-pill ${{subjectMaster ? "success" : ""}}`;
 
-      options.forEach((option) => {{
+      const target = document.createElement("section"); target.className = "sku-target";
+      const targetTitle = document.createElement("h3"); targetTitle.className = "sku-section-title"; targetTitle.textContent = "Ozon 原商品目标";
+      target.append(targetTitle); appendSkuFacts(target, analysis.targetFacts); optionsRoot.append(target);
+
+      const candidateTitle = document.createElement("h3"); candidateTitle.className = "sku-section-title"; candidateTitle.textContent = "1688 可采购规格";
+      optionsRoot.append(candidateTitle);
+      const modeNote = document.createElement("div"); modeNote.className = "sku-mode-note";
+      modeNote.textContent = singlePageSku
+        ? "页面只有一个真实 SKU，无需选择规格；请核对商品和数量后确认。"
+        : options.length > 1 && !analysis.recommendedSkuId
+          ? "系统没有找到可证明的唯一对应项，不会替你猜。请对照 Ozon 目标，选择数量、尺寸或颜色正确的规格。"
+          : analysis.recommendedSkuId
+            ? "系统根据明确重合字段标出建议项；请核对后再确认。"
+            : "等待可确认的 1688 SKU 证据。";
+      if (options.length > 1 && !analysis.recommendedSkuId) modeNote.classList.add("warning");
+      optionsRoot.append(modeNote);
+
+      const candidatesRoot = document.createElement("div"); candidatesRoot.className = "sku-candidate-grid";
+      analysis.candidates.forEach((candidate) => {{
+        const option = candidate.option;
         const label = document.createElement("label"); label.className = "sku-option";
+        if (analysis.recommendedSkuId === option.supplier_sku_id) label.classList.add("recommended");
         const radio = document.createElement("input"); radio.type = "radio"; radio.name = "supplierSku"; radio.value = option.supplier_sku_id || "";
-        radio.checked = !!lockedSku && lockedSku.supplier_sku_id === option.supplier_sku_id;
+        radio.checked = (!!lockedSku && lockedSku.supplier_sku_id === option.supplier_sku_id)
+          || (!receipt && (singlePageSku || analysis.recommendedSkuId === option.supplier_sku_id));
         radio.disabled = !!receipt;
+        radio.addEventListener("change", updateSkuLockButton);
         const copy = document.createElement("div");
-        const title = document.createElement("strong"); title.textContent = option.raw_label || option.combination_key || option.supplier_sku_id;
+        if (analysis.recommendedSkuId === option.supplier_sku_id) {{
+          const badge = document.createElement("span"); badge.className = "sku-badge"; badge.textContent = "建议选择 (Recommended)"; copy.append(badge);
+        }}
+        const title = document.createElement("strong"); title.textContent = candidate.facts.map((fact) => `${{fact.label}}：${{fact.value}}`).join(" · ") || option.raw_label || option.combination_key || option.supplier_sku_id;
         const composition = document.createElement("span"); composition.textContent = `套装数量 ${{option.set_quantity || "-"}} · ${{(option.set_composition || []).join(" / ") || valueText(option.selected_options)}}`;
         const price = document.createElement("span"); price.textContent = `价格 ${{valueText(option.price)}} · 库存 ${{valueText(option.stock)}}`;
-        copy.append(title, composition, price); label.append(radio, copy); optionsRoot.append(label);
+        const comparison = document.createElement("span"); comparison.className = "sku-comparison"; comparison.textContent = candidate.matches.length
+          ? `与 Ozon 直接重合：${{candidate.matches.map((token) => token.split(":").slice(1).join(":" )).join("、")}}`
+          : "未发现可直接核对的一致字段";
+        copy.append(title, composition, price, comparison); label.append(radio, copy); candidatesRoot.append(label);
       }});
+      optionsRoot.append(candidatesRoot);
       if (!options.length) {{
         const visibleGroups = skuGroups
           .map((group) => {{
@@ -1686,15 +1811,19 @@ def build_supplier_review_html(run_id: str) -> str:
           }})
           .filter(Boolean)
           .join("\\n");
-        optionsRoot.append(field("可见规格组 (Visible SKU Groups)", visibleGroups || null));
+        candidatesRoot.append(field("可见规格组 (Visible SKU Groups)", visibleGroups || null));
       }}
-      $("lockSupplierSku").disabled = !!receipt || !options.length;
+      updateSkuLockButton();
       $("skuDecisionMessage").className = receipt ? "success" : "muted";
       $("skuDecisionMessage").textContent = receipt
         ? "真实供应商 SKU 已锁定，后续采购、标题、属性和图片均以此为准。"
         : skuNeedsConfirmation
           ? "商品公开证据已采集；完整 SKU 矩阵未解析，已转入用户确认门禁，不会伪造 SKU。"
-          : "请选择 1688 页面已经存在的真实 SKU，不创建新套装。";
+          : singlePageSku
+            ? "这是页面唯一 SKU；系统未自动锁定，请由用户确认。"
+            : analysis.recommendedSkuId
+              ? "建议项只来自明确字段重合；请核对后确认，不创建新套装。"
+              : "请选择 1688 页面已经存在的真实 SKU，不创建新套装。";
 
       $("subjectMasterArea").hidden = !lockedSku;
       if (!lockedSku) return;

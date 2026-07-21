@@ -168,8 +168,13 @@ vm.runInContext(fs.readFileSync(scriptPath, "utf8"), context, { filename: script
     capturedPayload,
     "user-confirmed public detail evidence must be submitted even when the complete SKU matrix is not parsed",
   );
-  assert.deepEqual(capturedPayload.supplier_product.sku_options, []);
-  process.stdout.write("supplier managed capture without SKU matrix: OK\n");
+  assert.equal(capturedPayload.supplier_product.sku_options.length, 1);
+  const option = capturedPayload.supplier_product.sku_options[0];
+  assert.equal(option.supplier_sku_id, "123456789012");
+  assert.equal(option.evidence_source, "single_sku_detail_page");
+  assert.equal(option.evidence.no_visible_variant_selector, true);
+  assert.equal(option.complete, true);
+  process.stdout.write("supplier managed capture with single SKU fallback: OK\n");
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;

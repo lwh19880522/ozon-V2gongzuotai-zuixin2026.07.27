@@ -1294,6 +1294,41 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual([], item["supplier_sku_options"])
         self.assertEqual(WorkbenchState.SUPPLIER_COLLECTED.value, self.repo.load_run(run_id)["status"])
 
+    def test_supplier_selection_capture_exposes_page_unique_sku_for_confirmation(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        supplier_product = self.supplier_product_payload(seed.seed_id)
+        supplier_product["sku"] = {
+            "selected_options": {"visible_sku_labels": ["单一 SKU（页面无可选规格）"]},
+            "evidence": "no_visible_variant_selector",
+            "evidence_source": "dom_option_labels",
+            "complete": False,
+        }
+        supplier_product["sku_options"] = []
+        supplier_product["sku_groups"] = []
+
+        result = self.post_json(
+            f"/api/batches/{run_id}/supplier-selection/capture",
+            {
+                "channel_index": 0,
+                "seed_id": seed.seed_id,
+                "ozon_product_id": "ozon-1",
+                "supplier_product": supplier_product,
+            },
+        )
+        review = self.get_json(f"/api/batches/{run_id}/supplier-review")
+        options = review["data"]["items"][0]["supplier_sku_options"]
+        selected = self.post_json(
+            f"/api/batches/{run_id}/supplier-sku",
+            {"seed_id": seed.seed_id, "supplier_sku_id": "123456789012", "differences": []},
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(1, len(options))
+        self.assertEqual("123456789012", options[0]["supplier_sku_id"])
+        self.assertEqual("single_sku_detail_page", options[0]["evidence_source"])
+        self.assertTrue(selected["ok"])
+        self.assertTrue(selected["data"]["selection_status"]["complete"])
+
     def test_supplier_browser_result_is_ingested_and_waits_for_collection_review(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
         supplier_url = "https://detail.1688.com/offer/123456789012.html"
@@ -1391,7 +1426,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
     def test_extension_manifest_registers_1688_supplier_content_script(self) -> None:
         manifest_path = self.project_root / "browser_extension" / "ozon_v2_bridge" / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self.assertEqual("0.1.58", manifest["version"])
+        self.assertEqual("0.1.59", manifest["version"])
 
         supplier_scripts = [
             item
@@ -1742,6 +1777,14 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
 
         self.assertIn('id="skuDecisionPanel"', page)
         self.assertIn("锁定真实 SKU (Lock Real SKU)", page)
+        self.assertIn("Ozon 原商品目标", page)
+        self.assertIn("1688 可采购规格", page)
+        self.assertIn("页面只有一个真实 SKU，无需选择规格", page)
+        self.assertIn("确认页面唯一 SKU", page)
+        self.assertIn("确认所选 SKU", page)
+        self.assertIn("系统没有找到可证明的唯一对应项", page)
+        self.assertIn("function analyzeSupplierSkuOptions", page)
+        self.assertIn('radio.addEventListener("change", updateSkuLockButton)', page)
         self.assertIn("主体证据图 (Subject Evidence)", page)
         self.assertIn("确认主体证据 (Confirm Subject Evidence)", page)
         self.assertIn('id="subjectEvidenceCount"', page)

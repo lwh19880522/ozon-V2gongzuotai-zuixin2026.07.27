@@ -1887,7 +1887,7 @@ class WorkbenchService:
         raw_option = next(
             (
                 option
-                for option in supplier_product.get("sku_options", [])
+                for option in self._supplier_sku_options(supplier_product)
                 if isinstance(option, dict) and str(option.get("supplier_sku_id") or "") == supplier_sku_id
             ),
             None,
@@ -3175,7 +3175,7 @@ class WorkbenchService:
             current_option = next(
                 (
                     option
-                    for option in product.get("sku_options", [])
+                    for option in self._supplier_sku_options(product)
                     if isinstance(option, dict)
                     and str(option.get("supplier_sku_id") or "") == receipt.supplier_sku_id
                 ),
@@ -3389,7 +3389,7 @@ class WorkbenchService:
             merged = dict(stored_item)
             merged["ozon_product"] = ozon_product
             merged["supplier_product"] = supplier_product
-            merged["supplier_sku_options"] = supplier_product.get("sku_options") or [] if supplier_product else []
+            merged["supplier_sku_options"] = self._supplier_sku_options(supplier_product) if supplier_product else []
             merged["supplier_sku_groups"] = supplier_product.get("sku_groups") or [] if supplier_product else []
             merged["supplier_sku_matrix_status"] = (
                 supplier_product.get("sku_matrix_status") if supplier_product else None
@@ -3457,6 +3457,75 @@ class WorkbenchService:
             return filtered
         primary_owner = max(owner_groups, key=lambda key: len(owner_groups[key]))
         return owner_groups[primary_owner]
+
+    def _supplier_sku_options(self, product: dict[str, Any]) -> list[dict[str, Any]]:
+        raw_options = product.get("sku_options")
+        if isinstance(raw_options, list) and raw_options:
+            return [dict(option) for option in raw_options if isinstance(option, dict)]
+        sku_groups = product.get("sku_groups")
+        if isinstance(sku_groups, list) and sku_groups:
+            return []
+        sku = product.get("sku") if isinstance(product.get("sku"), dict) else {}
+        selected = sku.get("selected_options") if isinstance(sku.get("selected_options"), dict) else {}
+        visible_labels = selected.get("visible_sku_labels")
+        labels = [str(value) for value in visible_labels] if isinstance(visible_labels, list) else []
+        is_no_variant_page = (
+            str(sku.get("evidence") or "") == "no_visible_variant_selector"
+            or any("单一 SKU" in label and "无可选规格" in label for label in labels)
+        )
+        if not is_no_variant_page:
+            return []
+
+        offer_id = str(product.get("offer_id") or product.get("supplier_product_id") or "").strip()
+        if not offer_id:
+            supplier_url = str(product.get("final_url") or product.get("supplier_url") or "")
+            offer_match = re.search(r"/offer/(\d+)\.html", supplier_url)
+            offer_id = offer_match.group(1) if offer_match else ""
+        price = product.get("price")
+        price_payload = dict(price) if isinstance(price, dict) else {}
+        amount = str(price_payload.get("amount") or "").strip()
+        visible_price = str(price_payload.get("visible_text") or price or "")
+        if not amount:
+            amount_match = re.search(r"\d+(?:\.\d+)?", visible_price.replace(",", ""))
+            amount = amount_match.group(0) if amount_match else ""
+        images = self._supplier_product_images(product)
+        if not offer_id or not amount or not images:
+            return []
+
+        quantity = 1
+        quantity_sources = [str(product.get("title") or "")]
+        attributes = product.get("attributes")
+        if isinstance(attributes, dict):
+            quantity_sources.extend(str(value) for value in attributes.values())
+        for value in quantity_sources:
+            quantity_match = re.search(r"(\d+)\s*(?:支|件|个|只|套|枚|片|瓶|包|组)", value)
+            if quantity_match:
+                quantity = max(1, int(quantity_match.group(1)))
+                break
+        composition = [f"{quantity}件装"] if quantity > 1 else ["单件商品"]
+        option = SupplierSkuOption(
+            supplier_sku_id=offer_id,
+            combination_key="页面唯一 SKU",
+            raw_label="页面唯一 SKU（无需选择规格）",
+            selected_options={"规格": "页面唯一 SKU"},
+            set_quantity=quantity,
+            set_composition=composition,
+            price={
+                "currency": str(price_payload.get("currency") or "CNY"),
+                "amount": amount,
+            },
+            stock={"status": "unknown", "quantity": None},
+            image_urls=[images[0]],
+            evidence_source="single_sku_detail_page",
+            complete=True,
+            evidence={
+                "offer_id": offer_id,
+                "no_visible_variant_selector": True,
+                "recovered_from_collected_page": True,
+                "price_visible_text": visible_price,
+            },
+        )
+        return [option.to_dict()]
 
     def _supplier_title_is_product_title(self, product: dict[str, Any]) -> bool:
         title = str(product.get("title") or "").strip().casefold()
