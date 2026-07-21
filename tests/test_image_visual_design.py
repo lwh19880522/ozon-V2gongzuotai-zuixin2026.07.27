@@ -450,6 +450,7 @@ def test_render_visual_renders_verified_russian_integrated_rail(tmp_path: Path) 
     assert receipt["russian_copy_passed"] is True
     assert receipt["safe_area_passed"] is True
     assert receipt["mobile_readability_passed"] is True
+    assert receipt["visual_system"] == "ozon-edge-gradient-b1"
 
 
 def test_integrated_rail_uses_mobile_prominent_russian_type(
@@ -493,7 +494,81 @@ def test_integrated_rail_uses_mobile_prominent_russian_type(
     assert receipt["typography"]["minimum_mobile_scale_px"] >= 13
 
 
-def test_integrated_rail_sizes_panel_to_copy_instead_of_filling_canvas(
+def test_integrated_rail_uses_a_soft_edge_gradient_instead_of_a_card(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.png"
+    output = tmp_path / "output.png"
+    source_rgb = (205, 192, 180)
+    Image.new("RGB", (1024, 1024), source_rgb).save(source)
+
+    render_visual(source, output, _render_spec(panel_side="right"), {LOCKED_HASH})
+
+    rendered = Image.open(output)
+    assert rendered.getpixel((1000, 512)) != source_rgb
+    assert rendered.getpixel((320, 512)) == source_rgb
+    assert sum(rendered.getpixel((1000, 512))) < sum(rendered.getpixel((760, 512)))
+
+
+@pytest.mark.parametrize(
+    "slot_id,recipe,extra",
+    [
+        ("main_02", "integrated_rail", {}),
+        ("detail_01", "context_caption", {}),
+        ("detail_02", "feature_callout", {"callout_points": ((0.25, 0.5),)}),
+    ],
+)
+def test_b_system_never_draws_detached_rounded_text_cards(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    slot_id: str,
+    recipe: str,
+    extra: dict[str, object],
+) -> None:
+    from ozon_v2.images import visual_design
+
+    source = tmp_path / f"{recipe}.png"
+    output = tmp_path / f"{recipe}-output.png"
+    Image.new("RGB", (1024, 1024), (205, 192, 180)).save(source)
+
+    def reject_rounded_rectangle(*args: object, **kwargs: object) -> None:
+        pytest.fail("B system must not draw a detached rounded text card")
+
+    monkeypatch.setattr(
+        visual_design.ImageDraw.ImageDraw,
+        "rounded_rectangle",
+        reject_rounded_rectangle,
+    )
+
+    render_visual(
+        source,
+        output,
+        _render_spec(slot_id=slot_id, recipe=recipe, **extra),
+        {LOCKED_HASH},
+    )
+
+
+def test_context_caption_uses_a_bottom_gradient_without_darkening_the_top(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.png"
+    output = tmp_path / "caption.png"
+    source_rgb = (205, 192, 180)
+    Image.new("RGB", (1024, 1024), source_rgb).save(source)
+
+    render_visual(
+        source,
+        output,
+        _render_spec(slot_id="detail_01", recipe="context_caption"),
+        {LOCKED_HASH},
+    )
+
+    rendered = Image.open(output)
+    assert rendered.getpixel((512, 120)) == source_rgb
+    assert sum(rendered.getpixel((512, 1000))) < sum(source_rgb)
+
+
+def test_russian_headline_keeps_natural_sentence_case(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from ozon_v2.images import visual_design
@@ -501,30 +576,31 @@ def test_integrated_rail_sizes_panel_to_copy_instead_of_filling_canvas(
     source = tmp_path / "source.png"
     output = tmp_path / "output.png"
     Image.new("RGB", (1024, 1024), (205, 192, 180)).save(source)
-    captured_panels: list[tuple[int, int, int, int]] = []
-    original_rounded_rectangle = visual_design.ImageDraw.ImageDraw.rounded_rectangle
+    wrapped_values: list[str] = []
+    original_wrap = visual_design._wrap
 
-    def capture_rounded_rectangle(
-        draw: object, box: tuple[int, int, int, int], **kwargs: object
-    ) -> None:
-        captured_panels.append(box)
-        original_rounded_rectangle(draw, box, **kwargs)
+    def capture_wrap(draw: object, value: str, font: object, max_width: int) -> list[str]:
+        wrapped_values.append(value)
+        return original_wrap(draw, value, font, max_width)
 
-    monkeypatch.setattr(
-        visual_design.ImageDraw.ImageDraw,
-        "rounded_rectangle",
-        capture_rounded_rectangle,
+    monkeypatch.setattr(visual_design, "_wrap", capture_wrap)
+    spec = _render_spec(
+        facts=(
+            VisualFact(
+                headline="Надёжное крепление",
+                detail="Кабель проходит свободно",
+                evidence_sha256=LOCKED_HASH,
+            ),
+        )
     )
 
-    render_visual(source, output, _render_spec(), {LOCKED_HASH})
+    render_visual(source, output, spec, {LOCKED_HASH})
 
-    left, top, right, bottom = captured_panels[0]
-    assert right - left >= round(1024 * 0.42)
-    assert bottom - top <= round(1024 * 0.48)
-    assert top == round((1024 - (bottom - top)) / 2)
+    assert "Надёжное крепление" in wrapped_values
+    assert "НАДЁЖНОЕ КРЕПЛЕНИЕ" not in wrapped_values
 
 
-def test_feature_callout_uses_dark_copy_on_its_light_panel(
+def test_feature_callout_uses_light_copy_on_its_edge_gradient(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from ozon_v2.images import visual_design
@@ -563,7 +639,7 @@ def test_feature_callout_uses_dark_copy_on_its_light_panel(
         {LOCKED_HASH},
     )
 
-    assert captured_fills == [((25, 32, 51), (70, 75, 85))]
+    assert captured_fills == [((239, 177, 156), (244, 244, 244))]
 
 
 def test_feature_callout_uses_non_overlapping_boxes_for_same_anchor(

@@ -382,6 +382,7 @@ def render_visual(
         "copy_evidence_sha256s": [fact.evidence_sha256 for fact in spec.facts],
         "scene_signature": dict(spec.scene_signature),
         "visual_spec": spec.to_dict(),
+        "visual_system": "ozon-edge-gradient-b1",
         "visual_design_passed": True,
         "russian_copy_passed": True,
         "safe_area_passed": True,
@@ -471,7 +472,7 @@ def _draw_fact(
     detail_fill = detail_fill or (244, 244, 244)
     measured_lines: list[tuple[str, ImageFont.FreeTypeFont, tuple[int, int, int], int]] = []
     cursor = y
-    for line in _wrap(draw, fact.headline.upper(), headline_font, max_width):
+    for line in _wrap(draw, fact.headline, headline_font, max_width):
         measured_lines.append((line, headline_font, headline_fill, cursor))
         cursor += _line_height(draw, line, headline_font) + 2
     cursor += 3
@@ -500,7 +501,7 @@ def _measure_fact_height(
 ) -> int:
     height = sum(
         _line_height(draw, line, headline_font) + 2
-        for line in _wrap(draw, fact.headline.upper(), headline_font, max_width)
+        for line in _wrap(draw, fact.headline, headline_font, max_width)
     )
     height += 3
     height += sum(
@@ -520,6 +521,7 @@ def _draw_rail(
     detail_font: ImageFont.FreeTypeFont,
 ) -> None:
     short_edge = min(width, height)
+    _draw_side_gradient(draw, width, height, spec.panel_side, coverage=0.62, max_alpha=224)
     rail_width = min(round(width * 0.46), width - margin * 2)
     panel_padding = max(20, round(short_edge * 0.045))
     fact_gap = max(10, round(short_edge * 0.018))
@@ -538,8 +540,6 @@ def _draw_rail(
     left = margin if spec.panel_side == "left" else width - margin - rail_width
     top = round((height - rail_height) / 2)
     bottom = top + rail_height
-    radius = max(12, round(min(width, height) * 0.025))
-    draw.rounded_rectangle((left, top, left + rail_width, bottom), radius=radius, fill=(20, 31, 43, 190))
     y = top + panel_padding
     for index, fact in enumerate(spec.facts):
         y = _draw_fact(
@@ -572,8 +572,8 @@ def _draw_caption(
     if bar_height > min(height - margin * 2, round(height * 0.32)):
         raise ValueError("visual copy does not fit its safe area")
     top = height - margin - bar_height
-    radius = max(12, round(min(width, height) * 0.025))
-    draw.rounded_rectangle((margin, top, width - margin, height - margin), radius=radius, fill=(16, 41, 69, 205))
+    gradient_coverage = max(0.34, (height - top) / height + 0.06)
+    _draw_bottom_gradient(draw, width, height, coverage=gradient_coverage, max_alpha=224)
     _draw_fact(
         draw, spec.facts[0], margin + panel_padding, top + panel_padding, content_width,
         headline_font, detail_font, spec.accent_rgb, height - margin - panel_padding,
@@ -599,7 +599,6 @@ def _draw_callouts(
     )
     box_height = max(fact_heights) + panel_padding * 2
     marker_radius = max(5, round(short_edge * 0.006))
-    radius = max(12, round(min(width, height) * 0.02))
     available_height = height - margin * 2
     if box_height > round(height * 0.34) or len(spec.facts) * box_height > available_height:
         raise ValueError("visual copy does not fit its safe area")
@@ -609,6 +608,7 @@ def _draw_callouts(
         lane_gap = (available_height - len(spec.facts) * box_height) // (len(spec.facts) - 1)
         lane_tops = tuple(margin + index * (box_height + lane_gap) for index in range(len(spec.facts)))
 
+    layouts: list[tuple[VisualFact, int, int, int, int, int]] = []
     for fact, (point_x, point_y), lane_top in zip(spec.facts, spec.callout_points, lane_tops):
         anchor_x = min(max(round(point_x * width), marker_radius), width - 1 - marker_radius)
         anchor_y = min(max(round(point_y * height), marker_radius), height - 1 - marker_radius)
@@ -617,7 +617,15 @@ def _draw_callouts(
             max(margin, anchor_y - box_height // 2), height - margin - box_height
         )
         edge_x = left if left > anchor_x else left + box_width
-        edge_y = min(max(anchor_y, top + radius), top + box_height - radius)
+        edge_y = min(max(anchor_y, top + panel_padding), top + box_height - panel_padding)
+        layouts.append((fact, anchor_x, anchor_y, left, top, edge_x))
+
+    text_sides = {"left" if left == margin else "right" for _, _, _, left, _, _ in layouts}
+    for side in text_sides:
+        _draw_side_gradient(draw, width, height, side, coverage=0.56, max_alpha=204)
+
+    for fact, anchor_x, anchor_y, left, top, edge_x in layouts:
+        edge_y = min(max(anchor_y, top + panel_padding), top + box_height - panel_padding)
         draw.line((anchor_x, anchor_y, edge_x, edge_y), fill=(*spec.accent_rgb, 255), width=max(2, round(width * 0.004)))
         draw.ellipse(
             (
@@ -628,11 +636,50 @@ def _draw_callouts(
             ),
             fill=(*spec.accent_rgb, 255),
         )
-        draw.rounded_rectangle((left, top, left + box_width, top + box_height), radius=radius, fill=(250, 250, 250, 232))
         _draw_fact(
             draw, fact, left + panel_padding, top + panel_padding, content_width,
             headline_font, detail_font, spec.accent_rgb, top + box_height - panel_padding,
-            headline_fill=(25, 32, 51), detail_fill=(70, 75, 85),
+            headline_fill=spec.accent_rgb, detail_fill=(244, 244, 244),
+        )
+
+
+def _draw_side_gradient(
+    draw: ImageDraw.ImageDraw,
+    width: int,
+    height: int,
+    side: str,
+    *,
+    coverage: float,
+    max_alpha: int,
+) -> None:
+    gradient_width = max(1, min(width, round(width * coverage)))
+    start_x = 0 if side == "left" else width - gradient_width
+    denominator = max(1, gradient_width - 1)
+    for offset in range(gradient_width):
+        edge_strength = 1.0 - offset / denominator if side == "left" else offset / denominator
+        alpha = round(max_alpha * edge_strength**1.7)
+        draw.line(
+            (start_x + offset, 0, start_x + offset, height - 1),
+            fill=(12, 20, 31, alpha),
+        )
+
+
+def _draw_bottom_gradient(
+    draw: ImageDraw.ImageDraw,
+    width: int,
+    height: int,
+    *,
+    coverage: float,
+    max_alpha: int,
+) -> None:
+    gradient_height = max(1, min(height, round(height * coverage)))
+    start_y = height - gradient_height
+    denominator = max(1, gradient_height - 1)
+    for offset in range(gradient_height):
+        alpha = round(max_alpha * (offset / denominator) ** 1.7)
+        draw.line(
+            (0, start_y + offset, width - 1, start_y + offset),
+            fill=(12, 20, 31, alpha),
         )
 
 

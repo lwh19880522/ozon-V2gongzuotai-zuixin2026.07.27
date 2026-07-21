@@ -117,6 +117,16 @@ def test_product_media_skill_uses_visual_contract_v3_storyboard_and_local_copy_r
     assert "natural Russian sentence case" in skill
     assert "360-pixel preview" in prompt_contract
     assert "prominent Russian headline" in prompt_contract
+    assert "edge-gradient visual system" in skill
+    assert "side-edge gradient" in prompt_contract
+    assert "bottom gradient" in prompt_contract
+    assert "anchor lines" in prompt_contract
+    assert "detached rounded text cards" in prompt_contract
+    assert "soft side-edge gradient zone" in main_prompt
+    assert "bottom-gradient caption zone" in detail_a_prompt
+    assert "anchor-line callouts" in detail_a_prompt
+    assert "bottom-gradient caption zone" in detail_b_prompt
+    assert "edge-gradient visual system" in repair_prompt
     for prompt in (main_prompt, detail_a_prompt, detail_b_prompt, repair_prompt):
         assert "icons" in prompt
     assert "invented claims" in main_prompt
