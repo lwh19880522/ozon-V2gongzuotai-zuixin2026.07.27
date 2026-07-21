@@ -2276,6 +2276,25 @@ def build_image_workspace_html(run_id: str) -> str:
         f"ozon_image_worker_{index:02d} -> {worker_id}"
         for index, worker_id in enumerate(REGULAR_IMAGE_WORKER_IDS, start=1)
     )
+    visual_contract = (
+        "每个生图子智能体必须先读取并严格执行 skills/ozon-product-media-generator/SKILL.md；"
+        "新尝试固定使用提示词版本 ozon-image-v3，并在本地视觉回执中确认 visual_system=ozon-edge-gradient-b1；"
+        "main_01 保持无文案；其余允许文案的槽位只写有供应商锁定证据支持的自然俄文句式。"
+        "main_02 使用侧边渐变信息区，detail_01 与 detail_04 使用底部渐变，特征说明使用锚点线与柔和边缘渐变，禁止生硬的悬浮圆角文字卡；"
+        "detail_01、detail_04 固定最多 1 个事实块；detail_02、detail_03、detail_05、detail_06 只有在画面明确支持两个互不重叠的已验证事实时才可增加到 2 个，否则仍为 1 个；"
+        "逐张检查 360 像素预览，确保俄文标题是清晰的信息焦点且最小文字可读；只接受主体、数量、颜色、结构、俄文和排版均通过证据门禁的结果。"
+    )
+    trial_command = (
+        f"启动 Ozon V2 单件试图总控：批次 {run_id}。"
+        "读取并严格执行工作区技能 skills/ozon-image-generation-controller/SKILL.md；"
+        "这是效果验证模式，本次只允许领取 1 件当前批次中尚未分派的整件商品；"
+        "只在当前 Codex 总控任务内部使用 spawn_agent 创建 1 个生图子智能体，映射为 ozon_image_worker_01 -> ozon-image-worker-01；"
+        "严禁使用 create_thread、fork_thread 或任何会创建用户可见任务或线程的接口；"
+        "不得预领、并发领取或继续领取第二件。"
+        f"{visual_contract}"
+        "完成该商品 2 张主图和 6 张副图、写回队列并进入 manual_review_required 后立即停止，报告商品、Job ID、8 个槽位状态和人工审核入口；"
+        "若遇到证据、SKU、主体、租约或质量门禁则停止并报告真实原因，不得猜测或绕过；不得上传，不得最终审批，不得修改业务代码。"
+    )
     controller_command = (
         f"\u542f\u52a8 Ozon V2 \u751f\u56fe\u603b\u63a7\uff1a\u6279\u6b21 {run_id}\u3002"
         "\u8bfb\u53d6\u5e76\u4e25\u683c\u6267\u884c\u5de5\u4f5c\u533a\u6280\u80fd skills/ozon-image-generation-controller/SKILL.md\uff1b"
@@ -2283,9 +2302,11 @@ def build_image_workspace_html(run_id: str) -> str:
         "\u4e25\u7981\u4f7f\u7528 create_thread\u3001fork_thread \u6216\u4efb\u4f55\u4f1a\u5728\u4fa7\u8fb9\u680f\u521b\u5efa\u7528\u6237\u53ef\u89c1\u4efb\u52a1\u6216\u7ebf\u7a0b\u7684\u63a5\u53e3\uff1b"
         "可用并发位少于 5 时继续使用所有成功创建的子智能体，不得停机；不得因没有新增空位而停止现有子智能体；若 spawn_agent 失败则缩小到成功数量；只有当前无可用并发位且尚无现有子智能体时才不领取任务并报告等待，不得退回 create_thread 或用户可见任务；"
         f"\u6bcf\u4e2a\u5b50\u667a\u80fd\u4f53\u53ea\u80fd\u7528\u6620\u5c04\u7684\u961f\u5217 worker ID \u9886\u53d6\u4efb\u52a1\uff1a{worker_ids}\uff1b\u5b50\u667a\u80fd\u4f53\u7a7a\u95f2\u540e\u4f7f\u7528 followup_task \u7ee7\u7eed\u6d3e\u53d1\uff1b"
+        f"{visual_contract}"
         "\u6301\u7eed\u9886\u53d6\u5f53\u524d\u6279\u6b21\u961f\u5217\u4efb\u52a1\uff0c\u76f4\u5230\u961f\u5217\u4e3a\u7a7a\u3001\u8fdb\u5165\u4eba\u5de5\u5ba1\u6838\u6216\u9047\u5230\u963b\u585e\u95e8\u7981\u3002"
         "不得上传，不得修改业务代码；不得创建第 6 个常规生图 worker；当运行时提供第 6 个子智能体并发位时，保留 1 个子智能体位置用于失败恢复、诊断或人工介入。"
     )
+    trial_command_html = html.escape(trial_command)
     controller_command_html = html.escape(controller_command)
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -2365,6 +2386,12 @@ def build_image_workspace_html(run_id: str) -> str:
     .gate-callout {{ margin:0 14px 14px; padding:11px 12px; border-left:3px solid var(--amber); color:#74410a; background:#fff8eb; font-size:11px; }}
     .controller-panel {{ margin:0 14px 14px; padding:10px 0; border-top:1px solid var(--line); border-bottom:1px solid var(--line); }}
     .controller-panel strong {{ display:block; font-size:11px; }} .controller-panel p {{ margin:3px 0 8px; color:var(--muted); font-size:10px; }}
+    .controller-variant {{ padding:9px; border:1px solid #b8c7ef; border-radius:5px; background:#f7f9ff; }}
+    .controller-variant-head {{ display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:6px; }}
+    .controller-badge {{ padding:2px 6px; border-radius:3px; color:var(--blue); background:var(--blue-soft); font-size:9px; font-weight:700; }}
+    .controller-panel details {{ margin-top:10px; padding-top:9px; border-top:1px solid var(--line); }}
+    .controller-panel summary {{ color:var(--text); font-size:11px; font-weight:700; cursor:pointer; }}
+    .controller-panel details p {{ margin-top:6px; }}
     .controller-command {{ max-height:104px; overflow:auto; padding:9px; border:1px solid var(--line); border-radius:4px; background:var(--soft); font:10px/1.45 Consolas,"Courier New",monospace; white-space:pre-wrap; overflow-wrap:anywhere; user-select:text; }}
     .controller-actions {{ display:flex; align-items:center; gap:8px; margin-top:8px; }}
     .controller-actions button {{ min-height:32px; padding:0 10px; border:1px solid var(--blue); border-radius:4px; color:#fff; background:var(--blue); cursor:pointer; }}
@@ -2422,13 +2449,25 @@ def build_image_workspace_html(run_id: str) -> str:
             <div class="gate-row"><span class="gate-icon">2</span><div><strong>供应商原图 (Supplier Source)</strong><span>保持真实商品主体、颜色和结构。</span></div></div>
             <div class="gate-row blocked"><span class="gate-icon">!</span><div><strong>Codex 生图队列 (Codex Image Queue)</strong><span id="gateMessage">等待真实 SKU 与主体证据确认。</span></div></div>
           <div class="controller-panel">
-            <strong>&#29983;&#22270;&#24635;&#25511;&#21629;&#20196; (Image Controller Command)</strong>
-            <p>复制后粘贴到一个新的 Codex 总控任务；总控只使用 spawn_agent，按当前队列任务量和可用并发位创建并复用最多 5 个动态 Codex 生图子智能体，可用几个就使用几个，不会创建侧边栏任务。</p>
-            <div id="imageControllerCommand" class="controller-command">{controller_command_html}</div>
-            <div class="controller-actions">
-              <button id="copyImageControllerCommand" type="button">&#22797;&#21046;&#24635;&#25511;&#21629;&#20196; (Copy Command)</button>
-              <span id="imageControllerCopyStatus" class="copy-status" aria-live="polite"></span>
+            <strong>生图命令 (Image Commands)</strong>
+            <p>先用单件命令验证新版俄文标签和画面效果；确认后再运行整批命令。两种模式都停在人工审核，不会上传。</p>
+            <div class="controller-variant">
+              <div class="controller-variant-head"><strong>单件试图命令 (Single-Product Trial Command)</strong><span class="controller-badge">推荐先试 1 件</span></div>
+              <div id="imageTrialCommand" class="controller-command">{trial_command_html}</div>
+              <div class="controller-actions">
+                <button id="copyImageTrialCommand" type="button">复制单件试图命令 (Copy Trial Command)</button>
+                <span id="imageTrialCopyStatus" class="copy-status" aria-live="polite"></span>
+              </div>
             </div>
+            <details>
+              <summary>整批生图命令 (Full-Batch Command)</summary>
+              <p>单件效果确认后使用；按可用并发位动态调度最多 5 个内部生图子智能体。</p>
+              <div id="imageControllerCommand" class="controller-command">{controller_command_html}</div>
+              <div class="controller-actions">
+                <button id="copyImageControllerCommand" type="button">复制整批生图命令 (Copy Batch Command)</button>
+                <span id="imageControllerCopyStatus" class="copy-status" aria-live="polite"></span>
+              </div>
+            </details>
           </div>
           </div><div class="gate-callout">最多 5 个动态 Codex 生图子智能体在总控任务内部按整件商品领取任务，可用几个就调动几个；当运行时提供第 6 个子智能体并发位时，保留 1 个子智能体位置用于失败恢复、诊断或人工介入。只回传通过真实性校验的 2 张主图与 6 张副图。</div><button id="startGeneration" class="primary" disabled>等待 Codex 生图子智能体 (Waiting for Codex Subagents)</button><div id="imageJobControls" class="job-controls"><div id="imageJobStatus" class="job-status">当前商品尚未入队</div><button id="submitImageRepairs" class="repair-submit" type="button" disabled>提交选中图片返修 (Repair Selected)</button><div id="repairSelectionStatus" class="repair-selection-status" aria-live="polite"></div><button id="stopImageJob" type="button" disabled>停止生图 (Stop Generation)</button><button id="resumeImageJob" type="button" disabled>继续生图 (Resume Generation)</button></div></aside>
         </div>
@@ -2438,11 +2477,14 @@ def build_image_workspace_html(run_id: str) -> str:
   <script>
     const runId = {safe_run_id};
     const $ = (id) => document.getElementById(id);
+    const imageTrialCommand = $("imageTrialCommand");
+    const copyImageTrialCommand = $("copyImageTrialCommand");
+    const imageTrialCopyStatus = $("imageTrialCopyStatus");
     const imageControllerCommand = $("imageControllerCommand");
     const copyImageControllerCommand = $("copyImageControllerCommand");
     const imageControllerCopyStatus = $("imageControllerCopyStatus");
-    async function copyControllerCommand() {{
-      const command = imageControllerCommand.textContent.trim();
+    async function copyCommand(commandElement, statusElement) {{
+      const command = commandElement.textContent.trim();
       try {{
         if (navigator.clipboard && window.isSecureContext) {{
           await navigator.clipboard.writeText(command);
@@ -2457,11 +2499,14 @@ def build_image_workspace_html(run_id: str) -> str:
           document.execCommand("copy");
           textarea.remove();
         }}
-        imageControllerCopyStatus.textContent = "\u5df2\u590d\u5236 (Copied)";
+        statusElement.textContent = "\u5df2\u590d\u5236 (Copied)";
       }} catch (error) {{
-        imageControllerCopyStatus.textContent = "\u590d\u5236\u5931\u8d25\uff0c\u8bf7\u624b\u52a8\u9009\u62e9 (Copy Failed)";
+        statusElement.textContent = "\u590d\u5236\u5931\u8d25\uff0c\u8bf7\u624b\u52a8\u9009\u62e9 (Copy Failed)";
       }}
     }}
+    async function copyTrialCommand() {{ await copyCommand(imageTrialCommand, imageTrialCopyStatus); }}
+    async function copyControllerCommand() {{ await copyCommand(imageControllerCommand, imageControllerCopyStatus); }}
+    copyImageTrialCommand.addEventListener("click", copyTrialCommand);
     copyImageControllerCommand.addEventListener("click", copyControllerCommand);
     let imageWorkspaceItems = [];
     let imageWorkspaceIndex = 0;
