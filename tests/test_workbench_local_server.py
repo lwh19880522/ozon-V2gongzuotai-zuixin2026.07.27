@@ -1784,6 +1784,8 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn("确认所选 SKU", page)
         self.assertIn("系统没有找到可证明的唯一对应项", page)
         self.assertIn("function analyzeSupplierSkuOptions", page)
+        self.assertIn('const strongMatches = matches.filter((token) => !token.startsWith("包装数量:"));', page)
+        self.assertIn("score:strongMatches.length", page)
         self.assertIn('radio.addEventListener("change", updateSkuLockButton)', page)
         self.assertIn("主体证据图 (Subject Evidence)", page)
         self.assertIn("确认主体证据 (Confirm Subject Evidence)", page)

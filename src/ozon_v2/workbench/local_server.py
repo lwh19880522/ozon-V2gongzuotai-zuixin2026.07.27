@@ -1676,7 +1676,8 @@ def build_supplier_review_html(run_id: str) -> str:
         if (option.set_quantity) facts.push({{ key:"set_quantity", label:"包装数量", value:`${{option.set_quantity}} 件` }});
         const tokens = skuComparableTokens(facts);
         const matches = Array.from(tokens).filter((token) => targetTokens.has(token));
-        return {{ option, facts, matches, score:matches.length }};
+        const strongMatches = matches.filter((token) => !token.startsWith("包装数量:"));
+        return {{ option, facts, matches, score:strongMatches.length }};
       }});
       const ranked = [...candidates].sort((left, right) => right.score - left.score);
       const best = ranked[0] || null;
