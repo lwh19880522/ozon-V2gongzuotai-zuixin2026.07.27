@@ -1640,6 +1640,23 @@ def build_supplier_review_html(run_id: str) -> str:
       return String(key || "规格");
     }}
 
+    function skuPriceText(price) {{
+      if (!price || typeof price !== "object" || Array.isArray(price)) return valueText(price);
+      const amount = String(price.amount || "").trim();
+      const visible = String(price.visible_text || "").trim();
+      if (!amount) return visible || "价格未采集";
+      const currencySymbols = {{ CNY:"¥", RUB:"₽", USD:"$", EUR:"€" }};
+      const currency = String(price.currency || "").trim().toUpperCase();
+      return `${{currencySymbols[currency] || (currency ? `${{currency}} ` : "")}}${{amount}}`;
+    }}
+
+    function skuStockText(stock) {{
+      if (!stock || typeof stock !== "object" || Array.isArray(stock)) return `库存：${{valueText(stock)}}`;
+      const labels = {{ in_stock:"有货", out_of_stock:"缺货", unknown:"库存未知" }};
+      const status = labels[String(stock.status || "")] || "库存状态未采集";
+      return stock.quantity == null ? status : `${{status}} · 库存 ${{stock.quantity}}`;
+    }}
+
     function skuDecisionFacts(source) {{
       const payload = source && typeof source === "object" && !Array.isArray(source) ? source : {{}};
       return Object.entries(payload).map(([key, value]) => ({{
@@ -1796,7 +1813,7 @@ def build_supplier_review_html(run_id: str) -> str:
         }}
         const title = document.createElement("strong"); title.textContent = candidate.facts.map((fact) => `${{fact.label}}：${{fact.value}}`).join(" · ") || option.raw_label || option.combination_key || option.supplier_sku_id;
         const composition = document.createElement("span"); composition.textContent = `套装数量 ${{option.set_quantity || "-"}} · ${{(option.set_composition || []).join(" / ") || valueText(option.selected_options)}}`;
-        const price = document.createElement("span"); price.textContent = `价格 ${{valueText(option.price)}} · 库存 ${{valueText(option.stock)}}`;
+        const price = document.createElement("span"); price.textContent = `价格 ${{skuPriceText(option.price)}} · ${{skuStockText(option.stock)}}`;
         const comparison = document.createElement("span"); comparison.className = "sku-comparison"; comparison.textContent = candidate.matches.length
           ? `与 Ozon 直接重合：${{candidate.matches.map((token) => token.split(":").slice(1).join(":" )).join("、")}}`
           : "未发现可直接核对的一致字段";
