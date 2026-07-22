@@ -478,6 +478,14 @@ class FsRepo:
     def load_subject_masters(self, run_id: str) -> dict[str, Any]:
         return self._read_json(self.run_dir(run_id) / "subject_masters.json")
 
+    def save_generated_content_result(self, run_id: str, payload: dict[str, Any]) -> Path:
+        path = self.run_dir(run_id) / "generated_content_result.json"
+        self._write_json(path, payload)
+        return path
+
+    def load_generated_content_result(self, run_id: str) -> dict[str, Any]:
+        return self._read_json(self.run_dir(run_id) / "generated_content_result.json")
+
     def save_browser_bridge_status(self, payload: dict[str, Any]) -> dict[str, Any]:
         self._initialize_runtime_once()
         now = utc_now_iso()

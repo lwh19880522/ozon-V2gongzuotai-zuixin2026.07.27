@@ -1111,6 +1111,23 @@ class WorkbenchService:
             if subject_path.exists()
             else {}
         )
+        generated_content_path = self.repo.run_dir(run_id) / "generated_content_result.json"
+        generated_content_items: dict[str, dict[str, Any]] = {}
+        if generated_content_path.exists():
+            content_payload = self.repo.load_generated_content_result(run_id)
+            raw_content_items = content_payload.get("items", {})
+            if isinstance(raw_content_items, dict):
+                generated_content_items = {
+                    str(seed_id): item
+                    for seed_id, item in raw_content_items.items()
+                    if isinstance(item, dict)
+                }
+            elif isinstance(raw_content_items, list):
+                generated_content_items = {
+                    str(item.get("seed_id") or ""): item
+                    for item in raw_content_items
+                    if isinstance(item, dict) and item.get("seed_id")
+                }
         candidates = ozon_result.get("ozon_candidates") if isinstance(ozon_result.get("ozon_candidates"), list) else []
         items: list[dict[str, Any]] = []
         for candidate in candidates:
@@ -1146,6 +1163,29 @@ class WorkbenchService:
                 image_generation_status == "completed"
                 and len(accepted_slots) == 8
             )
+            content_entry = generated_content_items.get(seed_id, {})
+            generated_title = str(
+                content_entry.get("title_ru") or content_entry.get("title") or ""
+            ).strip()
+            generated_description = str(
+                content_entry.get("description_ru")
+                or content_entry.get("description")
+                or ""
+            ).strip()
+            content_status = str(content_entry.get("status") or "").strip().lower()
+            generated_content_ready = bool(
+                generated_title
+                and generated_description
+                and content_status not in {"blocked", "failed", "pending"}
+            )
+            template_ready = bool(schema and seller_template)
+            blocking_gates: list[str] = []
+            if not template_ready:
+                blocking_gates.append("category_template")
+            if not generated_content_ready:
+                blocking_gates.append("original_content")
+            if not generated_images_ready:
+                blocking_gates.append("images")
             items.append(
                 {
                     "seed_id": seed_id,
@@ -1161,9 +1201,13 @@ class WorkbenchService:
                     "attribute_schema_count": len(schema),
                     "prefill_plan_count": len(prefill_plan),
                     "prefill_plan": prefill_plan,
-                    "template_ready": bool(schema and seller_template),
-                    "generated_content_ready": False,
+                    "template_ready": template_ready,
+                    "generated_content_ready": generated_content_ready,
+                    "generated_title": generated_title or None,
+                    "generated_description": generated_description or None,
                     "generated_images_ready": generated_images_ready,
+                    "blocking_gates": blocking_gates,
+                    "ready_to_build": not blocking_gates,
                     "image_job_id": image_job_id or None,
                     "image_generation_status": image_generation_status,
                     "generated_image_count": len(accepted_slots),
@@ -1190,6 +1234,12 @@ class WorkbenchService:
         approved_product_count = sum(
             1 for item in items if item["generated_images_ready"]
         )
+        template_ready_count = sum(1 for item in items if item["template_ready"])
+        generated_content_ready_count = sum(
+            1 for item in items if item["generated_content_ready"]
+        )
+        ready_to_build_count = sum(1 for item in items if item["ready_to_build"])
+        all_products_ready = bool(items) and ready_to_build_count == len(items)
         draft_ready = run.get("status") in {
             WorkbenchState.DRAFT_READY.value,
             WorkbenchState.PUBLISH_WAITING_CONFIRMATION.value,
@@ -1210,12 +1260,15 @@ class WorkbenchService:
                     "generated_image_count": generated_image_count,
                     "generated_product_count": generated_product_count,
                     "approved_product_count": approved_product_count,
+                    "template_ready_count": template_ready_count,
+                    "generated_content_ready_count": generated_content_ready_count,
+                    "ready_to_build_count": ready_to_build_count,
+                    "blocked_product_count": len(items) - ready_to_build_count,
+                    "all_products_ready": all_products_ready,
                     "product_count": len(items),
                     "draft_ready": draft_ready,
                     "publish_locked": bool(run.get("publish_locked", True)),
-                    "ready_to_build": (
-                        template_ready and generated_content_ready and images_ready
-                    ),
+                    "ready_to_build": ready_to_build_count > 0,
                 },
             },
         )

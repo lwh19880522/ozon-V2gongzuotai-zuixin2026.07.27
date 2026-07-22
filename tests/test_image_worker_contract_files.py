@@ -24,6 +24,11 @@ def test_active_image_worker_contract_uses_dynamic_pool_up_to_five_workers() -> 
         assert worker_id in controller_skill
         assert worker_id in worker_skill
 
+    assert "5 个队列租约槽位" in controller_skill
+    assert "不与固定子智能体永久绑定" in controller_skill
+    assert "每次派发时动态分配" in controller_skill
+    assert "ozon_image_worker_01` ->" not in controller_skill
+
     combined_active_contract = "\n".join(
         (controller_agent, worker_skill, plugin_manifest, workbench_service)
     )

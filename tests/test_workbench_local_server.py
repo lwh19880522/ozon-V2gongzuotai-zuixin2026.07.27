@@ -144,6 +144,67 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             )
         return run_id, job["job_id"], queue
 
+    def attach_completed_image_job(self, run_id: str, seed_id: str) -> dict:
+        sku = SupplierSkuOption(
+            supplier_sku_id=f"approved-{seed_id}",
+            combination_key=f"approved>{seed_id}",
+            raw_label=f"approved {seed_id}",
+            selected_options={"颜色": "黑色"},
+            set_quantity=1,
+            set_composition=["1 件"],
+            price={"currency": "CNY", "amount": "12.80"},
+            stock={"status": "in_stock", "quantity": 10},
+            image_urls=[f"https://cbu01.alicdn.com/img/ibank/{seed_id}.jpg"],
+            evidence_source="trusted_sku_map",
+            complete=True,
+        )
+        receipt = SupplierSkuSelectionReceipt.confirmed(
+            run_id=run_id,
+            product_id=seed_id,
+            supplier_offer_id=f"offer-{seed_id}",
+            supplier_sku=sku,
+            ozon_target_sku={"sku_id": f"ozon-{seed_id}", "selected_options": {}},
+            differences=[],
+            confirmed_at="2026-07-22T00:00:00+00:00",
+        )
+        subject_path = self.tmpdir / f"{seed_id}-subject.bin"
+        subject_path.write_bytes(f"subject-{seed_id}".encode("utf-8"))
+        subject = SubjectMasterSelection.create(
+            receipt=receipt,
+            source_path=subject_path,
+            source_image_url=sku.image_urls[0],
+            visible_subject_quantity=1,
+            white_background_confirmed=False,
+            confirmed_at="2026-07-22T00:01:00+00:00",
+        )
+        queue = ImageGenerationQueue(
+            self.context.runtime_root / "image_generation" / "ozon_image_jobs.sqlite3"
+        )
+        job = queue.enqueue(receipt=receipt, subject_master=subject)
+        with queue._connect() as connection:
+            for slot in queue.list_slots(job["job_id"]):
+                output = self.tmpdir / f"{seed_id}-{slot['slot_id']}.png"
+                output.write_bytes(slot["slot_id"].encode("utf-8"))
+                connection.execute(
+                    "UPDATE image_slots SET status = 'accepted', accepted_path = ? "
+                    "WHERE job_id = ? AND slot_id = ?",
+                    (str(output.resolve()), job["job_id"], slot["slot_id"]),
+                )
+            connection.execute(
+                "UPDATE image_jobs SET status = 'completed' WHERE job_id = ?",
+                (job["job_id"],),
+            )
+        subject_items: dict = {}
+        subject_path_json = self.repo.run_dir(run_id) / "subject_masters.json"
+        if subject_path_json.exists():
+            subject_items = dict(self.repo.load_subject_masters(run_id).get("items") or {})
+        subject_items[seed_id] = {
+            "subject_master": subject.to_dict(),
+            "image_job_id": job["job_id"],
+        }
+        self.repo.save_subject_masters(run_id, {"run_id": run_id, "items": subject_items})
+        return job
+
     def test_home_page_loads(self) -> None:
         body = self.get_text("/")
 
@@ -2047,6 +2108,11 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn("spawn_agent", page)
         self.assertIn("create_thread", page)
         self.assertIn("\u6700\u591a 5 \u4e2a\u52a8\u6001 Codex \u751f\u56fe\u5b50\u667a\u80fd\u4f53", page)
+        self.assertIn("5 个队列租约槽位", page)
+        self.assertIn("不与固定子智能体永久绑定", page)
+        self.assertIn("子智能体名称由 Codex 动态创建", page)
+        self.assertIn("每次派发时动态分配一个当前空闲租约槽位", page)
+        self.assertNotIn("ozon_image_worker_01 -&gt; ozon-image-worker-01", page)
         self.assertIn("\u6bcf\u8f6e\u65b0\u589e\u6570\u91cf\u53d6", page)
         self.assertIn("\u4e0d\u5f97\u56e0\u6ca1\u6709\u65b0\u589e\u7a7a\u4f4d\u800c\u505c\u6b62\u73b0\u6709\u5b50\u667a\u80fd\u4f53", page)
         self.assertIn("\u53ef\u7528\u5e76\u53d1\u4f4d\u5c11\u4e8e 5 \u65f6\u7ee7\u7eed", page)
@@ -2235,6 +2301,10 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn('id="uploadGate"', page)
         self.assertIn('id="buildDraft"', page)
         self.assertIn("发布锁已开启 (Publish Lock Active)", page)
+        self.assertIn("逐商品独立门禁", page)
+        self.assertIn("其他商品继续等待也不会阻塞它", page)
+        self.assertIn("ready_to_build_count", page)
+        self.assertIn("item.blocking_gates", page)
         self.assertIn('id="buildDraft" class="primary" disabled', page)
         self.assertEqual(seed.seed_id, item["seed_id"])
         self.assertEqual(1, item["required_attribute_count"])
@@ -2313,6 +2383,52 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual(1, workspace["gates"]["approved_product_count"])
         self.assertTrue(workspace["items"][0]["generated_images_ready"])
         self.assertTrue(workspace["gates"]["images_ready"])
+
+    def test_upload_workspace_allows_ready_product_without_waiting_for_blocked_product(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        ozon_result = self.repo.load_ozon_collection_result(run_id)
+        ready_candidate = ozon_result["ozon_candidates"][0]
+        blocked_candidate = json.loads(json.dumps(ready_candidate))
+        blocked_candidate["seed_id"] = "seed-blocked"
+        blocked_candidate["product_id"] = "ozon-blocked"
+        blocked_candidate["title"] = "Blocked product"
+        ozon_result["ozon_candidates"].append(blocked_candidate)
+        self.repo.save_ozon_collection_result(run_id, ozon_result)
+
+        template_result = self.repo.load_attribute_template_result(run_id)
+        blocked_template = json.loads(json.dumps(template_result["seed_templates"][0]))
+        blocked_template["seed_id"] = "seed-blocked"
+        template_result["seed_templates"].append(blocked_template)
+        self.repo.save_attribute_template_result(run_id, template_result)
+
+        self.attach_completed_image_job(run_id, seed.seed_id)
+        self.repo.save_generated_content_result(
+            run_id,
+            {
+                "run_id": run_id,
+                "items": {
+                    seed.seed_id: {
+                        "status": "completed",
+                        "title_ru": "Оригинальный заголовок",
+                        "description_ru": "Оригинальное описание товара.",
+                    }
+                },
+            },
+        )
+
+        workspace = self.get_json(f"/api/batches/{run_id}/upload")["data"]
+        items = {item["seed_id"]: item for item in workspace["items"]}
+
+        self.assertTrue(items[seed.seed_id]["ready_to_build"])
+        self.assertEqual([], items[seed.seed_id]["blocking_gates"])
+        self.assertFalse(items["seed-blocked"]["ready_to_build"])
+        self.assertIn("original_content", items["seed-blocked"]["blocking_gates"])
+        self.assertIn("images", items["seed-blocked"]["blocking_gates"])
+        self.assertTrue(workspace["gates"]["ready_to_build"])
+        self.assertEqual(1, workspace["gates"]["ready_to_build_count"])
+        self.assertEqual(1, workspace["gates"]["blocked_product_count"])
+        self.assertFalse(workspace["gates"]["all_products_ready"])
+        self.assertFalse(workspace["gates"]["images_ready"])
 
     def test_operations_cockpit_pages_and_read_only_apis_use_runtime_data(self) -> None:
         run_id, _seed = self.prepare_supplier_review_run()
