@@ -14,6 +14,8 @@ Copy density is slot-specific: `detail_01` and `detail_04` remain at one verifie
 
 Any two accepted scene slots differ in at least three of environment, lighting, camera, shot scale, and buyer question. An accepted v3 receipt includes its complete `visual_spec`, `visual_contract_version=ozon-visual-v1`, and these four true pass flags: `visual_design_passed`, `russian_copy_passed`, `safe_area_passed`, and `mobile_readability_passed`.
 
+The full set uses at least five environment families, four lighting treatments, four camera/composition families, and three shot scales; one environment family appears no more than twice. Pixel-identical or visually near-duplicate finished slots fail the set gate regardless of their declared scene signatures.
+
 ## Allowed dynamic inputs
 
 Append only verified values to a fixed prompt asset:

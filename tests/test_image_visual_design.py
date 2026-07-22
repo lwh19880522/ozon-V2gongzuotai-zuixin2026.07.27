@@ -163,6 +163,35 @@ def test_scene_diversity_covers_detail_02_and_detail_03_in_a_full_eight_slot_set
     ]
 
 
+def test_full_eight_slot_set_rejects_one_reused_environment_family() -> None:
+    recipes = {
+        "main_01": "clean_hero",
+        "main_02": "integrated_rail",
+        "detail_01": "context_caption",
+        "detail_02": "feature_callout",
+        "detail_03": "metric_panel",
+        "detail_04": "context_caption",
+        "detail_05": "metric_panel",
+        "detail_06": "integrated_rail",
+    }
+    specs = tuple(
+        _spec(
+            slot_id,
+            recipe,
+            scene_signature=_scene(
+                environment="same_indoor_room",
+                lighting=f"lighting_{slot_id}",
+                camera=f"camera_{slot_id}",
+                shot_scale=f"shot_scale_{slot_id}",
+                buyer_question=f"question_{slot_id}",
+            ),
+        )
+        for slot_id, recipe in recipes.items()
+    )
+
+    assert "eight-slot set must use at least five environment families" in validate_visual_set(specs)
+
+
 def test_slot_contract_rejects_version_slot_recipe_copy_limit_and_missing_copy() -> None:
     invalid = _spec("unknown", "clean_hero", contract_version="old")
     wrong_recipe = _spec("detail_01", "clean_hero", facts=(_fact(),))

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from collections import Counter
 from dataclasses import dataclass
 from io import BytesIO
 import math
@@ -324,7 +325,29 @@ def validate_visual_set(specs: tuple[VisualSpec, ...]) -> list[str]:
                     errors.append(
                         f"scene slots {left.slot_id} and {right.slot_id} differ in fewer than three dimensions"
                     )
+    if len(specs) == len(SCENE_SLOTS) and seen_slots == set(SCENE_SLOTS):
+        minimum_unique = {
+            "environment": 5,
+            "lighting": 4,
+            "camera": 4,
+            "shot_scale": 3,
+        }
+        for field, minimum in minimum_unique.items():
+            values = [spec.scene_signature.get(field, "") for spec in specs]
+            if len(set(values)) < minimum:
+                errors.append(
+                    f"eight-slot set must use at least {minimum_word(minimum)} {field} families"
+                )
+        environment_counts = Counter(
+            spec.scene_signature.get("environment", "") for spec in specs
+        )
+        if environment_counts and max(environment_counts.values()) > 2:
+            errors.append("one environment family may appear in at most two slots")
     return errors
+
+
+def minimum_word(value: int) -> str:
+    return {3: "three", 4: "four", 5: "five"}.get(value, str(value))
 
 
 def render_visual(

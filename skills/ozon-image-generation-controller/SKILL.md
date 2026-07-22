@@ -36,6 +36,8 @@ Treat every product state independently. A product waiting for manual review is 
 
 A missing SKU or subject gate blocks only that product. Report the blocked product and its required user action, then continue every other eligible queued product. A `stopped` product does not stop other eligible products. Report its persisted stop reason and recovery action. Never auto-resume a stopped product because the stop may have been requested by the user.
 
+An already accepted slot is frozen evidence. If its receipt hash, source/output file hashes, and locked `visual_spec` verify, a console-rendering or display-metadata anomaly is not a product stop gate. Preserve that accepted slot and continue every remaining `pending` slot. Stop the product only when the frozen receipt or file actually fails cryptographic verification and the failure cannot be isolated to one non-accepted slot.
+
 Stop dispatching only when no eligible `pending` or `repair_pending` products remain, a system-wide queue or evidence store failure prevents all remaining work, or the user stops the batch. When stopping, report separate counts for manual review, stopped, missing SKU/subject, failed, and completed products.
 
 ## Boundaries

@@ -1041,8 +1041,12 @@ class WorkbenchService:
         all_selected = bool(items) and all(item["supplier_sku_selection"] for item in items)
         all_subjects = bool(items) and all(item["subject_master"] for item in items)
         all_jobs = bool(items) and all(item["image_job"] for item in items)
-        all_reviewable = all_jobs and all(
-            item["image_job"].get("status") == "manual_review_required" for item in items
+        all_generated = all_jobs and all(
+            item["image_job"].get("status") in {"manual_review_required", "completed"}
+            for item in items
+        )
+        all_approved = all_jobs and all(
+            item["image_job"].get("status") == "completed" for item in items
         )
         if not all_selected:
             gate_code = "supplier_sku_selection_required"
@@ -1053,12 +1057,15 @@ class WorkbenchService:
         elif not all_jobs:
             gate_code = "image_queue_missing"
             gate_message = "主体已确认，但本地生图任务尚未完整入列 (Image queue entry is missing)."
-        elif not all_reviewable:
+        elif not all_generated:
             gate_code = "waiting_for_codex_workers"
             gate_message = "任务已进入本地队列，等待最多 5 个动态 Codex 生图子智能体按可用容量处理 (Waiting for available Codex image subagents)."
-        else:
+        elif not all_approved:
             gate_code = "image_review_required"
-            gate_message = "八张图片已回写，等待用户逐张审核 (Eight images are ready for review)."
+            gate_message = "八张图片已回写；请逐件审核，合格后点击“确认本件 8 张图片可用” (Review and approve each eight-image set)."
+        else:
+            gate_code = "images_approved"
+            gate_message = "全部商品图片已由用户确认，可以通过上传图片门禁 (All image sets are approved)."
 
         return Result.success(
             "image_workspace.loaded",
@@ -1074,7 +1081,7 @@ class WorkbenchService:
                 },
                 "image_queue_summary": image_queue_summary,
                 "image_gate": {
-                    "ready": all_reviewable,
+                    "ready": all_approved,
                     "code": gate_code,
                     "message": gate_message,
                 },
@@ -1098,6 +1105,12 @@ class WorkbenchService:
             for item in template_result.get("seed_templates", [])
             if isinstance(item, dict)
         }
+        subject_path = self.repo.run_dir(run_id) / "subject_masters.json"
+        subject_items = (
+            self.repo.load_subject_masters(run_id).get("items", {})
+            if subject_path.exists()
+            else {}
+        )
         candidates = ozon_result.get("ozon_candidates") if isinstance(ozon_result.get("ozon_candidates"), list) else []
         items: list[dict[str, Any]] = []
         for candidate in candidates:
@@ -1109,6 +1122,30 @@ class WorkbenchService:
             category_candidates = template.get("category_candidates") if isinstance(template.get("category_candidates"), list) else []
             media = candidate.get("selected_sku_media") or {}
             images = media.get("selected_sku_images") or media.get("main_gallery_images") or []
+            subject_entry = subject_items.get(seed_id) if isinstance(subject_items, dict) else None
+            image_job_id = (
+                str(subject_entry.get("image_job_id") or "")
+                if isinstance(subject_entry, dict)
+                else ""
+            )
+            image_job = None
+            if image_job_id:
+                try:
+                    image_job = self._image_job_payload(image_job_id)
+                except ValueError:
+                    image_job = None
+            accepted_slots = [
+                slot
+                for slot in (image_job or {}).get("slots", [])
+                if slot.get("status") == "accepted"
+                and str(slot.get("accepted_path") or "")
+                and Path(str(slot["accepted_path"])).is_file()
+            ]
+            image_generation_status = str((image_job or {}).get("status") or "not_queued")
+            generated_images_ready = (
+                image_generation_status == "completed"
+                and len(accepted_slots) == 8
+            )
             items.append(
                 {
                     "seed_id": seed_id,
@@ -1126,11 +1163,33 @@ class WorkbenchService:
                     "prefill_plan": prefill_plan,
                     "template_ready": bool(schema and seller_template),
                     "generated_content_ready": False,
-                    "generated_images_ready": False,
+                    "generated_images_ready": generated_images_ready,
+                    "image_job_id": image_job_id or None,
+                    "image_generation_status": image_generation_status,
+                    "generated_image_count": len(accepted_slots),
+                    "generated_image_url": (
+                        f"/api/batches/{run_id}/image-job/{image_job_id}/slot/"
+                        f"{accepted_slots[0]['slot_id']}/file"
+                        if accepted_slots
+                        else None
+                    ),
                 }
             )
 
         template_ready = bool(items) and all(item["template_ready"] for item in items)
+        generated_content_ready = bool(items) and all(
+            item["generated_content_ready"] for item in items
+        )
+        images_ready = bool(items) and all(
+            item["generated_images_ready"] for item in items
+        )
+        generated_image_count = sum(item["generated_image_count"] for item in items)
+        generated_product_count = sum(
+            1 for item in items if item["generated_image_count"] == 8
+        )
+        approved_product_count = sum(
+            1 for item in items if item["generated_images_ready"]
+        )
         draft_ready = run.get("status") in {
             WorkbenchState.DRAFT_READY.value,
             WorkbenchState.PUBLISH_WAITING_CONFIRMATION.value,
@@ -1146,11 +1205,17 @@ class WorkbenchService:
                 "items": items,
                 "gates": {
                     "category_template_ready": template_ready,
-                    "generated_content_ready": False,
-                    "images_ready": False,
+                    "generated_content_ready": generated_content_ready,
+                    "images_ready": images_ready,
+                    "generated_image_count": generated_image_count,
+                    "generated_product_count": generated_product_count,
+                    "approved_product_count": approved_product_count,
+                    "product_count": len(items),
                     "draft_ready": draft_ready,
                     "publish_locked": bool(run.get("publish_locked", True)),
-                    "ready_to_build": False,
+                    "ready_to_build": (
+                        template_ready and generated_content_ready and images_ready
+                    ),
                 },
             },
         )
@@ -2402,6 +2467,35 @@ class WorkbenchService:
             "image_job.resumed",
             "Image generation was resumed.",
             self._response_payload(self.repo.load_run(run_id), event, {"image_job": image_job}),
+        )
+
+    def approve_image_job(self, run_id: str, job_id: str) -> Result:
+        queue = self._image_generation_queue()
+        job = queue.get_job(job_id)
+        if job is None or str(job.get("run_id") or "") != run_id:
+            return Result.failure("image_job.not_found", "The image job was not found in this batch.")
+        try:
+            queue.approve_review(job_id)
+        except ValueError as error:
+            return Result.failure(
+                "image_job.approval_invalid",
+                f"图片确认失败：{error}",
+                errors=[str(error)],
+                data={"run_id": run_id, "image_job_id": job_id},
+            )
+        image_job = self._image_job_payload(job_id)
+        event = self.repo.append_run_event(
+            run_id,
+            "image_job.approved",
+            "The user approved all eight frozen images for the upload image gate.",
+            {"image_job_id": job_id, "accepted_image_count": 8},
+        )
+        return Result.success(
+            "image_job.approved",
+            "All eight images were approved.",
+            self._response_payload(
+                self.repo.load_run(run_id), event, {"image_job": image_job}
+            ),
         )
 
     def request_image_repairs(

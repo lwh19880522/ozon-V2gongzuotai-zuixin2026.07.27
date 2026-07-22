@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from PIL import Image
+from PIL import Image, ImageChops, ImageStat
 
 from ozon_v2.domain.supplier_sku import stable_sha256
 from ozon_v2.images.visual_design import CURRENT_VISUAL_CONTRACT_VERSION
@@ -257,3 +257,32 @@ class SlotResultReceipt:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def validate_output_diversity(
+    receipts: tuple[SlotResultReceipt, ...],
+    *,
+    minimum_mean_rgb_delta: float = 6.0,
+) -> list[str]:
+    """Reject duplicate or visually near-duplicate finished slots."""
+    errors: list[str] = []
+    previews: dict[str, Image.Image] = {}
+    for receipt in receipts:
+        with Image.open(receipt.output_path) as source:
+            previews[receipt.slot_id] = source.convert("RGB").resize((64, 64))
+    for index, left in enumerate(receipts):
+        for right in receipts[index + 1 :]:
+            if left.output_sha256 == right.output_sha256:
+                errors.append(
+                    f"output slots {left.slot_id} and {right.slot_id} are pixel-identical"
+                )
+                continue
+            difference = ImageChops.difference(
+                previews[left.slot_id], previews[right.slot_id]
+            )
+            mean_rgb_delta = sum(ImageStat.Stat(difference).mean) / 3
+            if mean_rgb_delta < minimum_mean_rgb_delta:
+                errors.append(
+                    f"output slots {left.slot_id} and {right.slot_id} are visually near-duplicate"
+                )
+    return errors

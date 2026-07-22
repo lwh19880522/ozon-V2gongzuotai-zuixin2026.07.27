@@ -524,10 +524,20 @@ def _record_eight_v3_slots(
     job = queue.claim_next("ozon-image-worker-01", now_epoch=100, lease_seconds=30)
     assert job
     source = tmp_path / "source.png"
-    output = tmp_path / "output.png"
     _solid_grid(source, ["red", "green", "blue"])
-    Image.new("RGB", (120, 90), "red").save(output)
+    colors = [
+        "red",
+        "green",
+        "blue",
+        "orange",
+        "purple",
+        "cyan",
+        "yellow",
+        "brown",
+    ]
     for index, slot in enumerate(queue.list_slots(job["job_id"])):
+        output = tmp_path / f"output-{slot['slot_id']}.png"
+        Image.new("RGB", (120, 90), colors[index]).save(output)
         prompt_version = "ozon-image-v2" if mixed_v2 and index == 0 else "ozon-image-v3"
         validation = None if prompt_version == "ozon-image-v2" else _v3_validation(
             slot["slot_id"], master.source_sha256, repeated_scene=repeated_scene
@@ -585,7 +595,7 @@ def _record_user_requested_v3_repair(
     source = tmp_path / f"{slot_id}-repair-source.png"
     output = tmp_path / f"{slot_id}-repair-output.png"
     _solid_grid(source, ["red", "green"])
-    Image.new("RGB", (120, 90), "red").save(output)
+    Image.new("RGB", (120, 90), "black").save(output)
     queue.record_slot_result(
         _slot_receipt(
             job=repair_job,
@@ -704,6 +714,46 @@ def test_all_valid_v3_slots_can_be_ready_for_review(tmp_path: Path) -> None:
     reviewed = queue.mark_ready_for_review(job["job_id"], job["worker_id"], job["lease_epoch"])
 
     assert reviewed["status"] == "manual_review_required"
+
+
+def test_manual_review_approval_rechecks_receipts_and_completes_job(tmp_path: Path) -> None:
+    queue, job = _record_eight_v3_slots(tmp_path)
+    queue.mark_ready_for_review(job["job_id"], job["worker_id"], job["lease_epoch"])
+
+    completed = queue.approve_review(job["job_id"])
+
+    assert completed["status"] == "completed"
+    assert queue.get_job(job["job_id"])["status"] == "completed"
+
+
+def test_ready_for_review_rejects_pixel_identical_outputs_even_with_distinct_scene_labels(
+    tmp_path: Path,
+) -> None:
+    queue, job = _record_eight_v3_slots(tmp_path)
+    slots = queue.list_slots(job["job_id"])
+    first = slots[0]
+    second = slots[1]
+    first_receipt = SlotResultReceipt.from_dict(json.loads(first["receipt_json"]))
+    second_receipt = SlotResultReceipt.from_dict(json.loads(second["receipt_json"]))
+    duplicate = _rehash_receipt(
+        second_receipt,
+        output_path=first_receipt.output_path,
+        output_sha256=first_receipt.output_sha256,
+    )
+    with queue._connect() as connection:
+        connection.execute(
+            "UPDATE image_slots SET accepted_path = ?, receipt_json = ? "
+            "WHERE job_id = ? AND slot_id = ?",
+            (
+                duplicate.output_path,
+                json.dumps(duplicate.to_dict(), ensure_ascii=False, sort_keys=True),
+                job["job_id"],
+                second["slot_id"],
+            ),
+        )
+
+    with pytest.raises(ValueError, match="pixel-identical"):
+        queue.mark_ready_for_review(job["job_id"], job["worker_id"], job["lease_epoch"])
 
 
 def test_user_review_requeues_only_selected_slots_and_preserves_old_outputs(

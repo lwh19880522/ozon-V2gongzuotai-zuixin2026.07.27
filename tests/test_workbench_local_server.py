@@ -2001,6 +2001,8 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn('select.className = "repair-issue"', page)
         self.assertIn('textarea.className = "repair-note"', page)
         self.assertIn('id="submitImageRepairs"', page)
+        self.assertIn('id="approveImageJob"', page)
+        self.assertIn("确认本件 8 张图片可用", page)
         self.assertIn("提交选中图片返修 (Repair Selected)", page)
         self.assertIn("还需为 ${missingIssue.length} 张图片选择问题类型", page)
         self.assertIn("还需为 ${missingOtherNote.length} 张“其他问题”填写说明", page)
@@ -2066,6 +2068,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn("未锁定 SKU 或主体证据只阻塞对应商品", page)
         self.assertIn("stopped 商品不阻塞其他商品", page)
         self.assertIn("不得自动恢复 stopped 商品", page)
+        self.assertIn("已验签 accepted 槽位的显示元数据异常不得停止整件商品", page)
         self.assertIn("直到没有可调度的 pending 或 repair_pending 商品", page)
         self.assertIn("停止生图 (Stop Generation)", page)
         self.assertIn("继续生图 (Resume Generation)", page)
@@ -2141,6 +2144,33 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual("image_job.repair_requested", event.event_type)
         self.assertEqual(["detail_02"], event.data["slot_ids"])
 
+    def test_image_approval_api_completes_a_verified_review_job_and_records_event(self) -> None:
+        run_id, job_id, queue = self.prepare_reviewable_image_job()
+
+        def approve(active_queue: ImageGenerationQueue, active_job_id: str) -> dict:
+            with active_queue._connect() as connection:
+                connection.execute(
+                    "UPDATE image_jobs SET status = 'completed' WHERE job_id = ?",
+                    (active_job_id,),
+                )
+            return active_queue.get_job(active_job_id)
+
+        with patch.object(
+            ImageGenerationQueue,
+            "approve_review",
+            autospec=True,
+            side_effect=approve,
+        ):
+            result = self.post_json(
+                f"/api/batches/{run_id}/image-job/{job_id}/approve", {}
+            )
+
+        self.assertEqual("image_job.approved", result["code"])
+        self.assertEqual("completed", result["data"]["image_job"]["status"])
+        event = self.repo.load_run_events(run_id)[-1]
+        self.assertEqual("image_job.approved", event.event_type)
+        self.assertEqual(8, event.data["accepted_image_count"])
+
     def test_image_stop_api_persists_user_visible_reason_and_event(self) -> None:
         run_id, job_id, queue = self.prepare_reviewable_image_job()
 
@@ -2212,6 +2242,77 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertFalse(workspace["data"]["gates"]["images_ready"])
         self.assertFalse(workspace["data"]["gates"]["draft_ready"])
         self.assertTrue(workspace["data"]["gates"]["publish_locked"])
+
+    def test_upload_workspace_reads_generated_and_user_approved_image_jobs(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        sku = SupplierSkuOption(
+            supplier_sku_id="approved-sku",
+            combination_key="black>single",
+            raw_label="black single",
+            selected_options={"颜色": "黑色"},
+            set_quantity=1,
+            set_composition=["1 件"],
+            price={"currency": "CNY", "amount": "12.80"},
+            stock={"status": "in_stock", "quantity": 10},
+            image_urls=["https://cbu01.alicdn.com/img/ibank/approved.jpg"],
+            evidence_source="trusted_sku_map",
+            complete=True,
+        )
+        receipt = SupplierSkuSelectionReceipt.confirmed(
+            run_id=run_id,
+            product_id=seed.seed_id,
+            supplier_offer_id="approved-offer",
+            supplier_sku=sku,
+            ozon_target_sku={"sku_id": "ozon-approved", "selected_options": {}},
+            differences=[],
+            confirmed_at="2026-07-22T00:00:00+00:00",
+        )
+        subject_path = self.tmpdir / "approved-subject.bin"
+        subject_path.write_bytes(b"approved-subject")
+        subject = SubjectMasterSelection.create(
+            receipt=receipt,
+            source_path=subject_path,
+            source_image_url=sku.image_urls[0],
+            visible_subject_quantity=1,
+            white_background_confirmed=False,
+            confirmed_at="2026-07-22T00:01:00+00:00",
+        )
+        queue = ImageGenerationQueue(
+            self.context.runtime_root / "image_generation" / "ozon_image_jobs.sqlite3"
+        )
+        job = queue.enqueue(receipt=receipt, subject_master=subject)
+        with queue._connect() as connection:
+            for slot in queue.list_slots(job["job_id"]):
+                output = self.tmpdir / f"approved-{slot['slot_id']}.png"
+                output.write_bytes(slot["slot_id"].encode("utf-8"))
+                connection.execute(
+                    "UPDATE image_slots SET status = 'accepted', accepted_path = ? "
+                    "WHERE job_id = ? AND slot_id = ?",
+                    (str(output.resolve()), job["job_id"], slot["slot_id"]),
+                )
+            connection.execute(
+                "UPDATE image_jobs SET status = 'completed' WHERE job_id = ?",
+                (job["job_id"],),
+            )
+        self.repo.save_subject_masters(
+            run_id,
+            {
+                "run_id": run_id,
+                "items": {
+                    seed.seed_id: {
+                        "subject_master": subject.to_dict(),
+                        "image_job_id": job["job_id"],
+                    }
+                },
+            },
+        )
+
+        workspace = self.get_json(f"/api/batches/{run_id}/upload")["data"]
+
+        self.assertEqual(8, workspace["gates"]["generated_image_count"])
+        self.assertEqual(1, workspace["gates"]["approved_product_count"])
+        self.assertTrue(workspace["items"][0]["generated_images_ready"])
+        self.assertTrue(workspace["gates"]["images_ready"])
 
     def test_operations_cockpit_pages_and_read_only_apis_use_runtime_data(self) -> None:
         run_id, _seed = self.prepare_supplier_review_run()

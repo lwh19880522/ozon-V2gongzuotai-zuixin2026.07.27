@@ -2313,6 +2313,7 @@ def build_image_workspace_html(run_id: str) -> str:
         "main_02 使用侧边渐变信息区，detail_01 与 detail_04 使用底部渐变，特征说明使用锚点线与柔和边缘渐变，禁止生硬的悬浮圆角文字卡；"
         "detail_01、detail_04 固定最多 1 个事实块；detail_02、detail_03、detail_05、detail_06 只有在画面明确支持两个互不重叠的已验证事实时才可增加到 2 个，否则仍为 1 个；"
         "逐张检查 360 像素预览，确保俄文标题是清晰的信息焦点且最小文字可读；只接受主体、数量、颜色、结构、俄文和排版均通过证据门禁的结果。"
+        "八个槽位必须使用至少 5 种环境、4 种灯光、4 种机位和 3 种景别；main_01 做干净主视觉，main_02 做真实使用价值总览，六张附图依次证明使用结果、关键结构、材质细节、第二使用场景、尺寸适配、套装或维护信息，证据不支持的角色改为另一个可证明卖点；禁止用同一室内背景和同一产品居中构图换角度凑数。"
     )
     controller_command = (
         f"\u542f\u52a8 Ozon V2 \u751f\u56fe\u603b\u63a7\uff1a\u6279\u6b21 {run_id}\u3002"
@@ -2325,6 +2326,7 @@ def build_image_workspace_html(run_id: str) -> str:
         "manual_review_required 只暂停对应商品，必须跳过该商品并继续派发其他 pending 或含 repair_pending 的商品；"
         "未锁定 SKU 或主体证据只阻塞对应商品，不得阻塞其他已经入队的商品；"
         "stopped 商品不阻塞其他商品，必须报告已记录的停止原因和工作台恢复入口，但不得自动恢复 stopped 商品；"
+        "已验签 accepted 槽位的显示元数据异常不得停止整件商品；以冻结回执哈希、文件哈希和 visual_spec 为准，保留该槽位并继续所有 pending 槽位。只有文件或回执验签失败且无法隔离时才允许停止该商品；"
         "持续处理当前批次，直到没有可调度的 pending 或 repair_pending 商品、发生影响全部剩余任务的系统级故障，或用户明确停止批次；"
         "结束时分别汇报待人工审核、已停止、缺少 SKU/主体、失败和已完成的商品数量，不得把单商品等待态称为整批完成。"
         "不得上传，不得修改业务代码；不得创建第 6 个常规生图 worker；当运行时提供第 6 个子智能体并发位时，保留 1 个子智能体位置用于失败恢复、诊断或人工介入。"
@@ -2437,6 +2439,7 @@ def build_image_workspace_html(run_id: str) -> str:
     .job-controls button:disabled {{ opacity:.45; cursor:not-allowed; }}
     .job-controls .repair-submit {{ grid-column:1/-1; border-color:var(--red); color:#fff; background:var(--red); font-weight:650; }}
     .job-controls .repair-submit:disabled {{ opacity:1; border-color:#e2b9bd; border-style:dashed; color:#985a60; background:#f8e9eb; cursor:not-allowed; }}
+    .job-controls .approve-submit {{ grid-column:1/-1; border-color:var(--green); color:#fff; background:var(--green); font-weight:700; }}
     .repair-selection-status {{ grid-column:1/-1; min-height:16px; color:var(--muted); font-size:10px; }}
     .repair-selection-status.error {{ color:var(--red); }}
     .repair-selection-status.success {{ color:var(--green); }}
@@ -2497,7 +2500,7 @@ def build_image_workspace_html(run_id: str) -> str:
               <span id="imageControllerCopyStatus" class="copy-status" aria-live="polite">复制后粘贴到当前 Codex 对话执行</span>
             </div>
           </div>
-          </div><div class="gate-callout">最多 5 个动态 Codex 生图子智能体在总控任务内部按整件商品领取任务，可用几个就调动几个；当运行时提供第 6 个子智能体并发位时，保留 1 个子智能体位置用于失败恢复、诊断或人工介入。只回传通过真实性校验的 2 张主图与 6 张副图。</div><div id="imageJobControls" class="job-controls"><div id="imageJobStatus" class="job-status">当前商品尚未入队</div><button id="submitImageRepairs" class="repair-submit" type="button" disabled>提交选中图片返修 (Repair Selected)</button><div id="repairSelectionStatus" class="repair-selection-status" aria-live="polite"></div><button id="stopImageJob" type="button" disabled>停止生图 (Stop Generation)</button><button id="resumeImageJob" type="button" disabled>继续生图 (Resume Generation)</button></div></aside>
+          </div><div class="gate-callout">最多 5 个动态 Codex 生图子智能体在总控任务内部按整件商品领取任务，可用几个就调动几个；当运行时提供第 6 个子智能体并发位时，保留 1 个子智能体位置用于失败恢复、诊断或人工介入。只回传通过真实性校验的 2 张主图与 6 张副图。</div><div id="imageJobControls" class="job-controls"><div id="imageJobStatus" class="job-status">当前商品尚未入队</div><button id="approveImageJob" class="approve-submit" type="button" disabled>确认本件 8 张图片可用</button><button id="submitImageRepairs" class="repair-submit" type="button" disabled>提交选中图片返修 (Repair Selected)</button><div id="repairSelectionStatus" class="repair-selection-status" aria-live="polite"></div><button id="stopImageJob" type="button" disabled>停止生图 (Stop Generation)</button><button id="resumeImageJob" type="button" disabled>继续生图 (Resume Generation)</button></div></aside>
         </div>
       </main>
     </div>
@@ -2552,7 +2555,7 @@ def build_image_workspace_html(run_id: str) -> str:
     }}
     const repairIssueOptions = [
       ["product_truth", "主体、数量、颜色或结构错误"],
-      ["scene_quality", "场景不真实、不美观或融合差"],
+      ["scene_quality", "场景单调、重复、不真实或不美观"],
       ["composition", "构图、裁切、遮挡或比例问题"],
       ["selling_point", "卖点不清楚或用途证明不足"],
       ["russian_copy", "俄文标签错误、不清晰或排版不佳"],
@@ -2564,6 +2567,7 @@ def build_image_workspace_html(run_id: str) -> str:
     }}
     function updateRepairSubmitState() {{
       const button = $("submitImageRepairs");
+      const approveButton = $("approveImageJob");
       const status = $("repairSelectionStatus");
       const selected = [...document.querySelectorAll(".generated-review-card")].filter((card) => card.querySelector('input[type="checkbox"]')?.checked);
       const missingIssue = selected.filter((card) => !card.querySelector(".repair-issue")?.value);
@@ -2584,6 +2588,8 @@ def build_image_workspace_html(run_id: str) -> str:
       }});
       const valid = selected.length > 0 && !missingIssue.length && !missingOtherNote.length;
       button.disabled = !valid;
+      const currentJob = imageWorkspaceItems[imageWorkspaceIndex]?.image_job || null;
+      approveButton.disabled = !currentJob || currentJob.status !== "manual_review_required" || selected.length > 0 || (currentJob.slots || []).filter((slot) => slot.status === "accepted").length !== 8;
       if (!selected.length) {{
         button.textContent = "提交选中图片返修 (Repair Selected)";
         status.className = "repair-selection-status";
@@ -2615,7 +2621,7 @@ def build_image_workspace_html(run_id: str) -> str:
         if (slot.status === "repair_pending") card.classList.add("repairing");
         const cardHead = document.createElement("div"); cardHead.className = "generated-review-head";
         const slotName = document.createElement("strong"); slotName.textContent = slot.slot_id;
-        const badge = document.createElement("span"); badge.className = "repair-badge"; badge.textContent = slot.status === "repair_pending" ? "等待返修" : slot.status === "accepted" ? "待审核" : slot.status;
+        const badge = document.createElement("span"); badge.className = "repair-badge"; badge.textContent = job.status === "completed" ? "已确认" : slot.status === "repair_pending" ? "等待返修" : slot.status === "accepted" ? "待审核" : slot.status;
         cardHead.append(slotName, badge);
         const fullImageUrl = generatedImageUrl(job, slot);
         const imageLink = document.createElement("a"); imageLink.className = "generated-image-link"; imageLink.href = fullImageUrl; imageLink.target = "_blank"; imageLink.rel = "noopener"; imageLink.title = `查看 ${{slot.slot_id}} 高清原图`;
@@ -2676,6 +2682,7 @@ def build_image_workspace_html(run_id: str) -> str:
       if (status === "queue_missing") return {{ tone:"stop", text:"SKU 与主体已确认，但生图队列记录缺失；请检查入队流程" }};
       if (status === "stopped") return {{ tone:"stop", text:`生图已停止：${{job.stop_reason || "旧任务未记录停止原因"}}；确认后可点右侧“继续生图”` }};
       if (status === "manual_review_required") return {{ tone:"ready", text:"8 张图片已生成；等待人工审核不会阻塞其他商品继续生图" }};
+      if (status === "completed") return {{ tone:"ready", text:"本件 8 张图片已由用户确认，可进入上传图片门禁" }};
       if ((job.slots || []).some((slot) => slot.status === "repair_pending")) return {{ tone:"warn", text:"返修已入队；点击右侧“复制继续返修生图命令”，粘贴到 Codex 执行" }};
       if (status === "pending") return {{ tone:"warn", text:"已进入生图队列，等待总控领取" }};
       if (status === "in_progress") return {{ tone:"warn", text:"正在生成图片；其他商品仍按空闲并发位继续调度" }};
@@ -2689,6 +2696,7 @@ def build_image_workspace_html(run_id: str) -> str:
       $("imageJobStatus").textContent = job ? `${{job.job_id}} · ${{status}}${{status === "stopped" ? ` · ${{job.stop_reason || "旧任务未记录停止原因"}}` : ""}}${{repairPending ? ` · ${{repairPending}} 张等待返修` : ""}}` : status;
       $("stopImageJob").disabled = !job || ["stopped","manual_review_required","completed","failed"].includes(status);
       $("resumeImageJob").disabled = !job || status !== "stopped";
+      $("approveImageJob").textContent = status === "completed" ? "本件 8 张已确认" : "确认本件 8 张图片可用";
       copyImageControllerCommand.textContent = repairPending ? "复制继续返修生图命令 (Copy Repair Command)" : "复制整批生图命令 (Copy Production Command)";
       imageControllerCopyStatus.textContent = repairPending ? `当前商品有 ${{repairPending}} 张待返修；复制命令后粘贴到 Codex 执行` : "复制后粘贴到当前 Codex 对话执行";
       updateRepairSubmitState();
@@ -2787,6 +2795,7 @@ def build_image_workspace_html(run_id: str) -> str:
     $("nextImageItem").addEventListener("click", () => renderImageItemAt(imageWorkspaceIndex + 1));
     $("stopImageJob").addEventListener("click", () => updateImageJob("stop"));
     $("resumeImageJob").addEventListener("click", () => updateImageJob("resume"));
+    $("approveImageJob").addEventListener("click", () => updateImageJob("approve"));
     $("submitImageRepairs").addEventListener("click", submitSelectedRepairs);
     loadWorkspace(true).catch((error) => {{ $("workspaceStatus").textContent = "加载失败 (Failed)"; $("workspaceStatus").className = "pill error"; $("gateMessage").textContent = error.message || String(error); }});
     setInterval(() => loadWorkspace(false).catch(() => undefined), 2000);
@@ -2844,9 +2853,9 @@ def build_upload_workspace_html(run_id: str) -> str:
     <div class="app-main"><header class="topbar"><div><h1>Ozon V2 工具台 (Workbench)</h1><p>类目模板、预填计划、图片门禁与发布锁集中检查</p></div><span class="pill">已连接 (Connected)</span></header>
       <nav id="stageNavigation" class="stage-nav" aria-label="批次阶段 (Batch Stages)"><div class="stage-nav-inner"><a id="batchOverviewNav" class="stage-link" href="/?run_id={run_id}">批次总览 (Batch)</a><a id="supplierReviewNav" class="stage-link" href="/batches/{run_id}/supplier-review">供应商审核 (Supplier Review)</a><a id="imageProcessingNav" class="stage-link" href="/batches/{run_id}/images">图片处理 (Images)</a><a id="uploadDraftNav" class="stage-link active" aria-current="page" href="/batches/{run_id}/upload">上传草稿 (Upload)</a><span class="stage-run">批次 {run_id}</span></div></nav>
       <main class="workspace"><div class="page-head"><div><h2>上传草稿 (Upload)</h2><p>根据真实 Seller API 类目模板检查预填计划；标题、描述和图片未完成前不构建草稿。</p></div><span id="workspaceStatus" class="pill">加载中 (Loading)</span></div>
-        <section class="summary"><div class="metric"><span>商品 (Products)</span><strong id="productCount">0</strong></div><div class="metric"><span>必填属性 (Required)</span><strong id="requiredCount">0</strong></div><div class="metric"><span>预填计划 (Prefill)</span><strong id="prefillCount">0</strong></div><div class="metric"><span>可用图片 (Images)</span><strong id="imageReadyCount">0</strong></div></section>
+        <section class="summary"><div class="metric"><span>商品 (Products)</span><strong id="productCount">0</strong></div><div class="metric"><span>必填属性 (Required)</span><strong id="requiredCount">0</strong></div><div class="metric"><span>预填计划 (Prefill)</span><strong id="prefillCount">0</strong></div><div class="metric"><span>图片进度 (Images)</span><strong id="imageReadyCount">0 / 0</strong></div></section>
         <div class="upload-layout"><section class="panel"><div class="panel-head"><h3>草稿预填证据 (Draft Prefill Evidence)</h3><span class="pill">Seller API Template</span></div><div id="draftItems" class="draft-items"></div></section>
-          <aside id="uploadGate" class="panel"><div class="panel-head"><h3>上传门禁 (Upload Gate)</h3></div><div class="gate-list"><div id="templateGate" class="gate-row"><span class="gate-icon">1</span><div><strong>类目模板 (Category Template)</strong><span>等待检查</span></div></div><div class="gate-row blocked"><span class="gate-icon">!</span><div><strong>原创内容 (Original Content)</strong><span>标题和描述生成尚未实现。</span></div></div><div class="gate-row blocked"><span class="gate-icon">!</span><div><strong>图片门禁 (Image Gate)</strong><span>没有通过门禁的生成图片。</span></div></div><div class="gate-row blocked"><span class="gate-icon">!</span><div><strong>草稿文件 (Draft Artifact)</strong><span>最终 Seller API 草稿尚未构建。</span></div></div></div><div class="publish-lock"><strong>发布锁已开启 (Publish Lock Active)</strong><span>本页不会自动提交到 Ozon；门禁通过后仍需独立发布确认。</span></div><button id="buildDraft" class="primary" disabled>等待内容与图片门禁 (Waiting for Gates)</button></aside>
+          <aside id="uploadGate" class="panel"><div class="panel-head"><h3>上传门禁 (Upload Gate)</h3></div><div class="gate-list"><div id="templateGate" class="gate-row"><span class="gate-icon">1</span><div><strong>类目模板 (Category Template)</strong><span>等待检查</span></div></div><div id="contentGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>原创内容 (Original Content)</strong><span>等待原创标题和描述。</span></div></div><div id="imageUploadGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>图片门禁 (Image Gate)</strong><span>等待生图与用户审核。</span></div></div><div id="draftGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>草稿文件 (Draft Artifact)</strong><span>最终 Seller API 草稿尚未构建。</span></div></div></div><div class="publish-lock"><strong>发布锁已开启 (Publish Lock Active)</strong><span>本页不会自动提交到 Ozon；门禁通过后仍需独立发布确认。</span></div><button id="buildDraft" class="primary" disabled>等待内容与图片门禁 (Waiting for Gates)</button></aside>
         </div>
       </main>
     </div>
@@ -2855,8 +2864,9 @@ def build_upload_workspace_html(run_id: str) -> str:
     const runId = {safe_run_id}; const $ = (id) => document.getElementById(id);
     async function api(path) {{ const response = await fetch(path); const body = await response.json(); if (!response.ok) throw body; return body; }}
     function renderAttributes(container, attributes) {{ const entries = Object.entries(attributes || {{}}).slice(0, 12); if (!entries.length) return; const grid = document.createElement("div"); grid.className = "attribute-grid"; entries.forEach(([key,value]) => {{ const row = document.createElement("div"); row.className = "attribute"; const label = document.createElement("span"); label.textContent = key; const fact = document.createElement("strong"); fact.textContent = String(value); row.append(label,fact); grid.append(row); }}); container.append(grid); }}
-    function render(data) {{ const items = data.items || []; const gates = data.gates || {{}}; $("productCount").textContent = String(items.length); $("requiredCount").textContent = String(items.reduce((total,item) => total + (item.required_attribute_count || 0),0)); $("prefillCount").textContent = String(items.reduce((total,item) => total + (item.prefill_plan_count || 0),0)); $("imageReadyCount").textContent = gates.images_ready ? String(items.length) : "0"; $("workspaceStatus").textContent = gates.ready_to_build ? "可构建草稿 (Ready)" : "门禁阻塞 (Blocked)"; const templateStatus = $("templateGate").querySelector("span:last-child"); templateStatus.textContent = gates.category_template_ready ? "Seller API 类目模板已就绪。" : "Seller API 类目模板缺失。"; $("draftItems").replaceChildren();
-      items.forEach((item) => {{ const card = document.createElement("article"); card.className = "draft-item"; if (item.source_image) {{ const image = document.createElement("img"); image.src = item.source_image; image.alt = item.source_title || "Ozon source"; image.loading = "lazy"; image.referrerPolicy = "no-referrer"; card.append(image); }} else {{ const empty = document.createElement("div"); empty.className = "image-placeholder"; empty.textContent = "没有来源图片"; card.append(empty); }} const body = document.createElement("div"); const label = document.createElement("div"); label.className = "source-label"; label.textContent = "Ozon 来源标题 (Source Evidence Only)"; const title = document.createElement("h3"); title.className = "source-title"; title.textContent = item.source_title || item.seed_id; const notice = document.createElement("div"); notice.className = "notice"; notice.textContent = "该标题仅作证据，不会直接复制到草稿；俄文标题与描述仍需原创生成。"; const meta = document.createElement("div"); meta.className = "meta-grid"; meta.innerHTML = `<div class="meta"><span>精准类目</span><strong>${{item.category_path || "-"}}</strong></div><div class="meta"><span>属性模板</span><strong>${{item.attribute_schema_count || 0}} 字段</strong></div><div class="meta"><span>预填计划</span><strong>${{item.prefill_plan_count || 0}} 项</strong></div>`; body.append(label,title,notice,meta); renderAttributes(body,item.source_attributes); card.append(body); $("draftItems").append(card); }});
+    function setGate(id, ready, text) {{ const row = $(id); row.classList.toggle("blocked", !ready); row.querySelector(".gate-icon").textContent = ready ? "✓" : "!"; row.querySelector("span:last-child").textContent = text; }}
+    function render(data) {{ const items = data.items || []; const gates = data.gates || {{}}; $("productCount").textContent = String(items.length); $("requiredCount").textContent = String(items.reduce((total,item) => total + (item.required_attribute_count || 0),0)); $("prefillCount").textContent = String(items.reduce((total,item) => total + (item.prefill_plan_count || 0),0)); $("imageReadyCount").textContent = `${{gates.approved_product_count || 0}} / ${{gates.product_count || items.length}} 件 · ${{gates.generated_image_count || 0}} 张`; $("workspaceStatus").textContent = gates.ready_to_build ? "可构建草稿 (Ready)" : "门禁阻塞 (Blocked)"; setGate("templateGate", gates.category_template_ready === true, gates.category_template_ready ? "Seller API 类目模板已就绪。" : "Seller API 类目模板缺失。"); setGate("contentGate", gates.generated_content_ready === true, gates.generated_content_ready ? "原创标题和描述已完成。" : "原创标题和描述尚未完成，不能用 Ozon 来源文案代替。"); setGate("imageUploadGate", gates.images_ready === true, gates.images_ready ? `${{gates.approved_product_count}} / ${{gates.product_count}} 件已审核，共 ${{gates.generated_image_count}} 张。` : `${{gates.generated_product_count || 0}} / ${{gates.product_count || items.length}} 件已生成，${{gates.approved_product_count || 0}} / ${{gates.product_count || items.length}} 件已审核；请到图片处理逐件确认。`); setGate("draftGate", gates.draft_ready === true, gates.draft_ready ? "Seller API 草稿文件已构建。" : "内容和图片门禁通过后才能构建草稿。"); $("buildDraft").disabled = gates.ready_to_build !== true; $("draftItems").replaceChildren();
+      items.forEach((item) => {{ const card = document.createElement("article"); card.className = "draft-item"; const preview = item.generated_image_url || item.source_image; if (preview) {{ const image = document.createElement("img"); image.src = preview; image.alt = item.source_title || "Product image"; image.loading = "lazy"; image.referrerPolicy = "no-referrer"; card.append(image); }} else {{ const empty = document.createElement("div"); empty.className = "image-placeholder"; empty.textContent = "没有来源图片"; card.append(empty); }} const body = document.createElement("div"); const label = document.createElement("div"); label.className = "source-label"; label.textContent = item.generated_image_url ? `生成图片 ${{item.generated_image_count}} / 8 · ${{item.generated_images_ready ? "已审核" : "待审核"}}` : "Ozon 来源标题 (Source Evidence Only)"; const title = document.createElement("h3"); title.className = "source-title"; title.textContent = item.source_title || item.seed_id; const notice = document.createElement("div"); notice.className = "notice"; notice.textContent = "该标题仅作证据，不会直接复制到草稿；俄文标题与描述仍需原创生成。"; const meta = document.createElement("div"); meta.className = "meta-grid"; meta.innerHTML = `<div class="meta"><span>精准类目</span><strong>${{item.category_path || "-"}}</strong></div><div class="meta"><span>属性模板</span><strong>${{item.attribute_schema_count || 0}} 字段</strong></div><div class="meta"><span>图片状态</span><strong>${{item.image_generation_status || "not_queued"}} · ${{item.generated_image_count || 0}} 张</strong></div>`; body.append(label,title,notice,meta); renderAttributes(body,item.source_attributes); card.append(body); $("draftItems").append(card); }});
       if (!items.length) {{ const empty = document.createElement("div"); empty.className = "empty"; empty.textContent = "当前批次没有可用的类目模板与商品证据"; $("draftItems").append(empty); }}
     }}
     api(`/api/batches/${{encodeURIComponent(runId)}}/upload`).then((result) => render(result.data || {{}})).catch((error) => {{ $("workspaceStatus").textContent = "加载失败 (Failed)"; $("draftItems").textContent = error.message || String(error); }});
@@ -3423,6 +3433,9 @@ def create_handler(
                     return
                 if parts[5] == "resume":
                     self._send_result(service.resume_image_job(parts[2], parts[4]), run_id=parts[2])
+                    return
+                if parts[5] == "approve":
+                    self._send_result(service.approve_image_job(parts[2], parts[4]), run_id=parts[2])
                     return
             self._send_json({"ok": False, "code": "http.not_found", "message": "Not found.", "errors": []}, HTTPStatus.NOT_FOUND)
 

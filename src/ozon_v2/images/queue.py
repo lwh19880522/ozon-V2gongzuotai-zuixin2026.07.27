@@ -9,7 +9,12 @@ from typing import Any
 from ozon_v2.domain.supplier_sku import SupplierSkuSelectionReceipt, stable_sha256
 from ozon_v2.images.contracts import SubjectMasterSelection
 from ozon_v2.images.visual_design import VisualSpec, validate_visual_set, validate_visual_spec
-from ozon_v2.images.worker import CURRENT_PROMPT_VERSION, LEGACY_PROMPT_VERSION, SlotResultReceipt
+from ozon_v2.images.worker import (
+    CURRENT_PROMPT_VERSION,
+    LEGACY_PROMPT_VERSION,
+    SlotResultReceipt,
+    validate_output_diversity,
+)
 
 
 REGULAR_IMAGE_WORKER_IDS = tuple(
@@ -778,6 +783,7 @@ class ImageGenerationQueue:
                     specs.append(spec)
                 if not errors:
                     errors.extend(validate_visual_set(tuple(specs)))
+                    errors.extend(validate_output_diversity(tuple(receipts)))
                 if errors:
                     connection.rollback()
                     raise ValueError("visual set validation failed: " + "; ".join(errors))
@@ -796,6 +802,84 @@ class ImageGenerationQueue:
             updated = connection.execute(
                 "SELECT * FROM image_jobs WHERE job_id = ?",
                 (job_id,),
+            ).fetchone()
+            connection.commit()
+        return dict(updated)
+
+    def approve_review(self, job_id: str) -> dict[str, Any]:
+        """Persist explicit user approval after re-verifying all frozen outputs."""
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            job = connection.execute(
+                "SELECT * FROM image_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if job is None or job["status"] != "manual_review_required":
+                connection.rollback()
+                raise ValueError("image job is not waiting for manual review")
+            slots = connection.execute(
+                "SELECT * FROM image_slots WHERE job_id = ? ORDER BY ordinal",
+                (job_id,),
+            ).fetchall()
+            if len(slots) != len(SLOT_DEFINITIONS) or any(
+                slot["status"] != "accepted" for slot in slots
+            ):
+                connection.rollback()
+                raise ValueError("all eight image slots must be accepted before approval")
+            receipts: list[SlotResultReceipt] = []
+            current_specs: list[VisualSpec] = []
+            for slot in slots:
+                try:
+                    receipt = SlotResultReceipt.from_dict(json.loads(slot["receipt_json"]))
+                except (TypeError, ValueError, json.JSONDecodeError) as error:
+                    connection.rollback()
+                    raise ValueError(
+                        f"accepted slot receipt is missing or invalid: {error}"
+                    ) from None
+                if not receipt.verify():
+                    connection.rollback()
+                    raise ValueError("accepted slot receipt failed approval verification")
+                if (
+                    receipt.slot_id != slot["slot_id"]
+                    or receipt.selection_sha256 != job["selection_sha256"]
+                    or receipt.subject_master_sha256 != job["subject_master_sha256"]
+                    or not receipt.accepted
+                    or str(Path(slot["accepted_path"] or "").resolve())
+                    != str(Path(receipt.output_path).resolve())
+                ):
+                    connection.rollback()
+                    raise ValueError("accepted slot does not match the frozen image contract")
+                if receipt.prompt_version == CURRENT_PROMPT_VERSION:
+                    try:
+                        current_specs.append(
+                            VisualSpec.from_dict(receipt.validation["visual_spec"])
+                        )
+                    except (KeyError, TypeError, ValueError) as error:
+                        connection.rollback()
+                        raise ValueError(
+                            f"accepted slot visual spec is invalid: {error}"
+                        ) from None
+                receipts.append(receipt)
+            diversity_errors = validate_output_diversity(tuple(receipts))
+            if len(current_specs) == len(SLOT_DEFINITIONS):
+                diversity_errors.extend(validate_visual_set(tuple(current_specs)))
+            if diversity_errors:
+                connection.rollback()
+                raise ValueError(
+                    "approved image set failed pixel diversity validation: "
+                    + "; ".join(diversity_errors)
+                )
+            connection.execute(
+                """
+                UPDATE image_jobs
+                SET status = 'completed', worker_id = NULL, lease_expires = NULL,
+                    heartbeat_at = NULL, updated_at = ?
+                WHERE job_id = ?
+                """,
+                (now, job_id),
+            )
+            updated = connection.execute(
+                "SELECT * FROM image_jobs WHERE job_id = ?", (job_id,)
             ).fetchone()
             connection.commit()
         return dict(updated)
