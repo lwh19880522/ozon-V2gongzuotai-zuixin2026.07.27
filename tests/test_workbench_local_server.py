@@ -2301,8 +2301,10 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn('id="uploadGate"', page)
         self.assertIn('id="buildDraft"', page)
         self.assertIn("发布锁已开启 (Publish Lock Active)", page)
-        self.assertIn("逐商品独立门禁", page)
-        self.assertIn("其他商品继续等待也不会阻塞它", page)
+        self.assertIn("逐商品上传门禁", page)
+        self.assertIn("合格商品不等待整批", page)
+        self.assertIn("类目模板自动映射结果", page)
+        self.assertIn("required_attributes", page)
         self.assertIn("ready_to_build_count", page)
         self.assertIn("item.blocking_gates", page)
         self.assertIn('id="buildDraft" class="primary" disabled', page)
@@ -2388,6 +2390,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         run_id, seed = self.prepare_supplier_review_run()
         ozon_result = self.repo.load_ozon_collection_result(run_id)
         ready_candidate = ozon_result["ozon_candidates"][0]
+        ready_candidate["attributes"]["Цвет"] = "белый"
         blocked_candidate = json.loads(json.dumps(ready_candidate))
         blocked_candidate["seed_id"] = "seed-blocked"
         blocked_candidate["product_id"] = "ozon-blocked"
@@ -2402,33 +2405,147 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.repo.save_attribute_template_result(run_id, template_result)
 
         self.attach_completed_image_job(run_id, seed.seed_id)
-        self.repo.save_generated_content_result(
-            run_id,
-            {
-                "run_id": run_id,
-                "items": {
-                    seed.seed_id: {
-                        "status": "completed",
-                        "title_ru": "Оригинальный заголовок",
-                        "description_ru": "Оригинальное описание товара.",
-                    }
-                },
-            },
-        )
 
         workspace = self.get_json(f"/api/batches/{run_id}/upload")["data"]
         items = {item["seed_id"]: item for item in workspace["items"]}
 
         self.assertTrue(items[seed.seed_id]["ready_to_build"])
         self.assertEqual([], items[seed.seed_id]["blocking_gates"])
+        self.assertEqual("mapped", items[seed.seed_id]["attribute_mapping"][0]["status"])
         self.assertFalse(items["seed-blocked"]["ready_to_build"])
-        self.assertIn("original_content", items["seed-blocked"]["blocking_gates"])
         self.assertIn("images", items["seed-blocked"]["blocking_gates"])
         self.assertTrue(workspace["gates"]["ready_to_build"])
         self.assertEqual(1, workspace["gates"]["ready_to_build_count"])
         self.assertEqual(1, workspace["gates"]["blocked_product_count"])
         self.assertFalse(workspace["gates"]["all_products_ready"])
         self.assertFalse(workspace["gates"]["images_ready"])
+
+        draft = self.post_json(f"/api/batches/{run_id}/upload-draft", {})["data"]
+        self.assertEqual(1, draft["prepared_product_count"])
+        self.assertEqual([seed.seed_id], [item["seed_id"] for item in draft["items"]])
+        self.assertEqual("85", draft["items"][0]["attributes"][0]["attribute_id"])
+        self.assertTrue((self.repo.run_dir(run_id) / "upload_draft.json").exists())
+
+    def test_upload_workspace_bulk_maps_required_template_fields_from_evidence(self) -> None:
+        run_id, _seed = self.prepare_supplier_review_run()
+        ozon_result = self.repo.load_ozon_collection_result(run_id)
+        candidate = ozon_result["ozon_candidates"][0]
+        candidate["brand"] = "Test Brand"
+        candidate["title"] = "Щетка для уборки"
+        candidate["category_path"] = "Дом и сад / Инвентарь для уборки / Щетки"
+        candidate["attributes"] = {
+            "Тип": "Щетка для уборки",
+            "Артикул": "MODEL-42",
+            "Цвет": "Белый",
+        }
+        self.repo.save_ozon_collection_result(run_id, ozon_result)
+
+        template_result = self.repo.load_attribute_template_result(run_id)
+        template = template_result["seed_templates"][0]
+        template["category_candidates"][0]["category_path"] = candidate["category_path"]
+        template["category_candidates"][0]["leaf_category"] = "Щетки"
+        template["seller_attribute_template"]["matched_category_path"] = (
+            "Дом и сад / Инвентарь для уборки / Щетка для уборки"
+        )
+        template["upload_attribute_schema"] = [
+            {"attribute_id": "85", "attribute_label": "Бренд", "is_required": True},
+            {"attribute_id": "8229", "attribute_label": "Тип", "is_required": True},
+            {
+                "attribute_id": "9048",
+                "attribute_label": "Название модели (для объединения в одну карточку)",
+                "is_required": True,
+            },
+            {"attribute_id": "10096", "attribute_label": "Цвет товара", "is_required": False},
+        ]
+        self.repo.save_attribute_template_result(run_id, template_result)
+
+        workspace = self.get_json(f"/api/batches/{run_id}/upload")["data"]
+        item = workspace["items"][0]
+        mapped = {field["field_key"]: field for field in item["attribute_mapping"]}
+
+        self.assertEqual(4, item["mapped_attribute_count"])
+        self.assertEqual(3, item["required_mapped_count"])
+        self.assertEqual([], item["missing_required_fields"])
+        self.assertTrue(item["required_attributes_ready"])
+        self.assertEqual("Test Brand", mapped["85"]["value"])
+        self.assertEqual("Щетка для уборки", mapped["8229"]["value"])
+        self.assertEqual("MODEL-42", mapped["9048"]["value"])
+        self.assertEqual("ozon.attributes.Артикул", mapped["9048"]["evidence_ref"])
+        self.assertEqual("Белый", mapped["10096"]["value"])
+
+    def test_upload_workspace_flags_cross_domain_template_instead_of_mapping_it(self) -> None:
+        run_id, _seed = self.prepare_supplier_review_run()
+        ozon_result = self.repo.load_ozon_collection_result(run_id)
+        candidate = ozon_result["ozon_candidates"][0]
+        candidate["title"] = "Детский гамак для самолета"
+        candidate["category_path"] = "Детские товары / Переноски для детей / SUFEITE"
+        candidate["attributes"] = {"Тип": "Гамак детский в самолет", "Материал": "Рипстоп"}
+        self.repo.save_ozon_collection_result(run_id, ozon_result)
+
+        template_result = self.repo.load_attribute_template_result(run_id)
+        template = template_result["seed_templates"][0]
+        template["category_candidates"][0]["category_path"] = candidate["category_path"]
+        template["category_candidates"][0]["leaf_category"] = "SUFEITE"
+        template["seller_attribute_template"]["matched_category_path"] = (
+            "Продукты питания / Соль, сахар, специи / Мак"
+        )
+        template["upload_attribute_schema"] = [
+            {"attribute_id": "8229", "attribute_label": "Тип", "is_required": True},
+            {"attribute_id": "7578", "attribute_label": "Срок годности в днях", "is_required": True},
+        ]
+        self.repo.save_attribute_template_result(run_id, template_result)
+
+        item = self.get_json(f"/api/batches/{run_id}/upload")["data"]["items"][0]
+
+        self.assertFalse(item["template_ready"])
+        self.assertEqual("cross_domain_category_mismatch", item["category_template_assessment"]["reason"])
+        self.assertIn("category_template", item["blocking_gates"])
+
+    def test_upload_draft_resolves_required_dictionary_value_ids(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        ozon_result = self.repo.load_ozon_collection_result(run_id)
+        ozon_result["ozon_candidates"][0]["attributes"]["Цвет"] = "белый"
+        self.repo.save_ozon_collection_result(run_id, ozon_result)
+        template_result = self.repo.load_attribute_template_result(run_id)
+        template_result["seed_templates"][0]["upload_attribute_schema"][0]["dictionary_id"] = 100
+        self.repo.save_attribute_template_result(run_id, template_result)
+        self.attach_completed_image_job(run_id, seed.seed_id)
+        service = WorkbenchService(self.repo)
+
+        with patch.object(
+            service.seller_api_adapter,
+            "resolve_attribute_dictionary_value",
+            return_value={"dictionary_value_id": 501, "value": "Белый"},
+        ) as resolver:
+            result = service.build_upload_draft(run_id)
+
+        self.assertTrue(result.ok)
+        attribute = result.data["items"][0]["attributes"][0]
+        self.assertEqual(501, attribute["dictionary_value_id"])
+        resolver.assert_called_once_with(
+            description_category_id=17000001,
+            type_id=970001,
+            attribute_id=85,
+            value="белый",
+        )
+
+    def test_refresh_attribute_template_replaces_only_the_mismatched_product(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        template_result = self.repo.load_attribute_template_result(run_id)
+        template_result["seed_templates"][0]["seller_attribute_template"][
+            "matched_category_path"
+        ] = "Продукты питания / Соль, сахар, специи / Мак"
+        self.repo.save_attribute_template_result(run_id, template_result)
+        adapter = FakeSellerApiAdapter()
+        service = WorkbenchService(self.repo, seller_api_adapter=adapter)
+
+        result = service.refresh_attribute_template(run_id, seed.seed_id)
+
+        self.assertTrue(result.ok)
+        saved = self.repo.load_attribute_template_result(run_id)["seed_templates"][0]
+        self.assertEqual("Красота / Зеркала", saved["seller_attribute_template"]["matched_category_path"])
+        self.assertEqual(1, adapter.resolve_count)
+        self.assertEqual(seed.seed_id, result.data["seed_id"])
 
     def test_operations_cockpit_pages_and_read_only_apis_use_runtime_data(self) -> None:
         run_id, _seed = self.prepare_supplier_review_run()

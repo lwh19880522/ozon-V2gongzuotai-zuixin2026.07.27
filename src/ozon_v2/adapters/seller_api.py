@@ -78,25 +78,30 @@ class SellerApiAdapter:
         target_leaf = str(category_candidate.get("leaf_category") or "")
         target_url = str(category_candidate.get("category_url") or category_candidate.get("category_id") or "")
         target_title = str(category_candidate.get("product_title") or "")
+        target_product_type = str(category_candidate.get("product_type") or "")
         target_key = _normalize_category_text(" ".join([target_path, target_leaf, target_url]))
-        target_leaf_key = _normalize_category_text(target_leaf)
-        target_title_key = _normalize_category_text(target_title)
         if not target_key:
             raise SellerApiError("Public Ozon category evidence is missing.")
 
         tree = self._fetch_description_category_tree()
         matches: list[dict[str, Any]] = []
         for node in _iter_description_category_nodes(tree):
-            node_key = _normalize_category_text(node["matched_category_path"])
             if not node.get("description_category_id") or node.get("type_id") is None:
                 continue
-            score = _category_match_score(target_key, target_leaf_key, node_key)
-            node_leaf_key = _normalize_category_text(str(node["matched_category_path"]).rsplit("/", 1)[-1])
-            score += _category_title_match_score(target_title_key, node_leaf_key)
-            if score >= 35:
+            assessment = assess_category_template_match(
+                category_path=target_path,
+                leaf_category=target_leaf,
+                matched_category_path=str(node["matched_category_path"]),
+                product_title=target_title,
+                product_type=target_product_type,
+                category_url=target_url,
+            )
+            score = assessment["match_score"]
+            if assessment["credible"] and score >= 35:
                 item = dict(node)
                 item["match_score"] = score
                 item["match_confidence"] = "high" if score >= 80 else "medium" if score >= 35 else "low"
+                item["match_evidence"] = assessment
                 matches.append(item)
         if not matches:
             raise SellerApiError("Could not match public Ozon category to Seller description category template.")
@@ -129,6 +134,50 @@ class SellerApiAdapter:
         if not isinstance(result, list):
             raise SellerApiError("Seller attribute template response has invalid shape.")
         return result
+
+    def resolve_attribute_dictionary_value(
+        self,
+        *,
+        description_category_id: int,
+        type_id: int,
+        attribute_id: int,
+        value: str,
+    ) -> dict[str, Any]:
+        payload = self._post_json(
+            "/v1/description-category/attribute/values/search",
+            {
+                "attribute_id": attribute_id,
+                "description_category_id": description_category_id,
+                "type_id": type_id,
+                "value": value,
+                "limit": 100,
+            },
+        )
+        result = payload.get("result", [])
+        if isinstance(result, dict):
+            result = result.get("values") or result.get("items") or []
+        if not isinstance(result, list):
+            raise SellerApiError("Seller attribute dictionary response has invalid shape.")
+        target = _normalize_category_text(value)
+        exact_matches = []
+        for item in result:
+            if not isinstance(item, dict):
+                continue
+            visible_value = str(item.get("value") or item.get("name") or "").strip()
+            value_id = item.get("id") or item.get("value_id") or item.get("dictionary_value_id")
+            if value_id is None or _normalize_category_text(visible_value) != target:
+                continue
+            exact_matches.append(
+                {
+                    "dictionary_value_id": value_id,
+                    "value": visible_value,
+                }
+            )
+        if len(exact_matches) != 1:
+            raise SellerApiError(
+                f"Could not resolve one exact dictionary value for attribute {attribute_id}: {value}"
+            )
+        return exact_matches[0]
 
     def _fetch_product_refs(self, page_limit: int | None = None) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
@@ -282,7 +331,7 @@ def _category_tokens_match(left: str, right: str) -> bool:
 def _category_title_match_score(title_key: str, node_leaf_key: str) -> int:
     if not title_key or not node_leaf_key:
         return 0
-    if node_leaf_key in title_key:
+    if f" {node_leaf_key} " in f" {title_key} ":
         return 100
     title_tokens = _token_keys(title_key)
     leaf_tokens = _token_keys(node_leaf_key)
@@ -292,6 +341,88 @@ def _category_title_match_score(title_key: str, node_leaf_key: str) -> int:
         1 for leaf_token in leaf_tokens if any(_category_tokens_match(leaf_token, title) for title in title_tokens)
     )
     return int(80 * matched / len(leaf_tokens))
+
+
+_CATEGORY_CONTEXT_STOPWORDS = {
+    "для",
+    "товар",
+    "товары",
+    "изделия",
+    "аксессуары",
+    "принадлежности",
+}
+
+
+def assess_category_template_match(
+    *,
+    category_path: str,
+    matched_category_path: str,
+    leaf_category: str = "",
+    product_title: str = "",
+    product_type: str = "",
+    category_url: str = "",
+) -> dict[str, Any]:
+    target_key = _normalize_category_text(" ".join([category_path, leaf_category, category_url]))
+    target_leaf_key = _normalize_category_text(leaf_category)
+    node_key = _normalize_category_text(matched_category_path)
+    node_leaf = str(matched_category_path).rsplit("/", 1)[-1]
+    node_leaf_key = _normalize_category_text(node_leaf)
+    category_score = _category_match_score(target_key, target_leaf_key, node_key)
+    title_score = _category_title_match_score(_normalize_category_text(product_title), node_leaf_key)
+    type_score = _category_title_match_score(_normalize_category_text(product_type), node_leaf_key)
+
+    target_parts = [part.strip() for part in category_path.split("/") if part.strip()]
+    node_parts = [part.strip() for part in matched_category_path.split("/") if part.strip()]
+    root_compatible = _category_roots_match(
+        target_parts[0] if target_parts else "",
+        node_parts[0] if node_parts else "",
+    )
+    context_overlap = _category_context_overlap(
+        " ".join(target_parts[:-1] or target_parts),
+        " ".join(node_parts[:-1]),
+    )
+    has_hierarchy = len(target_parts) > 1 and len(node_parts) > 1
+    cross_domain = has_hierarchy and not root_compatible
+    credible = not cross_domain or type_score > 0 or (title_score > 0 and context_overlap > 0)
+    reason = "category_evidence_aligned" if credible else "cross_domain_category_mismatch"
+    return {
+        "credible": credible,
+        "reason": reason,
+        "match_score": category_score + max(title_score, type_score),
+        "category_score": category_score,
+        "title_score": title_score,
+        "product_type_score": type_score,
+        "root_compatible": root_compatible,
+        "context_overlap": context_overlap,
+    }
+
+
+def _category_roots_match(left: str, right: str) -> bool:
+    left_tokens = _context_tokens(_normalize_category_text(left))
+    right_tokens = _context_tokens(_normalize_category_text(right))
+    return bool(
+        left_tokens
+        and right_tokens
+        and any(_category_tokens_match(a, b) for a in left_tokens for b in right_tokens)
+    )
+
+
+def _category_context_overlap(left: str, right: str) -> int:
+    left_tokens = _context_tokens(_normalize_category_text(left))
+    right_tokens = _context_tokens(_normalize_category_text(right))
+    return sum(
+        1
+        for token in right_tokens
+        if any(_category_tokens_match(token, target) for target in left_tokens)
+    )
+
+
+def _context_tokens(value: str) -> set[str]:
+    return {
+        token
+        for token in _token_keys(value)
+        if token not in _CATEGORY_CONTEXT_STOPWORDS
+    }
 
 
 def _normalize_category_text(value: str | None) -> str:

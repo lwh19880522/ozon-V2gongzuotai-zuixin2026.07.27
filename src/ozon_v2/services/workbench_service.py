@@ -10,7 +10,11 @@ from urllib.parse import urlparse
 from urllib.request import ProxyHandler, Request, build_opener
 
 from ozon_v2.adapters.fs_repo import FsRepo
-from ozon_v2.adapters.seller_api import SellerApiAdapter, SellerApiError
+from ozon_v2.adapters.seller_api import (
+    SellerApiAdapter,
+    SellerApiError,
+    assess_category_template_match,
+)
 from ozon_v2.app.result import Result
 from ozon_v2.domain.models import QueryGenerationStatus, SeedProduct, SeedSearchQuery, WorkbenchAction, WorkbenchState, utc_now_iso
 from ozon_v2.domain.policies import decide_seed_existing_product_dedupe, seed_has_generated_ozon_query
@@ -19,6 +23,7 @@ from ozon_v2.domain.state_machine import allowed_workbench_actions, transition_w
 from ozon_v2.domain.validators import validate_attribute_template_result, validate_ozon_collection_result, validate_seed_ready_for_ozon
 from ozon_v2.images.contracts import SubjectMasterSelection
 from ozon_v2.images.queue import ImageGenerationQueue, ImageRepairRequestError
+from ozon_v2.services.attribute_mapping_service import map_template_attributes
 from ozon_v2.services.collection_contract_service import (
     CREATIVE_FIELDS_REQUIRING_REWRITE,
     CollectionContractService,
@@ -343,6 +348,19 @@ class WorkbenchService:
                 category_candidate["product_url"] = product_url
             if seed_template.get("source_query"):
                 category_candidate["source_query"] = seed_template["source_query"]
+            public_attributes = public_evidence.get("attribute_table")
+            if isinstance(public_attributes, dict):
+                product_type = next(
+                    (
+                        value
+                        for key, value in public_attributes.items()
+                        if str(key).strip().casefold() in {"тип", "type"}
+                        and str(value or "").strip()
+                    ),
+                    None,
+                )
+                if product_type:
+                    category_candidate["product_type"] = product_type
             seller_template = self.seller_api_adapter.resolve_attribute_template(category_candidate)
             upload_schema = seller_template.get("upload_attribute_schema") or []
             seed_template["public_attribute_evidence"] = public_evidence
@@ -381,6 +399,118 @@ class WorkbenchService:
                 }
             )
         return plan
+
+    def refresh_attribute_template(self, run_id: str, seed_id: str) -> Result:
+        try:
+            payload = self.repo.load_attribute_template_result(run_id)
+            ozon_result = self.repo.load_ozon_collection_result(run_id)
+        except FileNotFoundError:
+            return Result.failure(
+                "attribute_template.refresh_source_missing",
+                "Stored category evidence and Ozon product evidence are required.",
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+        seed_templates = payload.get("seed_templates", [])
+        template_index = next(
+            (
+                index
+                for index, item in enumerate(seed_templates)
+                if isinstance(item, dict) and str(item.get("seed_id") or "") == seed_id
+            ),
+            None,
+        )
+        candidate = next(
+            (
+                item
+                for item in ozon_result.get("ozon_candidates", [])
+                if isinstance(item, dict) and str(item.get("seed_id") or "") == seed_id
+            ),
+            None,
+        )
+        if template_index is None or candidate is None:
+            return Result.failure(
+                "attribute_template.refresh_product_missing",
+                "The requested batch product does not have both template and Ozon evidence.",
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+        seed_template = dict(seed_templates[template_index])
+        category_candidates = seed_template.get("category_candidates") or []
+        if not category_candidates:
+            return Result.failure(
+                "attribute_template.refresh_category_missing",
+                "The requested product has no frozen public category evidence.",
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+        category_candidate = dict(category_candidates[0])
+        category_candidate["product_title"] = candidate.get("title")
+        product_type = next(
+            (
+                value
+                for key, value in (candidate.get("attributes") or {}).items()
+                if str(key).strip().casefold() in {"тип", "type"}
+                and str(value or "").strip()
+            ),
+            "",
+        )
+        if product_type:
+            category_candidate["product_type"] = product_type
+        try:
+            resolved = self.seller_api_adapter.resolve_attribute_template(category_candidate)
+        except SellerApiError as exc:
+            return Result.failure(
+                "attribute_template.refresh_failed",
+                "Seller API could not resolve a credible replacement category template.",
+                errors=[str(exc)],
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+        schema = resolved.get("upload_attribute_schema") or []
+        assessment = assess_category_template_match(
+            category_path=str(category_candidate.get("category_path") or ""),
+            leaf_category=str(category_candidate.get("leaf_category") or ""),
+            matched_category_path=str(resolved.get("matched_category_path") or ""),
+            product_title=str(candidate.get("title") or ""),
+            product_type=str(product_type or ""),
+            category_url=str(category_candidate.get("category_url") or ""),
+        )
+        if not schema or not assessment["credible"]:
+            return Result.failure(
+                "attribute_template.refresh_mismatch",
+                "The replacement template still conflicts with the product category evidence.",
+                data={
+                    "run_id": run_id,
+                    "seed_id": seed_id,
+                    "category_template_assessment": assessment,
+                },
+            )
+        seed_template["seller_attribute_template"] = {
+            key: value for key, value in resolved.items() if key != "upload_attribute_schema"
+        }
+        seed_template["upload_attribute_schema"] = schema
+        seed_template["draft_prefill_plan"] = self._build_draft_prefill_plan(schema)
+        seed_templates[template_index] = seed_template
+        payload["seed_templates"] = seed_templates
+        self.repo.save_attribute_template_result(run_id, payload)
+        event = self.repo.append_run_event(
+            run_id,
+            "attribute_template.refreshed",
+            "One mismatched Seller API category template was resolved again from frozen evidence.",
+            {
+                "seed_id": seed_id,
+                "matched_category_path": resolved.get("matched_category_path"),
+                "attribute_count": len(schema),
+            },
+        )
+        return Result.success(
+            "attribute_template.refreshed",
+            "The product category template was refreshed. No product was published.",
+            {
+                "run_id": run_id,
+                "seed_id": seed_id,
+                "seller_attribute_template": seed_template["seller_attribute_template"],
+                "attribute_count": len(schema),
+                "last_event": event.to_dict(),
+            },
+        )
 
     def _seller_attribute_template_errors(self, run_id: str, expected_seed_ids: list[str]) -> list[str]:
         try:
@@ -1105,29 +1235,31 @@ class WorkbenchService:
             for item in template_result.get("seed_templates", [])
             if isinstance(item, dict)
         }
+        suppliers_by_seed: dict[str, dict[str, Any]] = {}
+        supplier_result_path = self.repo.run_dir(run_id) / "supplier_collection_result.json"
+        if supplier_result_path.exists():
+            supplier_result = self.repo.load_supplier_collection_result(run_id)
+            suppliers_by_seed = {
+                str(item.get("seed_id") or ""): item
+                for item in supplier_result.get("supplier_products", [])
+                if isinstance(item, dict)
+            }
+        supplier_selections: dict[str, dict[str, Any]] = {}
+        selection_path = self.repo.run_dir(run_id) / "supplier_sku_selections.json"
+        if selection_path.exists():
+            raw_selections = self.repo.load_supplier_sku_selections(run_id).get("selections", {})
+            if isinstance(raw_selections, dict):
+                supplier_selections = {
+                    str(seed_id): selection
+                    for seed_id, selection in raw_selections.items()
+                    if isinstance(selection, dict)
+                }
         subject_path = self.repo.run_dir(run_id) / "subject_masters.json"
         subject_items = (
             self.repo.load_subject_masters(run_id).get("items", {})
             if subject_path.exists()
             else {}
         )
-        generated_content_path = self.repo.run_dir(run_id) / "generated_content_result.json"
-        generated_content_items: dict[str, dict[str, Any]] = {}
-        if generated_content_path.exists():
-            content_payload = self.repo.load_generated_content_result(run_id)
-            raw_content_items = content_payload.get("items", {})
-            if isinstance(raw_content_items, dict):
-                generated_content_items = {
-                    str(seed_id): item
-                    for seed_id, item in raw_content_items.items()
-                    if isinstance(item, dict)
-                }
-            elif isinstance(raw_content_items, list):
-                generated_content_items = {
-                    str(item.get("seed_id") or ""): item
-                    for item in raw_content_items
-                    if isinstance(item, dict) and item.get("seed_id")
-                }
         candidates = ozon_result.get("ozon_candidates") if isinstance(ozon_result.get("ozon_candidates"), list) else []
         items: list[dict[str, Any]] = []
         for candidate in candidates:
@@ -1163,27 +1295,58 @@ class WorkbenchService:
                 image_generation_status == "completed"
                 and len(accepted_slots) == 8
             )
-            content_entry = generated_content_items.get(seed_id, {})
-            generated_title = str(
-                content_entry.get("title_ru") or content_entry.get("title") or ""
-            ).strip()
-            generated_description = str(
-                content_entry.get("description_ru")
-                or content_entry.get("description")
-                or ""
-            ).strip()
-            content_status = str(content_entry.get("status") or "").strip().lower()
-            generated_content_ready = bool(
-                generated_title
-                and generated_description
-                and content_status not in {"blocked", "failed", "pending"}
+            category_candidate = category_candidates[0] if category_candidates else {}
+            product_type = next(
+                (
+                    value
+                    for key, value in (candidate.get("attributes") or {}).items()
+                    if str(key).strip().casefold() in {"тип", "type"}
+                    and str(value or "").strip()
+                ),
+                "",
             )
-            template_ready = bool(schema and seller_template)
+            category_assessment = assess_category_template_match(
+                category_path=str(
+                    category_candidate.get("category_path")
+                    or candidate.get("category_path")
+                    or ""
+                ),
+                leaf_category=str(category_candidate.get("leaf_category") or ""),
+                matched_category_path=str(seller_template.get("matched_category_path") or ""),
+                product_title=str(candidate.get("title") or ""),
+                product_type=str(product_type or ""),
+                category_url=str(category_candidate.get("category_url") or ""),
+            )
+            template_ready = bool(
+                schema
+                and seller_template
+                and category_assessment["credible"]
+            )
+            mapping = (
+                map_template_attributes(
+                    schema,
+                    candidate,
+                    supplier_product=suppliers_by_seed.get(seed_id),
+                    supplier_selection=supplier_selections.get(seed_id),
+                )
+                if template_ready
+                else {
+                    "fields": [],
+                    "mapped_attribute_count": 0,
+                    "required_attribute_count": 0,
+                    "required_mapped_count": 0,
+                    "missing_required_fields": [],
+                    "required_attributes_ready": False,
+                }
+            )
+            required_attributes_ready = bool(
+                template_ready and mapping["required_attributes_ready"]
+            )
             blocking_gates: list[str] = []
             if not template_ready:
                 blocking_gates.append("category_template")
-            if not generated_content_ready:
-                blocking_gates.append("original_content")
+            elif not required_attributes_ready:
+                blocking_gates.append("required_attributes")
             if not generated_images_ready:
                 blocking_gates.append("images")
             items.append(
@@ -1202,9 +1365,12 @@ class WorkbenchService:
                     "prefill_plan_count": len(prefill_plan),
                     "prefill_plan": prefill_plan,
                     "template_ready": template_ready,
-                    "generated_content_ready": generated_content_ready,
-                    "generated_title": generated_title or None,
-                    "generated_description": generated_description or None,
+                    "category_template_assessment": category_assessment,
+                    "attribute_mapping": mapping["fields"],
+                    "mapped_attribute_count": mapping["mapped_attribute_count"],
+                    "required_mapped_count": mapping["required_mapped_count"],
+                    "missing_required_fields": mapping["missing_required_fields"],
+                    "required_attributes_ready": required_attributes_ready,
                     "generated_images_ready": generated_images_ready,
                     "blocking_gates": blocking_gates,
                     "ready_to_build": not blocking_gates,
@@ -1217,12 +1383,17 @@ class WorkbenchService:
                         if accepted_slots
                         else None
                     ),
+                    "generated_image_urls": [
+                        f"/api/batches/{run_id}/image-job/{image_job_id}/slot/"
+                        f"{slot['slot_id']}/file"
+                        for slot in accepted_slots
+                    ],
                 }
             )
 
         template_ready = bool(items) and all(item["template_ready"] for item in items)
-        generated_content_ready = bool(items) and all(
-            item["generated_content_ready"] for item in items
+        required_attributes_ready = bool(items) and all(
+            item["required_attributes_ready"] for item in items
         )
         images_ready = bool(items) and all(
             item["generated_images_ready"] for item in items
@@ -1235,8 +1406,15 @@ class WorkbenchService:
             1 for item in items if item["generated_images_ready"]
         )
         template_ready_count = sum(1 for item in items if item["template_ready"])
-        generated_content_ready_count = sum(
-            1 for item in items if item["generated_content_ready"]
+        required_attributes_ready_count = sum(
+            1 for item in items if item["required_attributes_ready"]
+        )
+        mapped_attribute_count = sum(item["mapped_attribute_count"] for item in items)
+        required_mapped_count = sum(item["required_mapped_count"] for item in items)
+        valid_required_attribute_count = sum(
+            item["required_attribute_count"]
+            for item in items
+            if item["template_ready"]
         )
         ready_to_build_count = sum(1 for item in items if item["ready_to_build"])
         all_products_ready = bool(items) and ready_to_build_count == len(items)
@@ -1255,13 +1433,16 @@ class WorkbenchService:
                 "items": items,
                 "gates": {
                     "category_template_ready": template_ready,
-                    "generated_content_ready": generated_content_ready,
+                    "required_attributes_ready": required_attributes_ready,
                     "images_ready": images_ready,
                     "generated_image_count": generated_image_count,
                     "generated_product_count": generated_product_count,
                     "approved_product_count": approved_product_count,
                     "template_ready_count": template_ready_count,
-                    "generated_content_ready_count": generated_content_ready_count,
+                    "required_attributes_ready_count": required_attributes_ready_count,
+                    "mapped_attribute_count": mapped_attribute_count,
+                    "required_mapped_count": required_mapped_count,
+                    "valid_required_attribute_count": valid_required_attribute_count,
                     "ready_to_build_count": ready_to_build_count,
                     "blocked_product_count": len(items) - ready_to_build_count,
                     "all_products_ready": all_products_ready,
@@ -1271,6 +1452,122 @@ class WorkbenchService:
                     "ready_to_build": ready_to_build_count > 0,
                 },
             },
+        )
+
+    def build_upload_draft(self, run_id: str) -> Result:
+        workspace = self.upload_workspace(run_id)
+        if not workspace.ok:
+            return workspace
+        ready_items = [
+            item
+            for item in workspace.data.get("items", [])
+            if item.get("ready_to_build") is True
+        ]
+        if not ready_items:
+            return Result.failure(
+                "upload_draft.no_ready_products",
+                "No product currently passes its own template, required-attribute, and image gates.",
+                data={"run_id": run_id, "prepared_product_count": 0, "items": []},
+            )
+        draft_items = []
+        blocked_items = []
+        for item in ready_items:
+            draft_attributes = []
+            unresolved_required_dictionaries = []
+            for field in item.get("attribute_mapping", []):
+                if field.get("status") != "mapped":
+                    continue
+                draft_attribute = {
+                    "attribute_id": field["field_key"],
+                    "label": field["label"],
+                    "value": field["value"],
+                    "dictionary_id": field.get("dictionary_id"),
+                    "dictionary_value_id": None,
+                    "dictionary_resolution_required": field.get(
+                        "dictionary_resolution_required", False
+                    ),
+                    "evidence_ref": field.get("evidence_ref"),
+                }
+                if field.get("dictionary_resolution_required"):
+                    try:
+                        resolved = self.seller_api_adapter.resolve_attribute_dictionary_value(
+                            description_category_id=int(item["description_category_id"]),
+                            type_id=int(item["type_id"]),
+                            attribute_id=int(field["field_key"]),
+                            value=str(field["value"]),
+                        )
+                    except (SellerApiError, TypeError, ValueError) as exc:
+                        draft_attribute["dictionary_resolution_error"] = str(exc)
+                        if field.get("required") is True:
+                            unresolved_required_dictionaries.append(
+                                {
+                                    "field_key": field["field_key"],
+                                    "label": field["label"],
+                                    "value": field["value"],
+                                    "error": str(exc),
+                                }
+                            )
+                    else:
+                        draft_attribute["dictionary_value_id"] = resolved[
+                            "dictionary_value_id"
+                        ]
+                        draft_attribute["dictionary_value"] = resolved["value"]
+                draft_attributes.append(draft_attribute)
+            if unresolved_required_dictionaries:
+                blocked_items.append(
+                    {
+                        "seed_id": item["seed_id"],
+                        "reason": "required_dictionary_value_unresolved",
+                        "fields": unresolved_required_dictionaries,
+                    }
+                )
+                continue
+            draft_items.append(
+                {
+                    "seed_id": item["seed_id"],
+                    "status": "attribute_prefill_ready",
+                    "description_category_id": item.get("description_category_id"),
+                    "type_id": item.get("type_id"),
+                    "category_path": item.get("category_path"),
+                    "source_title": item.get("source_title"),
+                    "attributes": draft_attributes,
+                    "image_job_id": item.get("image_job_id"),
+                    "reviewed_image_urls": item.get("generated_image_urls", []),
+                }
+            )
+        payload = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "kind": "per_product_attribute_prefill_draft",
+            "prepared_at": utc_now_iso(),
+            "prepared_product_count": len(draft_items),
+            "blocked_product_count": len(blocked_items),
+            "items": draft_items,
+            "blocked_items": blocked_items,
+            "publish_locked": True,
+        }
+        path = self.repo.save_upload_draft(run_id, payload)
+        event = self.repo.append_run_event(
+            run_id,
+            "upload_draft.prepared",
+            "Ready products were written to an isolated attribute prefill draft without publishing.",
+            {
+                "prepared_product_count": len(draft_items),
+                "seed_ids": [item["seed_id"] for item in draft_items],
+                "blocked_seed_ids": [item["seed_id"] for item in blocked_items],
+                "draft_path": str(path),
+            },
+        )
+        if not draft_items:
+            return Result.failure(
+                "upload_draft.required_dictionary_values_unresolved",
+                "Required Seller API dictionary values could not be resolved exactly.",
+                data={**payload, "draft_path": str(path), "last_event": event.to_dict()},
+            )
+        return Result.success(
+            "upload_draft.prepared",
+            "Ready product attribute drafts were prepared. Nothing was submitted to Ozon.",
+            {**payload, "draft_path": str(path), "last_event": event.to_dict()},
         )
 
     def batch_history(self) -> Result:

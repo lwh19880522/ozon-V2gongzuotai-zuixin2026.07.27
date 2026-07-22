@@ -2832,10 +2832,11 @@ def build_upload_workspace_html(run_id: str) -> str:
     .panel-head {{ min-height:50px; display:flex; align-items:center; justify-content:space-between; gap:10px; padding:0 14px; border-bottom:1px solid var(--line); }} .panel-head h3 {{ margin:0; font-size:14px; }}
     .draft-items {{ display:grid; gap:12px; padding:12px; }} .draft-item {{ display:grid; grid-template-columns:124px minmax(0,1fr); gap:14px; padding:12px; border:1px solid var(--line); border-radius:5px; }}
     .draft-item img {{ width:124px; height:124px; object-fit:contain; border:1px solid var(--line); border-radius:4px; background:#fff; }} .image-placeholder {{ width:124px; height:124px; display:grid; place-items:center; border:1px dashed #c9d1dc; border-radius:4px; color:var(--muted); background:var(--soft); font-size:11px; text-align:center; }}
-    .source-label {{ color:var(--muted); font-size:10px; }} .source-title {{ margin:3px 0 9px; font-size:16px; line-height:1.35; }} .notice {{ padding:8px 10px; border-left:3px solid var(--amber); color:#74410a; background:#fff8eb; font-size:10px; }}
+    .source-label {{ color:var(--muted); font-size:10px; }} .source-title {{ margin:3px 0 9px; font-size:16px; line-height:1.35; }} .notice {{ padding:8px 10px; border-left:3px solid var(--amber); color:#74410a; background:#fff8eb; font-size:10px; }} .inline-action {{ margin-left:8px; padding:3px 7px; border:1px solid #d5a14d; border-radius:4px; color:#74410a; background:#fff; cursor:pointer; }} .inline-action:disabled {{ opacity:.55; cursor:wait; }}
     .item-gate-summary {{ display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin-top:10px; padding:8px 9px; border:1px solid #e8c98f; border-radius:4px; color:#74410a; background:#fffaf0; font-size:10px; }} .item-gate-summary.ready {{ border-color:#9dd8c7; color:var(--green); background:var(--green-soft); }} .item-gate-summary strong {{ margin-right:3px; }} .item-gate-chip {{ padding:2px 6px; border-radius:3px; color:inherit; background:rgba(255,255,255,.72); }}
     .meta-grid {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); margin-top:11px; border:1px solid var(--line); border-radius:4px; overflow:hidden; }} .meta {{ padding:8px 9px; border-right:1px solid var(--line); }} .meta:last-child {{ border-right:0; }} .meta span {{ display:block; color:var(--muted); font-size:9px; }} .meta strong {{ display:block; margin-top:3px; overflow-wrap:anywhere; font-size:10px; }}
-    .attribute-grid {{ display:grid; grid-template-columns:1fr 1fr; margin-top:11px; border:1px solid var(--line); border-radius:4px; overflow:hidden; }} .attribute {{ display:flex; justify-content:space-between; gap:10px; padding:7px 9px; border-right:1px solid var(--line); border-bottom:1px solid #edf0f4; font-size:10px; }} .attribute:nth-child(2n) {{ border-right:0; }} .attribute span {{ color:var(--muted); }}
+    .mapping-summary {{ display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }} .mapping-chip {{ padding:3px 7px; border-radius:4px; color:var(--green); background:var(--green-soft); font-size:10px; }} .mapping-chip.warn {{ color:var(--red); background:var(--red-soft); }}
+    .attribute-grid {{ display:grid; grid-template-columns:1fr 1fr; margin-top:8px; border:1px solid var(--line); border-radius:4px; overflow:hidden; }} .attribute {{ display:grid; grid-template-columns:minmax(110px,.8fr) minmax(0,1.2fr); gap:10px; padding:8px 9px; border-right:1px solid var(--line); border-bottom:1px solid #edf0f4; font-size:10px; }} .attribute:nth-child(2n) {{ border-right:0; }} .attribute span {{ color:var(--muted); }} .attribute strong {{ overflow-wrap:anywhere; }} .attribute.missing strong {{ color:var(--red); }} .all-mappings {{ margin-top:8px; color:var(--muted); font-size:10px; }} .all-mappings summary {{ cursor:pointer; color:var(--blue); }}
     .gate-list {{ padding:6px 14px 12px; }} .gate-row {{ display:grid; grid-template-columns:22px minmax(0,1fr); gap:9px; padding:10px 0; border-bottom:1px solid #edf0f4; }} .gate-row:last-child {{ border-bottom:0; }} .gate-icon {{ width:22px; height:22px; display:grid; place-items:center; border-radius:50%; color:var(--green); background:var(--green-soft); font-size:11px; font-weight:700; }} .gate-row.blocked .gate-icon {{ color:var(--amber); background:var(--amber-soft); }} .gate-row strong {{ display:block; font-size:11px; }} .gate-row span {{ display:block; margin-top:2px; color:var(--muted); font-size:10px; }}
     .publish-lock {{ margin:0 14px 12px; padding:11px 12px; border-left:3px solid var(--amber); color:#74410a; background:#fff8eb; }} .publish-lock strong {{ display:block; font-size:11px; }} .publish-lock span {{ display:block; margin-top:3px; font-size:10px; }}
     .primary {{ width:calc(100% - 28px); height:38px; margin:0 14px 14px; border:1px solid var(--blue); border-radius:5px; color:#fff; background:var(--blue); }} .primary:disabled {{ opacity:.48; cursor:not-allowed; }} .empty {{ padding:26px; color:var(--muted); text-align:center; }}
@@ -2849,20 +2850,21 @@ def build_upload_workspace_html(run_id: str) -> str:
     <aside class="sidebar" aria-label="主菜单 (Primary Navigation)"><div class="sidebar-brand"><strong>Ozon V2</strong><span>运营驾驶舱 (Operations Cockpit)</span></div><div class="sidebar-group"><div class="sidebar-label">运营 (Operations)</div>
       <a class="sidebar-link" href="/?run_id={run_id}"><span class="nav-mark">B</span><span>批次总览 (Batch)</span></a><a class="sidebar-link" href="/batches/{run_id}/supplier-review"><span class="nav-mark">S</span><span>供应商审核 (Supplier)</span></a><a class="sidebar-link" href="/batches/{run_id}/images"><span class="nav-mark">I</span><span>图片处理 (Images)</span></a><a class="sidebar-link active" href="/batches/{run_id}/upload" aria-current="page"><span class="nav-mark">U</span><span>上传草稿 (Upload)</span></a>
     </div><div class="sidebar-group"><div class="sidebar-label">全局 (Global)</div><a class="sidebar-link" href="/batches"><span class="nav-mark">H</span><span>批次历史 (History)</span></a><a class="sidebar-link" href="/products"><span class="nav-mark">P</span><span>商品资料库 (Products)</span></a><a class="sidebar-link" href="/store"><span class="nav-mark">K</span><span>店铺授权 (Store)</span></a><a class="sidebar-link" href="/diagnostics"><span class="nav-mark">D</span><span>诊断中心 (Diagnostics)</span></a><a class="sidebar-link" href="/settings"><span class="nav-mark">C</span><span>系统设置 (Settings)</span></a></div></aside>
-    <div class="app-main"><header class="topbar"><div><h1>Ozon V2 工具台 (Workbench)</h1><p>类目模板、预填计划、图片门禁与发布锁集中检查</p></div><span class="pill">已连接 (Connected)</span></header>
+    <div class="app-main"><header class="topbar"><div><h1>Ozon V2 工具台 (Workbench)</h1><p>完整类目模板自动映射、缺失字段检查、图片门禁与发布锁</p></div><span class="pill">已连接 (Connected)</span></header>
       <nav id="stageNavigation" class="stage-nav" aria-label="批次阶段 (Batch Stages)"><div class="stage-nav-inner"><a id="batchOverviewNav" class="stage-link" href="/?run_id={run_id}">批次总览 (Batch)</a><a id="supplierReviewNav" class="stage-link" href="/batches/{run_id}/supplier-review">供应商审核 (Supplier Review)</a><a id="imageProcessingNav" class="stage-link" href="/batches/{run_id}/images">图片处理 (Images)</a><a id="uploadDraftNav" class="stage-link active" aria-current="page" href="/batches/{run_id}/upload">上传草稿 (Upload)</a><span class="stage-run">批次 {run_id}</span></div></nav>
-      <main class="workspace"><div class="page-head"><div><h2>上传草稿 (Upload)</h2><p>逐商品独立门禁：已满足模板、原创内容和审核图片的商品先推进，其他商品继续等待也不会阻塞它。</p></div><span id="workspaceStatus" class="pill">加载中 (Loading)</span></div>
-        <section class="summary"><div class="metric"><span>商品 (Products)</span><strong id="productCount">0</strong></div><div class="metric"><span>必填属性 (Required)</span><strong id="requiredCount">0</strong></div><div class="metric"><span>预填计划 (Prefill)</span><strong id="prefillCount">0</strong></div><div class="metric"><span>图片进度 (Images)</span><strong id="imageReadyCount">0 / 0</strong></div></section>
-        <div class="upload-layout"><section class="panel"><div class="panel-head"><h3>草稿预填证据 (Draft Prefill Evidence)</h3><span class="pill">Seller API Template</span></div><div id="draftItems" class="draft-items"></div></section>
-          <aside id="uploadGate" class="panel"><div class="panel-head"><h3>逐商品上传门禁 (Per-product Gate)</h3></div><div class="gate-list"><div id="templateGate" class="gate-row"><span class="gate-icon">1</span><div><strong>类目模板 (Category Template)</strong><span>等待检查</span></div></div><div id="contentGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>原创内容 (Original Content)</strong><span>等待原创标题和描述。</span></div></div><div id="imageUploadGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>图片门禁 (Image Gate)</strong><span>等待生图与用户审核。</span></div></div><div id="draftGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>可独立推进 (Ready Products)</strong><span>逐件计算，不再等待整批。</span></div></div></div><div class="publish-lock"><strong>发布锁已开启 (Publish Lock Active)</strong><span>合格商品独立进入后续草稿与发布确认；本页不会自动提交到 Ozon。</span></div><button id="buildDraft" class="primary" disabled>等待可独立推进的商品 (Waiting)</button></aside>
+      <main class="workspace"><div class="page-head"><div><h2>上传草稿 (Upload)</h2><p>类目模板驱动整件商品自动映射；只把错配模板、缺失必填项和未审核图片留给用户处理，合格商品不等待整批。</p></div><span id="workspaceStatus" class="pill">加载中 (Loading)</span></div>
+        <section class="summary"><div class="metric"><span>商品 (Products)</span><strong id="productCount">0</strong></div><div class="metric"><span>必填已映射 (Required)</span><strong id="requiredCount">0 / 0</strong></div><div class="metric"><span>全部已映射 (Mapped)</span><strong id="prefillCount">0</strong></div><div class="metric"><span>图片进度 (Images)</span><strong id="imageReadyCount">0 / 0</strong></div></section>
+        <div class="upload-layout"><section class="panel"><div class="panel-head"><h3>类目模板自动映射结果 (Automatic Attribute Mapping)</h3><span class="pill">Seller API Template</span></div><div id="draftItems" class="draft-items"></div></section>
+          <aside id="uploadGate" class="panel"><div class="panel-head"><h3>逐商品上传门禁 (Per-product Gate)</h3></div><div class="gate-list"><div id="templateGate" class="gate-row"><span class="gate-icon">1</span><div><strong>类目模板 (Category Template)</strong><span>等待检查</span></div></div><div id="attributeGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>必填属性 (Required Attributes)</strong><span>等待自动映射。</span></div></div><div id="imageUploadGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>图片门禁 (Image Gate)</strong><span>等待生图与用户审核。</span></div></div><div id="draftGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>可独立推进 (Ready Products)</strong><span>逐件计算，不再等待整批。</span></div></div></div><div class="publish-lock"><strong>发布锁已开启 (Publish Lock Active)</strong><span>这里只准备可审核草稿，不会自动提交到 Ozon；最终发布仍需用户确认。</span></div><button id="buildDraft" class="primary" disabled>等待可独立推进的商品 (Waiting)</button></aside>
         </div>
       </main>
     </div>
   </div>
   <script>
     const runId = {safe_run_id}; const $ = (id) => document.getElementById(id);
-    async function api(path) {{ const response = await fetch(path); const body = await response.json(); if (!response.ok) throw body; return body; }}
-    function renderAttributes(container, attributes) {{ const entries = Object.entries(attributes || {{}}).slice(0, 12); if (!entries.length) return; const grid = document.createElement("div"); grid.className = "attribute-grid"; entries.forEach(([key,value]) => {{ const row = document.createElement("div"); row.className = "attribute"; const label = document.createElement("span"); label.textContent = key; const fact = document.createElement("strong"); fact.textContent = String(value); row.append(label,fact); grid.append(row); }}); container.append(grid); }}
+    async function api(path, options={{}}) {{ const response = await fetch(path, options); const body = await response.json(); if (!response.ok) throw body; return body; }}
+    function mappingGrid(fields) {{ const grid = document.createElement("div"); grid.className = "attribute-grid"; (fields || []).forEach((field) => {{ const row = document.createElement("div"); row.className = `attribute${{field.status === "mapped" ? "" : " missing"}}`; const label = document.createElement("span"); label.textContent = `${{field.label || field.field_key}}${{field.required ? " *" : ""}}`; const fact = document.createElement("strong"); fact.textContent = field.status === "mapped" ? String(field.value) : "缺失，需补充"; row.append(label,fact); grid.append(row); }}); return grid; }}
+    function renderMapping(container, item) {{ if (!item.template_ready) {{ const summary = document.createElement("div"); summary.className = "mapping-summary"; const blocked = document.createElement("span"); blocked.className = "mapping-chip warn"; blocked.textContent = "模板错配，未执行字段映射"; summary.append(blocked); container.append(summary); return; }} const fields = item.attribute_mapping || []; const required = fields.filter((field) => field.required); const optionalMapped = fields.filter((field) => !field.required && field.status === "mapped"); const summary = document.createElement("div"); summary.className = "mapping-summary"; const ready = document.createElement("span"); ready.className = `mapping-chip${{item.required_attributes_ready ? "" : " warn"}}`; ready.textContent = `必填 ${{item.required_mapped_count || 0}} / ${{item.required_attribute_count || 0}}`; const mapped = document.createElement("span"); mapped.className = "mapping-chip"; mapped.textContent = `全部已映射 ${{item.mapped_attribute_count || 0}} / ${{item.attribute_schema_count || 0}}`; summary.append(ready,mapped); container.append(summary); if (required.length) container.append(mappingGrid(required)); if (optionalMapped.length) {{ const details = document.createElement("details"); details.className = "all-mappings"; const label = document.createElement("summary"); label.textContent = `查看已自动映射的可选字段 (${{optionalMapped.length}})`; details.append(label,mappingGrid(optionalMapped)); container.append(details); }} }}
     function setGate(id, ready, text) {{ const row = $(id); row.classList.toggle("blocked", !ready); row.querySelector(".gate-icon").textContent = ready ? "✓" : "!"; row.querySelector("span:last-child").textContent = text; }}
     function render(data) {{
       const items = data.items || [];
@@ -2870,18 +2872,19 @@ def build_upload_workspace_html(run_id: str) -> str:
       const total = gates.product_count || items.length;
       const readyCount = gates.ready_to_build_count || 0;
       $("productCount").textContent = String(items.length);
-      $("requiredCount").textContent = String(items.reduce((totalCount,item) => totalCount + (item.required_attribute_count || 0),0));
-      $("prefillCount").textContent = String(items.reduce((totalCount,item) => totalCount + (item.prefill_plan_count || 0),0));
+      const requiredTotal = gates.valid_required_attribute_count || 0;
+      $("requiredCount").textContent = `${{gates.required_mapped_count || 0}} / ${{requiredTotal}}`;
+      $("prefillCount").textContent = String(gates.mapped_attribute_count || 0);
       $("imageReadyCount").textContent = `${{gates.approved_product_count || 0}} / ${{total}} 件 · ${{gates.generated_image_count || 0}} 张`;
       $("workspaceStatus").textContent = readyCount > 0 ? `${{readyCount}} 件可独立推进 (Ready)` : "暂无可推进商品 (Waiting)";
       setGate("templateGate", (gates.template_ready_count || 0) > 0, `${{gates.template_ready_count || 0}} / ${{total}} 件模板已就绪。`);
-      setGate("contentGate", (gates.generated_content_ready_count || 0) > 0, `${{gates.generated_content_ready_count || 0}} / ${{total}} 件原创标题与描述已完成。`);
+      setGate("attributeGate", (gates.required_attributes_ready_count || 0) > 0, `${{gates.required_attributes_ready_count || 0}} / ${{total}} 件必填属性已自动映射完成。`);
       setGate("imageUploadGate", (gates.approved_product_count || 0) > 0, `${{gates.approved_product_count || 0}} / ${{total}} 件图片已审核，共 ${{gates.generated_image_count || 0}} 张。`);
       setGate("draftGate", readyCount > 0, readyCount > 0 ? `${{readyCount}} 件已通过自身门禁，可先进入草稿阶段。` : "每件商品独立等待自身缺失项。" );
       $("buildDraft").disabled = readyCount < 1;
       $("buildDraft").textContent = readyCount > 0 ? `构建已就绪商品草稿 (${{readyCount}})` : "等待可独立推进的商品 (Waiting)";
       $("draftItems").replaceChildren();
-      const blockerLabels = {{ category_template:"类目模板", original_content:"原创内容", images:"审核图片" }};
+      const blockerLabels = {{ category_template:"类目模板错配", required_attributes:"必填属性", images:"审核图片" }};
       items.forEach((item) => {{
         const card = document.createElement("article"); card.className = "draft-item";
         const preview = item.generated_image_url || item.source_image;
@@ -2889,17 +2892,18 @@ def build_upload_workspace_html(run_id: str) -> str:
         else {{ const empty = document.createElement("div"); empty.className = "image-placeholder"; empty.textContent = "没有来源图片"; card.append(empty); }}
         const body = document.createElement("div");
         const label = document.createElement("div"); label.className = "source-label"; label.textContent = item.generated_image_url ? `生成图片 ${{item.generated_image_count}} / 8 · ${{item.generated_images_ready ? "已审核" : "待审核"}}` : "Ozon 来源标题 (Source Evidence Only)";
-        const title = document.createElement("h3"); title.className = "source-title"; title.textContent = item.generated_title || item.source_title || item.seed_id;
-        const notice = document.createElement("div"); notice.className = "notice"; notice.textContent = item.generated_content_ready ? "本件原创俄文内容已回传；来源字段继续只作真实性证据。" : "该标题仅作证据，不会直接复制到草稿；俄文标题与描述仍需原创生成。";
+        const title = document.createElement("h3"); title.className = "source-title"; title.textContent = item.source_title || item.seed_id;
+        const notice = document.createElement("div"); notice.className = "notice"; notice.textContent = item.template_ready ? `已按完整类目模板自动映射；只剩 ${{(item.missing_required_fields || []).length}} 个必填字段需要处理。` : `检测到类目模板错配：${{item.category_path || "未知模板"}}。本件停止映射，避免把错误字段写进草稿。`; if (!item.template_ready) {{ const refresh = document.createElement("button"); refresh.type = "button"; refresh.className = "inline-action"; refresh.textContent = "重新解析正确类目模板"; refresh.addEventListener("click", async () => {{ refresh.disabled = true; refresh.textContent = "正在解析..."; try {{ await api(`/api/batches/${{encodeURIComponent(runId)}}/attribute-template/refresh`, {{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify({{seed_id:item.seed_id}})}}); window.location.reload(); }} catch (error) {{ refresh.textContent = error.message || "解析失败"; refresh.disabled = false; }} }}); notice.append(refresh); }}
         const gateSummary = document.createElement("div"); gateSummary.className = `item-gate-summary${{item.ready_to_build ? " ready" : ""}}`;
         const gateTitle = document.createElement("strong"); gateTitle.textContent = item.ready_to_build ? "本件可独立推进" : "本件继续等待"; gateSummary.append(gateTitle);
         (item.blocking_gates || []).forEach((gate) => {{ const chip = document.createElement("span"); chip.className = "item-gate-chip"; chip.textContent = `缺少：${{blockerLabels[gate] || gate}}`; gateSummary.append(chip); }});
         if (item.ready_to_build) {{ const ready = document.createElement("span"); ready.className = "item-gate-chip"; ready.textContent = "不等待其他商品"; gateSummary.append(ready); }}
         const meta = document.createElement("div"); meta.className = "meta-grid"; meta.innerHTML = `<div class="meta"><span>精准类目</span><strong>${{item.category_path || "-"}}</strong></div><div class="meta"><span>属性模板</span><strong>${{item.attribute_schema_count || 0}} 字段</strong></div><div class="meta"><span>图片状态</span><strong>${{item.image_generation_status || "not_queued"}} · ${{item.generated_image_count || 0}} 张</strong></div>`;
-        body.append(label,title,notice,gateSummary,meta); renderAttributes(body,item.source_attributes); card.append(body); $("draftItems").append(card);
+        body.append(label,title,notice,gateSummary,meta); renderMapping(body,item); card.append(body); $("draftItems").append(card);
       }});
       if (!items.length) {{ const empty = document.createElement("div"); empty.className = "empty"; empty.textContent = "当前批次没有可用的类目模板与商品证据"; $("draftItems").append(empty); }}
     }}
+    $("buildDraft").addEventListener("click", async () => {{ const button = $("buildDraft"); button.disabled = true; button.textContent = "正在生成属性草稿..."; try {{ const result = await api(`/api/batches/${{encodeURIComponent(runId)}}/upload-draft`, {{method:"POST",headers:{{"Content-Type":"application/json"}},body:"{{}}"}}); button.textContent = `已生成 ${{result.data.prepared_product_count || 0}} 件属性草稿`; $("workspaceStatus").textContent = "属性草稿已准备 (Prepared)"; }} catch (error) {{ button.textContent = error.message || "生成失败"; button.disabled = false; }} }});
     api(`/api/batches/${{encodeURIComponent(runId)}}/upload`).then((result) => render(result.data || {{}})).catch((error) => {{ $("workspaceStatus").textContent = "加载失败 (Failed)"; $("draftItems").textContent = error.message || String(error); }});
   </script>
 </body>
@@ -3333,6 +3337,9 @@ def create_handler(
                     return
                 self._send_result(service.dispatch(parts[2], str(payload.get("action", ""))))
                 return
+            if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "upload-draft":
+                self._send_result(service.build_upload_draft(parts[2]), run_id=parts[2])
+                return
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "autopilot":
                 self._send_result(service.run_until_blocked(parts[2], max_steps=int(payload.get("max_steps", 20))))
                 return
@@ -3359,6 +3366,15 @@ def create_handler(
                 if result.ok:
                     runner.start(parts[2], max_steps=int(payload.get("max_steps", 20) or 20))
                 self._send_result(result, run_id=parts[2])
+                return
+            if len(parts) == 5 and parts[:2] == ["api", "batches"] and parts[3:] == ["attribute-template", "refresh"]:
+                self._send_result(
+                    service.refresh_attribute_template(
+                        parts[2],
+                        str(payload.get("seed_id") or "").strip(),
+                    ),
+                    run_id=parts[2],
+                )
                 return
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "ozon-collection-progress":
                 self._send_result(service.save_ozon_collection_progress(parts[2], payload), run_id=parts[2])
