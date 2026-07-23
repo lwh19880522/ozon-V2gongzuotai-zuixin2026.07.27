@@ -80,6 +80,17 @@ class PricingInput:
             ),
         )
 
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "purchase_price_cny": str(self.purchase_price_cny),
+            "domestic_shipping_cny": str(self.domestic_shipping_cny),
+            "package_weight_g": str(self.package_weight_g),
+            "package_length_cm": str(self.package_length_cm),
+            "package_width_cm": str(self.package_width_cm),
+            "package_height_cm": str(self.package_height_cm),
+            "target_margin_rate": str(self.target_margin_rate),
+        }
+
 
 @dataclass(frozen=True)
 class PricingPolicy:
@@ -150,6 +161,21 @@ class PricingQuote:
     freight_channel_code: str
     billing_weight_kg: Decimal
     iterations: int
+
+    def to_dict(self) -> dict[str, str | int]:
+        return {
+            "cross_border_freight_cny": str(
+                self.cross_border_freight_cny
+            ),
+            "total_cost_cny": str(self.total_cost_cny),
+            "raw_listing_price_cny": str(self.raw_listing_price_cny),
+            "listing_price_cny": str(self.listing_price_cny),
+            "listing_price_rub": str(self.listing_price_rub),
+            "old_price_rub": str(self.old_price_rub),
+            "freight_channel_code": self.freight_channel_code,
+            "billing_weight_kg": str(self.billing_weight_kg),
+            "iterations": self.iterations,
+        }
 
 
 def round_up_to_dot_90(value: Decimal) -> Decimal:

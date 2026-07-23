@@ -2850,11 +2850,20 @@ def build_upload_workspace_html(run_id: str) -> str:
     .attribute-grid {{ display:grid; grid-template-columns:1fr 1fr; margin-top:8px; border:1px solid var(--line); border-radius:4px; overflow:hidden; }} .attribute {{ display:grid; grid-template-columns:minmax(110px,.8fr) minmax(0,1.2fr); gap:10px; padding:8px 9px; border-right:1px solid var(--line); border-bottom:1px solid #edf0f4; font-size:10px; }} .attribute:nth-child(2n) {{ border-right:0; }} .attribute span {{ color:var(--muted); }} .attribute strong {{ overflow-wrap:anywhere; }} .attribute.missing_fact strong {{ color:var(--red); }} .attribute.rewrite_required strong {{ color:var(--amber); }} .attribute.not_applicable strong {{ color:var(--muted); font-weight:500; }} .all-mappings {{ margin-top:8px; color:var(--muted); font-size:10px; }} .all-mappings summary {{ cursor:pointer; color:var(--blue); font-weight:650; }}
     .gate-list {{ padding:6px 14px 12px; }} .gate-row {{ display:grid; grid-template-columns:22px minmax(0,1fr); gap:9px; padding:10px 0; border-bottom:1px solid #edf0f4; }} .gate-row:last-child {{ border-bottom:0; }} .gate-icon {{ width:22px; height:22px; display:grid; place-items:center; border-radius:50%; color:var(--green); background:var(--green-soft); font-size:11px; font-weight:700; }} .gate-row.blocked .gate-icon {{ color:var(--amber); background:var(--amber-soft); }} .gate-row strong {{ display:block; font-size:11px; }} .gate-row span {{ display:block; margin-top:2px; color:var(--muted); font-size:10px; }}
     .content-controller {{ margin:12px 14px; padding:11px; border:1px solid #bfd0f8; border-radius:5px; background:var(--blue-soft); }} .content-controller strong {{ display:block; font-size:11px; }} .content-controller p {{ margin:4px 0 8px; color:var(--muted); font-size:10px; }} .content-command {{ max-height:190px; overflow:auto; padding:9px; border:1px solid #c9d5ec; border-radius:4px; white-space:pre-wrap; color:#263756; background:#fff; font:10px/1.5 Consolas,"Courier New",monospace; }} .content-copy {{ width:100%; min-height:34px; margin-top:8px; border:1px solid var(--blue); border-radius:4px; color:#fff; background:var(--blue); cursor:pointer; }} .content-copy-status {{ display:block; min-height:16px; margin-top:4px; color:var(--green); font-size:10px; text-align:center; }}
+    .pricing-workspace {{ margin-bottom:14px; }} .pricing-head-note {{ color:var(--muted); font-size:11px; }}
+    .pricing-layout {{ min-height:470px; display:grid; grid-template-columns:300px minmax(0,1fr); }} .pricing-products {{ padding:10px; border-right:1px solid var(--line); background:#f8fafc; }}
+    .pricing-product {{ width:100%; display:grid; grid-template-columns:54px minmax(0,1fr); gap:9px; margin-bottom:8px; padding:9px; border:1px solid var(--line); border-radius:6px; color:var(--text); background:#fff; cursor:pointer; text-align:left; }} .pricing-product:hover {{ border-color:#9eb5ee; }} .pricing-product.active {{ border-color:var(--blue); box-shadow:0 0 0 2px rgba(36,87,214,.10); }} .pricing-product img {{ width:54px; height:54px; object-fit:contain; border:1px solid var(--line); border-radius:4px; background:#fff; }} .pricing-product strong {{ display:block; max-height:38px; overflow:hidden; font-size:11px; line-height:1.35; }} .pricing-product span {{ display:block; margin-top:5px; color:var(--muted); font-size:10px; }} .pricing-product .confirmed {{ color:var(--green); }}
+    .pricing-editor {{ min-width:0; padding:16px; }} .pricing-editor-empty {{ min-height:430px; display:grid; place-items:center; color:var(--muted); }} .pricing-reference {{ display:grid; grid-template-columns:86px minmax(0,1fr); gap:13px; padding-bottom:14px; border-bottom:1px solid var(--line); }} .pricing-reference img {{ width:86px; height:86px; object-fit:contain; border:1px solid var(--line); border-radius:5px; background:#fff; }} .pricing-reference h4 {{ margin:0 0 7px; font-size:15px; }} .pricing-reference-row {{ display:flex; flex-wrap:wrap; gap:7px 14px; color:var(--muted); font-size:11px; }} .supplier-link {{ color:var(--blue); font-weight:650; text-decoration:none; }} .supplier-link:hover {{ text-decoration:underline; }}
+    .pricing-policy {{ display:flex; flex-wrap:wrap; gap:6px; margin:12px 0; }} .policy-chip {{ padding:4px 8px; border-radius:4px; color:#38506f; background:#edf3fb; font-size:10px; }}
+    .pricing-form {{ display:grid; grid-template-columns:repeat(4,minmax(130px,1fr)); gap:10px; }} .pricing-field {{ display:grid; gap:5px; }} .pricing-field label {{ color:var(--muted); font-size:10px; }} .pricing-field input {{ width:100%; height:36px; padding:0 9px; border:1px solid #cbd4e1; border-radius:5px; color:var(--text); background:#fff; }} .pricing-field input:focus {{ outline:2px solid rgba(36,87,214,.16); border-color:var(--blue); }}
+    .pricing-actions {{ display:flex; align-items:center; gap:9px; margin-top:14px; }} .pricing-action {{ min-height:38px; padding:0 16px; border:1px solid var(--blue); border-radius:5px; color:var(--blue); background:#fff; cursor:pointer; }} .pricing-action.primary-action {{ color:#fff; background:var(--blue); }} .pricing-action:disabled {{ opacity:.5; cursor:not-allowed; }} .pricing-message {{ min-height:20px; margin-top:8px; color:var(--muted); font-size:11px; }} .pricing-message.error {{ color:var(--red); }} .pricing-message.success {{ color:var(--green); }}
+    .pricing-result {{ display:grid; grid-template-columns:repeat(6,minmax(105px,1fr)); margin-top:14px; overflow:hidden; border:1px solid var(--line); border-radius:6px; }} .pricing-result-cell {{ min-height:70px; padding:10px; border-right:1px solid var(--line); background:#fbfcfe; }} .pricing-result-cell:last-child {{ border-right:0; }} .pricing-result-cell span {{ display:block; color:var(--muted); font-size:9px; }} .pricing-result-cell strong {{ display:block; margin-top:5px; font-size:14px; }} .pricing-result-cell.price {{ background:var(--green-soft); }} .pricing-result-cell.price strong {{ color:var(--green); }}
     .publish-lock {{ margin:0 14px 12px; padding:11px 12px; border-left:3px solid var(--amber); color:#74410a; background:#fff8eb; }} .publish-lock strong {{ display:block; font-size:11px; }} .publish-lock span {{ display:block; margin-top:3px; font-size:10px; }}
     .primary {{ width:calc(100% - 28px); height:38px; margin:0 14px 14px; border:1px solid var(--blue); border-radius:5px; color:#fff; background:var(--blue); }} .primary:disabled {{ opacity:.48; cursor:not-allowed; }} .empty {{ padding:26px; color:var(--muted); text-align:center; }}
-    @media(max-width:1000px) {{ .upload-layout {{ grid-template-columns:1fr; }} }}
+    @media(max-width:1100px) {{ .pricing-form {{ grid-template-columns:repeat(2,minmax(130px,1fr)); }} .pricing-result {{ grid-template-columns:repeat(3,1fr); }} .pricing-result-cell:nth-child(3) {{ border-right:0; }} }}
+    @media(max-width:1000px) {{ .upload-layout {{ grid-template-columns:1fr; }} .pricing-layout {{ grid-template-columns:250px minmax(0,1fr); }} }}
     @media(max-width:900px) {{ .app-shell {{ grid-template-columns:72px minmax(0,1fr); }} .sidebar {{ padding:14px 8px; }} .sidebar-brand {{ padding:4px 4px 16px; text-align:center; }} .sidebar-brand strong {{ font-size:14px; }} .sidebar-brand span,.sidebar-label,.sidebar-link span:last-child {{ display:none; }} .sidebar-link {{ justify-content:center; padding:0; }} .stage-nav-inner {{ overflow-x:auto; padding:0 10px; }} .stage-run {{ display:none; }} .summary {{ grid-template-columns:repeat(2,1fr); }} .metric:nth-child(2) {{ border-right:0; }} .metric:nth-child(-n+2) {{ border-bottom:1px solid var(--line); }} }}
-    @media(max-width:620px) {{ .app-shell {{ display:block; }} .sidebar {{ position:static; width:100%; height:auto; display:flex; align-items:center; gap:6px; overflow-x:auto; }} .sidebar-brand {{ min-width:92px; padding:0 8px; border:0; }} .sidebar-group {{ display:flex; gap:4px; margin:0; }} .sidebar-link {{ width:38px; flex:0 0 38px; }} .workspace {{ padding:10px; }} .page-head {{ align-items:flex-start; flex-direction:column; }} .draft-item {{ grid-template-columns:1fr; }} .draft-item img,.image-placeholder {{ width:100%; height:180px; }} .attribute-grid {{ grid-template-columns:1fr; }} .attribute {{ border-right:0; }} }}
+    @media(max-width:620px) {{ .app-shell {{ display:block; }} .sidebar {{ position:static; width:100%; height:auto; display:flex; align-items:center; gap:6px; overflow-x:auto; }} .sidebar-brand {{ min-width:92px; padding:0 8px; border:0; }} .sidebar-group {{ display:flex; gap:4px; margin:0; }} .sidebar-link {{ width:38px; flex:0 0 38px; }} .workspace {{ padding:10px; }} .page-head {{ align-items:flex-start; flex-direction:column; }} .pricing-layout {{ display:block; }} .pricing-products {{ display:flex; overflow-x:auto; border-right:0; border-bottom:1px solid var(--line); }} .pricing-product {{ min-width:230px; }} .pricing-form {{ grid-template-columns:1fr; }} .pricing-result {{ grid-template-columns:repeat(2,1fr); }} .pricing-result-cell:nth-child(2n) {{ border-right:0; }} .draft-item {{ grid-template-columns:1fr; }} .draft-item img,.image-placeholder {{ width:100%; height:180px; }} .attribute-grid {{ grid-template-columns:1fr; }} .attribute {{ border-right:0; }} }}
   </style>
 </head>
 <body>
@@ -2866,8 +2875,12 @@ def build_upload_workspace_html(run_id: str) -> str:
       <nav id="stageNavigation" class="stage-nav" aria-label="批次阶段 (Batch Stages)"><div class="stage-nav-inner"><a id="batchOverviewNav" class="stage-link" href="/?run_id={run_id}">批次总览 (Batch)</a><a id="supplierReviewNav" class="stage-link" href="/batches/{run_id}/supplier-review">供应商审核 (Supplier Review)</a><a id="imageProcessingNav" class="stage-link" href="/batches/{run_id}/images">图片处理 (Images)</a><a id="uploadDraftNav" class="stage-link active" aria-current="page" href="/batches/{run_id}/upload">上传草稿 (Upload)</a><span class="stage-run">批次 {run_id}</span></div></nav>
       <main class="workspace"><div class="page-head"><div><h2>上传草稿 (Upload)</h2><p>完整读取 Seller API 类目字段，使用 Ozon 与已确认 1688 事实准备客观属性，并明确列出待原创内容和真实缺口；合格商品不等待整批。</p></div><span id="workspaceStatus" class="pill">加载中 (Loading)</span></div>
         <section class="summary"><div class="metric"><span>商品 (Products)</span><strong id="productCount">0</strong></div><div class="metric"><span>必填已映射 (Required)</span><strong id="requiredCount">0 / 0</strong></div><div class="metric"><span>客观属性已映射 (Mapped Facts)</span><strong id="prefillCount">0</strong></div><div class="metric"><span>图片进度 (Images)</span><strong id="imageReadyCount">0 / 0</strong></div></section>
+        <section id="pricingWorkspace" class="panel pricing-workspace">
+          <div class="panel-head"><div><h3>价格与包装证据</h3><span class="pricing-head-note">逐件确认成本、包装尺寸、GUOO 跨境运费和 Ozon 建议上架价；确认后的包装数据会作为后续字段证据。</span></div><span id="pricingProgress" class="pill">0 / 0 已确认</span></div>
+          <div class="pricing-layout"><nav id="pricingProductList" class="pricing-products" aria-label="价格证据商品清单"></nav><section id="pricingEditor" class="pricing-editor"><div class="pricing-editor-empty">正在读取商品价格证据…</div></section></div>
+        </section>
         <div class="upload-layout"><section class="panel"><div class="panel-head"><h3>类目模板自动映射结果 · 完整字段与内容完善</h3><span class="pill">Seller API Template</span></div><div id="draftItems" class="draft-items"></div></section>
-          <aside id="uploadGate" class="panel"><div class="panel-head"><h3>逐商品上传门禁 (Per-product Gate)</h3></div><div class="content-controller"><strong>智能字段草稿总控（证据约束）</strong><p>Ozon 数据用于模仿结构与写法，1688 与已锁定 SKU 用于约束客观事实；无法证明的字段明确保留为未解决，不会自动上传。</p><div id="contentControllerCommand" class="content-command">{escaped_content_controller_command}</div><button id="copyContentControllerCommand" class="content-copy" type="button">复制整批智能字段草稿命令</button><span id="contentControllerCopyStatus" class="content-copy-status"></span></div><div class="gate-list"><div id="templateGate" class="gate-row"><span class="gate-icon">1</span><div><strong>类目模板 (Category Template)</strong><span>等待检查</span></div></div><div id="attributeGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>必填属性 (Required Attributes)</strong><span>等待自动映射。</span></div></div><div id="originalContentGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>原创内容 (Original Content)</strong><span>等待利用 Ozon 证据完成俄文内容。</span></div></div><div id="imageUploadGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>图片门禁 (Image Gate)</strong><span>等待生图与用户审核。</span></div></div><div id="draftGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>可独立推进 (Ready Products)</strong><span>逐件计算，不再等待整批。</span></div></div></div><div class="publish-lock"><strong>发布锁已开启 (Publish Lock Active)</strong><span>这里只准备可审核草稿，不会自动提交到 Ozon；最终发布仍需用户确认。</span></div><button id="buildDraft" class="primary" disabled>等待可独立推进的商品 (Waiting)</button></aside>
+          <aside id="uploadGate" class="panel"><div class="panel-head"><h3>逐商品上传门禁 (Per-product Gate)</h3></div><div class="content-controller"><strong>智能字段草稿总控（证据约束）</strong><p>Ozon 数据用于模仿结构与写法，1688 与已锁定 SKU 用于约束客观事实；无法证明的字段明确保留为未解决，不会自动上传。</p><div id="contentControllerCommand" class="content-command">{escaped_content_controller_command}</div><button id="copyContentControllerCommand" class="content-copy" type="button">复制整批智能字段草稿命令</button><span id="contentControllerCopyStatus" class="content-copy-status"></span></div><div class="gate-list"><div id="templateGate" class="gate-row"><span class="gate-icon">1</span><div><strong>类目模板 (Category Template)</strong><span>等待检查</span></div></div><div id="attributeGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>必填属性 (Required Attributes)</strong><span>等待自动映射。</span></div></div><div id="originalContentGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>原创内容 (Original Content)</strong><span>等待利用 Ozon 证据完成俄文内容。</span></div></div><div id="imageUploadGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>图片门禁 (Image Gate)</strong><span>等待生图与用户审核。</span></div></div><div id="pricingGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>价格与包装证据 (Pricing)</strong><span>等待逐件确认成本、包装和建议上架价。</span></div></div><div id="draftGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>可独立推进 (Ready Products)</strong><span>逐件计算，不再等待整批。</span></div></div></div><div class="publish-lock"><strong>发布锁已开启 (Publish Lock Active)</strong><span>这里只准备可审核草稿，不会自动提交到 Ozon；最终发布仍需用户确认。</span></div><button id="buildDraft" class="primary" disabled>等待可独立推进的商品 (Waiting)</button></aside>
         </div>
       </main>
     </div>
@@ -2875,10 +2888,100 @@ def build_upload_workspace_html(run_id: str) -> str:
   <script>
     const runId = {safe_run_id}; const $ = (id) => document.getElementById(id);
     async function api(path, options={{}}) {{ const response = await fetch(path, options); const body = await response.json(); if (!response.ok) throw body; return body; }}
+    const pricingState = {{ selectedSeedId:null, items:[], drafts:new Map(), previews:new Map() }};
+    const pricingEndpoints = {{
+      preview:`/api/batches/${{encodeURIComponent(runId)}}/pricing-evidence/preview`,
+      confirm:`/api/batches/${{encodeURIComponent(runId)}}/pricing-evidence/confirm`
+    }};
+    const pricingFieldDefinitions = [
+      ["purchase_price_cny","采购价（人工确认）","元"],
+      ["domestic_shipping_cny","国内运费","元"],
+      ["package_weight_g","包装后重量","克"],
+      ["package_length_cm","包装长度","厘米"],
+      ["package_width_cm","包装宽度","厘米"],
+      ["package_height_cm","包装高度","厘米"],
+      ["target_margin_rate","目标净利润率（20%=0.20）","小数"]
+    ];
+    function pricingDraftFor(item) {{
+      if (pricingState.drafts.has(item.seed_id)) return pricingState.drafts.get(item.seed_id);
+      const saved = item.pricing_evidence && item.pricing_evidence.inputs ? item.pricing_evidence.inputs : {{}};
+      const draft = {{ target_margin_rate:"0.20", ...saved }};
+      pricingState.drafts.set(item.seed_id, draft);
+      if (item.pricing_evidence && item.pricing_evidence.calculation) pricingState.previews.set(item.seed_id, item.pricing_evidence);
+      return draft;
+    }}
+    function saveVisiblePricingDraft() {{
+      const seedId = pricingState.selectedSeedId;
+      if (!seedId) return;
+      const draft = {{ ...(pricingState.drafts.get(seedId) || {{}}) }};
+      pricingFieldDefinitions.forEach(([key]) => {{ const input = document.querySelector(`[data-pricing-field="${{key}}"]`); if (input) draft[key] = input.value.trim(); }});
+      pricingState.drafts.set(seedId, draft);
+    }}
+    function pricingStatusLabel(item) {{
+      if (item.pricing_status === "confirmed") return "已确认";
+      if (item.pricing_status === "stale") return "参数已变，需重算";
+      return "待填写";
+    }}
+    function renderPricingProductList() {{
+      const list = $("pricingProductList"); list.replaceChildren();
+      pricingState.items.forEach((item, index) => {{
+        const button = document.createElement("button"); button.type = "button"; button.className = `pricing-product${{item.seed_id === pricingState.selectedSeedId ? " active" : ""}}`;
+        const image = document.createElement("img"); image.src = item.generated_image_url || item.source_image || ""; image.alt = item.source_title || `商品 ${{index + 1}}`; image.referrerPolicy = "no-referrer";
+        const body = document.createElement("span"); const title = document.createElement("strong"); title.textContent = `${{index + 1}}. ${{item.source_title || item.seed_id}}`;
+        const status = document.createElement("span"); status.className = item.pricing_ready ? "confirmed" : ""; status.textContent = pricingStatusLabel(item);
+        body.append(title,status); button.append(image,body);
+        button.addEventListener("click", () => {{ saveVisiblePricingDraft(); pricingState.selectedSeedId = item.seed_id; renderPricingProductList(); renderPricingEditor(); }});
+        list.append(button);
+      }});
+    }}
+    function pricingResultView(record) {{
+      const calculation = record && record.calculation; if (!calculation) return null;
+      const result = document.createElement("div"); result.className = "pricing-result";
+      [
+        ["GUOO 跨境运费",`${{calculation.cross_border_freight_cny}} 元`],
+        ["总成本",`${{calculation.total_cost_cny}} 元`],
+        ["未取整售价",`${{Number(calculation.raw_listing_price_cny).toFixed(2)}} 元`],
+        ["建议上架价",`${{calculation.listing_price_cny}} 元`,"price"],
+        ["Ozon 上架价",`${{calculation.listing_price_rub}} ₽`,"price"],
+        ["划线原价",`${{calculation.old_price_rub}} ₽`]
+      ].forEach(([label,value,tone]) => {{ const cell = document.createElement("div"); cell.className = `pricing-result-cell${{tone ? ` ${{tone}}` : ""}}`; const name = document.createElement("span"); name.textContent = label; const amount = document.createElement("strong"); amount.textContent = value; cell.append(name,amount); result.append(cell); }});
+      return result;
+    }}
+    function renderPricingEditor() {{
+      const editor = $("pricingEditor"); editor.replaceChildren();
+      const item = pricingState.items.find((entry) => entry.seed_id === pricingState.selectedSeedId);
+      if (!item) {{ const empty = document.createElement("div"); empty.className = "pricing-editor-empty"; empty.textContent = "当前没有可填写的商品"; editor.append(empty); return; }}
+      const draft = pricingDraftFor(item);
+      const reference = document.createElement("div"); reference.className = "pricing-reference";
+      const image = document.createElement("img"); image.src = item.generated_image_url || item.source_image || ""; image.alt = item.source_title || item.seed_id; image.referrerPolicy = "no-referrer";
+      const details = document.createElement("div"); const title = document.createElement("h4"); title.textContent = item.source_title || item.seed_id;
+      const rows = document.createElement("div"); rows.className = "pricing-reference-row";
+      const sku = document.createElement("span"); const selected = item.supplier_selected_sku || {{}}; sku.textContent = `已锁定 1688 SKU：${{selected.raw_label || selected.combination_key || selected.supplier_sku_id || "未找到"}}`;
+      const referencePrice = document.createElement("span"); const price = item.supplier_reference_price || {{}}; referencePrice.textContent = `1688 参考价：${{price.amount || price.visible_text || "-"}} ${{price.currency || "CNY"}}（仅参考）`;
+      const link = document.createElement("a"); link.className = "supplier-link"; link.target = "_blank"; link.rel = "noopener noreferrer"; link.href = item.supplier_url || "#"; link.textContent = "打开 1688 商品页"; if (!item.supplier_url) {{ link.setAttribute("aria-disabled","true"); link.addEventListener("click",(event) => event.preventDefault()); }}
+      rows.append(sku,referencePrice,link); details.append(title,rows); reference.append(image,details); editor.append(reference);
+      const policy = item.pricing_policy || {{}}; const policyRow = document.createElement("div"); policyRow.className = "pricing-policy";
+      [`佣金 ${{Number(policy.commission_rate || 0) * 100}}%`,`包装/标签费 ${{policy.packaging_fee_cny || "-"}} 元`,`汇率 1 CNY = ${{policy.rub_per_cny || "-"}} RUB`,`GUOO 陆空标快 ${{policy.freight_rule_version || ""}}`,`售价向上取 .90`].forEach((text) => {{ const chip = document.createElement("span"); chip.className = "policy-chip"; chip.textContent = text; policyRow.append(chip); }}); editor.append(policyRow);
+      const form = document.createElement("div"); form.className = "pricing-form";
+      pricingFieldDefinitions.forEach(([key,label,unit]) => {{ const field = document.createElement("div"); field.className = "pricing-field"; const name = document.createElement("label"); name.htmlFor = `pricing-${{key}}`; name.textContent = `${{label}}（${{unit}}）`; const input = document.createElement("input"); input.id = `pricing-${{key}}`; input.type = "number"; input.step = "any"; input.min = key === "domestic_shipping_cny" || key === "target_margin_rate" ? "0" : "0.000001"; input.value = draft[key] || ""; input.dataset.pricingField = key; input.addEventListener("input", () => {{ pricingState.previews.delete(item.seed_id); const message = $("pricingMessage"); if (message) {{ message.className = "pricing-message"; message.textContent = "输入已保留，点击“计算建议价格”查看新结果。"; }} }}); field.append(name,input); form.append(field); }}); editor.append(form);
+      const actions = document.createElement("div"); actions.className = "pricing-actions"; const previewButton = document.createElement("button"); previewButton.type = "button"; previewButton.className = "pricing-action"; previewButton.textContent = "计算建议价格"; const confirmButton = document.createElement("button"); confirmButton.type = "button"; confirmButton.className = "pricing-action primary-action"; confirmButton.textContent = "确认并写入本件价格与包装证据"; actions.append(previewButton,confirmButton); editor.append(actions);
+      const preview = pricingState.previews.get(item.seed_id) || item.pricing_evidence;
+      const message = document.createElement("div"); message.id = "pricingMessage"; message.className = `pricing-message${{item.pricing_ready || preview ? " success" : ""}}`; message.textContent = item.pricing_ready ? "本件价格与包装证据已确认，可独立进入后续门禁。" : item.pricing_status === "stale" ? "固定参数已变化，请重新计算并确认本件。" : preview ? "建议价格已计算；确认无误后写入本件价格与包装证据。" : "填写 7 项数据后先计算，再确认写入。"; editor.append(message);
+      const resultView = pricingResultView(preview); if (resultView) editor.append(resultView);
+      const submit = async (mode, button) => {{ saveVisiblePricingDraft(); const payload = {{ seed_id:item.seed_id, ...pricingState.drafts.get(item.seed_id) }}; previewButton.disabled = true; confirmButton.disabled = true; message.className = "pricing-message"; message.textContent = mode === "preview" ? "正在计算 GUOO 运费与建议上架价…" : "正在确认本件价格与包装证据…"; try {{ const response = await api(pricingEndpoints[mode], {{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify(payload)}}); pricingState.previews.set(item.seed_id,response.data); if (mode === "confirm") {{ await loadUploadWorkspace(); }} else {{ renderPricingEditor(); }} }} catch (error) {{ message.className = "pricing-message error"; message.textContent = (error.errors && error.errors[0]) || error.message || "价格计算失败"; previewButton.disabled = false; confirmButton.disabled = false; }} }};
+      previewButton.addEventListener("click", () => submit("preview",previewButton)); confirmButton.addEventListener("click", () => submit("confirm",confirmButton));
+    }}
+    function renderPricingWorkspace(data) {{
+      saveVisiblePricingDraft(); pricingState.items = data.items || [];
+      if (!pricingState.items.some((item) => item.seed_id === pricingState.selectedSeedId)) pricingState.selectedSeedId = pricingState.items.length ? pricingState.items[0].seed_id : null;
+      const confirmed = (data.gates || {{}}).pricing_ready_count || 0; $("pricingProgress").textContent = `${{confirmed}} / ${{pricingState.items.length}} 已确认`;
+      renderPricingProductList(); renderPricingEditor();
+    }}
     function mappingGrid(fields) {{ const statusText = {{ rewrite_required:"待原创（依据采集事实，不复制 Ozon 原文）", missing_fact:"缺少事实，需补充", not_applicable:"未提供可选素材", excluded:"不参与本阶段" }}; const grid = document.createElement("div"); grid.className = "attribute-grid"; (fields || []).forEach((field) => {{ const row = document.createElement("div"); row.className = `attribute ${{field.status || "missing_fact"}}`; const label = document.createElement("span"); label.textContent = `${{field.label || field.field_key}}${{field.required ? " *" : ""}}`; const fact = document.createElement("strong"); fact.textContent = field.status === "mapped" ? String(field.value) : (field.intelligence_decision === "unresolved" ? `证据不足：${{field.reason || "无法确认"}}` : (statusText[field.status] || "缺少事实，需补充")); row.append(label,fact); grid.append(row); }}); return grid; }}
     function renderMapping(container, item) {{ if (!item.template_ready) {{ const summary = document.createElement("div"); summary.className = "mapping-summary"; const blocked = document.createElement("span"); blocked.className = "mapping-chip warn"; blocked.textContent = "模板错配，未执行字段映射"; summary.append(blocked); container.append(summary); return; }} const fields = item.attribute_mapping || []; const summary = document.createElement("div"); summary.className = "mapping-summary"; const ready = document.createElement("span"); ready.className = `mapping-chip${{item.required_attributes_ready ? "" : " warn"}}`; ready.textContent = `必填 ${{item.required_mapped_count || 0}} / ${{item.required_attribute_count || 0}}`; const mapped = document.createElement("span"); mapped.className = "mapping-chip"; mapped.textContent = `客观属性已映射 ${{item.mapped_attribute_count || 0}}`; const rewrite = document.createElement("span"); rewrite.className = `mapping-chip${{(item.rewrite_required_count || 0) ? " warn" : ""}}`; rewrite.textContent = `待原创 ${{item.rewrite_required_count || 0}}`; const missing = document.createElement("span"); missing.className = `mapping-chip${{(item.missing_fact_count || 0) ? " warn" : ""}}`; missing.textContent = `缺少事实 ${{item.missing_fact_count || 0}}`; const assets = document.createElement("span"); assets.className = "mapping-chip"; assets.textContent = `未提供可选素材 ${{item.not_applicable_count || 0}}`; summary.append(ready,mapped,rewrite,missing,assets); container.append(summary); const details = document.createElement("details"); details.className = "all-mappings"; details.open = true; const label = document.createElement("summary"); label.textContent = `全部模板字段 (${{fields.length}})`; details.append(label,mappingGrid(fields)); container.append(details); }}
     function setGate(id, ready, text) {{ const row = $(id); row.classList.toggle("blocked", !ready); row.querySelector(".gate-icon").textContent = ready ? "✓" : "!"; row.querySelector("span:last-child").textContent = text; }}
     function render(data) {{
+      renderPricingWorkspace(data);
       const items = data.items || [];
       const gates = data.gates || {{}};
       const total = gates.product_count || items.length;
@@ -2893,11 +2996,12 @@ def build_upload_workspace_html(run_id: str) -> str:
       setGate("attributeGate", (gates.required_attributes_ready_count || 0) > 0, `${{gates.required_attributes_ready_count || 0}} / ${{total}} 件必填属性已自动映射完成。`);
       setGate("originalContentGate", (gates.original_content_ready_count || 0) > 0, `${{gates.original_content_ready_count || 0}} / ${{total}} 件俄文标题、简介、标签与 Rich Content 已完善。`);
       setGate("imageUploadGate", (gates.approved_product_count || 0) > 0, `${{gates.approved_product_count || 0}} / ${{total}} 件图片已审核，共 ${{gates.generated_image_count || 0}} 张。`);
+      setGate("pricingGate", (gates.pricing_ready_count || 0) > 0, `${{gates.pricing_ready_count || 0}} / ${{total}} 件价格与包装证据已确认。`);
       setGate("draftGate", readyCount > 0, readyCount > 0 ? `${{readyCount}} 件已通过自身门禁，可先进入草稿阶段。` : "每件商品独立等待自身缺失项。" );
       $("buildDraft").disabled = readyCount < 1;
       $("buildDraft").textContent = readyCount > 0 ? `构建已就绪商品草稿 (${{readyCount}})` : "等待可独立推进的商品 (Waiting)";
       $("draftItems").replaceChildren();
-      const blockerLabels = {{ category_template:"类目模板错配", required_attributes:"必填属性", original_content:"原创俄文内容", images:"审核图片" }};
+      const blockerLabels = {{ category_template:"类目模板错配", required_attributes:"必填属性", original_content:"原创俄文内容", images:"审核图片", pricing:"价格与包装证据" }};
       items.forEach((item) => {{
         const card = document.createElement("article"); card.className = "draft-item";
         const preview = item.generated_image_url || item.source_image;
@@ -2919,7 +3023,8 @@ def build_upload_workspace_html(run_id: str) -> str:
     async function copyText(text) {{ if (navigator.clipboard && window.isSecureContext) {{ await navigator.clipboard.writeText(text); return; }} const area = document.createElement("textarea"); area.value = text; area.style.position = "fixed"; area.style.opacity = "0"; document.body.append(area); area.select(); const copied = document.execCommand("copy"); area.remove(); if (!copied) throw new Error("复制失败"); }}
     $("copyContentControllerCommand").addEventListener("click", async () => {{ const button = $("copyContentControllerCommand"); const status = $("contentControllerCopyStatus"); button.disabled = true; try {{ await copyText($("contentControllerCommand").textContent); status.textContent = "整批智能字段草稿命令已复制"; }} catch (error) {{ status.textContent = error.message || "复制失败，请手动复制"; }} finally {{ button.disabled = false; }} }});
     $("buildDraft").addEventListener("click", async () => {{ const button = $("buildDraft"); button.disabled = true; button.textContent = "正在生成属性草稿..."; try {{ const result = await api(`/api/batches/${{encodeURIComponent(runId)}}/upload-draft`, {{method:"POST",headers:{{"Content-Type":"application/json"}},body:"{{}}"}}); button.textContent = `已生成 ${{result.data.prepared_product_count || 0}} 件属性草稿`; $("workspaceStatus").textContent = "属性草稿已准备 (Prepared)"; }} catch (error) {{ button.textContent = error.message || "生成失败"; button.disabled = false; }} }});
-    api(`/api/batches/${{encodeURIComponent(runId)}}/upload`).then((result) => render(result.data || {{}})).catch((error) => {{ $("workspaceStatus").textContent = "加载失败 (Failed)"; $("draftItems").textContent = error.message || String(error); }});
+    async function loadUploadWorkspace() {{ const result = await api(`/api/batches/${{encodeURIComponent(runId)}}/upload`); render(result.data || {{}}); return result.data || {{}}; }}
+    loadUploadWorkspace().catch((error) => {{ $("workspaceStatus").textContent = "加载失败 (Failed)"; $("draftItems").textContent = error.message || String(error); }});
   </script>
 </body>
 </html>"""
@@ -3357,6 +3462,26 @@ def create_handler(
                 return
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "upload-draft":
                 self._send_result(service.build_upload_draft(parts[2]), run_id=parts[2])
+                return
+            if (
+                len(parts) == 5
+                and parts[:2] == ["api", "batches"]
+                and parts[3:] == ["pricing-evidence", "preview"]
+            ):
+                self._send_result(
+                    service.preview_pricing_evidence(parts[2], payload),
+                    run_id=parts[2],
+                )
+                return
+            if (
+                len(parts) == 5
+                and parts[:2] == ["api", "batches"]
+                and parts[3:] == ["pricing-evidence", "confirm"]
+            ):
+                self._send_result(
+                    service.confirm_pricing_evidence(parts[2], payload),
+                    run_id=parts[2],
+                )
                 return
             if len(parts) == 5 and parts[:2] == ["api", "batches"] and parts[3:] == ["content-tasks", "complete"]:
                 self._send_result(

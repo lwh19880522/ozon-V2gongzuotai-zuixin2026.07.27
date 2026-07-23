@@ -62,6 +62,36 @@ def test_pricing_policy_round_trips_as_decimal_strings() -> None:
     assert PricingPolicy.from_mapping(payload) == policy
 
 
+def test_pricing_input_and_quote_serialize_as_decimal_strings() -> None:
+    inputs = _first_product_input()
+    quote = calculate_listing_price(
+        inputs,
+        PricingPolicy.default(),
+        initial_sale_rub="1194",
+    )
+
+    assert inputs.to_dict() == {
+        "purchase_price_cny": "9.9",
+        "domestic_shipping_cny": "7",
+        "package_weight_g": "380",
+        "package_length_cm": "28",
+        "package_width_cm": "11",
+        "package_height_cm": "2.5",
+        "target_margin_rate": "0.20",
+    }
+    assert quote.to_dict() == {
+        "cross_border_freight_cny": "16.952",
+        "total_cost_cny": "35.852",
+        "raw_listing_price_cny": str(quote.raw_listing_price_cny),
+        "listing_price_cny": "55.90",
+        "listing_price_rub": "671",
+        "old_price_rub": "839",
+        "freight_channel_code": "extra_small_standard",
+        "billing_weight_kg": "0.38",
+        "iterations": 2,
+    }
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [

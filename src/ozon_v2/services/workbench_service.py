@@ -18,6 +18,11 @@ from ozon_v2.adapters.seller_api import (
 from ozon_v2.app.result import Result
 from ozon_v2.domain.models import QueryGenerationStatus, SeedProduct, SeedSearchQuery, WorkbenchAction, WorkbenchState, utc_now_iso
 from ozon_v2.domain.policies import decide_seed_existing_product_dedupe, seed_has_generated_ozon_query
+from ozon_v2.domain.pricing import (
+    PricingInput,
+    PricingPolicy,
+    calculate_listing_price,
+)
 from ozon_v2.domain.supplier_sku import SupplierSkuOption, SupplierSkuSelectionReceipt, validate_supplier_sku_option
 from ozon_v2.domain.state_machine import allowed_workbench_actions, transition_workbench_state
 from ozon_v2.domain.validators import validate_attribute_template_result, validate_ozon_collection_result, validate_seed_ready_for_ozon
@@ -1239,6 +1244,217 @@ class WorkbenchService:
             },
         )
 
+    def preview_pricing_evidence(
+        self, run_id: str, payload: dict[str, Any]
+    ) -> Result:
+        return self._calculate_pricing_evidence(
+            run_id,
+            payload,
+            confirmed=False,
+        )
+
+    def confirm_pricing_evidence(
+        self, run_id: str, payload: dict[str, Any]
+    ) -> Result:
+        calculated = self._calculate_pricing_evidence(
+            run_id,
+            payload,
+            confirmed=True,
+        )
+        if not calculated.ok:
+            return calculated
+
+        seed_id = str(calculated.data["seed_id"])
+        evidence_path = self.repo.run_dir(run_id) / "pricing_evidence.json"
+        if evidence_path.exists():
+            stored = self.repo.load_pricing_evidence(run_id)
+        else:
+            stored = {
+                "schema_version": 1,
+                "run_id": run_id,
+                "items": {},
+            }
+        items = stored.get("items")
+        if not isinstance(items, dict):
+            items = {}
+        confirmed_item = {
+            **calculated.data,
+            "status": "confirmed",
+            "confirmed_by": "workbench_user",
+            "confirmed_at": utc_now_iso(),
+        }
+        items[seed_id] = confirmed_item
+        stored.update(
+            {
+                "schema_version": 1,
+                "run_id": run_id,
+                "items": items,
+            }
+        )
+        self.repo.save_pricing_evidence(run_id, stored)
+        self.repo.append_run_event(
+            run_id,
+            "pricing_evidence.confirmed",
+            "User confirmed product cost, package evidence, and listing price.",
+            {
+                "seed_id": seed_id,
+                "listing_price_cny": confirmed_item["calculation"][
+                    "listing_price_cny"
+                ],
+                "listing_price_rub": confirmed_item["calculation"][
+                    "listing_price_rub"
+                ],
+            },
+        )
+        return Result.success(
+            "pricing_evidence.confirmed",
+            "Product price and package evidence confirmed.",
+            confirmed_item,
+        )
+
+    def _calculate_pricing_evidence(
+        self,
+        run_id: str,
+        payload: dict[str, Any],
+        *,
+        confirmed: bool,
+    ) -> Result:
+        self.repo.load_run(run_id)
+        seed_id = str(payload.get("seed_id") or "").strip()
+        if not seed_id:
+            return Result.failure(
+                "pricing_evidence.seed_required",
+                "A product seed_id is required.",
+                data={"run_id": run_id},
+            )
+
+        try:
+            ozon_result = self.repo.load_ozon_collection_result(run_id)
+        except FileNotFoundError:
+            return Result.failure(
+                "pricing_evidence.ozon_evidence_required",
+                "Ozon product evidence is required before price calculation.",
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+        candidate = next(
+            (
+                item
+                for item in ozon_result.get("ozon_candidates", [])
+                if isinstance(item, dict)
+                and str(item.get("seed_id") or "") == seed_id
+            ),
+            None,
+        )
+        if candidate is None:
+            return Result.failure(
+                "pricing_evidence.product_not_found",
+                "The requested product does not belong to this batch.",
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+
+        selection_path = (
+            self.repo.run_dir(run_id) / "supplier_sku_selections.json"
+        )
+        selections: dict[str, Any] = {}
+        if selection_path.exists():
+            loaded = self.repo.load_supplier_sku_selections(run_id)
+            raw_selections = loaded.get("selections")
+            if isinstance(raw_selections, dict):
+                selections = raw_selections
+        selection = selections.get(seed_id)
+        supplier_sku = (
+            selection.get("supplier_sku")
+            if isinstance(selection, dict)
+            else None
+        )
+        if not isinstance(supplier_sku, dict) or not supplier_sku:
+            return Result.failure(
+                "pricing_evidence.supplier_sku_required",
+                "Lock one real 1688 SKU before confirming cost and package evidence.",
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+
+        supplier_product: dict[str, Any] = {}
+        supplier_path = (
+            self.repo.run_dir(run_id) / "supplier_collection_result.json"
+        )
+        if supplier_path.exists():
+            supplier_result = self.repo.load_supplier_collection_result(run_id)
+            supplier_product = next(
+                (
+                    item
+                    for item in supplier_result.get(
+                        "supplier_products", []
+                    )
+                    if isinstance(item, dict)
+                    and str(item.get("seed_id") or "") == seed_id
+                ),
+                {},
+            )
+
+        try:
+            inputs = PricingInput.from_values(
+                purchase_price_cny=payload.get("purchase_price_cny"),
+                domestic_shipping_cny=payload.get(
+                    "domestic_shipping_cny"
+                ),
+                package_weight_g=payload.get("package_weight_g"),
+                package_length_cm=payload.get("package_length_cm"),
+                package_width_cm=payload.get("package_width_cm"),
+                package_height_cm=payload.get("package_height_cm"),
+                target_margin_rate=payload.get("target_margin_rate"),
+            )
+            policy = PricingPolicy.from_mapping(
+                self.repo.load_pricing_settings()
+            )
+            quote = calculate_listing_price(
+                inputs,
+                policy,
+                initial_sale_rub=_candidate_sale_rub(candidate),
+            )
+        except ValueError as exc:
+            return Result.failure(
+                "pricing_evidence.calculation_invalid",
+                "The pricing inputs or fixed pricing policy are invalid.",
+                data={"run_id": run_id, "seed_id": seed_id},
+                errors=[str(exc)],
+            )
+
+        supplier_offer_id = str(
+            (selection or {}).get("supplier_offer_id")
+            or supplier_product.get("offer_id")
+            or ""
+        ).strip()
+        data = {
+            "seed_id": seed_id,
+            "status": "confirmed" if confirmed else "preview",
+            "inputs": inputs.to_dict(),
+            "parameter_snapshot": policy.to_dict(),
+            "calculation": quote.to_dict(),
+            "supplier_offer_id": supplier_offer_id or None,
+            "supplier_url": _supplier_product_url(
+                supplier_product,
+                supplier_offer_id,
+            ),
+            "supplier_sku_id": (
+                str(supplier_sku.get("supplier_sku_id") or "").strip()
+                or None
+            ),
+            "supplier_reference_price": supplier_sku.get("price"),
+            "ozon_reference_price_rub": str(
+                _candidate_sale_rub(candidate)
+            ),
+        }
+        return Result.success(
+            (
+                "pricing_evidence.confirmation_calculated"
+                if confirmed
+                else "pricing_evidence.previewed"
+            ),
+            "Product listing price calculated from confirmed cost and package inputs.",
+            data,
+        )
+
     def upload_workspace(self, run_id: str) -> Result:
         run = self.repo.load_run(run_id)
         try:
@@ -1291,6 +1507,21 @@ class WorkbenchService:
             if subject_path.exists()
             else {}
         )
+        pricing_policy = PricingPolicy.from_mapping(
+            self.repo.load_pricing_settings()
+        ).to_dict()
+        pricing_items: dict[str, dict[str, Any]] = {}
+        pricing_path = self.repo.run_dir(run_id) / "pricing_evidence.json"
+        if pricing_path.exists():
+            raw_pricing_items = self.repo.load_pricing_evidence(run_id).get(
+                "items", {}
+            )
+            if isinstance(raw_pricing_items, dict):
+                pricing_items = {
+                    str(seed_id): item
+                    for seed_id, item in raw_pricing_items.items()
+                    if isinstance(item, dict)
+                }
         candidates = ozon_result.get("ozon_candidates") if isinstance(ozon_result.get("ozon_candidates"), list) else []
         items: list[dict[str, Any]] = []
         for candidate in candidates:
@@ -1300,6 +1531,28 @@ class WorkbenchService:
             prefill_plan = template.get("draft_prefill_plan") if isinstance(template.get("draft_prefill_plan"), list) else []
             seller_template = template.get("seller_attribute_template") or {}
             category_candidates = template.get("category_candidates") if isinstance(template.get("category_candidates"), list) else []
+            supplier_product = suppliers_by_seed.get(seed_id) or {}
+            supplier_selection = supplier_selections.get(seed_id) or {}
+            supplier_sku = supplier_selection.get("supplier_sku") or {}
+            supplier_offer_id = (
+                supplier_selection.get("supplier_offer_id")
+                or supplier_product.get("offer_id")
+            )
+            pricing_record = pricing_items.get(seed_id) or {}
+            pricing_confirmed = (
+                pricing_record.get("status") == "confirmed"
+            )
+            pricing_policy_current = (
+                pricing_record.get("parameter_snapshot") == pricing_policy
+            )
+            pricing_ready = pricing_confirmed and pricing_policy_current
+            pricing_status = (
+                "confirmed"
+                if pricing_ready
+                else "stale"
+                if pricing_confirmed
+                else "missing"
+            )
             media = candidate.get("selected_sku_media") or {}
             images = media.get("selected_sku_images") or media.get("main_gallery_images") or []
             subject_entry = subject_items.get(seed_id) if isinstance(subject_items, dict) else None
@@ -1359,6 +1612,12 @@ class WorkbenchService:
                     candidate,
                     supplier_product=suppliers_by_seed.get(seed_id),
                     supplier_selection=supplier_selections.get(seed_id),
+                    pricing_evidence=(
+                        pricing_record.get("inputs")
+                        if pricing_ready
+                        and isinstance(pricing_record.get("inputs"), dict)
+                        else None
+                    ),
                     rewritten_content=(
                         (generated_content_items.get(seed_id) or {}).get("field_results")
                         or (generated_content_items.get(seed_id) or {}).get("fields")
@@ -1394,6 +1653,8 @@ class WorkbenchService:
                 blocking_gates.append("original_content")
             if not generated_images_ready:
                 blocking_gates.append("images")
+            if not pricing_ready:
+                blocking_gates.append("pricing")
             items.append(
                 {
                     "seed_id": seed_id,
@@ -1401,16 +1662,17 @@ class WorkbenchService:
                     "source_description": (candidate.get("content_score_evidence") or {}).get("description_or_rich_content_blocks") or [],
                     "source_attributes": candidate.get("attributes") or {},
                     "source_content_score_evidence": candidate.get("content_score_evidence") or {},
-                    "supplier_attributes": (suppliers_by_seed.get(seed_id) or {}).get("attributes") or {},
-                    "supplier_title": (suppliers_by_seed.get(seed_id) or {}).get("title"),
-                    "supplier_offer_id": (
-                        (supplier_selections.get(seed_id) or {}).get("supplier_offer_id")
-                        or (suppliers_by_seed.get(seed_id) or {}).get("offer_id")
+                    "supplier_attributes": supplier_product.get("attributes") or {},
+                    "supplier_title": supplier_product.get("title"),
+                    "supplier_offer_id": supplier_offer_id,
+                    "supplier_url": _supplier_product_url(
+                        supplier_product,
+                        str(supplier_offer_id or ""),
                     ),
                     "supplier_selected_sku": (
-                        (supplier_selections.get(seed_id) or {}).get("supplier_sku")
-                        or {}
+                        supplier_sku
                     ),
+                    "supplier_reference_price": supplier_sku.get("price"),
                     "supplier_selected_options": (
                         ((supplier_selections.get(seed_id) or {}).get("supplier_sku") or {}).get("selected_options")
                         or {}
@@ -1448,6 +1710,12 @@ class WorkbenchService:
                     "required_attributes_ready": required_attributes_ready,
                     "original_content_ready": original_content_ready,
                     "generated_images_ready": generated_images_ready,
+                    "pricing_ready": pricing_ready,
+                    "pricing_status": pricing_status,
+                    "pricing_evidence": (
+                        pricing_record if pricing_record else None
+                    ),
+                    "pricing_policy": pricing_policy,
                     "blocking_gates": blocking_gates,
                     "ready_to_build": not blocking_gates,
                     "image_job_id": image_job_id or None,
@@ -1476,6 +1744,12 @@ class WorkbenchService:
         )
         images_ready = bool(items) and all(
             item["generated_images_ready"] for item in items
+        )
+        pricing_ready = bool(items) and all(
+            item["pricing_ready"] for item in items
+        )
+        pricing_ready_count = sum(
+            1 for item in items if item["pricing_ready"]
         )
         generated_image_count = sum(item["generated_image_count"] for item in items)
         generated_product_count = sum(
@@ -1521,6 +1795,10 @@ class WorkbenchService:
                     "required_attributes_ready": required_attributes_ready,
                     "original_content_ready": original_content_ready,
                     "images_ready": images_ready,
+                    "pricing_ready": pricing_ready,
+                    "pricing_ready_count": pricing_ready_count,
+                    "pricing_pending_count": len(items) - pricing_ready_count,
+                    "pricing_policy": pricing_policy,
                     "generated_image_count": generated_image_count,
                     "generated_product_count": generated_product_count,
                     "approved_product_count": approved_product_count,
@@ -5358,3 +5636,35 @@ def _normalize_content_text(value: Any) -> str:
         for part in re.split(r"[^\w]+", str(value or "").casefold().replace("ё", "е"))
         if part
     )
+
+
+def _candidate_sale_rub(candidate: dict[str, Any]) -> str:
+    price = candidate.get("price")
+    if isinstance(price, dict):
+        price = (
+            price.get("amount")
+            or price.get("value")
+            or price.get("visible_text")
+        )
+    normalized = re.sub(r"[^\d.,-]", "", str(price or "")).replace(",", ".")
+    if not normalized:
+        raise ValueError(
+            "The collected Ozon reference price is missing for this product."
+        )
+    return normalized
+
+
+def _supplier_product_url(
+    supplier_product: dict[str, Any],
+    supplier_offer_id: str,
+) -> str | None:
+    for key in ("supplier_url", "final_url", "url"):
+        value = str(supplier_product.get(key) or "").strip()
+        if value:
+            return value
+    if supplier_offer_id:
+        return (
+            "https://detail.1688.com/offer/"
+            f"{supplier_offer_id}.html"
+        )
+    return None

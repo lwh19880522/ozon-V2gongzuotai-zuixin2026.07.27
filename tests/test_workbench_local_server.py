@@ -206,6 +206,44 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.repo.save_subject_masters(run_id, {"run_id": run_id, "items": subject_items})
         return job
 
+    def prepare_pricing_sources(self, run_id: str, seed_id: str) -> None:
+        supplier_product = self.supplier_product_payload(seed_id)
+        self.repo.save_supplier_collection_result(
+            run_id,
+            {
+                "run_id": run_id,
+                "supplier_products": [supplier_product],
+            },
+        )
+        self.repo.save_supplier_sku_selections(
+            run_id,
+            {
+                "run_id": run_id,
+                "selections": {
+                    seed_id: {
+                        "supplier_offer_id": supplier_product["offer_id"],
+                        "supplier_sku": supplier_product["sku_options"][0],
+                        "ozon_target_sku": {
+                            "sku_id": "ozon-sku-1",
+                            "selected_options": {"single_sku": "visible"},
+                        },
+                    }
+                },
+            },
+        )
+
+    def pricing_input_payload(self, seed_id: str) -> dict:
+        return {
+            "seed_id": seed_id,
+            "purchase_price_cny": "9.9",
+            "domestic_shipping_cny": "7",
+            "package_weight_g": "380",
+            "package_length_cm": "28",
+            "package_width_cm": "11",
+            "package_height_cm": "2.5",
+            "target_margin_rate": "0.20",
+        }
+
     def test_pricing_evidence_round_trips_without_touching_other_batch_files(
         self,
     ) -> None:
@@ -2431,6 +2469,18 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn('id="draftItems"', page)
         self.assertIn('id="uploadGate"', page)
         self.assertIn('id="buildDraft"', page)
+        self.assertIn('id="pricingWorkspace"', page)
+        self.assertIn('id="pricingProductList"', page)
+        self.assertIn('id="pricingEditor"', page)
+        self.assertIn('id="pricingProgress"', page)
+        self.assertIn("价格与包装证据", page)
+        self.assertIn("打开 1688 商品页", page)
+        self.assertIn("采购价（人工确认）", page)
+        self.assertIn("目标净利润率", page)
+        self.assertIn("确认并写入本件价格与包装证据", page)
+        self.assertIn("/pricing-evidence/preview", page)
+        self.assertIn("/pricing-evidence/confirm", page)
+        self.assertIn("pricingState", page)
         self.assertIn("发布锁已开启 (Publish Lock Active)", page)
         self.assertIn("逐商品上传门禁", page)
         self.assertIn("合格商品不等待整批", page)
@@ -2449,6 +2499,122 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertFalse(workspace["data"]["gates"]["images_ready"])
         self.assertFalse(workspace["data"]["gates"]["draft_ready"])
         self.assertTrue(workspace["data"]["gates"]["publish_locked"])
+
+    def test_pricing_preview_is_side_effect_free_and_confirm_persists_one_product(
+        self,
+    ) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+        pricing_path = self.repo.run_dir(run_id) / "pricing_evidence.json"
+        template = self.repo.load_attribute_template_result(run_id)
+        template["seed_templates"][0]["upload_attribute_schema"].extend(
+            [
+                {
+                    "attribute_id": "package-weight",
+                    "attribute_label": "Вес с упаковкой, г",
+                    "is_required": False,
+                },
+                {
+                    "attribute_id": "package-length",
+                    "attribute_label": "Длина упаковки, см",
+                    "is_required": False,
+                },
+                {
+                    "attribute_id": "package-width",
+                    "attribute_label": "Ширина упаковки, см",
+                    "is_required": False,
+                },
+                {
+                    "attribute_id": "package-height",
+                    "attribute_label": "Высота упаковки, см",
+                    "is_required": False,
+                },
+            ]
+        )
+        self.repo.save_attribute_template_result(run_id, template)
+
+        preview = self.post_json(
+            f"/api/batches/{run_id}/pricing-evidence/preview",
+            self.pricing_input_payload(seed.seed_id),
+        )["data"]
+
+        self.assertFalse(pricing_path.exists())
+        self.assertEqual("preview", preview["status"])
+        self.assertEqual(
+            "https://detail.1688.com/offer/123456789012.html",
+            preview["supplier_url"],
+        )
+        self.assertEqual(
+            {"currency": "CNY", "amount": "12.80"},
+            preview["supplier_reference_price"],
+        )
+        self.assertEqual("55.90", preview["calculation"]["listing_price_cny"])
+        self.assertEqual("671", preview["calculation"]["listing_price_rub"])
+
+        confirmed = self.post_json(
+            f"/api/batches/{run_id}/pricing-evidence/confirm",
+            self.pricing_input_payload(seed.seed_id),
+        )["data"]
+
+        self.assertTrue(pricing_path.exists())
+        self.assertEqual("confirmed", confirmed["status"])
+        self.assertEqual("workbench_user", confirmed["confirmed_by"])
+        stored = self.repo.load_pricing_evidence(run_id)
+        self.assertEqual(
+            confirmed["calculation"],
+            stored["items"][seed.seed_id]["calculation"],
+        )
+
+        workspace = self.get_json(f"/api/batches/{run_id}/upload")["data"]
+        item = workspace["items"][0]
+        self.assertTrue(item["pricing_ready"])
+        self.assertEqual("confirmed", item["pricing_status"])
+        self.assertNotIn("pricing", item["blocking_gates"])
+        self.assertEqual(1, workspace["gates"]["pricing_ready_count"])
+        mapped = {
+            field["field_key"]: field
+            for field in item["attribute_mapping"]
+        }
+        self.assertEqual("380", mapped["package-weight"]["value"])
+        self.assertEqual(
+            "user_confirmed_pricing_evidence",
+            mapped["package-weight"]["source"],
+        )
+        self.assertEqual("28", mapped["package-length"]["value"])
+        self.assertEqual("11", mapped["package-width"]["value"])
+        self.assertEqual("2.5", mapped["package-height"]["value"])
+
+    def test_pricing_confirmation_requires_locked_supplier_sku(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+
+        result = self.post_json(
+            f"/api/batches/{run_id}/pricing-evidence/confirm",
+            self.pricing_input_payload(seed.seed_id),
+            ok=False,
+        )
+
+        self.assertEqual("pricing_evidence.supplier_sku_required", result["code"])
+        self.assertFalse(
+            (self.repo.run_dir(run_id) / "pricing_evidence.json").exists()
+        )
+
+    def test_pricing_policy_change_marks_confirmed_evidence_stale(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+        self.post_json(
+            f"/api/batches/{run_id}/pricing-evidence/confirm",
+            self.pricing_input_payload(seed.seed_id),
+        )
+        settings = self.repo.load_pricing_settings()
+        settings["commission_rate"] = "0.16"
+        self.repo.save_pricing_settings(settings)
+
+        workspace = self.get_json(f"/api/batches/{run_id}/upload")["data"]
+        item = workspace["items"][0]
+
+        self.assertFalse(item["pricing_ready"])
+        self.assertEqual("stale", item["pricing_status"])
+        self.assertIn("pricing", item["blocking_gates"])
 
     def test_upload_workspace_reads_generated_and_user_approved_image_jobs(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
@@ -2540,6 +2706,11 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.repo.save_attribute_template_result(run_id, template_result)
 
         self.attach_completed_image_job(run_id, seed.seed_id)
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+        self.post_json(
+            f"/api/batches/{run_id}/pricing-evidence/confirm",
+            self.pricing_input_payload(seed.seed_id),
+        )
 
         workspace = self.get_json(f"/api/batches/{run_id}/upload")["data"]
         items = {item["seed_id"]: item for item in workspace["items"]}
@@ -3214,7 +3385,23 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         template_result["seed_templates"][0]["upload_attribute_schema"][0]["dictionary_id"] = 100
         self.repo.save_attribute_template_result(run_id, template_result)
         self.attach_completed_image_job(run_id, seed.seed_id)
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+        selections = self.repo.load_supplier_sku_selections(run_id)
+        selections["selections"][seed.seed_id]["supplier_sku"][
+            "selected_options"
+        ] = {"Цвет": "белый"}
+        self.repo.save_supplier_sku_selections(run_id, selections)
+        supplier_result = self.repo.load_supplier_collection_result(run_id)
+        supplier_result["supplier_products"][0]["attributes"] = {
+            "Цвет": "белый"
+        }
+        self.repo.save_supplier_collection_result(run_id, supplier_result)
         service = WorkbenchService(self.repo)
+        pricing = service.confirm_pricing_evidence(
+            run_id,
+            self.pricing_input_payload(seed.seed_id),
+        )
+        self.assertTrue(pricing.ok)
 
         with patch.object(
             service.seller_api_adapter,
@@ -3223,7 +3410,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         ) as resolver:
             result = service.build_upload_draft(run_id)
 
-        self.assertTrue(result.ok)
+        self.assertTrue(result.ok, result.to_dict())
         attribute = result.data["items"][0]["attributes"][0]
         self.assertEqual(501, attribute["dictionary_value_id"])
         resolver.assert_called_once_with(
