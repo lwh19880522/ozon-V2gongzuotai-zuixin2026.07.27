@@ -204,6 +204,79 @@ class AttributeMappingServiceTests(unittest.TestCase):
         self.assertIsNone(fields["warranty"]["value"])
         self.assertEqual("generated_original_content", fields["title"]["source"])
 
+    def test_maps_locked_supplier_sku_quantity_and_stable_seller_code(self) -> None:
+        schema = [
+            {
+                "attribute_id": "quantity",
+                "attribute_label": "Количество товара в УЕИ",
+                "is_required": True,
+            },
+            {
+                "attribute_id": "seller-code",
+                "attribute_label": "Код продавца",
+                "is_required": True,
+            },
+        ]
+
+        result = map_template_attributes(
+            schema,
+            {"seed_id": "seed-1599", "attributes": {}},
+            supplier_product={"offer_id": "559479796544", "attributes": {}},
+            supplier_selection={
+                "supplier_offer_id": "559479796544",
+                "supplier_sku": {
+                    "supplier_sku_id": "559479796544",
+                    "combination_key": "页面唯一 SKU",
+                    "selected_options": {"规格": "页面唯一 SKU"},
+                    "set_quantity": 1,
+                    "set_composition": ["单件商品"],
+                },
+            },
+        )
+        fields = {field["field_key"]: field for field in result["fields"]}
+
+        self.assertEqual("mapped", fields["quantity"]["status"])
+        self.assertEqual(1, fields["quantity"]["value"])
+        self.assertEqual("confirmed_supplier_sku", fields["quantity"]["source"])
+        self.assertEqual(
+            "supplier_selection.supplier_sku.set_quantity",
+            fields["quantity"]["evidence_ref"],
+        )
+        self.assertEqual("mapped", fields["seller-code"]["status"])
+        self.assertRegex(
+            str(fields["seller-code"]["value"]),
+            r"^OZV2-559479796544-[A-F0-9]{8}$",
+        )
+        self.assertEqual("workflow_generated", fields["seller-code"]["source"])
+
+    def test_does_not_accept_chinese_generated_text_for_russian_model_field(
+        self,
+    ) -> None:
+        result = map_template_attributes(
+            [
+                {
+                    "attribute_id": "model",
+                    "attribute_label": "Название модели (для объединения в одну карточку)",
+                    "attribute_type": "String",
+                    "is_required": False,
+                }
+            ],
+            {"attributes": {}},
+            supplier_product={"attributes": {"规格": "两用打孔钳"}},
+            rewritten_content={
+                "model": {
+                    "decision": "filled",
+                    "value": "两用打孔钳",
+                    "evidence_refs": ["supplier.attributes.规格"],
+                    "reason": "Copied from the supplier specification.",
+                }
+            },
+        )
+        field = result["fields"][0]
+
+        self.assertEqual("missing_fact", field["status"])
+        self.assertIsNone(field["value"])
+
 
 if __name__ == "__main__":
     unittest.main()

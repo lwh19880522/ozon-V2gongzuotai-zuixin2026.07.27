@@ -1,4 +1,4 @@
 interface:
   display_name: "Ozon Intelligent Field Drafter"
-  short_description: "Fill Ozon drafts from verified product evidence"
-  default_prompt: "Use $ozon-intelligent-field-drafter to complete evidence-backed fields for the current Ozon V2 batch."
+  short_description: "Build Russian Ozon fields from locked SKU evidence"
+  default_prompt: "Use $ozon-intelligent-field-drafter to complete and classify every pending field for the current Ozon V2 batch from the full locked supplier SKU and collected evidence."

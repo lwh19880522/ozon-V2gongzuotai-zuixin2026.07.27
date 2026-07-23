@@ -2750,6 +2750,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
                         "decision": "unresolved",
                         "reason": "Гарантия не указана в собранных данных Ozon и 1688.",
                         "evidence_refs": [],
+                        "resolution_class": "source_fact_missing",
                     },
                     "title": (
                         "Комплект ручных инструментов для точной работы, 1 предмет"
@@ -2757,13 +2758,15 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
                 },
             },
         )["data"]
-        self.assertEqual("completed", completed["status"])
+        self.assertEqual("completed_with_gaps", completed["status"])
         self.assertEqual(1, completed["unresolved_field_count"])
 
         refreshed = self.get_json(f"/api/batches/{run_id}/content-tasks")["data"]
         self.assertEqual(0, refreshed["summary"]["pending"])
         self.assertEqual(0, refreshed["summary"]["pending_fields"])
         self.assertEqual(1, refreshed["summary"]["unresolved_fields"])
+        self.assertEqual(1, refreshed["summary"]["completed_with_gaps"])
+        self.assertEqual("completed_with_gaps", refreshed["items"][0]["status"])
         workspace_item = self.get_json(f"/api/batches/{run_id}/upload")["data"]["items"][0]
         mapped = {
             field["field_key"]: field
@@ -2779,6 +2782,327 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn("skills/ozon-intelligent-field-drafter/SKILL.md", page)
         self.assertNotIn("mode=evidence_inference", page)
         self.assertNotIn("JSON 为", page)
+
+    def test_content_tasks_expose_full_locked_supplier_sku_evidence(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        self.repo.save_supplier_collection_result(
+            run_id,
+            {
+                "run_id": run_id,
+                "supplier_products": [
+                    {
+                        "seed_id": seed.seed_id,
+                        "offer_id": "559479796544",
+                        "title": "两用打孔钳",
+                        "attributes": {"规格": "两用打孔钳"},
+                    }
+                ],
+            },
+        )
+        self.repo.save_supplier_sku_selections(
+            run_id,
+            {
+                "run_id": run_id,
+                "selections": {
+                    seed.seed_id: {
+                        "supplier_offer_id": "559479796544",
+                        "supplier_sku": {
+                            "supplier_sku_id": "559479796544",
+                            "combination_key": "页面唯一 SKU",
+                            "raw_label": "页面唯一 SKU（无需选择规格）",
+                            "selected_options": {"规格": "页面唯一 SKU"},
+                            "set_quantity": 1,
+                            "set_composition": ["单件商品"],
+                            "price": {"currency": "CNY", "amount": "4.70"},
+                            "stock": {"status": "unknown", "quantity": None},
+                        },
+                        "ozon_target_sku": {
+                            "sku_id": "ozon-test",
+                            "selected_options": {"Цвет": "Белый"},
+                        },
+                    }
+                },
+            },
+        )
+
+        task = self.get_json(f"/api/batches/{run_id}/content-tasks")["data"]["items"][0]
+
+        self.assertEqual(
+            1,
+            task["evidence"]["confirmed_supplier_sku"]["set_quantity"],
+        )
+        self.assertEqual(
+            ["单件商品"],
+            task["evidence"]["confirmed_supplier_sku"]["set_composition"],
+        )
+        self.assertEqual(
+            "页面唯一 SKU（无需选择规格）",
+            task["evidence"]["confirmed_supplier_sku"]["raw_label"],
+        )
+        self.assertEqual(
+            {"Цвет": "Белый"},
+            task["evidence"]["ozon_selected_sku"],
+        )
+        self.assertEqual(
+            1,
+            task["evidence_index"]["supplier_selection.supplier_sku.set_quantity"],
+        )
+        self.assertEqual(
+            "单件商品",
+            task["evidence_index"][
+                "supplier_selection.supplier_sku.set_composition.0"
+            ],
+        )
+        self.assertEqual(
+            "Белый",
+            task["evidence_index"]["ozon.target_sku.selected_options.Цвет"],
+        )
+
+    def test_content_task_rejects_chinese_customer_facing_objective_text(
+        self,
+    ) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        self.repo.save_supplier_collection_result(
+            run_id,
+            {
+                "run_id": run_id,
+                "supplier_products": [
+                    {
+                        "seed_id": seed.seed_id,
+                        "offer_id": "559479796544",
+                        "title": "两用打孔钳",
+                        "attributes": {"规格": "两用打孔钳"},
+                    }
+                ],
+            },
+        )
+        template_result = self.repo.load_attribute_template_result(run_id)
+        template_result["seed_templates"][0]["upload_attribute_schema"] = [
+            {
+                "attribute_id": "model",
+                "attribute_label": "Название модели (для объединения в одну карточку)",
+                "attribute_type": "String",
+                "is_required": False,
+            }
+        ]
+        self.repo.save_attribute_template_result(run_id, template_result)
+
+        invalid = self.post_json(
+            f"/api/batches/{run_id}/content-tasks/complete",
+            {
+                "seed_id": seed.seed_id,
+                "fields": {
+                    "model": {
+                        "decision": "filled",
+                        "value": "两用打孔钳",
+                        "evidence_refs": ["supplier.attributes.规格"],
+                        "reason": "Translated model name from the supplier specification.",
+                    }
+                },
+            },
+            ok=False,
+        )
+
+        self.assertEqual("content_task.validation_failed", invalid["code"])
+        self.assertTrue(
+            any("Russian text is required" in error for error in invalid["errors"])
+        )
+
+    def test_unresolved_fields_require_classification_and_do_not_report_ready(
+        self,
+    ) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        template_result = self.repo.load_attribute_template_result(run_id)
+        template_result["seed_templates"][0]["upload_attribute_schema"] = [
+            {
+                "attribute_id": "warranty",
+                "attribute_label": "Гарантия",
+                "attribute_type": "String",
+                "is_required": False,
+            }
+        ]
+        self.repo.save_attribute_template_result(run_id, template_result)
+
+        invalid = self.post_json(
+            f"/api/batches/{run_id}/content-tasks/complete",
+            {
+                "seed_id": seed.seed_id,
+                "fields": {
+                    "warranty": {
+                        "decision": "unresolved",
+                        "reason": "Гарантия отсутствует в собранных данных.",
+                        "evidence_refs": [],
+                    }
+                },
+            },
+            ok=False,
+        )
+        self.assertTrue(
+            any("resolution_class" in error for error in invalid["errors"])
+        )
+
+        completed = self.post_json(
+            f"/api/batches/{run_id}/content-tasks/complete",
+            {
+                "seed_id": seed.seed_id,
+                "fields": {
+                    "warranty": {
+                        "decision": "unresolved",
+                        "reason": "Гарантия отсутствует в собранных данных.",
+                        "evidence_refs": [],
+                        "resolution_class": "source_fact_missing",
+                    }
+                },
+            },
+        )["data"]
+        refreshed = self.get_json(f"/api/batches/{run_id}/content-tasks")["data"]
+
+        self.assertEqual("completed_with_gaps", completed["status"])
+        self.assertEqual("completed_with_gaps", refreshed["items"][0]["status"])
+        self.assertEqual(1, refreshed["summary"]["completed_with_gaps"])
+        self.assertEqual(0, refreshed["summary"]["ready"])
+
+    def test_legacy_unclassified_unresolved_decision_is_reopened(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        template_result = self.repo.load_attribute_template_result(run_id)
+        template_result["seed_templates"][0]["upload_attribute_schema"] = [
+            {
+                "attribute_id": "warranty",
+                "attribute_label": "Гарантия",
+                "attribute_type": "String",
+                "is_required": False,
+            }
+        ]
+        self.repo.save_attribute_template_result(run_id, template_result)
+        self.repo.save_generated_content_result(
+            run_id,
+            {
+                "schema_version": 2,
+                "run_id": run_id,
+                "items": {
+                    seed.seed_id: {
+                        "field_results": {
+                            "warranty": {
+                                "decision": "unresolved",
+                                "reason": "Legacy unresolved decision.",
+                                "evidence_refs": [],
+                                "mode": "evidence_inference",
+                            }
+                        }
+                    }
+                },
+            },
+        )
+
+        task = self.get_json(f"/api/batches/{run_id}/content-tasks")["data"]["items"][0]
+
+        self.assertEqual("pending", task["status"])
+        self.assertEqual(1, task["pending_field_count"])
+        self.assertEqual("pending", task["field_tasks"][0]["status"])
+
+    def test_completing_reopened_task_drops_superseded_unresolved_results(
+        self,
+    ) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        self.repo.save_supplier_collection_result(
+            run_id,
+            {
+                "run_id": run_id,
+                "supplier_products": [
+                    {
+                        "seed_id": seed.seed_id,
+                        "offer_id": "559479796544",
+                        "title": "两用打孔钳",
+                        "attributes": {},
+                    }
+                ],
+            },
+        )
+        self.repo.save_supplier_sku_selections(
+            run_id,
+            {
+                "run_id": run_id,
+                "selections": {
+                    seed.seed_id: {
+                        "supplier_offer_id": "559479796544",
+                        "supplier_sku": {
+                            "supplier_sku_id": "559479796544",
+                            "combination_key": "页面唯一 SKU",
+                            "selected_options": {"规格": "页面唯一 SKU"},
+                            "set_quantity": 1,
+                            "set_composition": ["单件商品"],
+                        },
+                    }
+                },
+            },
+        )
+        template_result = self.repo.load_attribute_template_result(run_id)
+        template_result["seed_templates"][0]["upload_attribute_schema"] = [
+            {
+                "attribute_id": "quantity",
+                "attribute_label": "Количество товара в УЕИ",
+                "attribute_type": "Integer",
+                "is_required": True,
+            },
+            {
+                "attribute_id": "seller-code",
+                "attribute_label": "Код продавца",
+                "attribute_type": "String",
+                "is_required": True,
+            },
+            {
+                "attribute_id": "warranty",
+                "attribute_label": "Гарантия",
+                "attribute_type": "String",
+                "is_required": False,
+            },
+        ]
+        self.repo.save_attribute_template_result(run_id, template_result)
+        legacy_results = {
+            field_key: {
+                "decision": "unresolved",
+                "reason": "Legacy unresolved decision.",
+                "evidence_refs": [],
+                "mode": "evidence_inference",
+            }
+            for field_key in ("quantity", "seller-code", "warranty")
+        }
+        self.repo.save_generated_content_result(
+            run_id,
+            {
+                "schema_version": 2,
+                "run_id": run_id,
+                "items": {
+                    seed.seed_id: {
+                        "field_results": legacy_results,
+                    }
+                },
+            },
+        )
+
+        task = self.get_json(f"/api/batches/{run_id}/content-tasks")["data"]["items"][0]
+        self.assertEqual(
+            ["warranty"],
+            [field["field_key"] for field in task["field_tasks"]],
+        )
+        completed = self.post_json(
+            f"/api/batches/{run_id}/content-tasks/complete",
+            {
+                "seed_id": seed.seed_id,
+                "fields": {
+                    "warranty": {
+                        "decision": "unresolved",
+                        "resolution_class": "source_fact_missing",
+                        "reason": "Гарантия отсутствует в собранных данных.",
+                        "evidence_refs": [],
+                    }
+                },
+            },
+        )["data"]
+        saved = self.repo.load_generated_content_result(run_id)["items"][seed.seed_id]
+
+        self.assertEqual(1, completed["unresolved_field_count"])
+        self.assertEqual(["warranty"], sorted(saved["field_results"]))
 
     def test_upload_workspace_flags_cross_domain_template_instead_of_mapping_it(self) -> None:
         run_id, _seed = self.prepare_supplier_review_run()

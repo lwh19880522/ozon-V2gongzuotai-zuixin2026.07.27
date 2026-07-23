@@ -19,8 +19,15 @@ def test_field_drafter_skill_owns_intelligent_field_workflow() -> None:
     assert "evidence_inference" in text
     assert '"decision":"filled"' in text
     assert '"decision":"unresolved"' in text
+    assert "resolution_class" in text
+    assert "source_fact_missing" in text
     assert "evidence_refs" in text
     assert "summary.pending_fields=0" in text
+    assert "not proof of readiness" in text
+    assert "set_quantity" in text
+    assert "set_composition" in text
+    assert "customer-facing" in text
+    assert "Russian" in text
     assert "1688" in text
     assert "Ozon" in text
     assert "supplier truth" in text
@@ -41,6 +48,9 @@ def test_field_drafter_skill_has_detailed_source_and_validation_policy() -> None
     assert "ozon_attributes" in policy
     assert "Identity fields" in policy
     assert "Dictionary fields" in policy
+    assert "Russian normalization" in policy
+    assert "Resolution classes" in policy
+    assert "workflow_defaults" in policy
     assert "Never infer" in policy
     assert "Required fields" in policy
 
@@ -50,7 +60,7 @@ def test_plugin_versions_workbench_and_both_skill_phases_as_one_product() -> Non
         (ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
     )
 
-    assert plugin["version"] == "0.3.0"
+    assert plugin["version"] == "0.3.1"
     assert "field-drafting" in plugin["keywords"]
     description = plugin["interface"]["longDescription"]
     prompts = "\n".join(plugin["interface"]["defaultPrompt"])
@@ -58,4 +68,3 @@ def test_plugin_versions_workbench_and_both_skill_phases_as_one_product() -> Non
     assert "image generation" in description.casefold()
     assert "$ozon-intelligent-field-drafter" in prompts
     assert "$ozon-image-generation-controller" in prompts
-

@@ -2808,8 +2808,10 @@ def build_upload_workspace_html(run_id: str) -> str:
         f"Use $ozon-intelligent-field-drafter for Ozon V2 batch {run_id}. "
         "Read and follow the workspace Skill at "
         "skills/ozon-intelligent-field-drafter/SKILL.md. "
-        "Complete every pending field decision from the existing Ozon and confirmed "
-        "1688 evidence, then report filled, unresolved, and blocked fields. "
+        "Use the complete locked 1688 SKU plus existing Ozon and supplier evidence. "
+        "Complete every pending field decision, translate customer-facing facts into "
+        "Russian, classify genuine evidence gaps, and report ready, gap, and blocked "
+        "products separately. "
         "Stop before upload, publish, or final approval."
     )
     escaped_content_controller_command = html.escape(content_controller_command)

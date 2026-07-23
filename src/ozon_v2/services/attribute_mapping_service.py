@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from typing import Any
@@ -16,10 +17,12 @@ _ALIAS_GROUPS: dict[str, tuple[str, ...]] = {
     "quantity": (
         "количество в упаковке шт",
         "количество товара в оед",
+        "количество товара в уеи",
         "единиц в одном товаре",
         "quantity",
         "数量",
     ),
+    "seller_code": ("код продавца", "seller code", "offer id"),
     "package_contents": ("комплектация", "состав комплекта", "package contents", "包装清单"),
     "size": ("размер", "размеры мм", "size", "尺寸", "规格"),
     "length": ("длина мм", "длина см", "length", "长度", "全长"),
@@ -177,6 +180,10 @@ def map_template_attributes(
                 and generated_result.get("structured") is True
                 and generated_result["decision"] == "filled"
                 and _has_value(generated_result.get("value"))
+                and _generated_objective_value_is_acceptable(
+                    canonical_label,
+                    generated_result.get("value"),
+                )
             ):
                 evidence_refs = generated_result.get("evidence_refs", [])
                 mapped_fields.append(
@@ -340,6 +347,28 @@ def _collect_evidence(
                 f"supplier_selection.supplier_sku.selected_options.{label}",
                 10,
             )
+        add(
+            "Количество товара в УЕИ",
+            supplier_sku.get("set_quantity"),
+            "confirmed_supplier_sku",
+            "supplier_selection.supplier_sku.set_quantity",
+            5,
+        )
+        seller_code = _stable_seller_code(
+            supplier_offer_id=(
+                supplier_selection.get("supplier_offer_id")
+                or (supplier_product or {}).get("offer_id")
+            ),
+            supplier_sku_id=supplier_sku.get("supplier_sku_id"),
+            combination_key=supplier_sku.get("combination_key"),
+        )
+        add(
+            "Код продавца",
+            seller_code,
+            "workflow_generated",
+            "workflow.defaults.seller_code",
+            5,
+        )
     if supplier_product:
         for label, value in _mapping_items(supplier_product.get("attributes")):
             if _is_supplier_specification_artifact(label, value):
@@ -408,6 +437,41 @@ def _plain_value(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _stable_seller_code(
+    *,
+    supplier_offer_id: Any,
+    supplier_sku_id: Any,
+    combination_key: Any,
+) -> str | None:
+    offer_id = re.sub(r"[^A-Za-z0-9_-]+", "", str(supplier_offer_id or "").strip())
+    identity = "|".join(
+        str(value or "").strip()
+        for value in (supplier_sku_id, combination_key)
+        if str(value or "").strip()
+    )
+    if not offer_id or not identity:
+        return None
+    suffix = hashlib.sha1(identity.encode("utf-8")).hexdigest()[:8].upper()
+    return f"OZV2-{offer_id}-{suffix}"
+
+
+def _generated_objective_value_is_acceptable(
+    canonical_label: str,
+    value: Any,
+) -> bool:
+    if canonical_label not in {
+        "model",
+        "type",
+        "package_contents",
+        "color",
+        "material",
+        "country",
+        "gender",
+    }:
+        return True
+    return not bool(re.search(r"[\u3400-\u9fff]", str(value or "")))
 
 
 def _generated_field_result(value: Any) -> dict[str, Any] | None:

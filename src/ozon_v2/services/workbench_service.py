@@ -37,6 +37,24 @@ from ozon_v2.services.seed_query_service import SeedQueryService
 from ozon_v2.services.seller_history_service import SellerHistoryService
 
 
+_CONTENT_RESOLUTION_CLASSES = {
+    "source_fact_missing",
+    "supplier_identity_missing",
+    "dictionary_value_missing",
+    "evidence_conflict",
+    "not_applicable",
+}
+_RUSSIAN_OBJECTIVE_FIELDS = {
+    "model",
+    "type",
+    "package_contents",
+    "color",
+    "material",
+    "country",
+    "gender",
+}
+
+
 class WorkbenchService:
     def __init__(
         self,
@@ -1385,12 +1403,31 @@ class WorkbenchService:
                     "source_content_score_evidence": candidate.get("content_score_evidence") or {},
                     "supplier_attributes": (suppliers_by_seed.get(seed_id) or {}).get("attributes") or {},
                     "supplier_title": (suppliers_by_seed.get(seed_id) or {}).get("title"),
+                    "supplier_offer_id": (
+                        (supplier_selections.get(seed_id) or {}).get("supplier_offer_id")
+                        or (suppliers_by_seed.get(seed_id) or {}).get("offer_id")
+                    ),
+                    "supplier_selected_sku": (
+                        (supplier_selections.get(seed_id) or {}).get("supplier_sku")
+                        or {}
+                    ),
                     "supplier_selected_options": (
                         ((supplier_selections.get(seed_id) or {}).get("supplier_sku") or {}).get("selected_options")
                         or {}
                     ),
                     "source_image": images[0] if images else None,
-                    "selected_options": (candidate.get("target_sku") or {}).get("selected_options") or {},
+                    "selected_options": (
+                        (
+                            (supplier_selections.get(seed_id) or {}).get(
+                                "ozon_target_sku"
+                            )
+                            or {}
+                        ).get("selected_options")
+                        or (candidate.get("target_sku") or {}).get(
+                            "selected_options"
+                        )
+                        or {}
+                    ),
                     "category_path": seller_template.get("matched_category_path") or (category_candidates[0].get("category_path") if category_candidates else None),
                     "description_category_id": seller_template.get("description_category_id"),
                     "type_id": seller_template.get("type_id"),
@@ -1542,10 +1579,12 @@ class WorkbenchService:
             evidence = {
                 "ozon_title_style_reference": item.get("source_title"),
                 "ozon_attributes": item.get("source_attributes") or {},
+                "ozon_selected_sku": item.get("selected_options") or {},
                 "ozon_content_score_evidence": item.get("source_content_score_evidence") or {},
                 "supplier_title": item.get("supplier_title"),
                 "supplier_attributes": item.get("supplier_attributes") or {},
-                "confirmed_supplier_sku": item.get("supplier_selected_options") or {},
+                "supplier_offer_id": item.get("supplier_offer_id"),
+                "confirmed_supplier_sku": item.get("supplier_selected_sku") or {},
             }
             evidence_index = _content_evidence_index(evidence)
             supplier_truth_available = bool(
@@ -1561,7 +1600,12 @@ class WorkbenchService:
                     in {"title", "description", "rich_content", "hashtags"}
                     else "evidence_inference"
                 )
-                completed_result = generated_field_results.get(field_key)
+                stored_result = generated_field_results.get(field_key)
+                completed_result = (
+                    stored_result
+                    if _content_result_is_accepted(field, stored_result)
+                    else None
+                )
                 field_tasks.append(
                     {
                         "field_key": field_key,
@@ -1582,6 +1626,10 @@ class WorkbenchService:
                         "dictionary_id": field.get("dictionary_id"),
                         "current_mapping_status": field.get("status"),
                         "reference_evidence": field.get("reference_evidence", []),
+                        "candidate_evidence_refs": _field_candidate_evidence_refs(
+                            field,
+                            evidence_index,
+                        ),
                         "supplier_truth_required": bool(
                             supplier_truth_available
                             and canonical_label in {"brand", "model", "article", "color"}
@@ -1594,10 +1642,24 @@ class WorkbenchService:
             unresolved_field_count = sum(
                 1 for field in field_tasks if field.get("decision") == "unresolved"
             )
+            blocking_unresolved_field_count = sum(
+                1
+                for field in field_tasks
+                if field.get("decision") == "unresolved"
+                and field.get("required") is True
+            )
+            if pending_field_count:
+                task_status = "pending"
+            elif blocking_unresolved_field_count:
+                task_status = "blocked"
+            elif unresolved_field_count:
+                task_status = "completed_with_gaps"
+            else:
+                task_status = "ready"
             task_items.append(
                 {
                     "seed_id": seed_id,
-                    "status": "pending" if pending_field_count else "completed",
+                    "status": task_status,
                     "target_score": 90,
                     "category_path": item.get("category_path"),
                     "field_tasks": field_tasks,
@@ -1623,16 +1685,31 @@ class WorkbenchService:
                         "complete_all_pending_fields": True,
                         "objective_values_require_evidence_refs": True,
                         "unverifiable_fields_must_be_unresolved": True,
+                        "unresolved_requires_resolution_class": True,
+                        "customer_facing_text_must_be_russian": True,
+                        "translation_and_exact_unit_normalization_allowed": True,
                     },
                     "completed_fields": generated.get("fields") or {},
                     "completed_field_results": generated_field_results,
                     "pending_field_count": pending_field_count,
                     "unresolved_field_count": unresolved_field_count,
+                    "blocking_unresolved_field_count": (
+                        blocking_unresolved_field_count
+                    ),
+                    "existing_mapped_field_count": item.get(
+                        "mapped_attribute_count", 0
+                    ),
+                    "template_field_count": item.get("attribute_schema_count", 0),
                 }
             )
 
         pending = sum(1 for item in task_items if item["status"] == "pending")
-        completed = sum(1 for item in task_items if item["status"] == "completed")
+        ready = sum(1 for item in task_items if item["status"] == "ready")
+        completed_with_gaps = sum(
+            1 for item in task_items if item["status"] == "completed_with_gaps"
+        )
+        blocked = sum(1 for item in task_items if item["status"] == "blocked")
+        completed = ready + completed_with_gaps + blocked
         pending_fields = sum(item["pending_field_count"] for item in task_items)
         unresolved_fields = sum(item["unresolved_field_count"] for item in task_items)
         completed_fields = sum(
@@ -1648,6 +1725,9 @@ class WorkbenchService:
                     "total": len(task_items),
                     "pending": pending,
                     "completed": completed,
+                    "ready": ready,
+                    "completed_with_gaps": completed_with_gaps,
+                    "blocked": blocked,
                     "pending_fields": pending_fields,
                     "completed_fields": completed_fields,
                     "unresolved_fields": unresolved_fields,
@@ -1717,16 +1797,21 @@ class WorkbenchService:
                 value = raw_value.get("value")
                 evidence_refs = raw_value.get("evidence_refs")
                 reason = str(raw_value.get("reason") or "").strip()
+                resolution_class = str(
+                    raw_value.get("resolution_class") or ""
+                ).strip()
             elif mode == "creative_rewrite" and _has_content_value(raw_value):
                 decision = "filled"
                 value = raw_value
                 evidence_refs = []
                 reason = "Original Russian content generated from collected evidence."
+                resolution_class = ""
             else:
                 decision = ""
                 value = None
                 evidence_refs = []
                 reason = ""
+                resolution_class = ""
             evidence_refs = (
                 [
                     str(reference)
@@ -1745,6 +1830,11 @@ class WorkbenchService:
             if decision == "unresolved":
                 if mode == "creative_rewrite":
                     errors.append(f"{label}: creative content must be completed.")
+                if resolution_class not in _CONTENT_RESOLUTION_CLASSES:
+                    errors.append(
+                        f"{label}: unresolved decisions require resolution_class "
+                        f"from {', '.join(sorted(_CONTENT_RESOLUTION_CLASSES))}."
+                    )
                 if len(reason) < 10:
                     errors.append(
                         f"{label}: unresolved decisions require a concrete reason."
@@ -1779,6 +1869,15 @@ class WorkbenchService:
                         errors.append(
                             f"{label}: supplier identity requires a 1688 evidence_ref."
                         )
+                    if (
+                        _field_requires_russian_objective_text(field)
+                        and re.search(r"[\u3400-\u9fff]", str(value or ""))
+                    ):
+                        errors.append(
+                            f"{label}: Russian text is required for customer-facing "
+                            "objective fields; translate the verified supplier fact "
+                            "without changing its meaning."
+                        )
             normalized_results[field_key] = {
                 "decision": decision,
                 "value": value,
@@ -1786,6 +1885,9 @@ class WorkbenchService:
                 "reason": reason,
                 "mode": mode,
                 "label": label,
+                "resolution_class": (
+                    resolution_class if decision == "unresolved" else None
+                ),
             }
 
         source_title = str(evidence.get("ozon_title_style_reference") or "")
@@ -1860,7 +1962,11 @@ class WorkbenchService:
             if isinstance(result_items.get(seed_id), dict)
             else {}
         )
-        stored_field_results = _generated_field_results(existing_item)
+        stored_field_results = {
+            field_key: result
+            for field_key, result in _generated_field_results(existing_item).items()
+            if field_key in task_fields
+        }
         stored_field_results.update(normalized_results)
         flattened_fields = {
             key: result.get("value")
@@ -1879,12 +1985,30 @@ class WorkbenchService:
         }
         result_payload["schema_version"] = 2
         result_payload["updated_at"] = completed_at
-        path = self.repo.save_generated_content_result(run_id, result_payload)
         unresolved_field_count = sum(
             1
             for result in stored_field_results.values()
             if result.get("decision") == "unresolved"
         )
+        required_field_keys = {
+            str(field.get("field_key") or "")
+            for field in task.get("field_tasks", [])
+            if field.get("required") is True
+        }
+        blocking_unresolved_field_count = sum(
+            1
+            for field_key, result in stored_field_results.items()
+            if field_key in required_field_keys
+            and result.get("decision") == "unresolved"
+        )
+        if blocking_unresolved_field_count:
+            completion_status = "blocked"
+        elif unresolved_field_count:
+            completion_status = "completed_with_gaps"
+        else:
+            completion_status = "completed"
+        result_items[seed_id]["status"] = completion_status
+        path = self.repo.save_generated_content_result(run_id, result_payload)
         self.repo.append_run_event(
             run_id,
             "content_task.completed",
@@ -1893,6 +2017,10 @@ class WorkbenchService:
                 "seed_id": seed_id,
                 "field_keys": sorted(expected),
                 "unresolved_field_count": unresolved_field_count,
+                "blocking_unresolved_field_count": (
+                    blocking_unresolved_field_count
+                ),
+                "status": completion_status,
                 "target_score": 90,
                 "result_path": str(path),
             },
@@ -1903,9 +2031,12 @@ class WorkbenchService:
             {
                 "run_id": run_id,
                 "seed_id": seed_id,
-                "status": "completed",
+                "status": completion_status,
                 "field_count": len(expected),
                 "unresolved_field_count": unresolved_field_count,
+                "blocking_unresolved_field_count": (
+                    blocking_unresolved_field_count
+                ),
                 "target_score": 90,
             },
         )
@@ -2011,7 +2142,8 @@ class WorkbenchService:
                             "ozon_attributes": item.get("source_attributes") or {},
                             "ozon_content_score_evidence": item.get("source_content_score_evidence") or {},
                             "supplier_attributes": item.get("supplier_attributes") or {},
-                            "confirmed_supplier_sku": item.get("supplier_selected_options") or {},
+                            "confirmed_supplier_sku": item.get("supplier_selected_sku") or {},
+                            "ozon_selected_sku": item.get("selected_options") or {},
                         },
                         "policy": (
                             "Generate original Russian content from verified facts. "
@@ -5095,6 +5227,10 @@ def _content_evidence_index(evidence: dict[str, Any]) -> dict[str, Any]:
                 index[reference] = value
 
     add("ozon.title", evidence.get("ozon_title_style_reference"))
+    ozon_selected_sku = evidence.get("ozon_selected_sku")
+    if isinstance(ozon_selected_sku, dict):
+        for label, value in ozon_selected_sku.items():
+            add(f"ozon.target_sku.selected_options.{label}", value)
     ozon_attributes = evidence.get("ozon_attributes")
     if isinstance(ozon_attributes, dict):
         for label, value in ozon_attributes.items():
@@ -5114,18 +5250,98 @@ def _content_evidence_index(evidence: dict[str, Any]) -> dict[str, Any]:
                     value,
                 )
     add("supplier.title", evidence.get("supplier_title"))
+    add("supplier.offer_id", evidence.get("supplier_offer_id"))
     supplier_attributes = evidence.get("supplier_attributes")
     if isinstance(supplier_attributes, dict):
         for label, value in supplier_attributes.items():
             add(f"supplier.attributes.{label}", value)
     confirmed_supplier_sku = evidence.get("confirmed_supplier_sku")
     if isinstance(confirmed_supplier_sku, dict):
-        for label, value in confirmed_supplier_sku.items():
+        for key in (
+            "supplier_sku_id",
+            "combination_key",
+            "raw_label",
+            "set_quantity",
+            "evidence_source",
+            "complete",
+        ):
             add(
-                f"supplier_selection.supplier_sku.selected_options.{label}",
-                value,
+                f"supplier_selection.supplier_sku.{key}",
+                confirmed_supplier_sku.get(key),
             )
+        selected_options = confirmed_supplier_sku.get("selected_options")
+        if isinstance(selected_options, dict):
+            for label, value in selected_options.items():
+                add(
+                    f"supplier_selection.supplier_sku.selected_options.{label}",
+                    value,
+                )
+        set_composition = confirmed_supplier_sku.get("set_composition")
+        if isinstance(set_composition, list):
+            for index_number, value in enumerate(set_composition):
+                add(
+                    "supplier_selection.supplier_sku."
+                    f"set_composition.{index_number}",
+                    value,
+                )
+        for group_name in ("price", "stock"):
+            group = confirmed_supplier_sku.get(group_name)
+            if not isinstance(group, dict):
+                continue
+            for key, value in group.items():
+                add(
+                    f"supplier_selection.supplier_sku.{group_name}.{key}",
+                    value,
+                )
     return index
+
+
+def _field_candidate_evidence_refs(
+    field: dict[str, Any],
+    evidence_index: dict[str, Any],
+) -> list[str]:
+    canonical_label = canonical_attribute_label(field.get("label"))
+    candidates: list[str] = []
+    for reference in evidence_index:
+        evidence_label = reference.rsplit(".", 1)[-1]
+        if canonical_attribute_label(evidence_label) == canonical_label:
+            candidates.append(reference)
+    special_suffixes = {
+        "quantity": (".set_quantity",),
+        "package_contents": (".set_composition.0", ".raw_label"),
+        "model": (".raw_label", ".combination_key"),
+        "article": (".supplier_sku_id",),
+    }
+    for suffix in special_suffixes.get(canonical_label, ()):
+        candidates.extend(
+            reference
+            for reference in evidence_index
+            if reference.endswith(suffix)
+        )
+    return list(dict.fromkeys(candidates))
+
+
+def _content_result_is_accepted(
+    field: dict[str, Any],
+    result: dict[str, Any] | None,
+) -> bool:
+    if not isinstance(result, dict):
+        return False
+    decision = str(result.get("decision") or "")
+    if decision == "unresolved":
+        return str(result.get("resolution_class") or "") in _CONTENT_RESOLUTION_CLASSES
+    if decision != "filled" or not _has_content_value(result.get("value")):
+        return False
+    if (
+        _field_requires_russian_objective_text(field)
+        and re.search(r"[\u3400-\u9fff]", str(result.get("value") or ""))
+    ):
+        return False
+    return True
+
+
+def _field_requires_russian_objective_text(field: dict[str, Any]) -> bool:
+    return canonical_attribute_label(field.get("label")) in _RUSSIAN_OBJECTIVE_FIELDS
 
 
 def _has_content_value(value: Any) -> bool:

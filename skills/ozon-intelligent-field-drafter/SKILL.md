@@ -1,83 +1,106 @@
 ---
 name: ozon-intelligent-field-drafter
-description: Fill or explicitly leave unresolved every pending Ozon V2 Seller API template field from collected Ozon evidence, confirmed 1688 supplier facts, and the user-locked supplier SKU. Use for batch field drafting, Russian title/description/Rich Content creation, objective attribute inference, evidence-backed completion, and retrying rejected field-task submissions before upload.
+description: Build auditable Russian Ozon V2 Seller API field drafts from collected Ozon evidence, confirmed 1688 product facts, and the complete user-locked supplier SKU. Use for batch field drafting, objective attribute completion, Russian title/description/Rich Content creation, classified evidence gaps, and retrying rejected field decisions before upload.
 ---
 
 # Ozon Intelligent Field Drafter
 
 ## Core contract
 
-Complete one Ozon V2 batch through the workbench field-task API. Treat the Ozon
-listing as a structure and writing reference. Treat the confirmed 1688 SKU and
-supplier evidence as supplier truth. Fill a field only when its value is supported
-by collected evidence; otherwise return an explicit `unresolved` decision.
+Complete one Ozon V2 batch through the workbench field-task API. Use Ozon as a
+Russian structure and terminology reference. Use the confirmed 1688 product and
+the complete locked supplier SKU as product truth. Translate or normalize a
+verified fact without changing its meaning; never copy Chinese customer-facing
+text into a Russian Ozon field.
 
-Read [field-policy.md](references/field-policy.md) before deciding any objective
-field.
+Read [field-policy.md](references/field-policy.md) before deciding objective
+fields.
 
 ## Workflow
 
 1. Require an Ozon V2 `run_id`.
 2. GET `http://127.0.0.1:8765/api/batches/{run_id}/content-tasks`.
 3. Process every item with `status=pending`. Do not spawn subagents.
-4. For each item, read all `field_tasks` with `status=pending`, the complete
-   `evidence_index`, the full Ozon evidence, supplier attributes, and confirmed
-   supplier SKU.
-5. Decide every pending field:
-   - `creative_rewrite`: write original Russian content from verified facts.
-     Preserve useful Ozon structure and information hierarchy without copying its
-     wording.
-   - `evidence_inference`: derive the narrowest value supported by exact entries
-     in `evidence_index`. Cite every supporting key in `evidence_refs`.
-   - If the evidence cannot prove a value, return `unresolved` with a concrete
-     missing-fact reason. Never guess to increase completion counts.
-6. POST one product at a time to
-   `http://127.0.0.1:8765/api/batches/{run_id}/content-tasks/complete`.
-   The `fields` object must cover every pending field for that product.
-7. If the server returns validation errors, correct only the rejected product and
-   resubmit it. Preserve all accepted decisions.
-8. Repeat the GET after each pass until `summary.pending=0` and
-   `summary.pending_fields=0`.
-9. Read the upload workspace once more and report filled fields, unresolved
-   fields, required-field blockers, and products ready for draft construction.
+4. For every pending entry in `field_tasks`, inspect its
+   `candidate_evidence_refs`, then
+   verify the referenced values in `evidence_index`. Read the full evidence when
+   candidates are incomplete.
+5. Inspect the complete `confirmed_supplier_sku`, including `raw_label`,
+   `selected_options`, `set_quantity`, `set_composition`, SKU ID, price, and
+   stock. Do not reduce it to the visible option label.
+6. Decide every pending field:
+   - `creative_rewrite`: create original Russian content from verified facts.
+   - `evidence_inference`: translate, normalize, or extract the narrowest value
+     supported by exact evidence keys. Cite all supporting keys.
+   - `unresolved`: classify a genuinely unavailable fact with one permitted
+     `resolution_class`; never use unresolved merely because translation or
+     normalization is required.
+7. POST one product at a time to
+   `http://127.0.0.1:8765/api/batches/{run_id}/content-tasks/complete`. Cover
+   every pending field for that product.
+8. Correct only rejected fields and resubmit the same product. Preserve accepted
+   decisions.
+9. Repeat GET until `summary.pending=0` and `summary.pending_fields=0`. This is
+   not proof of readiness: inspect `summary.ready`,
+   `summary.completed_with_gaps`, and `summary.blocked`.
+10. GET `http://127.0.0.1:8765/api/batches/{run_id}/upload` and report, per
+    product, total mapped fields, newly filled fields, classified optional gaps,
+    required blockers, image blockers, and draft readiness.
 
 ## Submission shapes
 
-Use this shape for an objective field:
+Objective fact translated from the locked SKU:
 
 ```json
-{"decision":"filled","value":"1","evidence_refs":["supplier_selection.supplier_sku.selected_options.数量"],"reason":"The locked supplier SKU contains one sales unit."}
+{"decision":"filled","value":"Зеленый трехместный диван","evidence_refs":["supplier_selection.supplier_sku.raw_label","supplier_selection.supplier_sku.selected_options.规格"],"reason":"The locked supplier variant was translated into Russian without changing color or capacity."}
 ```
 
-Use this shape when a fact is not provable:
+Exact quantity from the locked SKU:
 
 ```json
-{"decision":"unresolved","reason":"Neither collected Ozon nor confirmed 1688 evidence states the warranty.","evidence_refs":[]}
+{"decision":"filled","value":"1","evidence_refs":["supplier_selection.supplier_sku.set_quantity"],"reason":"The locked supplier SKU contains one sales unit."}
 ```
 
-Creative fields may be submitted as strings, but prefer the structured
-`"decision":"filled"` shape with relevant `evidence_refs` so the audit trail
-remains complete.
+Unavailable source fact:
+
+```json
+{"decision":"unresolved","resolution_class":"source_fact_missing","reason":"Neither collected Ozon evidence nor confirmed 1688 evidence states the warranty.","evidence_refs":[]}
+```
+
+Creative fields may be strings, but prefer structured `decision=filled` values
+with evidence references.
+
+## Resolution classes
+
+Use exactly one for every unresolved field:
+
+- `source_fact_missing`: no collected source states the fact.
+- `supplier_identity_missing`: brand, model, color, or other identity is absent
+  from confirmed supplier truth.
+- `dictionary_value_missing`: evidence has a fact but no exact permitted Seller
+  API dictionary value is available.
+- `evidence_conflict`: higher-priority sources conflict and cannot be reconciled.
+- `not_applicable`: the field demonstrably does not apply to this product.
 
 ## Validation rules
 
-- Submit only exact `field_key` values from the current task.
-- Use only exact keys present in `evidence_index` as `evidence_refs`.
-- Keep numbers, units, quantity, color, material, model, brand, package contents,
-  compatibility, certification, and warranty inside verified evidence.
-- For identity fields marked `supplier_truth_required`, cite at least one
-  `supplier.*` or `supplier_selection.*` key.
-- Write Russian creative content that passes the server's language, originality,
-  length, hashtag, and Rich Content JSON checks.
-- Treat an accepted `unresolved` decision as a completed field decision, not as a
-  fabricated value. A required unresolved field remains an upload blocker.
+- Submit exact `field_key` values from the current task.
+- Cite only exact `evidence_index` keys.
+- For `supplier_truth_required`, cite `supplier.*` or `supplier_selection.*`.
+- Translate verified Chinese descriptive values into natural Russian for
+  customer-facing model, type, color, material, package, and similar fields.
+- Preserve codes, quantities, measurements, colors, materials, composition, and
+  variant identity during translation.
+- Do not translate an identifier into a different identifier and do not invent
+  absent certification, customs, warranty, weight, or regulatory facts.
+- `completed_with_gaps` is not `ready`; a required unresolved field is
+  `blocked`.
 
 ## Phase relationship
 
 This Skill and `$ozon-image-generation-controller` are peer executors of the same
-Ozon V2 workbench product. Field drafting must not wait for unrelated image work,
-and image work must not change field decisions. The workbench combines both
-outputs at each product's upload gate so ready products can advance independently.
+Ozon V2 batch. Field drafting must not wait for unrelated image work. Each
+product passes its own field and image gates independently.
 
 ## Boundaries
 
