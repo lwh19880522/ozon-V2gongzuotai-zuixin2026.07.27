@@ -29,6 +29,30 @@ _ALIAS_GROUPS: dict[str, tuple[str, ...]] = {
     "width": ("ширина мм", "ширина см", "width", "宽度"),
     "height": ("высота мм", "высота см", "height", "高度"),
     "weight": ("вес товара г", "вес г", "weight", "重量"),
+    "package_length": (
+        "длина упаковки см",
+        "длина упаковки мм",
+        "package length",
+        "包装长度",
+    ),
+    "package_width": (
+        "ширина упаковки см",
+        "ширина упаковки мм",
+        "package width",
+        "包装宽度",
+    ),
+    "package_height": (
+        "высота упаковки см",
+        "высота упаковки мм",
+        "package height",
+        "包装高度",
+    ),
+    "package_weight": (
+        "вес с упаковкой г",
+        "вес в упаковке г",
+        "package weight",
+        "包装重量",
+    ),
     "volume": ("объем мл", "объём мл", "volume", "容量"),
     "gender": ("пол ребенка", "пол", "gender", "性别"),
     "title": ("название", "title"),
@@ -74,11 +98,13 @@ def map_template_attributes(
     supplier_product: dict[str, Any] | None = None,
     supplier_selection: dict[str, Any] | None = None,
     rewritten_content: dict[str, Any] | None = None,
+    pricing_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     evidence = _collect_evidence(
         ozon_candidate,
         supplier_product=supplier_product,
         supplier_selection=supplier_selection,
+        pricing_evidence=pricing_evidence,
     )
     mapped_fields: list[dict[str, Any]] = []
     for schema_field in upload_schema:
@@ -259,9 +285,13 @@ def map_template_attributes(
                 ),
                 "dictionary_resolution_required": bool(schema_field.get("dictionary_id")),
                 "reason": (
-                    "Mapped from the user-confirmed supplier truth source."
-                    if selected["source"] in _SUPPLIER_TRUTH_SOURCES
-                    else "Mapped from frozen Ozon reference evidence."
+                    "Mapped from user-confirmed package evidence."
+                    if selected["source"] == "user_confirmed_pricing_evidence"
+                    else (
+                        "Mapped from the user-confirmed supplier truth source."
+                        if selected["source"] in _SUPPLIER_TRUTH_SOURCES
+                        else "Mapped from frozen Ozon reference evidence."
+                    )
                 ),
             }
         )
@@ -300,6 +330,7 @@ def _collect_evidence(
     *,
     supplier_product: dict[str, Any] | None,
     supplier_selection: dict[str, Any] | None,
+    pricing_evidence: dict[str, Any] | None,
 ) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
 
@@ -322,6 +353,19 @@ def _collect_evidence(
         )
 
     add("Бренд", ozon_candidate.get("brand"), "ozon_structured", "ozon.brand", 50)
+    for key, label in (
+        ("package_weight_g", "Вес с упаковкой, г"),
+        ("package_length_cm", "Длина упаковки, см"),
+        ("package_width_cm", "Ширина упаковки, см"),
+        ("package_height_cm", "Высота упаковки, см"),
+    ):
+        add(
+            label,
+            (pricing_evidence or {}).get(key),
+            "user_confirmed_pricing_evidence",
+            f"pricing_evidence.inputs.{key}",
+            1,
+        )
     target_sku = ozon_candidate.get("target_sku") or {}
     for label, value in _mapping_items(target_sku.get("selected_options")):
         add(label, value, "ozon_selected_sku", f"ozon.target_sku.selected_options.{label}", 60)

@@ -17,6 +17,7 @@ from ozon_v2.domain.supplier_sku import SupplierSkuOption, SupplierSkuSelectionR
 from ozon_v2.images.contracts import SubjectMasterSelection
 from ozon_v2.images.queue import ImageGenerationQueue
 from ozon_v2.services.collection_contract_service import CollectionContractService
+from ozon_v2.services.attribute_mapping_service import map_template_attributes
 from ozon_v2.services.workbench_service import WorkbenchService
 from ozon_v2.workbench.local_server import create_handler
 
@@ -204,6 +205,78 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         }
         self.repo.save_subject_masters(run_id, {"run_id": run_id, "items": subject_items})
         return job
+
+    def test_pricing_evidence_round_trips_without_touching_other_batch_files(
+        self,
+    ) -> None:
+        run = self.repo.create_workbench_batch_record(target_count=1)
+        payload = {
+            "schema_version": 1,
+            "run_id": run["run_id"],
+            "items": {"seed-1": {"status": "confirmed"}},
+        }
+
+        saved_path = self.repo.save_pricing_evidence(run["run_id"], payload)
+
+        self.assertEqual(saved_path.name, "pricing_evidence.json")
+        self.assertEqual(
+            self.repo.load_pricing_evidence(run["run_id"]),
+            payload,
+        )
+        self.assertTrue((self.repo.run_dir(run["run_id"]) / "run.json").exists())
+
+    def test_pricing_settings_use_fixed_store_defaults_and_round_trip(self) -> None:
+        defaults = self.repo.load_pricing_settings()
+        self.assertEqual(defaults["commission_rate"], "0.15")
+        self.assertEqual(defaults["packaging_fee_cny"], "2.00")
+        self.assertEqual(defaults["rub_per_cny"], "12")
+
+        updated = {**defaults, "rub_per_cny": "12.5"}
+        saved_path = self.repo.save_pricing_settings(updated)
+
+        self.assertEqual(saved_path.name, "pricing_settings.json")
+        self.assertEqual(self.repo.load_pricing_settings(), updated)
+
+    def test_package_weight_maps_only_to_package_weight_field(self) -> None:
+        result = map_template_attributes(
+            [
+                {
+                    "attribute_id": 1,
+                    "attribute_label": "Вес с упаковкой, г",
+                    "is_required": False,
+                },
+                {
+                    "attribute_id": 2,
+                    "attribute_label": "Вес товара, г",
+                    "is_required": False,
+                },
+                {
+                    "attribute_id": 3,
+                    "attribute_label": "Длина упаковки, см",
+                    "is_required": False,
+                },
+                {
+                    "attribute_id": 4,
+                    "attribute_label": "Длина, мм",
+                    "is_required": False,
+                },
+            ],
+            {},
+            pricing_evidence={
+                "package_weight_g": "380",
+                "package_length_cm": "28",
+            },
+        )
+
+        fields = {field["field_key"]: field for field in result["fields"]}
+        self.assertEqual(fields["1"]["value"], "380")
+        self.assertEqual(
+            fields["1"]["source"],
+            "user_confirmed_pricing_evidence",
+        )
+        self.assertEqual(fields["2"]["status"], "missing_fact")
+        self.assertEqual(fields["3"]["value"], "28")
+        self.assertEqual(fields["4"]["status"], "missing_fact")
 
     def test_home_page_loads(self) -> None:
         body = self.get_text("/")

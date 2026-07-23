@@ -45,6 +45,23 @@ def test_first_product_uses_guoo_standard_and_rounds_up_to_dot_90() -> None:
     assert quote.iterations == 2
 
 
+def test_pricing_policy_round_trips_as_decimal_strings() -> None:
+    policy = PricingPolicy.default()
+
+    payload = policy.to_dict()
+
+    assert payload == {
+        "commission_rate": "0.15",
+        "packaging_fee_cny": "2.00",
+        "rub_per_cny": "12",
+        "old_price_discount_rate": "0.80",
+        "freight_rule_version": "2026-05-20",
+        "logistics_channel": "guoo_land_air_standard",
+        "rounding_policy": "round_up_to_dot_90",
+    }
+    assert PricingPolicy.from_mapping(payload) == policy
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [

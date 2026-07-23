@@ -88,6 +88,8 @@ class PricingPolicy:
     rub_per_cny: Decimal
     old_price_discount_rate: Decimal
     freight_rule_version: str
+    logistics_channel: str = "guoo_land_air_standard"
+    rounding_policy: str = "round_up_to_dot_90"
 
     @classmethod
     def default(cls) -> "PricingPolicy":
@@ -98,6 +100,43 @@ class PricingPolicy:
             old_price_discount_rate=Decimal("0.80"),
             freight_rule_version="2026-05-20",
         )
+
+    @classmethod
+    def from_mapping(cls, payload: dict[str, Any]) -> "PricingPolicy":
+        return cls(
+            commission_rate=_decimal(
+                payload.get("commission_rate"), "commission_rate"
+            ),
+            packaging_fee_cny=_decimal(
+                payload.get("packaging_fee_cny"), "packaging_fee_cny"
+            ),
+            rub_per_cny=_decimal(payload.get("rub_per_cny"), "rub_per_cny"),
+            old_price_discount_rate=_decimal(
+                payload.get("old_price_discount_rate"),
+                "old_price_discount_rate",
+            ),
+            freight_rule_version=str(
+                payload.get("freight_rule_version") or ""
+            ).strip(),
+            logistics_channel=str(
+                payload.get("logistics_channel")
+                or "guoo_land_air_standard"
+            ).strip(),
+            rounding_policy=str(
+                payload.get("rounding_policy") or "round_up_to_dot_90"
+            ).strip(),
+        )
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "commission_rate": str(self.commission_rate),
+            "packaging_fee_cny": str(self.packaging_fee_cny),
+            "rub_per_cny": str(self.rub_per_cny),
+            "old_price_discount_rate": str(self.old_price_discount_rate),
+            "freight_rule_version": self.freight_rule_version,
+            "logistics_channel": self.logistics_channel,
+            "rounding_policy": self.rounding_policy,
+        }
 
 
 @dataclass(frozen=True)

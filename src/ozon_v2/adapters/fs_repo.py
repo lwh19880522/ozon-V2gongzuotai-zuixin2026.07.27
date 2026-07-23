@@ -12,6 +12,7 @@ from typing import Any, Iterable
 
 from ozon_v2.app.context import AppContext, build_default_context
 from ozon_v2.domain.credentials import CredentialStatus, SellerCredentials
+from ozon_v2.domain.pricing import PricingPolicy
 from ozon_v2.domain.models import (
     CollectionPair,
     ExistingStoreProduct,
@@ -75,6 +76,10 @@ class FsRepo:
     @property
     def credentials_template_path(self) -> Path:
         return self.config_dir / "seller_credentials.template.json"
+
+    @property
+    def pricing_settings_path(self) -> Path:
+        return self.config_dir / "pricing_settings.json"
 
     @property
     def credential_assistant_state_path(self) -> Path:
@@ -469,6 +474,23 @@ class FsRepo:
 
     def load_supplier_sku_selections(self, run_id: str) -> dict[str, Any]:
         return self._read_json(self.run_dir(run_id) / "supplier_sku_selections.json")
+
+    def save_pricing_settings(self, payload: dict[str, Any]) -> Path:
+        self._write_json(self.pricing_settings_path, payload)
+        return self.pricing_settings_path
+
+    def load_pricing_settings(self) -> dict[str, Any]:
+        if not self.pricing_settings_path.exists():
+            return PricingPolicy.default().to_dict()
+        return self._read_json(self.pricing_settings_path)
+
+    def save_pricing_evidence(self, run_id: str, payload: dict[str, Any]) -> Path:
+        path = self.run_dir(run_id) / "pricing_evidence.json"
+        self._write_json(path, payload)
+        return path
+
+    def load_pricing_evidence(self, run_id: str) -> dict[str, Any]:
+        return self._read_json(self.run_dir(run_id) / "pricing_evidence.json")
 
     def save_subject_masters(self, run_id: str, payload: dict[str, Any]) -> Path:
         path = self.run_dir(run_id) / "subject_masters.json"
