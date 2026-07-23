@@ -57,3 +57,12 @@ def test_image_controller_dispatches_user_selected_repairs_without_reopening_fro
     assert "review_note" in text
     assert "only the explicitly selected slots" in text
     assert "Never reopen or regenerate an unselected `accepted` slot" in text
+
+
+def test_image_controller_is_a_peer_phase_of_intelligent_field_drafting() -> None:
+    text = SKILL_PATH.read_text(encoding="utf-8")
+
+    assert "skills/ozon-intelligent-field-drafter/SKILL.md" in text
+    assert "peer executors" in text
+    assert "must not change field decisions" in text
+    assert "per-product upload gate" in text

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ozon Intelligent Field Drafter"
+  short_description: "Fill Ozon drafts from verified product evidence"
+  default_prompt: "Use $ozon-intelligent-field-drafter to complete evidence-backed fields for the current Ozon V2 batch."

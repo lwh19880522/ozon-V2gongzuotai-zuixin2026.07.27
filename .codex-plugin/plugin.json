@@ -1,7 +1,7 @@
 {
   "name": "ozon-v2-ops-controller",
-  "version": "0.2.0",
-  "description": "Ozon V2 controller for deduped collection, real supplier SKU review, and verified image queues.",
+  "version": "0.3.0",
+  "description": "Ozon V2 controller for verified collection, intelligent field drafting, and evidence-locked image generation.",
   "author": {
     "name": "Ozon V2"
   },
@@ -11,14 +11,15 @@
     "automation",
     "mcp",
     "collection",
+    "field-drafting",
     "image-generation",
     "supplier-sku"
   ],
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Ozon V2 Ops Controller",
-    "shortDescription": "Verified Ozon collection and image workbench.",
-    "longDescription": "Controls Ozon V2 collection runs, real supplier SKU selection, locked subject masters, and a resumable dynamic pool of up to five subagents with any sixth child slot reserved.",
+    "shortDescription": "Verified Ozon fields and image workbench.",
+    "longDescription": "Coordinates Ozon V2 collection, evidence-backed field drafting, real supplier SKU selection, and resumable image generation through a dynamic pool of up to five subagents as one per-product workflow with upload and publish gates.",
     "developerName": "Ozon V2",
     "category": "Productivity",
     "capabilities": [
@@ -29,6 +30,8 @@
       "Run Ozon V2 doctor.",
       "Start a deduped seed-gated Ozon V2 run.",
       "Show Ozon V2 run status.",
+      "Use $ozon-intelligent-field-drafter to complete evidence-backed product fields for an Ozon V2 batch.",
+      "Use $ozon-image-generation-controller to process the verified image queue for an Ozon V2 batch.",
       "Process the next verified Ozon image job."
     ],
     "brandColor": "#2563EB"

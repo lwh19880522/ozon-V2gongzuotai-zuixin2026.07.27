@@ -1481,6 +1481,64 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertTrue(selected["ok"])
         self.assertTrue(selected["data"]["selection_status"]["complete"])
 
+    def test_supplier_selection_capture_recovers_skus_from_specification_matrix(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        supplier_product = self.supplier_product_payload(seed.seed_id)
+        supplier_product["sku"] = {
+            "selected_options": {"visible_sku_labels": ["单一 SKU（页面无可选规格）"]},
+            "evidence": "no_visible_variant_selector",
+            "evidence_source": "dom_option_labels",
+            "complete": False,
+        }
+        supplier_product["sku_options"] = []
+        supplier_product["sku_groups"] = []
+        supplier_product["attributes"] = {
+            "品牌": "梅芳",
+            "刃口材质": "碳钢",
+            "型号": "全长(mm)",
+            "1018（6寸鸡眼钳带锁扣）": "135",
+            "1020（9寸多功能三合一皮带打孔钳）": "210",
+            "1022A（耐用升级款）": "300",
+            "1022D（红柄打孔钳）": ".",
+            "产品规格": "全长(mm)",
+            "全长": "全部 135 210 300",
+            "打孔直径": "全部 2.5 3.0 展开参数",
+        }
+
+        result = self.post_json(
+            f"/api/batches/{run_id}/supplier-selection/capture",
+            {
+                "channel_index": 0,
+                "seed_id": seed.seed_id,
+                "ozon_product_id": "ozon-1",
+                "supplier_product": supplier_product,
+            },
+        )
+        review = self.get_json(f"/api/batches/{run_id}/supplier-review")
+        item = review["data"]["items"][0]
+        options = item["supplier_sku_options"]
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(3, len(options))
+        target = next(option for option in options if option["selected_options"]["型号"] == "1020")
+        self.assertEqual(
+            {"型号": "1020", "规格": "9寸多功能三合一皮带打孔钳", "全长": "210毫米"},
+            target["selected_options"],
+        )
+        self.assertEqual("dom_specification_table", target["evidence_source"])
+        self.assertTrue(target["complete"])
+        decision = WorkbenchService(self.repo)._supplier_sku_decision(
+            {"title": "Пробойник", "attributes": {"Длина, мм": "210"}},
+            options,
+        )
+        self.assertEqual(target["supplier_sku_id"], decision["recommended_sku_id"])
+        stored = self.repo.load_supplier_collection_result(run_id)["supplier_products"][0]
+        self.assertNotIn("型号", stored["attributes"])
+        self.assertNotIn("1020（9寸多功能三合一皮带打孔钳）", stored["attributes"])
+        self.assertNotIn("1022D（红柄打孔钳）", stored["attributes"])
+        self.assertNotIn("产品规格", stored["attributes"])
+        self.assertNotIn("全长", stored["attributes"])
+
     def test_supplier_browser_result_is_ingested_and_waits_for_collection_review(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
         supplier_url = "https://detail.1688.com/offer/123456789012.html"
@@ -1578,7 +1636,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
     def test_extension_manifest_registers_1688_supplier_content_script(self) -> None:
         manifest_path = self.project_root / "browser_extension" / "ozon_v2_bridge" / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self.assertEqual("0.1.60", manifest["version"])
+        self.assertEqual("0.1.61", manifest["version"])
 
         supplier_scripts = [
             item
@@ -2304,6 +2362,10 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn("逐商品上传门禁", page)
         self.assertIn("合格商品不等待整批", page)
         self.assertIn("类目模板自动映射结果", page)
+        self.assertIn("全部模板字段", page)
+        self.assertIn("待原创", page)
+        self.assertIn("缺少事实", page)
+        self.assertIn("未提供可选素材", page)
         self.assertIn("required_attributes", page)
         self.assertIn("ready_to_build_count", page)
         self.assertIn("item.blocking_gates", page)
@@ -2424,6 +2486,15 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual(1, draft["prepared_product_count"])
         self.assertEqual([seed.seed_id], [item["seed_id"] for item in draft["items"]])
         self.assertEqual("85", draft["items"][0]["attributes"][0]["attribute_id"])
+        self.assertEqual(90, draft["items"][0]["content_optimization"]["target_score"])
+        self.assertEqual(
+            ready_candidate["attributes"],
+            draft["items"][0]["content_optimization"]["objective_evidence"]["ozon_attributes"],
+        )
+        self.assertIn(
+            "ozon_content_score_evidence",
+            draft["items"][0]["content_optimization"]["objective_evidence"],
+        )
         self.assertTrue((self.repo.run_dir(run_id) / "upload_draft.json").exists())
 
     def test_upload_workspace_bulk_maps_required_template_fields_from_evidence(self) -> None:
@@ -2437,6 +2508,10 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             "Тип": "Щетка для уборки",
             "Артикул": "MODEL-42",
             "Цвет": "Белый",
+        }
+        candidate["content_score_evidence"]["attribute_table"] = {
+            **candidate["attributes"],
+            "Ширина, мм": "120",
         }
         self.repo.save_ozon_collection_result(run_id, ozon_result)
 
@@ -2456,6 +2531,10 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
                 "is_required": True,
             },
             {"attribute_id": "10096", "attribute_label": "Цвет товара", "is_required": False},
+            {"attribute_id": "9799", "attribute_label": "Ширина, мм", "is_required": False},
+            {"attribute_id": "4180", "attribute_label": "Название", "is_required": False},
+            {"attribute_id": "4191", "attribute_label": "Аннотация", "is_required": False},
+            {"attribute_id": "11254", "attribute_label": "Rich-контент JSON", "is_required": False},
         ]
         self.repo.save_attribute_template_result(run_id, template_result)
 
@@ -2463,7 +2542,9 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         item = workspace["items"][0]
         mapped = {field["field_key"]: field for field in item["attribute_mapping"]}
 
-        self.assertEqual(4, item["mapped_attribute_count"])
+        self.assertEqual(5, item["mapped_attribute_count"])
+        self.assertEqual(3, item["rewrite_required_count"])
+        self.assertEqual(3, workspace["gates"]["rewrite_required_count"])
         self.assertEqual(3, item["required_mapped_count"])
         self.assertEqual([], item["missing_required_fields"])
         self.assertTrue(item["required_attributes_ready"])
@@ -2472,6 +2553,232 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual("MODEL-42", mapped["9048"]["value"])
         self.assertEqual("ozon.attributes.Артикул", mapped["9048"]["evidence_ref"])
         self.assertEqual("Белый", mapped["10096"]["value"])
+        self.assertEqual("120", mapped["9799"]["value"])
+        self.assertEqual("rewrite_required", mapped["4180"]["status"])
+        self.assertEqual("rewrite_required", mapped["4191"]["status"])
+        self.assertEqual("rewrite_required", mapped["11254"]["status"])
+
+    def test_ozon_content_tasks_recreate_creative_fields_from_collected_evidence(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        ozon_result = self.repo.load_ozon_collection_result(run_id)
+        candidate = ozon_result["ozon_candidates"][0]
+        candidate["brand"] = "PRO SEWING"
+        candidate["title"] = "Исходный дырокол для кожи 3 в 1"
+        candidate["attributes"] = {
+            "Тип": "Пробойник для кожи",
+            "Материал": "Сталь",
+            "Длина, мм": "210",
+        }
+        candidate["content_score_evidence"]["attribute_table"] = dict(candidate["attributes"])
+        candidate["content_score_evidence"]["description_or_rich_content_blocks"] = [
+            "Исходное описание карточки Ozon для стилевого и структурного анализа."
+        ]
+        self.repo.save_ozon_collection_result(run_id, ozon_result)
+
+        template_result = self.repo.load_attribute_template_result(run_id)
+        template = template_result["seed_templates"][0]
+        template["upload_attribute_schema"] = [
+            {"attribute_id": "85", "attribute_label": "Бренд", "is_required": True},
+            {"attribute_id": "4180", "attribute_label": "Название", "is_required": False},
+            {"attribute_id": "4191", "attribute_label": "Аннотация", "is_required": False},
+            {"attribute_id": "23171", "attribute_label": "#Хештеги", "is_required": False},
+            {"attribute_id": "11254", "attribute_label": "Rich-контент JSON", "is_required": False},
+        ]
+        self.repo.save_attribute_template_result(run_id, template_result)
+
+        pending_workspace = self.get_json(f"/api/batches/{run_id}/upload")["data"]
+        pending_item = pending_workspace["items"][0]
+        self.assertFalse(pending_item["original_content_ready"])
+        self.assertIn("original_content", pending_item["blocking_gates"])
+        self.assertEqual(0, pending_workspace["gates"]["original_content_ready_count"])
+
+        tasks = self.get_json(f"/api/batches/{run_id}/content-tasks")["data"]
+        self.assertEqual(1, tasks["summary"]["pending"])
+        self.assertEqual(seed.seed_id, tasks["items"][0]["seed_id"])
+        self.assertEqual(4, len(tasks["items"][0]["rewrite_fields"]))
+        self.assertEqual(candidate["attributes"], tasks["items"][0]["evidence"]["ozon_attributes"])
+        self.assertEqual(
+            candidate["content_score_evidence"],
+            tasks["items"][0]["evidence"]["ozon_content_score_evidence"],
+        )
+
+        invalid = self.post_json(
+            f"/api/batches/{run_id}/content-tasks/complete",
+            {
+                "seed_id": seed.seed_id,
+                "fields": {
+                    "4180": candidate["title"],
+                    "4191": "Коротко",
+                    "23171": "#кожа",
+                    "11254": "{}",
+                },
+            },
+            ok=False,
+        )
+        self.assertEqual("content_task.validation_failed", invalid["code"])
+
+        completed = self.post_json(
+            f"/api/batches/{run_id}/content-tasks/complete",
+            {
+                "seed_id": seed.seed_id,
+                "fields": {
+                    "4180": "Пробойник для кожи PRO SEWING, стальной инструмент 3 в 1",
+                    "4191": (
+                        "Стальной пробойник предназначен для аккуратной работы с кожей, тканью "
+                        "и резиной. Формат 3 в 1 помогает подготавливать отверстия и устанавливать "
+                        "фурнитуру, а длина инструмента составляет 210 мм."
+                    ),
+                    "23171": "#пробойник #кожа #швейныйинструмент #фурнитура",
+                    "11254": json.dumps(
+                        {
+                            "content": [
+                                {"title": "Точная работа", "text": "Стальной инструмент 3 в 1"},
+                                {"title": "Размер", "text": "Длина 210 мм"},
+                            ]
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            },
+        )["data"]
+        self.assertEqual("completed", completed["status"])
+        self.assertTrue((self.repo.run_dir(run_id) / "generated_content_result.json").exists())
+
+        refreshed_tasks = self.get_json(f"/api/batches/{run_id}/content-tasks")["data"]
+        self.assertEqual(0, refreshed_tasks["summary"]["pending"])
+        self.assertEqual(1, refreshed_tasks["summary"]["completed"])
+        item = self.get_json(f"/api/batches/{run_id}/upload")["data"]["items"][0]
+        mapped = {field["field_key"]: field for field in item["attribute_mapping"]}
+        self.assertEqual(0, item["rewrite_required_count"])
+        self.assertTrue(item["original_content_ready"])
+        self.assertNotIn("original_content", item["blocking_gates"])
+        self.assertEqual("generated_original_content", mapped["4180"]["source"])
+        self.assertEqual("mapped", mapped["11254"]["status"])
+
+        page = self.get_text(f"/batches/{run_id}/upload")
+        self.assertIn('id="contentControllerCommand"', page)
+        self.assertIn('id="copyContentControllerCommand"', page)
+        self.assertIn('id="originalContentGate"', page)
+        self.assertIn("复制整批智能字段草稿命令", page)
+        self.assertIn("$ozon-intelligent-field-drafter", page)
+        self.assertIn("skills/ozon-intelligent-field-drafter/SKILL.md", page)
+        self.assertNotIn("yandex", page.casefold())
+
+    def test_intelligent_field_tasks_cover_missing_objective_fields_and_require_evidence(
+        self,
+    ) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        ozon_result = self.repo.load_ozon_collection_result(run_id)
+        candidate = ozon_result["ozon_candidates"][0]
+        candidate["title"] = "Исходный комплект ручных инструментов"
+        candidate["attributes"] = {"Комплектация": "1 инструмент"}
+        candidate["content_score_evidence"]["attribute_table"] = dict(candidate["attributes"])
+        self.repo.save_ozon_collection_result(run_id, ozon_result)
+
+        template_result = self.repo.load_attribute_template_result(run_id)
+        template_result["seed_templates"][0]["upload_attribute_schema"] = [
+            {
+                "attribute_id": "tools-count",
+                "attribute_label": "Количество инструментов в наборе, шт.",
+                "is_required": True,
+            },
+            {
+                "attribute_id": "warranty",
+                "attribute_label": "Гарантия",
+                "is_required": False,
+            },
+            {
+                "attribute_id": "title",
+                "attribute_label": "Название",
+                "is_required": False,
+            },
+        ]
+        self.repo.save_attribute_template_result(run_id, template_result)
+
+        tasks = self.get_json(f"/api/batches/{run_id}/content-tasks")["data"]
+        task = tasks["items"][0]
+        field_tasks = {field["field_key"]: field for field in task["field_tasks"]}
+        self.assertEqual(1, tasks["summary"]["pending"])
+        self.assertEqual(3, tasks["summary"]["pending_fields"])
+        self.assertEqual("evidence_inference", field_tasks["tools-count"]["mode"])
+        self.assertEqual("evidence_inference", field_tasks["warranty"]["mode"])
+        self.assertEqual("creative_rewrite", field_tasks["title"]["mode"])
+        self.assertEqual(
+            "1 инструмент",
+            task["evidence_index"]["ozon.attributes.Комплектация"],
+        )
+
+        invalid = self.post_json(
+            f"/api/batches/{run_id}/content-tasks/complete",
+            {
+                "seed_id": seed.seed_id,
+                "fields": {
+                    "tools-count": {
+                        "decision": "filled",
+                        "value": "1",
+                        "evidence_refs": [],
+                        "reason": "Получено из комплектации.",
+                    },
+                    "warranty": {
+                        "decision": "unresolved",
+                        "reason": "Гарантия не указана в собранных данных.",
+                    },
+                    "title": (
+                        "Комплект ручных инструментов для точной работы, 1 предмет"
+                    ),
+                },
+            },
+            ok=False,
+        )
+        self.assertEqual("content_task.validation_failed", invalid["code"])
+        self.assertTrue(
+            any("evidence_refs" in error for error in invalid.get("errors", []))
+        )
+
+        completed = self.post_json(
+            f"/api/batches/{run_id}/content-tasks/complete",
+            {
+                "seed_id": seed.seed_id,
+                "fields": {
+                    "tools-count": {
+                        "decision": "filled",
+                        "value": "1",
+                        "evidence_refs": ["ozon.attributes.Комплектация"],
+                        "reason": "Количество извлечено из собранной комплектации.",
+                    },
+                    "warranty": {
+                        "decision": "unresolved",
+                        "reason": "Гарантия не указана в собранных данных Ozon и 1688.",
+                        "evidence_refs": [],
+                    },
+                    "title": (
+                        "Комплект ручных инструментов для точной работы, 1 предмет"
+                    ),
+                },
+            },
+        )["data"]
+        self.assertEqual("completed", completed["status"])
+        self.assertEqual(1, completed["unresolved_field_count"])
+
+        refreshed = self.get_json(f"/api/batches/{run_id}/content-tasks")["data"]
+        self.assertEqual(0, refreshed["summary"]["pending"])
+        self.assertEqual(0, refreshed["summary"]["pending_fields"])
+        self.assertEqual(1, refreshed["summary"]["unresolved_fields"])
+        workspace_item = self.get_json(f"/api/batches/{run_id}/upload")["data"]["items"][0]
+        mapped = {
+            field["field_key"]: field
+            for field in workspace_item["attribute_mapping"]
+        }
+        self.assertEqual("generated_evidence_completion", mapped["tools-count"]["source"])
+        self.assertEqual("unresolved", mapped["warranty"]["intelligence_decision"])
+        self.assertEqual("generated_original_content", mapped["title"]["source"])
+
+        page = self.get_text(f"/batches/{run_id}/upload")
+        self.assertIn("智能字段草稿", page)
+        self.assertIn("$ozon-intelligent-field-drafter", page)
+        self.assertIn("skills/ozon-intelligent-field-drafter/SKILL.md", page)
+        self.assertNotIn("mode=evidence_inference", page)
+        self.assertNotIn("JSON 为", page)
 
     def test_upload_workspace_flags_cross_domain_template_instead_of_mapping_it(self) -> None:
         run_id, _seed = self.prepare_supplier_review_run()

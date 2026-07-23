@@ -23,7 +23,10 @@ from ozon_v2.domain.state_machine import allowed_workbench_actions, transition_w
 from ozon_v2.domain.validators import validate_attribute_template_result, validate_ozon_collection_result, validate_seed_ready_for_ozon
 from ozon_v2.images.contracts import SubjectMasterSelection
 from ozon_v2.images.queue import ImageGenerationQueue, ImageRepairRequestError
-from ozon_v2.services.attribute_mapping_service import map_template_attributes
+from ozon_v2.services.attribute_mapping_service import (
+    canonical_attribute_label,
+    map_template_attributes,
+)
 from ozon_v2.services.collection_contract_service import (
     CREATIVE_FIELDS_REQUIRING_REWRITE,
     CollectionContractService,
@@ -1254,6 +1257,16 @@ class WorkbenchService:
                     for seed_id, selection in raw_selections.items()
                     if isinstance(selection, dict)
                 }
+        generated_content_items: dict[str, dict[str, Any]] = {}
+        generated_content_path = self.repo.run_dir(run_id) / "generated_content_result.json"
+        if generated_content_path.exists():
+            raw_generated_content = self.repo.load_generated_content_result(run_id).get("items", {})
+            if isinstance(raw_generated_content, dict):
+                generated_content_items = {
+                    str(seed_id): content
+                    for seed_id, content in raw_generated_content.items()
+                    if isinstance(content, dict)
+                }
         subject_path = self.repo.run_dir(run_id) / "subject_masters.json"
         subject_items = (
             self.repo.load_subject_masters(run_id).get("items", {})
@@ -1328,11 +1341,20 @@ class WorkbenchService:
                     candidate,
                     supplier_product=suppliers_by_seed.get(seed_id),
                     supplier_selection=supplier_selections.get(seed_id),
+                    rewritten_content=(
+                        (generated_content_items.get(seed_id) or {}).get("field_results")
+                        or (generated_content_items.get(seed_id) or {}).get("fields")
+                        or {}
+                    ),
                 )
                 if template_ready
                 else {
                     "fields": [],
                     "mapped_attribute_count": 0,
+                    "rewrite_required_count": 0,
+                    "missing_fact_count": 0,
+                    "not_applicable_count": 0,
+                    "excluded_attribute_count": 0,
                     "required_attribute_count": 0,
                     "required_mapped_count": 0,
                     "missing_required_fields": [],
@@ -1342,11 +1364,16 @@ class WorkbenchService:
             required_attributes_ready = bool(
                 template_ready and mapping["required_attributes_ready"]
             )
+            original_content_ready = bool(
+                template_ready and mapping["rewrite_required_count"] == 0
+            )
             blocking_gates: list[str] = []
             if not template_ready:
                 blocking_gates.append("category_template")
             elif not required_attributes_ready:
                 blocking_gates.append("required_attributes")
+            if template_ready and not original_content_ready:
+                blocking_gates.append("original_content")
             if not generated_images_ready:
                 blocking_gates.append("images")
             items.append(
@@ -1355,6 +1382,13 @@ class WorkbenchService:
                     "source_title": candidate.get("title"),
                     "source_description": (candidate.get("content_score_evidence") or {}).get("description_or_rich_content_blocks") or [],
                     "source_attributes": candidate.get("attributes") or {},
+                    "source_content_score_evidence": candidate.get("content_score_evidence") or {},
+                    "supplier_attributes": (suppliers_by_seed.get(seed_id) or {}).get("attributes") or {},
+                    "supplier_title": (suppliers_by_seed.get(seed_id) or {}).get("title"),
+                    "supplier_selected_options": (
+                        ((supplier_selections.get(seed_id) or {}).get("supplier_sku") or {}).get("selected_options")
+                        or {}
+                    ),
                     "source_image": images[0] if images else None,
                     "selected_options": (candidate.get("target_sku") or {}).get("selected_options") or {},
                     "category_path": seller_template.get("matched_category_path") or (category_candidates[0].get("category_path") if category_candidates else None),
@@ -1368,9 +1402,14 @@ class WorkbenchService:
                     "category_template_assessment": category_assessment,
                     "attribute_mapping": mapping["fields"],
                     "mapped_attribute_count": mapping["mapped_attribute_count"],
+                    "rewrite_required_count": mapping["rewrite_required_count"],
+                    "missing_fact_count": mapping["missing_fact_count"],
+                    "not_applicable_count": mapping["not_applicable_count"],
+                    "excluded_attribute_count": mapping["excluded_attribute_count"],
                     "required_mapped_count": mapping["required_mapped_count"],
                     "missing_required_fields": mapping["missing_required_fields"],
                     "required_attributes_ready": required_attributes_ready,
+                    "original_content_ready": original_content_ready,
                     "generated_images_ready": generated_images_ready,
                     "blocking_gates": blocking_gates,
                     "ready_to_build": not blocking_gates,
@@ -1395,6 +1434,9 @@ class WorkbenchService:
         required_attributes_ready = bool(items) and all(
             item["required_attributes_ready"] for item in items
         )
+        original_content_ready = bool(items) and all(
+            item["original_content_ready"] for item in items
+        )
         images_ready = bool(items) and all(
             item["generated_images_ready"] for item in items
         )
@@ -1409,7 +1451,13 @@ class WorkbenchService:
         required_attributes_ready_count = sum(
             1 for item in items if item["required_attributes_ready"]
         )
+        original_content_ready_count = sum(
+            1 for item in items if item["original_content_ready"]
+        )
         mapped_attribute_count = sum(item["mapped_attribute_count"] for item in items)
+        rewrite_required_count = sum(item["rewrite_required_count"] for item in items)
+        missing_fact_count = sum(item["missing_fact_count"] for item in items)
+        not_applicable_count = sum(item["not_applicable_count"] for item in items)
         required_mapped_count = sum(item["required_mapped_count"] for item in items)
         valid_required_attribute_count = sum(
             item["required_attribute_count"]
@@ -1434,13 +1482,18 @@ class WorkbenchService:
                 "gates": {
                     "category_template_ready": template_ready,
                     "required_attributes_ready": required_attributes_ready,
+                    "original_content_ready": original_content_ready,
                     "images_ready": images_ready,
                     "generated_image_count": generated_image_count,
                     "generated_product_count": generated_product_count,
                     "approved_product_count": approved_product_count,
                     "template_ready_count": template_ready_count,
                     "required_attributes_ready_count": required_attributes_ready_count,
+                    "original_content_ready_count": original_content_ready_count,
                     "mapped_attribute_count": mapped_attribute_count,
+                    "rewrite_required_count": rewrite_required_count,
+                    "missing_fact_count": missing_fact_count,
+                    "not_applicable_count": not_applicable_count,
                     "required_mapped_count": required_mapped_count,
                     "valid_required_attribute_count": valid_required_attribute_count,
                     "ready_to_build_count": ready_to_build_count,
@@ -1451,6 +1504,409 @@ class WorkbenchService:
                     "publish_locked": bool(run.get("publish_locked", True)),
                     "ready_to_build": ready_to_build_count > 0,
                 },
+            },
+        )
+
+    def content_tasks(self, run_id: str) -> Result:
+        workspace = self.upload_workspace(run_id)
+        if not workspace.ok:
+            return workspace
+        generated_content_path = self.repo.run_dir(run_id) / "generated_content_result.json"
+        generated_items: dict[str, dict[str, Any]] = {}
+        if generated_content_path.exists():
+            raw_items = self.repo.load_generated_content_result(run_id).get("items", {})
+            if isinstance(raw_items, dict):
+                generated_items = {
+                    str(seed_id): item
+                    for seed_id, item in raw_items.items()
+                    if isinstance(item, dict)
+                }
+
+        task_items: list[dict[str, Any]] = []
+        for item in workspace.data.get("items", []):
+            if item.get("template_ready") is not True:
+                continue
+            intelligent_fields = [
+                field
+                for field in item.get("attribute_mapping", [])
+                if field.get("status") in {"rewrite_required", "missing_fact"}
+                or field.get("source")
+                in {"generated_original_content", "generated_evidence_completion"}
+                or field.get("intelligence_decision") == "unresolved"
+            ]
+            if not intelligent_fields:
+                continue
+            seed_id = str(item.get("seed_id") or "")
+            generated = generated_items.get(seed_id) or {}
+            generated_field_results = _generated_field_results(generated)
+            evidence = {
+                "ozon_title_style_reference": item.get("source_title"),
+                "ozon_attributes": item.get("source_attributes") or {},
+                "ozon_content_score_evidence": item.get("source_content_score_evidence") or {},
+                "supplier_title": item.get("supplier_title"),
+                "supplier_attributes": item.get("supplier_attributes") or {},
+                "confirmed_supplier_sku": item.get("supplier_selected_options") or {},
+            }
+            evidence_index = _content_evidence_index(evidence)
+            supplier_truth_available = bool(
+                evidence["supplier_attributes"] or evidence["confirmed_supplier_sku"]
+            )
+            field_tasks: list[dict[str, Any]] = []
+            for field in intelligent_fields:
+                field_key = str(field.get("field_key") or "")
+                canonical_label = canonical_attribute_label(field.get("label"))
+                mode = (
+                    "creative_rewrite"
+                    if canonical_label
+                    in {"title", "description", "rich_content", "hashtags"}
+                    else "evidence_inference"
+                )
+                completed_result = generated_field_results.get(field_key)
+                field_tasks.append(
+                    {
+                        "field_key": field_key,
+                        "label": field.get("label"),
+                        "mode": mode,
+                        "status": (
+                            "completed"
+                            if completed_result is not None
+                            else "pending"
+                        ),
+                        "decision": (
+                            completed_result.get("decision")
+                            if completed_result
+                            else None
+                        ),
+                        "required": field.get("required") is True,
+                        "attribute_type": field.get("attribute_type"),
+                        "dictionary_id": field.get("dictionary_id"),
+                        "current_mapping_status": field.get("status"),
+                        "reference_evidence": field.get("reference_evidence", []),
+                        "supplier_truth_required": bool(
+                            supplier_truth_available
+                            and canonical_label in {"brand", "model", "article", "color"}
+                        ),
+                    }
+                )
+            pending_field_count = sum(
+                1 for field in field_tasks if field["status"] == "pending"
+            )
+            unresolved_field_count = sum(
+                1 for field in field_tasks if field.get("decision") == "unresolved"
+            )
+            task_items.append(
+                {
+                    "seed_id": seed_id,
+                    "status": "pending" if pending_field_count else "completed",
+                    "target_score": 90,
+                    "category_path": item.get("category_path"),
+                    "field_tasks": field_tasks,
+                    "rewrite_fields": [
+                        {
+                            "field_key": field.get("field_key"),
+                            "label": field.get("label"),
+                            "attribute_type": field.get("attribute_type"),
+                            "reference_evidence": field.get("reference_evidence", []),
+                        }
+                        for field in intelligent_fields
+                        if canonical_attribute_label(field.get("label"))
+                        in {"title", "description", "rich_content", "hashtags"}
+                    ],
+                    "evidence": evidence,
+                    "evidence_index": evidence_index,
+                    "rules": {
+                        "language": "ru-RU",
+                        "use_ozon_structure_as_reference": True,
+                        "copy_ozon_text_verbatim": False,
+                        "supplier_truth_overrides_ozon": True,
+                        "unsupported_claims_forbidden": True,
+                        "complete_all_pending_fields": True,
+                        "objective_values_require_evidence_refs": True,
+                        "unverifiable_fields_must_be_unresolved": True,
+                    },
+                    "completed_fields": generated.get("fields") or {},
+                    "completed_field_results": generated_field_results,
+                    "pending_field_count": pending_field_count,
+                    "unresolved_field_count": unresolved_field_count,
+                }
+            )
+
+        pending = sum(1 for item in task_items if item["status"] == "pending")
+        completed = sum(1 for item in task_items if item["status"] == "completed")
+        pending_fields = sum(item["pending_field_count"] for item in task_items)
+        unresolved_fields = sum(item["unresolved_field_count"] for item in task_items)
+        completed_fields = sum(
+            len(item["field_tasks"]) - item["pending_field_count"]
+            for item in task_items
+        )
+        return Result.success(
+            "content_tasks.loaded",
+            "Intelligent field-draft tasks loaded from Ozon and supplier evidence.",
+            {
+                "run_id": run_id,
+                "summary": {
+                    "total": len(task_items),
+                    "pending": pending,
+                    "completed": completed,
+                    "pending_fields": pending_fields,
+                    "completed_fields": completed_fields,
+                    "unresolved_fields": unresolved_fields,
+                    "target_score": 90,
+                },
+                "items": task_items,
+                "boundaries": {
+                    "code_changes": False,
+                    "image_generation": False,
+                    "upload": False,
+                    "publish_approval": False,
+                },
+            },
+        )
+
+    def complete_content_task(self, run_id: str, payload: dict[str, Any]) -> Result:
+        tasks = self.content_tasks(run_id)
+        if not tasks.ok:
+            return tasks
+        seed_id = str(payload.get("seed_id") or "").strip()
+        task = next(
+            (
+                item
+                for item in tasks.data.get("items", [])
+                if str(item.get("seed_id") or "") == seed_id
+            ),
+            None,
+        )
+        if task is None:
+            return Result.failure(
+                "content_task.not_found",
+                "No Ozon content task exists for this product.",
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+        raw_fields = payload.get("fields")
+        fields = (
+            {str(key): value for key, value in raw_fields.items()}
+            if isinstance(raw_fields, dict)
+            else {}
+        )
+        task_fields = {
+            str(field.get("field_key") or ""): field
+            for field in task.get("field_tasks", [])
+            if str(field.get("field_key") or "")
+        }
+        expected = {
+            key: field
+            for key, field in task_fields.items()
+            if field.get("status") == "pending"
+        }
+        missing = sorted(key for key in expected if key not in fields)
+        unexpected = sorted(key for key in fields if key not in expected)
+        errors: list[str] = []
+        if missing:
+            errors.append(f"Missing intelligent field decisions: {', '.join(missing)}")
+        if unexpected:
+            errors.append(f"Unexpected template fields: {', '.join(unexpected)}")
+
+        evidence = task.get("evidence") or {}
+        evidence_index = task.get("evidence_index") or {}
+        normalized_results: dict[str, dict[str, Any]] = {}
+        for field_key, field in expected.items():
+            raw_value = fields.get(field_key)
+            mode = str(field.get("mode") or "")
+            if isinstance(raw_value, dict):
+                decision = str(raw_value.get("decision") or "").strip()
+                value = raw_value.get("value")
+                evidence_refs = raw_value.get("evidence_refs")
+                reason = str(raw_value.get("reason") or "").strip()
+            elif mode == "creative_rewrite" and _has_content_value(raw_value):
+                decision = "filled"
+                value = raw_value
+                evidence_refs = []
+                reason = "Original Russian content generated from collected evidence."
+            else:
+                decision = ""
+                value = None
+                evidence_refs = []
+                reason = ""
+            evidence_refs = (
+                [
+                    str(reference)
+                    for reference in evidence_refs
+                    if str(reference or "").strip()
+                ]
+                if isinstance(evidence_refs, list)
+                else []
+            )
+            label = str(field.get("label") or field_key)
+            if decision not in {"filled", "unresolved"}:
+                errors.append(
+                    f"{label}: decision must be filled or unresolved."
+                )
+                continue
+            if decision == "unresolved":
+                if mode == "creative_rewrite":
+                    errors.append(f"{label}: creative content must be completed.")
+                if len(reason) < 10:
+                    errors.append(
+                        f"{label}: unresolved decisions require a concrete reason."
+                    )
+                if _has_content_value(value):
+                    errors.append(
+                        f"{label}: unresolved decisions must not contain a value."
+                    )
+            else:
+                if not _has_content_value(value):
+                    errors.append(f"{label}: a filled decision requires a value.")
+                if mode == "evidence_inference":
+                    if not evidence_refs:
+                        errors.append(
+                            f"{label}: evidence_refs are required for objective fields."
+                        )
+                    unknown_refs = [
+                        reference
+                        for reference in evidence_refs
+                        if reference not in evidence_index
+                    ]
+                    if unknown_refs:
+                        errors.append(
+                            f"{label}: unknown evidence_refs: {', '.join(unknown_refs)}"
+                        )
+                    if field.get("supplier_truth_required") is True and not any(
+                        reference.startswith(
+                            ("supplier.", "supplier_selection.")
+                        )
+                        for reference in evidence_refs
+                    ):
+                        errors.append(
+                            f"{label}: supplier identity requires a 1688 evidence_ref."
+                        )
+            normalized_results[field_key] = {
+                "decision": decision,
+                "value": value,
+                "evidence_refs": evidence_refs,
+                "reason": reason,
+                "mode": mode,
+                "label": label,
+            }
+
+        source_title = str(evidence.get("ozon_title_style_reference") or "")
+        description_blocks = (
+            (evidence.get("ozon_content_score_evidence") or {}).get(
+                "description_or_rich_content_blocks"
+            )
+            or []
+        )
+        normalized_source_title = _normalize_content_text(source_title)
+        normalized_source_blocks = {
+            _normalize_content_text(value)
+            for value in description_blocks
+            if _has_content_value(value)
+        }
+        for field_key, field in expected.items():
+            if str(field.get("mode") or "") != "creative_rewrite":
+                continue
+            field_result = normalized_results.get(field_key) or {}
+            if field_result.get("decision") != "filled":
+                continue
+            label = str(field.get("label") or field_key)
+            value = field_result.get("value")
+            if not _has_content_value(value):
+                continue
+            text_value = str(value).strip()
+            normalized_label = _normalize_content_text(label)
+            normalized_value = _normalize_content_text(text_value)
+            if not re.search(r"[А-Яа-яЁё]", text_value):
+                errors.append(f"{label}: Russian text is required.")
+            if normalized_label == "название":
+                if not 20 <= len(text_value) <= 200:
+                    errors.append(f"{label}: length must be 20-200 characters.")
+                if normalized_source_title and normalized_value == normalized_source_title:
+                    errors.append(f"{label}: must be recreated, not copied from Ozon.")
+            elif normalized_label in {"аннотация", "описание"}:
+                if not 120 <= len(text_value) <= 5000:
+                    errors.append(f"{label}: length must be 120-5000 characters.")
+                if normalized_value in normalized_source_blocks:
+                    errors.append(f"{label}: must be recreated, not copied from Ozon.")
+            elif "rich" in normalized_label:
+                try:
+                    rich_content = json.loads(text_value)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    errors.append(f"{label}: valid JSON is required.")
+                else:
+                    if not isinstance(rich_content, (dict, list)) or not rich_content:
+                        errors.append(f"{label}: JSON content must not be empty.")
+            elif "хештег" in normalized_label:
+                if len(re.findall(r"#[\wА-Яа-яЁё]+", text_value)) < 3:
+                    errors.append(f"{label}: at least three relevant Russian hashtags are required.")
+
+        if errors:
+            return Result.failure(
+                "content_task.validation_failed",
+                "Intelligent field draft did not pass evidence and originality validation.",
+                errors=errors,
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+
+        result_path = self.repo.run_dir(run_id) / "generated_content_result.json"
+        if result_path.exists():
+            result_payload = self.repo.load_generated_content_result(run_id)
+        else:
+            result_payload = {"schema_version": 1, "run_id": run_id, "items": {}}
+        result_items = result_payload.get("items")
+        if not isinstance(result_items, dict):
+            result_items = {}
+            result_payload["items"] = result_items
+        existing_item = (
+            result_items.get(seed_id)
+            if isinstance(result_items.get(seed_id), dict)
+            else {}
+        )
+        stored_field_results = _generated_field_results(existing_item)
+        stored_field_results.update(normalized_results)
+        flattened_fields = {
+            key: result.get("value")
+            for key, result in stored_field_results.items()
+            if result.get("decision") == "filled"
+            and _has_content_value(result.get("value"))
+        }
+        completed_at = utc_now_iso()
+        result_items[seed_id] = {
+            "status": "completed",
+            "target_score": 90,
+            "fields": flattened_fields,
+            "field_results": stored_field_results,
+            "completed_at": completed_at,
+            "evidence_policy": "ozon_structure_reference_plus_verified_product_facts",
+        }
+        result_payload["schema_version"] = 2
+        result_payload["updated_at"] = completed_at
+        path = self.repo.save_generated_content_result(run_id, result_payload)
+        unresolved_field_count = sum(
+            1
+            for result in stored_field_results.values()
+            if result.get("decision") == "unresolved"
+        )
+        self.repo.append_run_event(
+            run_id,
+            "content_task.completed",
+            "Evidence-constrained intelligent field draft was validated and saved without publishing.",
+            {
+                "seed_id": seed_id,
+                "field_keys": sorted(expected),
+                "unresolved_field_count": unresolved_field_count,
+                "target_score": 90,
+                "result_path": str(path),
+            },
+        )
+        return Result.success(
+            "content_task.completed",
+            "Intelligent field draft was validated and saved.",
+            {
+                "run_id": run_id,
+                "seed_id": seed_id,
+                "status": "completed",
+                "field_count": len(expected),
+                "unresolved_field_count": unresolved_field_count,
+                "target_score": 90,
             },
         )
 
@@ -1531,6 +1987,37 @@ class WorkbenchService:
                     "category_path": item.get("category_path"),
                     "source_title": item.get("source_title"),
                     "attributes": draft_attributes,
+                    "content_optimization": {
+                        "target_score": 90,
+                        "status": (
+                            "rewrite_required"
+                            if any(
+                                field.get("status") == "rewrite_required"
+                                for field in item.get("attribute_mapping", [])
+                            )
+                            else "not_required"
+                        ),
+                        "rewrite_fields": [
+                            {
+                                "field_key": field.get("field_key"),
+                                "label": field.get("label"),
+                                "reference_evidence": field.get("reference_evidence", []),
+                            }
+                            for field in item.get("attribute_mapping", [])
+                            if field.get("status") == "rewrite_required"
+                        ],
+                        "objective_evidence": {
+                            "ozon_title_reference_only": item.get("source_title"),
+                            "ozon_attributes": item.get("source_attributes") or {},
+                            "ozon_content_score_evidence": item.get("source_content_score_evidence") or {},
+                            "supplier_attributes": item.get("supplier_attributes") or {},
+                            "confirmed_supplier_sku": item.get("supplier_selected_options") or {},
+                        },
+                        "policy": (
+                            "Generate original Russian content from verified facts. "
+                            "Do not copy Ozon title, description, or rich content."
+                        ),
+                    },
                     "image_job_id": item.get("image_job_id"),
                     "reviewed_image_urls": item.get("generated_image_urls", []),
                 }
@@ -4136,25 +4623,52 @@ class WorkbenchService:
         unit_aliases = {
             "мл": "ml",
             "ml": "ml",
+            "毫升": "ml",
             "мм": "mm",
             "mm": "mm",
+            "毫米": "mm",
             "см": "cm",
             "cm": "cm",
+            "厘米": "cm",
             "кг": "kg",
             "kg": "kg",
+            "千克": "kg",
             "л": "l",
             "l": "l",
+            "升": "l",
             "г": "g",
             "g": "g",
+            "克": "g",
             "м": "m",
             "m": "m",
+            "米": "m",
         }
-        units = "мл|ml|мм|mm|см|cm|кг|kg|л|l|г|g|м|m"
+        units = "毫升|毫米|厘米|千克|мл|ml|мм|mm|см|cm|кг|kg|升|л|l|克|г|g|米|м|m"
         tokens: set[str] = set()
 
         def number_text(raw: str) -> str:
             number = float(raw.replace(",", "."))
             return str(int(number)) if number.is_integer() else str(number)
+
+        label_unit_pattern = re.compile(
+            rf"(?<![a-zа-я])({units})(?![a-zа-я])",
+            re.I,
+        )
+
+        def collect_labeled_measurements(raw: Any) -> None:
+            if isinstance(raw, dict):
+                for raw_label, raw_value in raw.items():
+                    unit_match = label_unit_pattern.search(str(raw_label).lower())
+                    if unit_match and isinstance(raw_value, (str, int, float)):
+                        unit = unit_aliases[unit_match.group(1).lower()]
+                        for raw_number in re.findall(r"\d+(?:[.,]\d+)?", str(raw_value)):
+                            tokens.add(f"{number_text(raw_number)}{unit}")
+                    collect_labeled_measurements(raw_value)
+            elif isinstance(raw, (list, tuple, set)):
+                for item in raw:
+                    collect_labeled_measurements(item)
+
+        collect_labeled_measurements(value)
 
         series_pattern = re.compile(
             rf"(?<!\d)((?:\d+(?:[.,]\d+)?\s*[/×xх]\s*)+\d+(?:[.,]\d+)?)\s*({units})(?![a-zа-я])",
@@ -4250,6 +4764,22 @@ class WorkbenchService:
     ) -> tuple[dict[str, Any], list[str]]:
         normalized = dict(product)
         raw_options = product.get("sku_options") if isinstance(product.get("sku_options"), list) else []
+        recovered_options, cleaned_attributes = WorkbenchService._recover_specification_table_skus(product)
+        if recovered_options:
+            normalized["attributes"] = cleaned_attributes
+            if not raw_options:
+                raw_options = recovered_options
+                normalized["sku"] = {
+                    "selected_options": {
+                        "visible_sku_labels": [
+                            str(option.get("raw_label") or "")
+                            for option in recovered_options[:12]
+                        ]
+                    },
+                    "evidence": "specification_table_sku_rows",
+                    "evidence_source": "dom_specification_table",
+                    "complete": False,
+                }
         valid_options: list[dict[str, Any]] = []
         candidates: list[dict[str, Any]] = []
         errors: list[str] = []
@@ -4286,10 +4816,151 @@ class WorkbenchService:
         )
         return normalized, errors
 
+    @staticmethod
+    def _recover_specification_table_skus(
+        product: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        attributes = product.get("attributes")
+        if not isinstance(attributes, dict):
+            return [], {}
+        entries = [
+            (str(key).strip().rstrip("：:"), str(value).strip())
+            for key, value in attributes.items()
+            if str(key).strip() and str(value).strip()
+        ]
+        dimension_pattern = re.compile(
+            r"^(全长|长度|宽度|高度|直径|尺寸)\s*(?:[（(]\s*(mm|cm|毫米|厘米)\s*[)）])?$",
+            re.I,
+        )
+        header_index = -1
+        header_key = ""
+        header_value = ""
+        dimension_label = ""
+        dimension_unit = "毫米"
+        for index, (key, value) in enumerate(entries):
+            dimension_match = dimension_pattern.fullmatch(value)
+            if key not in {"型号", "款号", "货号", "产品规格"} or not dimension_match:
+                continue
+            header_index = index
+            header_key = key
+            header_value = value
+            dimension_label = dimension_match.group(1)
+            raw_unit = str(dimension_match.group(2) or "").casefold()
+            dimension_unit = "厘米" if raw_unit in {"cm", "厘米"} else "毫米"
+            break
+        if header_index < 0:
+            return [], dict(attributes)
+
+        row_pattern = re.compile(
+            r"^([a-z0-9][a-z0-9._/-]{1,31})\s*[（(]\s*(.{2,120}?)\s*[)）]$",
+            re.I,
+        )
+        value_pattern = re.compile(r"^(\d+(?:\.\d+)?)\s*(mm|cm|毫米|厘米)?$", re.I)
+        rows: list[dict[str, str]] = []
+        consumed_keys = {header_key}
+        for key, value in entries[header_index + 1 :]:
+            row_match = row_pattern.fullmatch(key)
+            value_match = value_pattern.fullmatch(value)
+            if not row_match or not value_match:
+                continue
+            raw_unit = str(value_match.group(2) or "").casefold()
+            unit = "厘米" if raw_unit in {"cm", "厘米"} else dimension_unit
+            rows.append(
+                {
+                    "source_key": key,
+                    "source_value": value,
+                    "model": row_match.group(1),
+                    "specification": row_match.group(2).strip(),
+                    "measurement": f"{value_match.group(1)}{unit}",
+                }
+            )
+            consumed_keys.add(key)
+        if len(rows) < 2:
+            return [], dict(attributes)
+
+        def is_matrix_artifact(key: Any, value: Any) -> bool:
+            clean_key = str(key).strip().rstrip("：:")
+            clean_value = str(value).strip()
+            if clean_key in consumed_keys:
+                return True
+            if clean_key in {"型号", "款号", "货号", "产品规格"} and dimension_pattern.fullmatch(clean_value):
+                return True
+            if re.match(r"^[a-z0-9][a-z0-9._/-]{1,31}\s*[（(]", clean_key, flags=re.I):
+                return True
+            return clean_value.startswith(("全部", "全选", "不限")) or clean_value.endswith(
+                ("展开参数", "收起参数")
+            )
+
+        cleaned_attributes = {
+            key: value
+            for key, value in attributes.items()
+            if not is_matrix_artifact(key, value)
+        }
+        offer_id = str(product.get("offer_id") or product.get("supplier_product_id") or "").strip()
+        if not offer_id:
+            supplier_url = str(product.get("final_url") or product.get("supplier_url") or "")
+            offer_match = re.search(r"/offer/(\d+)\.html", supplier_url)
+            offer_id = offer_match.group(1) if offer_match else ""
+        price_payload = dict(product.get("price") or {}) if isinstance(product.get("price"), dict) else {}
+        visible_price = str(price_payload.get("visible_text") or product.get("price") or "")
+        amount = str(price_payload.get("amount") or "").strip()
+        if not amount:
+            amount_match = re.search(r"\d+(?:\.\d+)?", visible_price.replace(",", ""))
+            amount = amount_match.group(0) if amount_match else ""
+        images = [
+            str(value).strip()
+            for value in (product.get("images") or [])
+            if str(value).strip()
+            and not re.search(r"\.svg(?:[?#]|$)|-55-tps-|_sum\.(?:jpg|jpeg|png|webp)(?:[?#]|$)", str(value), re.I)
+        ]
+        if not offer_id or not amount or not images:
+            return [], cleaned_attributes
+
+        options: list[dict[str, Any]] = []
+        for index, row in enumerate(rows):
+            raw_label = " / ".join(
+                [row["model"], row["specification"], row["measurement"]]
+            )
+            options.append(
+                SupplierSkuOption(
+                    supplier_sku_id=f"spec-{offer_id}-{index + 1}-{row['model']}",
+                    combination_key=raw_label,
+                    raw_label=raw_label,
+                    selected_options={
+                        "型号": row["model"],
+                        "规格": row["specification"],
+                        dimension_label: row["measurement"],
+                    },
+                    set_quantity=1,
+                    set_composition=["单件商品"],
+                    price={
+                        "currency": str(price_payload.get("currency") or "CNY"),
+                        "amount": amount,
+                    },
+                    stock={"status": "unknown", "quantity": None},
+                    image_urls=[images[0]],
+                    evidence_source="dom_specification_table",
+                    complete=True,
+                    evidence={
+                        "offer_id": offer_id,
+                        "header_key": header_key,
+                        "header_value": header_value,
+                        "source_row_key": row["source_key"],
+                        "source_row_value": row["source_value"],
+                        "recovered_from_collected_attributes": True,
+                        "price_visible_text": visible_price,
+                    },
+                ).to_dict()
+            )
+        return options, cleaned_attributes
+
     def _supplier_sku_options(self, product: dict[str, Any]) -> list[dict[str, Any]]:
         raw_options = product.get("sku_options")
         if isinstance(raw_options, list) and raw_options:
             return [dict(option) for option in raw_options if isinstance(option, dict)]
+        recovered_options, _cleaned_attributes = self._recover_specification_table_skus(product)
+        if recovered_options:
+            return recovered_options
         sku_groups = product.get("sku_groups")
         if isinstance(sku_groups, list) and sku_groups:
             return []
@@ -4388,3 +5059,86 @@ class WorkbenchService:
         run["needs_query_generation_seed_ids"] = [
             seed.seed_id for seed in seeds if not seed_has_generated_ozon_query(seed)
         ]
+
+
+def _generated_field_results(generated: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    structured = generated.get("field_results")
+    if isinstance(structured, dict):
+        return {
+            str(field_key): dict(result)
+            for field_key, result in structured.items()
+            if isinstance(result, dict)
+            and str(result.get("decision") or "") in {"filled", "unresolved"}
+        }
+    legacy_fields = generated.get("fields")
+    if not isinstance(legacy_fields, dict):
+        return {}
+    return {
+        str(field_key): {
+            "decision": "filled",
+            "value": value,
+            "evidence_refs": [],
+            "reason": "Previously validated generated content.",
+            "mode": "creative_rewrite",
+        }
+        for field_key, value in legacy_fields.items()
+        if _has_content_value(value)
+    }
+
+
+def _content_evidence_index(evidence: dict[str, Any]) -> dict[str, Any]:
+    index: dict[str, Any] = {}
+
+    def add(reference: str, value: Any) -> None:
+        if _has_content_value(value) or isinstance(value, (dict, list)):
+            if value not in (None, "", [], {}):
+                index[reference] = value
+
+    add("ozon.title", evidence.get("ozon_title_style_reference"))
+    ozon_attributes = evidence.get("ozon_attributes")
+    if isinstance(ozon_attributes, dict):
+        for label, value in ozon_attributes.items():
+            add(f"ozon.attributes.{label}", value)
+    content_evidence = evidence.get("ozon_content_score_evidence")
+    if isinstance(content_evidence, dict):
+        attribute_table = content_evidence.get("attribute_table")
+        if isinstance(attribute_table, dict):
+            for label, value in attribute_table.items():
+                add(f"ozon.content_score_evidence.attribute_table.{label}", value)
+        blocks = content_evidence.get("description_or_rich_content_blocks")
+        if isinstance(blocks, list):
+            for index_number, value in enumerate(blocks):
+                add(
+                    "ozon.content_score_evidence."
+                    f"description_or_rich_content_blocks.{index_number}",
+                    value,
+                )
+    add("supplier.title", evidence.get("supplier_title"))
+    supplier_attributes = evidence.get("supplier_attributes")
+    if isinstance(supplier_attributes, dict):
+        for label, value in supplier_attributes.items():
+            add(f"supplier.attributes.{label}", value)
+    confirmed_supplier_sku = evidence.get("confirmed_supplier_sku")
+    if isinstance(confirmed_supplier_sku, dict):
+        for label, value in confirmed_supplier_sku.items():
+            add(
+                f"supplier_selection.supplier_sku.selected_options.{label}",
+                value,
+            )
+    return index
+
+
+def _has_content_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    return True
+
+
+def _normalize_content_text(value: Any) -> str:
+    return " ".join(
+        part
+        for part in re.split(r"[^\w]+", str(value or "").casefold().replace("ё", "е"))
+        if part
+    )

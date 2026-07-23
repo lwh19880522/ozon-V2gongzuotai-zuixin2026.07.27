@@ -36,6 +36,10 @@ An already accepted slot is frozen evidence. If its receipt hash, source/output 
 
 Stop dispatching only when no eligible `pending` or `repair_pending` products remain, a system-wide queue or evidence store failure prevents all remaining work, or the user stops the batch. When stopping, report separate counts for manual review, stopped, missing SKU/subject, failed, and completed products.
 
+## Sibling field phase
+
+This controller and `skills/ozon-intelligent-field-drafter/SKILL.md` are peer executors of the same Ozon V2 workbench batch. Image workers must not change field decisions, and they must not wait for unrelated field drafting. The workbench combines accepted images and completed field decisions at each product's per-product upload gate, so one blocked product does not delay another ready product.
+
 ## Boundaries
 
 - Never upload.

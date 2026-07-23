@@ -438,6 +438,114 @@
     }];
   }
 
+  function collectTableAttributePairs() {
+    const pairs = [];
+    for (const row of document.querySelectorAll("tr")) {
+      const cells = row.querySelectorAll("th,td");
+      if (cells.length < 2) continue;
+      const key = normalizedText(textOf(cells[0], 100), 100).replace(/[：:]$/, "");
+      const value = normalizedText(textOf(cells[1], 300), 300);
+      if (key && value && key !== value) pairs.push({ key, value });
+    }
+    return pairs;
+  }
+
+  function specificationDimension(value) {
+    const match = normalizedText(value, 100).match(
+      /^(全长|长度|宽度|高度|直径|尺寸)\s*(?:[（(]\s*(mm|cm|毫米|厘米)\s*[)）])?$/i,
+    );
+    if (!match) return null;
+    const rawUnit = String(match[2] || "").toLowerCase();
+    return {
+      label: match[1],
+      unit: rawUnit === "cm" || rawUnit === "厘米" ? "厘米" : "毫米",
+    };
+  }
+
+  function specificationModelRow(key, value) {
+    const keyMatch = normalizedText(key, 180).match(
+      /^([a-z0-9][a-z0-9._/-]{1,31})\s*[（(]\s*(.{2,120}?)\s*[)）]$/i,
+    );
+    const valueMatch = normalizedText(value, 80).match(
+      /^(\d+(?:\.\d+)?)\s*(mm|cm|毫米|厘米)?$/i,
+    );
+    if (!keyMatch || !valueMatch) return null;
+    return {
+      model: keyMatch[1],
+      specification: normalizedText(keyMatch[2], 120),
+      measurement: valueMatch[1],
+      unit: String(valueMatch[2] || "").toLowerCase(),
+    };
+  }
+
+  function collectSpecificationTable(pairs = null) {
+    const sourcePairs = Array.isArray(pairs) ? pairs : collectTableAttributePairs();
+    const header = sourcePairs.map((pair, index) => ({
+      ...pair,
+      index,
+      dimension: /^(?:型号|款号|货号|产品规格)$/.test(pair.key)
+        ? specificationDimension(pair.value)
+        : null,
+    })).find((pair) => pair.dimension);
+    if (!header) return null;
+    const rows = sourcePairs.map((pair, index) => ({
+      ...pair,
+      index,
+      parsed: specificationModelRow(pair.key, pair.value),
+    })).filter((pair) => pair.parsed && pair.index > header.index);
+    if (rows.length < 2) return null;
+    return {
+      header_key: header.key,
+      header_value: header.value,
+      dimension_label: header.dimension.label,
+      unit: header.dimension.unit,
+      rows: rows.map((row) => ({ key: row.key, value: row.value, ...row.parsed })),
+      consumed_keys: new Set([header.key, ...rows.map((row) => row.key)]),
+    };
+  }
+
+  function collectSpecificationTableSkuOptions(specificationTable) {
+    if (!specificationTable || !Array.isArray(specificationTable.rows)) return [];
+    const currentOfferId = offerId(location.href);
+    const price = collectPrice();
+    const amount = visiblePriceAmount(price);
+    const images = collectImages();
+    if (!currentOfferId || !amount || !images.length) return [];
+    const soldOut = /已下架|暂时缺货|无货|售罄/.test(textOf(document.body, 100000));
+    return specificationTable.rows.map((row, index) => {
+      const rawUnit = String(row.unit || "").toLowerCase();
+      const unit = rawUnit === "cm" || rawUnit === "厘米" ? "厘米" : specificationTable.unit;
+      const measurement = `${row.measurement}${unit}`;
+      const selectedOptions = {
+        型号: row.model,
+        规格: row.specification,
+        [specificationTable.dimension_label]: measurement,
+      };
+      const rawLabel = `${row.model} / ${row.specification} / ${measurement}`;
+      return {
+        supplier_sku_id: `spec-${currentOfferId}-${stableTextId(`${row.key}|${row.value}|${index}`)}`,
+        combination_key: rawLabel,
+        raw_label: rawLabel,
+        selected_options: selectedOptions,
+        set_quantity: 1,
+        set_composition: [row.specification],
+        price: { currency: "CNY", amount },
+        stock: { status: soldOut ? "out_of_stock" : "in_stock", quantity: null },
+        image_urls: [images[0]],
+        evidence_source: "dom_specification_table",
+        complete: true,
+        evidence: {
+          offer_id: currentOfferId,
+          header_key: specificationTable.header_key,
+          header_value: specificationTable.header_value,
+          source_row_key: row.key,
+          source_row_value: row.value,
+          price_visible_text: price.visible_text,
+        },
+      };
+    });
+  }
+
   function skuPropertyDefinitions(rawProps) {
     if (!Array.isArray(rawProps)) return [];
     return rawProps.map((raw) => {
@@ -509,7 +617,7 @@
     return 1;
   }
 
-  function collectTrustedSkuOptions(visibleGroups = null) {
+  function collectTrustedSkuOptions(visibleGroups = null, specificationTable = null) {
     const options = [];
     const seen = new Set();
     for (const source of scriptSources()) {
@@ -573,7 +681,9 @@
     if (options.length) return options;
     const groups = Array.isArray(visibleGroups) ? visibleGroups : collectVisibleSkuGroups();
     const domOptions = collectDomSkuOptions(groups);
-    return domOptions.length ? domOptions : collectSingleSkuOption(groups);
+    if (domOptions.length) return domOptions;
+    const specificationOptions = collectSpecificationTableSkuOptions(specificationTable);
+    return specificationOptions.length ? specificationOptions : collectSingleSkuOption(groups);
   }
 
   function collectTitle() {
@@ -711,17 +821,24 @@
     };
   }
 
-  function collectAttributes() {
+  function collectAttributes(specificationTable = null, tablePairs = null) {
     const attributes = {};
     const add = (key, value) => {
       const cleanKey = normalizedText(key, 100).replace(/[：:]$/, "");
       const cleanValue = normalizedText(value, 300);
+      if (specificationTable && specificationTable.consumed_keys.has(cleanKey)) return;
+      if (
+        specificationTable
+        && /^(?:型号|款号|货号|产品规格)$/.test(cleanKey)
+        && specificationDimension(cleanValue)
+      ) return;
+      if (specificationTable && /^[a-z0-9][a-z0-9._/-]{1,31}\s*[（(]/i.test(cleanKey)) return;
+      if (specificationTable && /^(?:全部|全选|不限)/.test(cleanValue)) return;
+      if (specificationTable && /(?:展开参数|收起参数)$/.test(cleanValue)) return;
       if (cleanKey && cleanValue && cleanKey !== cleanValue && !attributes[cleanKey]) attributes[cleanKey] = cleanValue;
     };
-    for (const row of document.querySelectorAll("tr")) {
-      const cells = row.querySelectorAll("th,td");
-      if (cells.length >= 2) add(textOf(cells[0], 100), textOf(cells[1], 300));
-    }
+    const pairs = Array.isArray(tablePairs) ? tablePairs : collectTableAttributePairs();
+    for (const pair of pairs) add(pair.key, pair.value);
     for (const node of document.querySelectorAll("[class*='attribute'], [class*='parameter'], [class*='property']")) {
       const text = textOf(node, 500);
       const split = text.match(/^([^：:]{1,40})[：:]\s*(.{1,300})$/);
@@ -730,7 +847,7 @@
     return attributes;
   }
 
-  function collectSku(visibleGroups = null) {
+  function collectSku(visibleGroups = null, skuOptions = null) {
     const groups = Array.isArray(visibleGroups) ? visibleGroups : collectVisibleSkuGroups();
     const labels = [];
     for (const group of groups) {
@@ -738,12 +855,20 @@
         if (option.label && !labels.includes(option.label)) labels.push(option.label);
       }
     }
+    const specificationOptions = Array.isArray(skuOptions)
+      ? skuOptions.filter((option) => option.evidence_source === "dom_specification_table")
+      : [];
+    if (!labels.length && specificationOptions.length) {
+      for (const option of specificationOptions) labels.push(option.raw_label);
+    }
     return {
       selected_options: {
         visible_sku_labels: labels.length ? labels.slice(0, 12) : ["单一 SKU（页面无可选规格）"],
       },
-      evidence: labels.length ? "visible_selected_or_available_sku_labels" : "no_visible_variant_selector",
-      evidence_source: "dom_option_labels",
+      evidence: specificationOptions.length
+        ? "specification_table_sku_rows"
+        : (labels.length ? "visible_selected_or_available_sku_labels" : "no_visible_variant_selector"),
+      evidence_source: specificationOptions.length ? "dom_specification_table" : "dom_option_labels",
       complete: false,
     };
   }
@@ -751,6 +876,9 @@
   function collectProduct(item) {
     const visibleSkuGroups = collectVisibleSkuGroups();
     const skuGroups = visibleSkuGroups.length ? visibleSkuGroups : collectEmbeddedSkuGroups();
+    const tablePairs = collectTableAttributePairs();
+    const specificationTable = collectSpecificationTable(tablePairs);
+    const skuOptions = collectTrustedSkuOptions(skuGroups, specificationTable);
     return {
       seed_id: String(item.seed_id || ""),
       supplier_url: String(item.supplier_url || ""),
@@ -758,12 +886,12 @@
       offer_id: offerId(location.href),
       title: collectTitle(),
       seller: collectSeller(),
-      sku: collectSku(skuGroups),
+      sku: collectSku(skuGroups, skuOptions),
       sku_groups: skuGroups,
-      sku_options: collectTrustedSkuOptions(skuGroups),
+      sku_options: skuOptions,
       images: collectImages(),
       price: collectPrice(),
-      attributes: collectAttributes(),
+      attributes: collectAttributes(specificationTable, tablePairs),
       domestic_shipping_evidence: collectShipping(),
     };
   }

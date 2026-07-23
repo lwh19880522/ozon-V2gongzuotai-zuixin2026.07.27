@@ -11,7 +11,7 @@ _ALIAS_GROUPS: dict[str, tuple[str, ...]] = {
     "model": ("модель", "название модели", "model", "型号"),
     "article": ("артикул", "код модели", "model code", "货号"),
     "color": ("цвет", "цвет товара", "название цвета", "color", "颜色"),
-    "material": ("материал", "material", "材质"),
+    "material": ("материал", "material", "材质", "刃口材质"),
     "country": ("страна изготовитель", "страна производства", "country of origin", "产地"),
     "quantity": (
         "количество в упаковке шт",
@@ -22,7 +22,7 @@ _ALIAS_GROUPS: dict[str, tuple[str, ...]] = {
     ),
     "package_contents": ("комплектация", "состав комплекта", "package contents", "包装清单"),
     "size": ("размер", "размеры мм", "size", "尺寸", "规格"),
-    "length": ("длина мм", "длина см", "length", "长度"),
+    "length": ("длина мм", "длина см", "length", "长度", "全长"),
     "width": ("ширина мм", "ширина см", "width", "宽度"),
     "height": ("высота мм", "высота см", "height", "高度"),
     "weight": ("вес товара г", "вес г", "weight", "重量"),
@@ -31,6 +31,7 @@ _ALIAS_GROUPS: dict[str, tuple[str, ...]] = {
     "title": ("название", "title"),
     "description": ("аннотация", "описание", "description"),
     "rich_content": ("rich контент json", "rich content", "rich_content"),
+    "hashtags": ("хештеги", "hashtags"),
 }
 
 _ALIASES = {
@@ -38,7 +39,17 @@ _ALIASES = {
     for canonical, aliases in _ALIAS_GROUPS.items()
     for alias in aliases
 }
-_CREATIVE_FIELDS = {"title", "description", "rich_content"}
+_CREATIVE_FIELDS = {"title", "description", "rich_content", "hashtags"}
+_SUPPLIER_IDENTITY_FIELDS = {"brand", "model", "article", "color"}
+_SUPPLIER_TRUTH_SOURCES = {"confirmed_supplier_sku", "supplier_attributes"}
+_OPTIONAL_ASSET_FIELDS = {
+    "озон видеообложка ссылка",
+    "озон видео название",
+    "озон видео ссылка",
+    "озон видео товары на видео",
+    "документ pdf",
+    "название файла pdf",
+}
 
 
 def normalize_attribute_label(value: Any) -> str:
@@ -59,6 +70,7 @@ def map_template_attributes(
     *,
     supplier_product: dict[str, Any] | None = None,
     supplier_selection: dict[str, Any] | None = None,
+    rewritten_content: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     evidence = _collect_evidence(
         ozon_candidate,
@@ -71,6 +83,9 @@ def map_template_attributes(
         label = str(schema_field.get("attribute_label") or "").strip()
         normalized_label = normalize_attribute_label(label)
         canonical_label = canonical_attribute_label(label)
+        generated_result = _generated_field_result(
+            (rewritten_content or {}).get(field_key)
+        )
         required = schema_field.get("is_required") is True
         base = {
             "field_key": field_key,
@@ -80,15 +95,45 @@ def map_template_attributes(
             "dictionary_id": schema_field.get("dictionary_id"),
         }
         if canonical_label in _CREATIVE_FIELDS:
+            if (
+                generated_result
+                and generated_result["decision"] == "filled"
+                and _has_value(generated_result.get("value"))
+            ):
+                mapped_fields.append(
+                    {
+                        **base,
+                        "status": "mapped",
+                        "value": _plain_value(generated_result["value"]),
+                        "source": "generated_original_content",
+                        "source_label": label,
+                        "evidence_ref": f"generated_content.fields.{field_key}",
+                        "evidence_refs": generated_result.get("evidence_refs", []),
+                        "mapping_method": "validated_original_content",
+                        "dictionary_resolution_required": bool(schema_field.get("dictionary_id")),
+                        "reason": generated_result.get("reason")
+                        or "Validated original Russian content generated from collected facts.",
+                    }
+                )
+                continue
             mapped_fields.append(
                 {
                     **base,
-                    "status": "excluded",
+                    "status": "rewrite_required",
                     "value": None,
                     "source": None,
                     "evidence_ref": None,
-                    "mapping_method": "creative_field_boundary",
-                    "reason": "Creative content is handled outside objective attribute mapping.",
+                    "mapping_method": "ozon_original_content_required",
+                    "reference_evidence": _creative_reference_evidence(
+                        canonical_label,
+                        ozon_candidate,
+                        supplier_product=supplier_product,
+                        supplier_selection=supplier_selection,
+                    ),
+                    "reason": (
+                        "Ozon original content must be generated from collected facts; "
+                        "the source listing text must not be copied."
+                    ),
                 }
             )
             continue
@@ -99,33 +144,96 @@ def map_template_attributes(
             if item["normalized_label"] == normalized_label
             or item["canonical_label"] == canonical_label
         ]
+        if canonical_label in _SUPPLIER_IDENTITY_FIELDS and (supplier_product or supplier_selection):
+            candidates = [
+                item for item in candidates if item["source"] in _SUPPLIER_TRUTH_SOURCES
+            ]
         candidates.sort(
             key=lambda item: (
-                0 if item["normalized_label"] == normalized_label else 1,
                 item["priority"],
+                0 if item["normalized_label"] == normalized_label else 1,
             )
         )
         selected = candidates[0] if candidates else None
         if selected is None and canonical_label == "model":
             selected = next(
-                (item for item in evidence if item["canonical_label"] == "article"),
+                (
+                    item
+                    for item in evidence
+                    if item["canonical_label"] == "article"
+                    and (
+                        not (supplier_product or supplier_selection)
+                        or item["source"] in _SUPPLIER_TRUTH_SOURCES
+                    )
+                ),
                 None,
             )
             if selected is not None:
                 selected = {**selected, "mapping_method": "model_identifier_fallback"}
 
         if selected is None:
-            mapped_fields.append(
-                {
-                    **base,
-                    "status": "unresolved",
-                    "value": None,
-                    "source": None,
-                    "evidence_ref": None,
-                    "mapping_method": None,
-                    "reason": "No evidence-backed value matches this template field.",
-                }
+            if (
+                generated_result
+                and generated_result.get("structured") is True
+                and generated_result["decision"] == "filled"
+                and _has_value(generated_result.get("value"))
+            ):
+                evidence_refs = generated_result.get("evidence_refs", [])
+                mapped_fields.append(
+                    {
+                        **base,
+                        "status": "mapped",
+                        "value": _plain_value(generated_result["value"]),
+                        "source": "generated_evidence_completion",
+                        "source_label": label,
+                        "evidence_ref": (
+                            evidence_refs[0]
+                            if evidence_refs
+                            else f"generated_content.field_results.{field_key}"
+                        ),
+                        "evidence_refs": evidence_refs,
+                        "mapping_method": "evidence_supported_inference",
+                        "dictionary_resolution_required": bool(
+                            schema_field.get("dictionary_id")
+                        ),
+                        "reason": generated_result.get("reason")
+                        or "Derived from collected Ozon and supplier evidence.",
+                    }
+                )
+                continue
+            status = (
+                "not_applicable"
+                if not required and normalized_label in _OPTIONAL_ASSET_FIELDS
+                else "missing_fact"
             )
+            missing_field = {
+                **base,
+                "status": status,
+                "value": None,
+                "source": None,
+                "evidence_ref": None,
+                "mapping_method": None,
+                "reason": (
+                    "Optional asset was not collected for this product."
+                    if status == "not_applicable"
+                    else "No evidence-backed value matches this template field."
+                ),
+            }
+            if (
+                status == "missing_fact"
+                and generated_result
+                and generated_result.get("structured") is True
+                and generated_result["decision"] == "unresolved"
+            ):
+                missing_field.update(
+                    {
+                        "intelligence_decision": "unresolved",
+                        "evidence_refs": generated_result.get("evidence_refs", []),
+                        "reason": generated_result.get("reason")
+                        or missing_field["reason"],
+                    }
+                )
+            mapped_fields.append(missing_field)
             continue
 
         mapped_fields.append(
@@ -143,7 +251,11 @@ def map_template_attributes(
                     else "verified_alias"
                 ),
                 "dictionary_resolution_required": bool(schema_field.get("dictionary_id")),
-                "reason": "Mapped from frozen Ozon or user-confirmed supplier evidence.",
+                "reason": (
+                    "Mapped from the user-confirmed supplier truth source."
+                    if selected["source"] in _SUPPLIER_TRUTH_SOURCES
+                    else "Mapped from frozen Ozon reference evidence."
+                ),
             }
         )
 
@@ -157,6 +269,18 @@ def map_template_attributes(
     return {
         "fields": mapped_fields,
         "mapped_attribute_count": sum(1 for field in mapped_fields if field["status"] == "mapped"),
+        "rewrite_required_count": sum(
+            1 for field in mapped_fields if field["status"] == "rewrite_required"
+        ),
+        "missing_fact_count": sum(
+            1 for field in mapped_fields if field["status"] == "missing_fact"
+        ),
+        "not_applicable_count": sum(
+            1 for field in mapped_fields if field["status"] == "not_applicable"
+        ),
+        "excluded_attribute_count": sum(
+            1 for field in mapped_fields if field["status"] == "excluded"
+        ),
         "required_attribute_count": len(required_fields),
         "required_mapped_count": len(required_mapped),
         "missing_required_fields": missing_required,
@@ -190,12 +314,21 @@ def _collect_evidence(
             }
         )
 
-    add("Бренд", ozon_candidate.get("brand"), "ozon_structured", "ozon.brand", 5)
+    add("Бренд", ozon_candidate.get("brand"), "ozon_structured", "ozon.brand", 50)
     target_sku = ozon_candidate.get("target_sku") or {}
     for label, value in _mapping_items(target_sku.get("selected_options")):
-        add(label, value, "ozon_selected_sku", f"ozon.target_sku.selected_options.{label}", 10)
+        add(label, value, "ozon_selected_sku", f"ozon.target_sku.selected_options.{label}", 60)
     for label, value in _mapping_items(ozon_candidate.get("attributes")):
-        add(label, value, "ozon_attributes", f"ozon.attributes.{label}", 20)
+        add(label, value, "ozon_attributes", f"ozon.attributes.{label}", 70)
+    content_score_evidence = ozon_candidate.get("content_score_evidence") or {}
+    for label, value in _mapping_items(content_score_evidence.get("attribute_table")):
+        add(
+            label,
+            value,
+            "ozon_content_score_evidence",
+            f"ozon.content_score_evidence.attribute_table.{label}",
+            80,
+        )
 
     if supplier_selection:
         supplier_sku = supplier_selection.get("supplier_sku") or {}
@@ -205,12 +338,56 @@ def _collect_evidence(
                 value,
                 "confirmed_supplier_sku",
                 f"supplier_selection.supplier_sku.selected_options.{label}",
-                30,
+                10,
             )
     if supplier_product:
         for label, value in _mapping_items(supplier_product.get("attributes")):
-            add(label, value, "supplier_attributes", f"supplier.attributes.{label}", 40)
+            if _is_supplier_specification_artifact(label, value):
+                continue
+            add(label, value, "supplier_attributes", f"supplier.attributes.{label}", 20)
     return items
+
+
+def _is_supplier_specification_artifact(label: Any, value: Any) -> bool:
+    raw_label = str(label or "").strip().rstrip("：:")
+    raw_value = str(value or "").strip()
+    if raw_label in {"型号", "款号", "货号", "产品规格"} and re.fullmatch(
+        r"(?:全长|长度|宽度|高度|直径|尺寸)\s*(?:[（(]\s*(?:mm|cm|毫米|厘米)\s*[)）])?",
+        raw_value,
+        flags=re.I,
+    ):
+        return True
+    if re.fullmatch(
+        r"[a-z0-9][a-z0-9._/-]{1,31}\s*[（(].{2,120}[)）]",
+        raw_label,
+        flags=re.I,
+    ) and re.fullmatch(r"\d+(?:\.\d+)?\s*(?:mm|cm|毫米|厘米)?", raw_value, flags=re.I):
+        return True
+    return raw_value.startswith(("全部", "全选", "不限")) or raw_value.endswith(
+        ("展开参数", "收起参数")
+    )
+
+
+def _creative_reference_evidence(
+    canonical_label: str,
+    ozon_candidate: dict[str, Any],
+    *,
+    supplier_product: dict[str, Any] | None,
+    supplier_selection: dict[str, Any] | None,
+) -> list[str]:
+    references = ["ozon.attributes", "ozon.content_score_evidence.attribute_table"]
+    content_score_evidence = ozon_candidate.get("content_score_evidence") or {}
+    if canonical_label == "title" and _has_value(ozon_candidate.get("title")):
+        references.append("ozon.title")
+    if canonical_label in {"description", "rich_content", "hashtags"} and _has_value(
+        content_score_evidence.get("description_or_rich_content_blocks")
+    ):
+        references.append("ozon.content_score_evidence.description_or_rich_content_blocks")
+    if supplier_product:
+        references.extend(["supplier.title", "supplier.attributes"])
+    if supplier_selection:
+        references.append("supplier_selection.supplier_sku.selected_options")
+    return references
 
 
 def _mapping_items(value: Any) -> list[tuple[Any, Any]]:
@@ -231,3 +408,30 @@ def _plain_value(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _generated_field_result(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict) and str(value.get("decision") or "").strip():
+        evidence_refs = value.get("evidence_refs")
+        return {
+            "decision": str(value.get("decision") or "").strip(),
+            "value": value.get("value"),
+            "evidence_refs": [
+                str(reference)
+                for reference in evidence_refs
+                if str(reference or "").strip()
+            ]
+            if isinstance(evidence_refs, list)
+            else [],
+            "reason": str(value.get("reason") or "").strip(),
+            "structured": True,
+        }
+    if _has_value(value):
+        return {
+            "decision": "filled",
+            "value": value,
+            "evidence_refs": [],
+            "reason": "",
+            "structured": False,
+        }
+    return None
