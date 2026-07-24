@@ -2485,6 +2485,12 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn("逐商品上传门禁", page)
         self.assertIn("合格商品不等待整批", page)
         self.assertIn("类目模板自动映射结果", page)
+        self.assertIn("上传基础字段（价格与包装物流）", page)
+        self.assertIn("item.upload_core_fields", page)
+        self.assertIn(
+            "已由用户确认；构建草稿时自动写入。包装字段不会冒充商品净尺寸字段",
+            page,
+        )
         self.assertIn("全部模板字段", page)
         self.assertIn("待原创", page)
         self.assertIn("缺少事实", page)
@@ -2604,6 +2610,31 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual("28", mapped["package-length"]["value"])
         self.assertEqual("11", mapped["package-width"]["value"])
         self.assertEqual("2.5", mapped["package-height"]["value"])
+
+    def test_confirmed_pricing_evidence_populates_upload_core_fields(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+        self.post_json(
+            f"/api/batches/{run_id}/pricing-evidence/confirm",
+            self.pricing_input_payload(seed.seed_id),
+        )
+
+        item = self.get_json(f"/api/batches/{run_id}/upload")["data"]["items"][0]
+
+        self.assertEqual(
+            {
+                "price": "671",
+                "old_price": "839",
+                "currency_code": "RUB",
+                "depth": "280",
+                "width": "110",
+                "height": "25",
+                "dimension_unit": "mm",
+                "weight": "380",
+                "weight_unit": "g",
+            },
+            item["upload_core_fields"],
+        )
 
     def test_pricing_confirmation_requires_locked_supplier_sku(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
@@ -2759,6 +2790,10 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn(
             "ozon_content_score_evidence",
             draft["items"][0]["content_optimization"]["objective_evidence"],
+        )
+        self.assertEqual(
+            items[seed.seed_id]["upload_core_fields"],
+            draft["items"][0]["upload_core_fields"],
         )
         self.assertTrue((self.repo.run_dir(run_id) / "upload_draft.json").exists())
 

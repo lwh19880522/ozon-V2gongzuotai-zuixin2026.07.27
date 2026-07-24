@@ -4,6 +4,7 @@ import json
 import random
 import re
 from collections.abc import Callable
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -1553,6 +1554,11 @@ class WorkbenchService:
                 if pricing_confirmed
                 else "missing"
             )
+            upload_core_fields = (
+                _pricing_upload_core_fields(pricing_record)
+                if pricing_ready
+                else None
+            )
             media = candidate.get("selected_sku_media") or {}
             images = media.get("selected_sku_images") or media.get("main_gallery_images") or []
             subject_entry = subject_items.get(seed_id) if isinstance(subject_items, dict) else None
@@ -1715,6 +1721,7 @@ class WorkbenchService:
                     "pricing_evidence": (
                         pricing_record if pricing_record else None
                     ),
+                    "upload_core_fields": upload_core_fields,
                     "pricing_policy": pricing_policy,
                     "blocking_gates": blocking_gates,
                     "ready_to_build": not blocking_gates,
@@ -2395,6 +2402,7 @@ class WorkbenchService:
                     "type_id": item.get("type_id"),
                     "category_path": item.get("category_path"),
                     "source_title": item.get("source_title"),
+                    "upload_core_fields": item.get("upload_core_fields"),
                     "attributes": draft_attributes,
                     "content_optimization": {
                         "target_score": 90,
@@ -5652,6 +5660,44 @@ def _candidate_sale_rub(candidate: dict[str, Any]) -> str:
             "The collected Ozon reference price is missing for this product."
         )
     return normalized
+
+
+def _pricing_upload_core_fields(
+    pricing_record: dict[str, Any],
+) -> dict[str, str] | None:
+    inputs = pricing_record.get("inputs")
+    calculation = pricing_record.get("calculation")
+    if not isinstance(inputs, dict) or not isinstance(calculation, dict):
+        return None
+    required_inputs = (
+        "package_length_cm",
+        "package_width_cm",
+        "package_height_cm",
+        "package_weight_g",
+    )
+    required_calculation = ("listing_price_rub", "old_price_rub")
+    if any(inputs.get(key) in (None, "") for key in required_inputs):
+        return None
+    if any(calculation.get(key) in (None, "") for key in required_calculation):
+        return None
+
+    def normalized(value: Any) -> str:
+        return format(Decimal(str(value)).normalize(), "f")
+
+    def millimeters(key: str) -> str:
+        return normalized(Decimal(str(inputs[key])) * Decimal("10"))
+
+    return {
+        "price": normalized(calculation["listing_price_rub"]),
+        "old_price": normalized(calculation["old_price_rub"]),
+        "currency_code": "RUB",
+        "depth": millimeters("package_length_cm"),
+        "width": millimeters("package_width_cm"),
+        "height": millimeters("package_height_cm"),
+        "dimension_unit": "mm",
+        "weight": normalized(inputs["package_weight_g"]),
+        "weight_unit": "g",
+    }
 
 
 def _supplier_product_url(
