@@ -2851,8 +2851,9 @@ def build_upload_workspace_html(run_id: str) -> str:
     .gate-list {{ padding:6px 14px 12px; }} .gate-row {{ display:grid; grid-template-columns:22px minmax(0,1fr); gap:9px; padding:10px 0; border-bottom:1px solid #edf0f4; }} .gate-row:last-child {{ border-bottom:0; }} .gate-icon {{ width:22px; height:22px; display:grid; place-items:center; border-radius:50%; color:var(--green); background:var(--green-soft); font-size:11px; font-weight:700; }} .gate-row.blocked .gate-icon {{ color:var(--amber); background:var(--amber-soft); }} .gate-row strong {{ display:block; font-size:11px; }} .gate-row span {{ display:block; margin-top:2px; color:var(--muted); font-size:10px; }}
     .content-controller {{ margin:12px 14px; padding:11px; border:1px solid #bfd0f8; border-radius:5px; background:var(--blue-soft); }} .content-controller strong {{ display:block; font-size:11px; }} .content-controller p {{ margin:4px 0 8px; color:var(--muted); font-size:10px; }} .content-command {{ max-height:190px; overflow:auto; padding:9px; border:1px solid #c9d5ec; border-radius:4px; white-space:pre-wrap; color:#263756; background:#fff; font:10px/1.5 Consolas,"Courier New",monospace; }} .content-copy {{ width:100%; min-height:34px; margin-top:8px; border:1px solid var(--blue); border-radius:4px; color:#fff; background:var(--blue); cursor:pointer; }} .content-copy-status {{ display:block; min-height:16px; margin-top:4px; color:var(--green); font-size:10px; text-align:center; }}
     .pricing-workspace {{ margin-bottom:14px; }} .pricing-head-note {{ color:var(--muted); font-size:11px; }}
-    .pricing-layout {{ min-height:470px; display:grid; grid-template-columns:300px minmax(0,1fr); }} .pricing-products {{ padding:10px; border-right:1px solid var(--line); background:#f8fafc; }}
+    .pricing-layout {{ min-height:470px; display:grid; grid-template-columns:300px minmax(0,1fr); }} .pricing-product-column {{ height:470px; align-self:start; display:grid; grid-template-rows:426px 44px; border-right:1px solid var(--line); background:#f8fafc; }} .pricing-products {{ min-height:0; padding:10px; overflow:hidden; }}
     .pricing-product {{ width:100%; display:grid; grid-template-columns:54px minmax(0,1fr); gap:9px; margin-bottom:8px; padding:9px; border:1px solid var(--line); border-radius:6px; color:var(--text); background:#fff; cursor:pointer; text-align:left; }} .pricing-product:hover {{ border-color:#9eb5ee; }} .pricing-product.active {{ border-color:var(--blue); box-shadow:0 0 0 2px rgba(36,87,214,.10); }} .pricing-product img {{ width:54px; height:54px; object-fit:contain; border:1px solid var(--line); border-radius:4px; background:#fff; }} .pricing-product strong {{ display:block; max-height:38px; overflow:hidden; font-size:11px; line-height:1.35; }} .pricing-product span {{ display:block; margin-top:5px; color:var(--muted); font-size:10px; }} .pricing-product .confirmed {{ color:var(--green); }}
+    .pricing-pager {{ display:flex; align-items:center; justify-content:center; gap:8px; padding:6px 10px; border-top:1px solid var(--line); background:#fff; }} .pricing-pager button {{ width:28px; height:28px; display:grid; place-items:center; border:1px solid #cbd4e1; border-radius:5px; color:var(--blue); background:#fff; cursor:pointer; }} .pricing-pager button:disabled {{ color:#aab3c1; background:#f4f6f9; cursor:not-allowed; }} .pricing-page-label {{ min-width:104px; color:var(--muted); font-size:10px; text-align:center; }}
     .pricing-editor {{ min-width:0; padding:16px; }} .pricing-editor-empty {{ min-height:430px; display:grid; place-items:center; color:var(--muted); }} .pricing-reference {{ display:grid; grid-template-columns:86px minmax(0,1fr); gap:13px; padding-bottom:14px; border-bottom:1px solid var(--line); }} .pricing-reference img {{ width:86px; height:86px; object-fit:contain; border:1px solid var(--line); border-radius:5px; background:#fff; }} .pricing-reference h4 {{ margin:0 0 7px; font-size:15px; }} .pricing-reference-row {{ display:flex; flex-wrap:wrap; gap:7px 14px; color:var(--muted); font-size:11px; }} .supplier-link {{ color:var(--blue); font-weight:650; text-decoration:none; }} .supplier-link:hover {{ text-decoration:underline; }}
     .pricing-policy {{ display:flex; flex-wrap:wrap; gap:6px; margin:12px 0; }} .policy-chip {{ padding:4px 8px; border-radius:4px; color:#38506f; background:#edf3fb; font-size:10px; }}
     .pricing-form {{ display:grid; grid-template-columns:repeat(4,minmax(130px,1fr)); gap:10px; }} .pricing-field {{ display:grid; gap:5px; }} .pricing-field label {{ color:var(--muted); font-size:10px; }} .pricing-field input {{ width:100%; height:36px; padding:0 9px; border:1px solid #cbd4e1; border-radius:5px; color:var(--text); background:#fff; }} .pricing-field input:focus {{ outline:2px solid rgba(36,87,214,.16); border-color:var(--blue); }}
@@ -2863,7 +2864,7 @@ def build_upload_workspace_html(run_id: str) -> str:
     @media(max-width:1100px) {{ .pricing-form {{ grid-template-columns:repeat(2,minmax(130px,1fr)); }} .pricing-result {{ grid-template-columns:repeat(3,1fr); }} .pricing-result-cell:nth-child(3) {{ border-right:0; }} }}
     @media(max-width:1000px) {{ .upload-layout {{ grid-template-columns:1fr; }} .pricing-layout {{ grid-template-columns:250px minmax(0,1fr); }} }}
     @media(max-width:900px) {{ .app-shell {{ grid-template-columns:72px minmax(0,1fr); }} .sidebar {{ padding:14px 8px; }} .sidebar-brand {{ padding:4px 4px 16px; text-align:center; }} .sidebar-brand strong {{ font-size:14px; }} .sidebar-brand span,.sidebar-label,.sidebar-link span:last-child {{ display:none; }} .sidebar-link {{ justify-content:center; padding:0; }} .stage-nav-inner {{ overflow-x:auto; padding:0 10px; }} .stage-run {{ display:none; }} .summary {{ grid-template-columns:repeat(2,1fr); }} .metric:nth-child(2) {{ border-right:0; }} .metric:nth-child(-n+2) {{ border-bottom:1px solid var(--line); }} }}
-    @media(max-width:620px) {{ .app-shell {{ display:block; }} .sidebar {{ position:static; width:100%; height:auto; display:flex; align-items:center; gap:6px; overflow-x:auto; }} .sidebar-brand {{ min-width:92px; padding:0 8px; border:0; }} .sidebar-group {{ display:flex; gap:4px; margin:0; }} .sidebar-link {{ width:38px; flex:0 0 38px; }} .workspace {{ padding:10px; }} .page-head {{ align-items:flex-start; flex-direction:column; }} .pricing-layout {{ display:block; }} .pricing-products {{ display:flex; overflow-x:auto; border-right:0; border-bottom:1px solid var(--line); }} .pricing-product {{ min-width:230px; }} .pricing-form {{ grid-template-columns:1fr; }} .pricing-result {{ grid-template-columns:repeat(2,1fr); }} .pricing-result-cell:nth-child(2n) {{ border-right:0; }} .draft-item {{ grid-template-columns:1fr; }} .draft-item img,.image-placeholder {{ width:100%; height:180px; }} .attribute-grid {{ grid-template-columns:1fr; }} .attribute {{ border-right:0; }} }}
+    @media(max-width:620px) {{ .app-shell {{ display:block; }} .sidebar {{ position:static; width:100%; height:auto; display:flex; align-items:center; gap:6px; overflow-x:auto; }} .sidebar-brand {{ min-width:92px; padding:0 8px; border:0; }} .sidebar-group {{ display:flex; gap:4px; margin:0; }} .sidebar-link {{ width:38px; flex:0 0 38px; }} .workspace {{ padding:10px; }} .page-head {{ align-items:flex-start; flex-direction:column; }} .pricing-layout {{ display:block; }} .pricing-product-column {{ height:138px; grid-template-rows:94px 44px; border-right:0; border-bottom:1px solid var(--line); }} .pricing-products {{ display:flex; gap:8px; overflow:hidden; }} .pricing-product {{ min-width:230px; margin-bottom:0; }} .pricing-form {{ grid-template-columns:1fr; }} .pricing-result {{ grid-template-columns:repeat(2,1fr); }} .pricing-result-cell:nth-child(2n) {{ border-right:0; }} .draft-item {{ grid-template-columns:1fr; }} .draft-item img,.image-placeholder {{ width:100%; height:180px; }} .attribute-grid {{ grid-template-columns:1fr; }} .attribute {{ border-right:0; }} }}
   </style>
 </head>
 <body>
@@ -2877,7 +2878,7 @@ def build_upload_workspace_html(run_id: str) -> str:
         <section class="summary"><div class="metric"><span>商品 (Products)</span><strong id="productCount">0</strong></div><div class="metric"><span>必填已映射 (Required)</span><strong id="requiredCount">0 / 0</strong></div><div class="metric"><span>客观属性已映射 (Mapped Facts)</span><strong id="prefillCount">0</strong></div><div class="metric"><span>图片进度 (Images)</span><strong id="imageReadyCount">0 / 0</strong></div></section>
         <section id="pricingWorkspace" class="panel pricing-workspace">
           <div class="panel-head"><div><h3>价格与包装证据</h3><span class="pricing-head-note">逐件确认成本、包装尺寸、GUOO 跨境运费和 Ozon 建议上架价；确认后的包装数据会作为后续字段证据。</span></div><span id="pricingProgress" class="pill">0 / 0 已确认</span></div>
-          <div class="pricing-layout"><nav id="pricingProductList" class="pricing-products" aria-label="价格证据商品清单"></nav><section id="pricingEditor" class="pricing-editor"><div class="pricing-editor-empty">正在读取商品价格证据…</div></section></div>
+          <div class="pricing-layout"><div class="pricing-product-column"><nav id="pricingProductList" class="pricing-products" aria-label="价格证据商品清单"></nav><div id="pricingPager" class="pricing-pager"><button id="pricingPrevPage" type="button" aria-label="上一页">‹</button><span id="pricingPageLabel" class="pricing-page-label" aria-live="polite">第 1 / 1 页 · 每页 5 件</span><button id="pricingNextPage" type="button" aria-label="下一页">›</button></div></div><section id="pricingEditor" class="pricing-editor"><div class="pricing-editor-empty">正在读取商品价格证据…</div></section></div>
         </section>
         <div class="upload-layout"><section class="panel"><div class="panel-head"><h3>类目模板自动映射结果 · 完整字段与内容完善</h3><span class="pill">Seller API Template</span></div><div id="draftItems" class="draft-items"></div></section>
           <aside id="uploadGate" class="panel"><div class="panel-head"><h3>逐商品上传门禁 (Per-product Gate)</h3></div><div class="content-controller"><strong>智能字段草稿总控（证据约束）</strong><p>Ozon 数据用于模仿结构与写法，1688 与已锁定 SKU 用于约束客观事实；无法证明的字段明确保留为未解决，不会自动上传。</p><div id="contentControllerCommand" class="content-command">{escaped_content_controller_command}</div><button id="copyContentControllerCommand" class="content-copy" type="button">复制整批智能字段草稿命令</button><span id="contentControllerCopyStatus" class="content-copy-status"></span></div><div class="gate-list"><div id="templateGate" class="gate-row"><span class="gate-icon">1</span><div><strong>类目模板 (Category Template)</strong><span>等待检查</span></div></div><div id="attributeGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>必填属性 (Required Attributes)</strong><span>等待自动映射。</span></div></div><div id="originalContentGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>原创内容 (Original Content)</strong><span>等待利用 Ozon 证据完成俄文内容。</span></div></div><div id="imageUploadGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>图片门禁 (Image Gate)</strong><span>等待生图与用户审核。</span></div></div><div id="pricingGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>价格与包装证据 (Pricing)</strong><span>等待逐件确认成本、包装和建议上架价。</span></div></div><div id="draftGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>可独立推进 (Ready Products)</strong><span>逐件计算，不再等待整批。</span></div></div></div><div class="publish-lock"><strong>发布锁已开启 (Publish Lock Active)</strong><span>这里只准备可审核草稿，不会自动提交到 Ozon；最终发布仍需用户确认。</span></div><button id="buildDraft" class="primary" disabled>等待可独立推进的商品 (Waiting)</button></aside>
@@ -2888,7 +2889,7 @@ def build_upload_workspace_html(run_id: str) -> str:
   <script>
     const runId = {safe_run_id}; const $ = (id) => document.getElementById(id);
     async function api(path, options={{}}) {{ const response = await fetch(path, options); const body = await response.json(); if (!response.ok) throw body; return body; }}
-    const pricingState = {{ selectedSeedId:null, items:[], drafts:new Map(), previews:new Map() }};
+    const pricingState = {{ selectedSeedId:null, items:[], drafts:new Map(), previews:new Map(), page:0, pageSize:5 }};
     const pricingEndpoints = {{
       preview:`/api/batches/${{encodeURIComponent(runId)}}/pricing-evidence/preview`,
       confirm:`/api/batches/${{encodeURIComponent(runId)}}/pricing-evidence/confirm`
@@ -2924,7 +2925,12 @@ def build_upload_workspace_html(run_id: str) -> str:
     }}
     function renderPricingProductList() {{
       const list = $("pricingProductList"); list.replaceChildren();
-      pricingState.items.forEach((item, index) => {{
+      const pageCount = Math.max(1, Math.ceil(pricingState.items.length / pricingState.pageSize));
+      pricingState.page = Math.min(Math.max(0, pricingState.page), pageCount - 1);
+      const pageStart = pricingState.page * pricingState.pageSize;
+      const pageItems = pricingState.items.slice(pageStart, pageStart + pricingState.pageSize);
+      pageItems.forEach((item, pageIndex) => {{
+        const index = pageStart + pageIndex;
         const button = document.createElement("button"); button.type = "button"; button.className = `pricing-product${{item.seed_id === pricingState.selectedSeedId ? " active" : ""}}`;
         const image = document.createElement("img"); image.src = item.generated_image_url || item.source_image || ""; image.alt = item.source_title || `商品 ${{index + 1}}`; image.referrerPolicy = "no-referrer";
         const body = document.createElement("span"); const title = document.createElement("strong"); title.textContent = `${{index + 1}}. ${{item.source_title || item.seed_id}}`;
@@ -2933,6 +2939,19 @@ def build_upload_workspace_html(run_id: str) -> str:
         button.addEventListener("click", () => {{ saveVisiblePricingDraft(); pricingState.selectedSeedId = item.seed_id; renderPricingProductList(); renderPricingEditor(); }});
         list.append(button);
       }});
+      $("pricingPageLabel").textContent = `第 ${{pricingState.page + 1}} / ${{pageCount}} 页 · 每页 5 件`;
+      $("pricingPrevPage").disabled = pricingState.page === 0;
+      $("pricingNextPage").disabled = pricingState.page >= pageCount - 1;
+    }}
+    function changePricingPage(offset) {{
+      saveVisiblePricingDraft();
+      const pageCount = Math.max(1, Math.ceil(pricingState.items.length / pricingState.pageSize));
+      const nextPage = Math.min(Math.max(0, pricingState.page + offset), pageCount - 1);
+      if (nextPage === pricingState.page) return;
+      pricingState.page = nextPage;
+      const firstItem = pricingState.items[nextPage * pricingState.pageSize];
+      pricingState.selectedSeedId = firstItem ? firstItem.seed_id : null;
+      renderPricingProductList(); renderPricingEditor();
     }}
     function pricingResultView(record) {{
       const calculation = record && record.calculation; if (!calculation) return null;
@@ -2974,6 +2993,8 @@ def build_upload_workspace_html(run_id: str) -> str:
     function renderPricingWorkspace(data) {{
       saveVisiblePricingDraft(); pricingState.items = data.items || [];
       if (!pricingState.items.some((item) => item.seed_id === pricingState.selectedSeedId)) pricingState.selectedSeedId = pricingState.items.length ? pricingState.items[0].seed_id : null;
+      const selectedIndex = pricingState.items.findIndex((item) => item.seed_id === pricingState.selectedSeedId);
+      if (selectedIndex >= 0) pricingState.page = Math.floor(selectedIndex / pricingState.pageSize);
       const confirmed = (data.gates || {{}}).pricing_ready_count || 0; $("pricingProgress").textContent = `${{confirmed}} / ${{pricingState.items.length}} 已确认`;
       renderPricingProductList(); renderPricingEditor();
     }}
@@ -3022,6 +3043,8 @@ def build_upload_workspace_html(run_id: str) -> str:
     }}
     async function copyText(text) {{ if (navigator.clipboard && window.isSecureContext) {{ await navigator.clipboard.writeText(text); return; }} const area = document.createElement("textarea"); area.value = text; area.style.position = "fixed"; area.style.opacity = "0"; document.body.append(area); area.select(); const copied = document.execCommand("copy"); area.remove(); if (!copied) throw new Error("复制失败"); }}
     $("copyContentControllerCommand").addEventListener("click", async () => {{ const button = $("copyContentControllerCommand"); const status = $("contentControllerCopyStatus"); button.disabled = true; try {{ await copyText($("contentControllerCommand").textContent); status.textContent = "整批智能字段草稿命令已复制"; }} catch (error) {{ status.textContent = error.message || "复制失败，请手动复制"; }} finally {{ button.disabled = false; }} }});
+    $("pricingPrevPage").addEventListener("click", () => changePricingPage(-1));
+    $("pricingNextPage").addEventListener("click", () => changePricingPage(1));
     $("buildDraft").addEventListener("click", async () => {{ const button = $("buildDraft"); button.disabled = true; button.textContent = "正在生成属性草稿..."; try {{ const result = await api(`/api/batches/${{encodeURIComponent(runId)}}/upload-draft`, {{method:"POST",headers:{{"Content-Type":"application/json"}},body:"{{}}"}}); button.textContent = `已生成 ${{result.data.prepared_product_count || 0}} 件属性草稿`; $("workspaceStatus").textContent = "属性草稿已准备 (Prepared)"; }} catch (error) {{ button.textContent = error.message || "生成失败"; button.disabled = false; }} }});
     async function loadUploadWorkspace() {{ const result = await api(`/api/batches/${{encodeURIComponent(runId)}}/upload`); render(result.data || {{}}); return result.data || {{}}; }}
     loadUploadWorkspace().catch((error) => {{ $("workspaceStatus").textContent = "加载失败 (Failed)"; $("draftItems").textContent = error.message || String(error); }});

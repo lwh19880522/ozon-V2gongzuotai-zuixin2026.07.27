@@ -2500,6 +2500,27 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertFalse(workspace["data"]["gates"]["draft_ready"])
         self.assertTrue(workspace["data"]["gates"]["publish_locked"])
 
+    def test_upload_pricing_product_list_uses_fixed_five_item_pages(self) -> None:
+        run_id, _seed = self.prepare_supplier_review_run()
+
+        page = self.get_text(f"/batches/{run_id}/upload")
+
+        self.assertIn('id="pricingPager"', page)
+        self.assertIn('id="pricingPrevPage"', page)
+        self.assertIn('id="pricingPageLabel"', page)
+        self.assertIn('id="pricingNextPage"', page)
+        self.assertIn("pageSize:5", page)
+        self.assertIn(
+            "slice(pageStart, pageStart + pricingState.pageSize)",
+            page,
+        )
+        self.assertIn(
+            "Math.ceil(pricingState.items.length / pricingState.pageSize)",
+            page,
+        )
+        self.assertIn("每页 5 件", page)
+        self.assertIn(".pricing-product-column { height:470px;", page)
+
     def test_pricing_preview_is_side_effect_free_and_confirm_persists_one_product(
         self,
     ) -> None:
