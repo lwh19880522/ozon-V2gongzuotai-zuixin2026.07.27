@@ -97,7 +97,7 @@ class ImageWorkflowServiceTests(RuntimeTestCase):
             supplier_image_downloader=download,
         )
 
-    def test_last_subject_master_confirmation_enters_image_stage_and_enqueues_job(self) -> None:
+    def test_last_subject_master_confirmation_enters_upload_preparation_without_image_job(self) -> None:
         selected = self.service.confirm_supplier_sku(
             self.run_id,
             seed_id=self.seed.seed_id,
@@ -115,8 +115,8 @@ class ImageWorkflowServiceTests(RuntimeTestCase):
 
         self.assertTrue(confirmed.ok, confirmed.errors)
         self.assertEqual(WorkbenchState.IMAGE_PROCESSING.value, self.repo.load_run(self.run_id)["status"])
-        self.assertEqual("pending", confirmed.data["image_job"]["status"])
-        self.assertEqual(8, len(confirmed.data["image_job"]["slots"]))
+        self.assertNotIn("image_job", confirmed.data)
+        self.assertEqual("post_upload_package", confirmed.data["image_task_mode"])
         self.assertEqual(4, confirmed.data["subject_master"]["set_quantity"])
         self.assertEqual(
             [self.subject_url, self.gallery_url],
@@ -131,13 +131,10 @@ class ImageWorkflowServiceTests(RuntimeTestCase):
         )
         self.assertFalse(confirmed.data["subject_master"]["white_background_confirmed"])
 
-        workspace = self.service.image_workspace(self.run_id)
-        self.assertTrue(workspace.ok)
-        item = workspace.data["items"][0]
-        self.assertEqual("supplier-sku-set-x4", item["supplier_sku_selection"]["supplier_sku_id"])
-        self.assertEqual(4, item["subject_master"]["visible_subject_quantity"])
-        self.assertEqual("pending", item["image_job"]["status"])
-        self.assertEqual("waiting_for_codex_workers", workspace.data["image_gate"]["code"])
+        stored = self.repo.load_subject_masters(self.run_id)["items"][self.seed.seed_id]
+        self.assertEqual("post_upload_package", stored["image_task_mode"])
+        self.assertNotIn("image_job_id", stored)
+        self.assertEqual([], self.service._image_generation_queue().list_run_jobs(self.run_id))
 
     def test_subject_master_rejects_quantity_that_does_not_match_real_supplier_set(self) -> None:
         self.assertTrue(
@@ -214,7 +211,7 @@ class ImageWorkflowServiceTests(RuntimeTestCase):
         stored = self.repo.load_subject_masters(self.run_id)["items"][self.seed.seed_id]
         self.assertEqual(original, stored)
 
-    def test_image_job_can_stop_and_resume_without_changing_locked_evidence(self) -> None:
+    def test_subject_confirmation_does_not_create_a_legacy_image_job(self) -> None:
         self.assertTrue(
             self.service.confirm_supplier_sku(
                 self.run_id,
@@ -228,17 +225,13 @@ class ImageWorkflowServiceTests(RuntimeTestCase):
             source_image_urls=[self.subject_url, self.gallery_url],
             visible_subject_quantity=4,
         )
-        job_id = confirmed.data["image_job"]["job_id"]
-        selection_sha256 = confirmed.data["image_job"]["selection_sha256"]
-
-        stopped = self.service.stop_image_job(self.run_id, job_id)
-        resumed = self.service.resume_image_job(self.run_id, job_id)
-
-        self.assertTrue(stopped.ok)
-        self.assertEqual("stopped", stopped.data["image_job"]["status"])
-        self.assertTrue(resumed.ok)
-        self.assertEqual("pending", resumed.data["image_job"]["status"])
-        self.assertEqual(selection_sha256, resumed.data["image_job"]["selection_sha256"])
+        self.assertTrue(confirmed.ok)
+        self.assertEqual([], self.service._image_generation_queue().list_run_jobs(self.run_id))
+        stored = self.repo.load_subject_masters(self.run_id)["items"][self.seed.seed_id]
+        self.assertEqual(
+            confirmed.data["subject_master"]["subject_master_sha256"],
+            stored["subject_master"]["subject_master_sha256"],
+        )
 
     def test_pending_supplier_sku_can_be_reopened_with_audit_history(self) -> None:
         supplier_result = self.repo.load_supplier_collection_result(self.run_id)
@@ -268,7 +261,7 @@ class ImageWorkflowServiceTests(RuntimeTestCase):
             source_image_urls=[self.subject_url],
             visible_subject_quantity=4,
         )
-        job_id = confirmed.data["image_job"]["job_id"]
+        self.assertNotIn("image_job", confirmed.data)
         self.assertEqual(WorkbenchState.IMAGE_PROCESSING.value, self.repo.load_run(self.run_id)["status"])
 
         reopened = self.service.reopen_supplier_sku_selection(
@@ -277,13 +270,15 @@ class ImageWorkflowServiceTests(RuntimeTestCase):
         )
 
         self.assertTrue(reopened.ok, reopened.errors)
-        self.assertEqual("stopped", self.service._image_generation_queue().get_job(job_id)["status"])
         selections = self.repo.load_supplier_sku_selections(self.run_id)
         subjects = self.repo.load_subject_masters(self.run_id)
         self.assertNotIn(self.seed.seed_id, selections["selections"])
         self.assertNotIn(self.seed.seed_id, subjects["items"])
         self.assertEqual("supplier-sku-set-x4", selections["history"][-1]["receipt"]["supplier_sku_id"])
-        self.assertEqual(job_id, subjects["history"][-1]["subject_entry"]["image_job_id"])
+        self.assertEqual(
+            "post_upload_package",
+            subjects["history"][-1]["subject_entry"]["image_task_mode"],
+        )
         reselection = self.service.confirm_supplier_sku(
             self.run_id,
             seed_id=self.seed.seed_id,
@@ -292,7 +287,7 @@ class ImageWorkflowServiceTests(RuntimeTestCase):
         self.assertTrue(reselection.ok, reselection.errors)
         self.assertEqual("supplier-sku-single", reselection.data["receipt"]["supplier_sku_id"])
 
-    def test_started_image_job_blocks_supplier_sku_reopen(self) -> None:
+    def test_submitted_product_blocks_supplier_sku_reopen(self) -> None:
         self.assertTrue(
             self.service.confirm_supplier_sku(
                 self.run_id,
@@ -300,16 +295,27 @@ class ImageWorkflowServiceTests(RuntimeTestCase):
                 supplier_sku_id="supplier-sku-set-x4",
             ).ok
         )
-        confirmed = self.service.confirm_subject_master(
+        self.assertTrue(self.service.confirm_subject_master(
             self.run_id,
             seed_id=self.seed.seed_id,
             source_image_urls=[self.subject_url],
             visible_subject_quantity=4,
+        ).ok)
+        self.repo.save_upload_submissions(
+            self.run_id,
+            {
+                "schema_version": 1,
+                "run_id": self.run_id,
+                "items": {
+                    self.seed.seed_id: {
+                        "seed_id": self.seed.seed_id,
+                        "task_id": 7001,
+                        "status": "submitted",
+                        "image_task_package_id": "ozon-image-test",
+                    }
+                },
+            },
         )
-        job_id = confirmed.data["image_job"]["job_id"]
-        queue = self.service._image_generation_queue()
-        claimed = queue.claim_next("ozon-image-worker-01")
-        self.assertEqual(job_id, claimed["job_id"])
 
         reopened = self.service.reopen_supplier_sku_selection(
             self.run_id,
@@ -320,4 +326,3 @@ class ImageWorkflowServiceTests(RuntimeTestCase):
         self.assertEqual("supplier_sku_selection.reopen_blocked", reopened.code)
         self.assertIn(self.seed.seed_id, self.repo.load_supplier_sku_selections(self.run_id)["selections"])
         self.assertIn(self.seed.seed_id, self.repo.load_subject_masters(self.run_id)["items"])
-        self.assertEqual("in_progress", queue.get_job(job_id)["status"])

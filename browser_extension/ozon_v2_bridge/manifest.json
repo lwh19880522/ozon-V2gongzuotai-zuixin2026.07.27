@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Ozon V2 Browser Bridge",
-  "version": "0.1.61",
+  "version": "0.1.63",
   "description": "Runs Ozon and user-verified 1688 collection tasks in the current browser session and writes evidence back to the local workbench.",
   "permissions": [
     "alarms",

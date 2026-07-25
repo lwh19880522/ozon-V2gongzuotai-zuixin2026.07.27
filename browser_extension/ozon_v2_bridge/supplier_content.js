@@ -355,7 +355,6 @@
     if (fixedGroups.some((candidate) => candidate.options.length !== 1)) return [];
     const price = collectPrice();
     const amount = visiblePriceAmount(price);
-    if (!amount) return [];
     return group.options.map((option, index) => {
       const label = normalizedText(option.label, 120);
       const fixedOptions = fixedGroups.map((candidate) => candidate.options[0]);
@@ -398,7 +397,8 @@
           fixed_group_names: fixedGroups.map((candidate) => candidate.name),
           option_index: option.option_index,
           native_supplier_sku_id: usableGroups.length === 1 && Boolean(option.supplier_sku_id),
-          price_visible_text: price.visible_text,
+          price_visible_text: price && price.visible_text || "",
+          price_independent_sku_selection: true,
         },
       };
     }).filter(Boolean);
@@ -410,7 +410,7 @@
     const price = collectPrice();
     const amount = visiblePriceAmount(price);
     const images = collectImages();
-    if (!currentOfferId || !amount || !images.length) return [];
+    if (!currentOfferId || !images.length) return [];
     const title = collectTitle();
     const attributes = collectAttributes();
     const setQuantity = setQuantityFromValues([title, ...Object.values(attributes)]);
@@ -433,7 +433,8 @@
       evidence: {
         offer_id: currentOfferId,
         no_visible_variant_selector: true,
-        price_visible_text: price.visible_text,
+        price_visible_text: price && price.visible_text || "",
+        price_independent_sku_selection: true,
       },
     }];
   }
@@ -510,7 +511,7 @@
     const price = collectPrice();
     const amount = visiblePriceAmount(price);
     const images = collectImages();
-    if (!currentOfferId || !amount || !images.length) return [];
+    if (!currentOfferId || !images.length) return [];
     const soldOut = /已下架|暂时缺货|无货|售罄/.test(textOf(document.body, 100000));
     return specificationTable.rows.map((row, index) => {
       const rawUnit = String(row.unit || "").toLowerCase();
@@ -540,7 +541,8 @@
           header_value: specificationTable.header_value,
           source_row_key: row.key,
           source_row_value: row.value,
-          price_visible_text: price.visible_text,
+        price_visible_text: price && price.visible_text || "",
+        price_independent_sku_selection: true,
         },
       };
     });
@@ -611,8 +613,18 @@
 
   function setQuantityFromValues(values) {
     for (const value of values) {
-      const match = value.match(/(\d+)\s*(?:支|件|个|只|套|枚|片|瓶|包|组)/);
-      if (match) return Number(match[1]);
+      const multipliers = [...String(value || "").matchAll(/(?:x|×|\*)\s*(\d+)\b/gi)]
+        .map((match) => Number(match[1]))
+        .filter((quantity) => Number.isFinite(quantity) && quantity > 0);
+      if (multipliers.length) {
+        return multipliers.reduce((total, quantity) => total + quantity, 0);
+      }
+      const documentedCounts = [...String(value || "").matchAll(/(\d+)\s*(?:支|件|个|只|套|枚|片|瓶|包|组)/g)]
+        .map((match) => Number(match[1]))
+        .filter((quantity) => Number.isFinite(quantity) && quantity > 0);
+      if (documentedCounts.length) {
+        return documentedCounts.reduce((total, quantity) => total + quantity, 0);
+      }
     }
     return 1;
   }
@@ -621,8 +633,11 @@
     const options = [];
     const seen = new Set();
     for (const source of scriptSources()) {
-      const skuMap = extractJsonValue(source, "skuMap") || extractJsonValue(source, "skuInfoMap");
-      if (!skuMap || Array.isArray(skuMap) || typeof skuMap !== "object") continue;
+      const skuMap = [
+        extractJsonValue(source, "skuMap"),
+        extractJsonValue(source, "skuInfoMap"),
+      ].find((candidate) => candidate && !Array.isArray(candidate) && typeof candidate === "object");
+      if (!skuMap) continue;
       const definitions = skuPropertyDefinitions(
         extractJsonValue(source, "skuProps") || extractJsonValue(source, "skuPropertyList")
       );
@@ -654,7 +669,6 @@
         const complete = Boolean(
           supplierSkuId
           && Object.keys(selectedOptions).length
-          && amount
           && Number.isFinite(quantity)
           && imageUrls.length
         );
@@ -673,7 +687,10 @@
           image_urls: imageUrls,
           evidence_source: "embedded_sku_map",
           complete,
-          evidence: { sku_map_key: mapKey },
+          evidence: {
+            sku_map_key: mapKey,
+            price_independent_sku_selection: true,
+          },
         });
         seen.add(supplierSkuId);
       }
@@ -897,7 +914,7 @@
   }
 
   function missingRequired(product, { requireSkuOptions = true } = {}) {
-    const requiredFields = ["title", "seller", "sku", "images", "price", "domestic_shipping_evidence"];
+    const requiredFields = ["title", "seller", "sku", "images", "domestic_shipping_evidence"];
     if (requireSkuOptions) requiredFields.splice(3, 0, "sku_options");
     return requiredFields.filter((field) => {
       const value = product[field];

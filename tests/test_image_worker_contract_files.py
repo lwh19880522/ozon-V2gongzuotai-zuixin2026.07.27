@@ -4,7 +4,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_active_image_worker_contract_uses_dynamic_pool_up_to_five_workers() -> None:
+def test_active_image_worker_contract_uses_ten_fixed_visible_tasks() -> None:
     controller_skill = (ROOT / "skills" / "ozon-image-generation-controller" / "SKILL.md").read_text(
         encoding="utf-8"
     )
@@ -15,36 +15,58 @@ def test_active_image_worker_contract_uses_dynamic_pool_up_to_five_workers() -> 
         encoding="utf-8"
     )
     plugin_manifest = (ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
-    workbench_service = (ROOT / "src" / "ozon_v2" / "services" / "workbench_service.py").read_text(
+    fs_repo = (ROOT / "src" / "ozon_v2" / "adapters" / "fs_repo.py").read_text(
         encoding="utf-8"
     )
 
-    for index in range(1, 6):
+    for index in range(1, 11):
         worker_id = f"ozon-image-worker-{index:02d}"
         assert worker_id in controller_skill
         assert worker_id in worker_skill
 
-    assert "5 个队列租约槽位" in controller_skill
-    assert "不与固定子智能体永久绑定" in controller_skill
-    assert "每次派发时动态分配" in controller_skill
-    assert "ozon_image_worker_01` ->" not in controller_skill
+    assert "10 个固定可见任务槽位" in controller_skill
+    assert "全局并发上限为 10" in controller_skill
+    assert "按槽位顺序复用" in controller_skill
 
     combined_active_contract = "\n".join(
-        (controller_agent, worker_skill, plugin_manifest, workbench_service)
+        (controller_agent, worker_skill, plugin_manifest, fs_repo)
     )
-    assert "up to five reusable image subagents" in controller_agent
-    assert "spawn_agent" in controller_agent
-    assert "Never use create_thread" in controller_agent
-    assert "available capacity" in controller_agent
-    assert "sixth child slot reserved" in controller_agent
-    assert "dynamic pool of up to five subagents" in plugin_manifest
-    assert "等待最多 5 个动态 Codex 生图子智能体" in workbench_service
-    assert "worker tasks" not in controller_agent
-    assert "exactly five" not in combined_active_contract
-    assert "等待 5 个固定 Codex 生图子智能体" not in workbench_service
-    assert "exactly two" not in combined_active_contract
-    assert "two-worker" not in combined_active_contract
-    assert "等待两个 Codex 生图工作线程" not in combined_active_contract
+    assert "ten fixed reusable user-visible Codex tasks" in controller_agent
+    assert "reuse the registered tasks in slot order" in controller_agent.casefold()
+    assert "only when the user explicitly requests a new task" in controller_agent
+    assert "fixed pool of ten user-visible tasks" in plugin_manifest
+    assert '"image_tasks" / "pending"' in fs_repo
+    assert "subagent" not in combined_active_contract
+    assert "最多 5" not in combined_active_contract
+
+
+def test_worker_contract_uses_only_claimed_task_package_assignments() -> None:
+    worker_skill = (
+        ROOT / "skills" / "ozon-product-media-generator" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    worker_agent = (
+        ROOT / "skills" / "ozon-product-media-generator" / "agents" / "openai.yaml"
+    ).read_text(encoding="utf-8")
+
+    assert "scripts/ozon_image_task_inbox.py" in worker_skill
+    assert "image_tasks/in_progress" in worker_skill
+    assert "RUN package_id=" in worker_agent
+    assert "claim and process the next product" not in worker_agent
+
+
+def test_product_media_skill_directly_replaces_ozon_gallery_without_workbench_callback() -> None:
+    worker_skill = (
+        ROOT / "skills" / "ozon-product-media-generator" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    worker_agent = (
+        ROOT / "skills" / "ozon-product-media-generator" / "agents" / "openai.yaml"
+    ).read_text(encoding="utf-8")
+
+    assert "image_tasks/in_progress" in worker_skill
+    assert "replace_product_pictures" in worker_skill
+    assert "all eight ordered public image URLs" in worker_skill
+    assert "never return generated files to the workbench" in worker_skill
+    assert "direct Ozon gallery replacement" in worker_agent
 
 
 def test_product_media_contract_keeps_white_anchor_out_of_finished_slots() -> None:
@@ -147,6 +169,132 @@ def test_product_media_skill_uses_visual_contract_v3_storyboard_and_local_copy_r
     assert diversity_contract in main_prompt
     assert diversity_contract in detail_a_prompt
     assert diversity_contract in detail_b_prompt
+
+
+def test_product_media_skill_and_grid_prompts_require_three_by_four_finished_images() -> None:
+    skill_root = ROOT / "skills" / "ozon-product-media-generator"
+    skill = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+    prompt_contract = (skill_root / "references" / "prompt-contract.md").read_text(
+        encoding="utf-8"
+    )
+    main_prompt = (skill_root / "assets" / "main-grid-prompt.txt").read_text(
+        encoding="utf-8"
+    )
+    detail_a_prompt = (skill_root / "assets" / "detail-grid-a-prompt.txt").read_text(
+        encoding="utf-8"
+    )
+    detail_b_prompt = (skill_root / "assets" / "detail-grid-b-prompt.txt").read_text(
+        encoding="utf-8"
+    )
+    repair_prompt = (skill_root / "assets" / "repair-slot-prompt.txt").read_text(
+        encoding="utf-8"
+    )
+
+    assert "ozon-image-v4" in "\n".join((skill, prompt_contract))
+    assert "3:4" in skill
+    assert "3:4" in prompt_contract
+    assert "3:2" in main_prompt
+    assert "each panel is exactly 3:4 portrait" in main_prompt
+    for prompt in (detail_a_prompt, detail_b_prompt):
+        assert "9:4" in prompt
+        assert "each panel is exactly 3:4 portrait" in prompt
+    assert "exactly 3:4 portrait" in repair_prompt
+
+
+def test_product_media_skill_maps_one_primary_ozon_reference_to_every_finished_slot() -> None:
+    skill_root = ROOT / "skills" / "ozon-product-media-generator"
+    skill = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+    prompt_contract = (skill_root / "references" / "prompt-contract.md").read_text(
+        encoding="utf-8"
+    )
+    main_prompt = (skill_root / "assets" / "main-grid-prompt.txt").read_text(
+        encoding="utf-8"
+    )
+    detail_a_prompt = (skill_root / "assets" / "detail-grid-a-prompt.txt").read_text(
+        encoding="utf-8"
+    )
+    detail_b_prompt = (skill_root / "assets" / "detail-grid-b-prompt.txt").read_text(
+        encoding="utf-8"
+    )
+    repair_prompt = (skill_root / "assets" / "repair-slot-prompt.txt").read_text(
+        encoding="utf-8"
+    )
+    combined = "\n".join(
+        (skill, prompt_contract, main_prompt, detail_a_prompt, detail_b_prompt, repair_prompt)
+    )
+
+    assert "reference_mapping_version=ozon-reference-map-v1" in combined
+    assert "primary_ozon_reference" in skill
+    assert "one primary Ozon reference per finished slot" in prompt_contract
+    assert "main_01` through `detail_06" in prompt_contract
+    assert "gallery order" in prompt_contract
+    assert "same reference may be bound to at most two slots" in prompt_contract
+    assert "one white identity anchor, eight slot-specific Ozon references" in skill
+
+    assert "Ozon reference A maps only to Panel 1" in main_prompt
+    assert "Ozon reference B maps only to Panel 2" in main_prompt
+    for prompt in (detail_a_prompt, detail_b_prompt):
+        assert "Ozon reference A maps only to Panel 1" in prompt
+        assert "Ozon reference B maps only to Panel 2" in prompt
+        assert "Ozon reference C maps only to Panel 3" in prompt
+    for prompt in (main_prompt, detail_a_prompt, detail_b_prompt):
+        assert "Do not blend visual directions across panels" in prompt
+        assert "Replace the reference product with the locked target product" in prompt
+        assert "Do not copy reference branding, text, watermark, price" in prompt
+
+    for receipt_field in (
+        "primary_ozon_reference_sha256",
+        "reference_slot_index",
+        "reference_reused",
+        "reference_composition_followed",
+        "locked_subject_preserved",
+    ):
+        assert receipt_field in prompt_contract
+    for blueprint_field in (
+        "subject_position",
+        "subject_scale",
+        "camera_family",
+        "shot_scale",
+        "background_family",
+        "lighting_family",
+        "negative_space",
+        "copy_zone",
+    ):
+        assert blueprint_field in prompt_contract
+
+    assert "Reuse the failed slot's original primary Ozon reference" in repair_prompt
+    assert "unless the user explicitly changes that reference" in repair_prompt
+    assert "1x2 main grid" in skill
+    assert "two 1x3 supporting grids" in skill
+    assert "exactly 3:4 portrait" in combined
+
+
+def test_product_media_skill_materializes_references_and_checkpoints_every_generation_call() -> None:
+    skill_root = ROOT / "skills" / "ozon-product-media-generator"
+    skill = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+    prompt_contract = (skill_root / "references" / "prompt-contract.md").read_text(
+        encoding="utf-8"
+    )
+    combined = "\n".join((skill, prompt_contract))
+
+    assert "materialize-references" in combined
+    assert "reference_manifest.json" in combined
+    assert "512" in combined
+    assert "checkpoint-asset" in combined
+    assert "checkpoint-status" in combined
+    assert "immediately after each image-generation call" in combined
+    assert "reuse every hash-verified checkpoint" in combined
+    assert "primary_ozon_reference_path" in combined
+
+
+def test_product_media_handoff_shows_only_final_rendered_slots_with_russian_labels() -> None:
+    skill_root = ROOT / "skills" / "ozon-product-media-generator"
+    skill = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "view_image" in skill
+    assert "all eight accepted_path files" in skill
+    assert "raw imagegen grids are never the final preview" in skill
+    assert "Russian labels" in skill
 
 
 def test_product_media_skill_uses_structured_user_feedback_for_selected_repairs() -> None:

@@ -34,6 +34,15 @@ def test_complete_real_supplier_sku_is_valid_and_round_trips() -> None:
     assert SupplierSkuOption.from_dict(sku.to_dict()) == sku
 
 
+def test_supplier_sku_selection_does_not_require_price() -> None:
+    sku = replace(
+        complete_four_piece_sku(),
+        price={"currency": "CNY", "amount": ""},
+    )
+
+    assert validate_supplier_sku_option(sku) == []
+
+
 def test_dom_button_labels_cannot_claim_complete_real_sku() -> None:
     sku = replace(
         complete_four_piece_sku(),

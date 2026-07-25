@@ -4,6 +4,7 @@ from collections.abc import Mapping, Sequence
 from collections import Counter
 from dataclasses import dataclass
 from io import BytesIO
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -406,6 +407,8 @@ def render_visual(
         "scene_signature": dict(spec.scene_signature),
         "visual_spec": spec.to_dict(),
         "visual_system": "ozon-edge-gradient-b1",
+        "visual_source_sha256": _file_sha256(source),
+        "visual_output_sha256": _file_sha256(output),
         "visual_design_passed": True,
         "russian_copy_passed": True,
         "safe_area_passed": True,
@@ -417,6 +420,14 @@ def render_visual(
             "minimum_mobile_scale_px": minimum_mobile_scale_px,
         },
     }
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _write_atomically(output: Path, content: bytes) -> None:

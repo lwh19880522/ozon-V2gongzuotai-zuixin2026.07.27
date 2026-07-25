@@ -73,7 +73,7 @@ function skuGroup(name, options) {
 
 const groups = [
   skuGroup("规格", [
-    skuOption("儿童飞机脚踏板【灰色】", "https://cbu01.alicdn.com/img/ibank/hammock-grey.jpg"),
+    skuOption("清洁剂100ml*2+刷子*1", "https://cbu01.alicdn.com/img/ibank/hammock-grey.jpg"),
     skuOption("儿童飞机脚踏板【黑色】", "https://cbu01.alicdn.com/img/ibank/hammock-black.jpg", true),
   ]),
   skuGroup("颜色", [
@@ -167,9 +167,14 @@ vm.runInContext(fs.readFileSync(scriptPath, "utf8"), context, { filename: script
   assert.equal(product.sku_groups.length, 2);
   assert.equal(product.sku_options.length, 2, "one varying group plus fixed singleton groups must become selectable SKU cards");
   assert.deepEqual(product.sku_options[0].selected_options, {
-    "规格": "儿童飞机脚踏板【灰色】",
+    "规格": "清洁剂100ml*2+刷子*1",
     "颜色": "黑色",
   });
+  assert.equal(
+    product.sku_options[0].set_quantity,
+    3,
+    "a composite SKU label must sum every explicit item multiplier",
+  );
   assert.deepEqual(product.sku_options[1].selected_options, {
     "规格": "儿童飞机脚踏板【黑色】",
     "颜色": "黑色",

@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from typing import Any
 
 
 _ALIAS_GROUPS: dict[str, tuple[str, ...]] = {
-    "brand": ("бренд", "марка", "brand", "品牌"),
+    "brand": (
+        "бренд",
+        "бренд в одежде и обуви",
+        "марка",
+        "brand",
+        "品牌",
+    ),
     "type": ("тип", "тип товара", "вид товара", "type", "类型", "品类"),
     "model": ("модель", "название модели", "model", "型号"),
     "article": ("артикул", "код модели", "model code", "货号"),
@@ -21,6 +28,11 @@ _ALIAS_GROUPS: dict[str, tuple[str, ...]] = {
         "единиц в одном товаре",
         "quantity",
         "数量",
+    ),
+    "factory_package_count": ("количество заводских упаковок",),
+    "set_item_count": (
+        "количество инструментов в наборе шт",
+        "количество предметов в наборе шт",
     ),
     "seller_code": ("код продавца", "seller code", "offer id"),
     "package_contents": ("комплектация", "состав комплекта", "package contents", "包装清单"),
@@ -55,6 +67,69 @@ _ALIAS_GROUPS: dict[str, tuple[str, ...]] = {
     ),
     "volume": ("объем мл", "объём мл", "volume", "容量"),
     "gender": ("пол ребенка", "пол", "gender", "性别"),
+    "upper_material": (
+        "материал верха",
+        "upper material",
+        "鞋面材质",
+        "帮面材质",
+        "鞋帮材质",
+    ),
+    "lining_material": (
+        "материал подкладки обуви",
+        "материал подкладки",
+        "lining material",
+        "内里材质",
+        "里料材质",
+        "鞋里材质",
+    ),
+    "sole_material": (
+        "материал подошвы обуви",
+        "материал подошвы",
+        "sole material",
+        "鞋底材质",
+    ),
+    "fastening_type": (
+        "вид застежки",
+        "fastening type",
+        "闭合方式",
+        "扣合方式",
+        "鞋子闭合方式",
+    ),
+    "target_audience": ("целевая аудитория", "target audience", "适用人群"),
+    "heel_height": ("высота каблука см", "heel height", "跟高", "鞋跟高度"),
+    "shaft_height": ("высота голенища см", "shaft height", "筒高", "靴筒高度"),
+    "insole_length": ("длина стельки см", "insole length", "鞋垫长", "内长"),
+    "style": ("стиль", "style", "风格"),
+    "decorative_elements": (
+        "декоративные элементы",
+        "decorative elements",
+        "流行元素",
+        "装饰",
+    ),
+    "season": ("сезон", "season", "适用季节", "上市季节"),
+    "waterproof": ("непромокаемые", "waterproof", "防水"),
+    "fit": ("посадка", "fit", "版型"),
+    "collection": ("коллекция", "collection", "系列"),
+    "manufacturer_size": (
+        "размер производителя",
+        "manufacturer size",
+        "厂家尺码",
+        "尺码",
+    ),
+    "size_information": (
+        "информация о размерах",
+        "size information",
+        "尺码说明",
+    ),
+    "sole_attachment": (
+        "метод крепления подошвы",
+        "sole attachment",
+        "鞋底工艺",
+    ),
+    "disable_product_grouping": (
+        "объединить на одной карточке",
+        "объединить в похожие товары",
+    ),
     "title": ("название", "title"),
     "description": ("аннотация", "описание", "description"),
     "rich_content": ("rich контент json", "rich content", "rich_content"),
@@ -67,8 +142,31 @@ _ALIASES = {
     for alias in aliases
 }
 _CREATIVE_FIELDS = {"title", "description", "rich_content", "hashtags"}
+_VISUAL_INFERENCE_FIELDS = {
+    "color",
+    "factory_package_count",
+    "set_item_count",
+}
 _SUPPLIER_IDENTITY_FIELDS = {"brand", "model", "article", "color"}
 _SUPPLIER_TRUTH_SOURCES = {"confirmed_supplier_sku", "supplier_attributes"}
+_STORE_FIXED_FIELDS: dict[str, dict[str, str]] = {
+    "country": {
+        "value": "Китай",
+        "evidence_ref": "workflow.defaults.country_of_manufacture",
+        "reason": (
+            "The store ships products purchased from China; the user-approved "
+            "country of manufacture is fixed to China for this workflow."
+        ),
+    },
+    "disable_product_grouping": {
+        "value": "Нет",
+        "evidence_ref": "workflow.defaults.disable_product_grouping",
+        "reason": (
+            "The workbench creates one independently reviewed supplier SKU per "
+            "Ozon product and does not auto-group it with other product cards."
+        ),
+    },
+}
 _OPTIONAL_ASSET_FIELDS = {
     "озон видеообложка ссылка",
     "озон видео название",
@@ -89,6 +187,48 @@ def canonical_attribute_label(value: Any) -> str:
     if normalized.startswith("название модели"):
         return "model"
     return _ALIASES.get(normalized, normalized)
+
+
+def is_visual_inference_field(value: Any) -> bool:
+    return canonical_attribute_label(value) in _VISUAL_INFERENCE_FIELDS
+
+
+def attribute_content_score_progress(
+    fields: list[dict[str, Any]],
+) -> dict[str, Any]:
+    scorable = [
+        field
+        for field in fields
+        if canonical_attribute_label(field.get("label")) not in _CREATIVE_FIELDS
+        and normalize_attribute_label(field.get("label")) not in _OPTIONAL_ASSET_FIELDS
+        and field.get("status") not in {"excluded", "not_applicable"}
+    ]
+    filled = sum(1 for field in scorable if field.get("status") == "mapped")
+    total = len(scorable)
+    completion = round((filled / total * 100), 1) if total else 0.0
+    if completion >= 70:
+        points = 30
+        next_band_points = None
+    elif completion >= 50:
+        points = 15
+        next_band_points = 30
+    elif completion >= 15:
+        points = 7.5
+        next_band_points = 15
+    else:
+        points = 0
+        next_band_points = 7.5
+    target_50 = math.ceil(total * 0.5)
+    target_70 = math.ceil(total * 0.7)
+    return {
+        "scorable_attribute_count": total,
+        "filled_attribute_count": filled,
+        "completion_percent": completion,
+        "estimated_attribute_points": points,
+        "fields_to_50_percent": max(0, target_50 - filled),
+        "fields_to_70_percent": max(0, target_70 - filled),
+        "next_band_points": next_band_points,
+    }
 
 
 def map_template_attributes(
@@ -122,6 +262,12 @@ def map_template_attributes(
             "required": required,
             "attribute_type": schema_field.get("attribute_type"),
             "dictionary_id": schema_field.get("dictionary_id"),
+            "allowed_values": (
+                list(schema_field.get("allowed_values"))
+                if isinstance(schema_field.get("allowed_values"), list)
+                else []
+            ),
+            "visual_inference_supported": is_visual_inference_field(label),
         }
         if canonical_label in _CREATIVE_FIELDS:
             if (
@@ -167,6 +313,25 @@ def map_template_attributes(
             )
             continue
 
+        fixed_field = _STORE_FIXED_FIELDS.get(canonical_label)
+        if fixed_field is not None:
+            mapped_fields.append(
+                {
+                    **base,
+                    "status": "mapped",
+                    "value": fixed_field["value"],
+                    "source": "store_fixed_policy",
+                    "source_label": label,
+                    "evidence_ref": fixed_field["evidence_ref"],
+                    "mapping_method": "store_fixed_value",
+                    "dictionary_resolution_required": bool(
+                        schema_field.get("dictionary_id")
+                    ),
+                    "reason": fixed_field["reason"],
+                }
+            )
+            continue
+
         candidates = [
             item
             for item in evidence
@@ -199,6 +364,93 @@ def map_template_attributes(
             )
             if selected is not None:
                 selected = {**selected, "mapping_method": "model_identifier_fallback"}
+
+        if selected is None and canonical_label == "brand":
+            mapped_fields.append(
+                {
+                    **base,
+                    "status": "mapped",
+                    "value": "Нет бренда",
+                    "source": "approved_no_brand_policy",
+                    "source_label": label,
+                    "evidence_ref": "workbench.policy.no_brand",
+                    "mapping_method": "approved_no_brand_fallback",
+                    "dictionary_resolution_required": bool(
+                        schema_field.get("dictionary_id")
+                    ),
+                    "reason": (
+                        "No verified brand was found in the locked supplier or "
+                        "Ozon evidence; the user-approved Ozon no-brand value is used."
+                    ),
+                }
+            )
+            continue
+
+        if selected is not None and _customer_facing_value_needs_normalization(
+            canonical_label,
+            selected.get("value"),
+        ):
+            if (
+                generated_result
+                and generated_result.get("structured") is True
+                and generated_result["decision"] == "filled"
+                and _has_value(generated_result.get("value"))
+                and _generated_objective_value_is_acceptable(
+                    canonical_label,
+                    generated_result.get("value"),
+                )
+            ):
+                evidence_refs = generated_result.get("evidence_refs", [])
+                mapped_fields.append(
+                    {
+                        **base,
+                        "status": "mapped",
+                        "value": _plain_value(generated_result["value"]),
+                        "source": "generated_evidence_completion",
+                        "source_label": label,
+                        "evidence_ref": (
+                            evidence_refs[0]
+                            if evidence_refs
+                            else selected["evidence_ref"]
+                        ),
+                        "evidence_refs": evidence_refs,
+                        "mapping_method": "customer_facing_normalization",
+                        "dictionary_resolution_required": bool(
+                            schema_field.get("dictionary_id")
+                        ),
+                        "reason": generated_result.get("reason")
+                        or (
+                            "Supplier truth was translated and normalized for "
+                            "the Russian customer-facing field."
+                        ),
+                    }
+                )
+            else:
+                mapped_fields.append(
+                    {
+                        **base,
+                        "status": "rewrite_required",
+                        "value": None,
+                        "source": selected["source"],
+                        "source_label": selected["source_label"],
+                        "evidence_ref": selected["evidence_ref"],
+                        "reference_evidence": [selected["evidence_ref"]],
+                        "mapping_method": (
+                            "customer_facing_normalization_required"
+                        ),
+                        "dictionary_resolution_required": bool(
+                            schema_field.get("dictionary_id")
+                        ),
+                        "reason": (
+                            "Verified supplier truth contains Chinese text or "
+                            "supplier fulfillment/promotional language. The "
+                            "field Skill must preserve the product fact, "
+                            "translate it to Russian, and remove the unrelated "
+                            "seller wording before upload."
+                        ),
+                    }
+                )
+            continue
 
         if selected is None:
             if (
@@ -322,6 +574,7 @@ def map_template_attributes(
         "required_mapped_count": len(required_mapped),
         "missing_required_fields": missing_required,
         "required_attributes_ready": bool(required_fields) and not missing_required,
+        "attribute_score_progress": attribute_content_score_progress(mapped_fields),
     }
 
 
@@ -353,6 +606,16 @@ def _collect_evidence(
         )
 
     add("Бренд", ozon_candidate.get("brand"), "ozon_structured", "ozon.brand", 50)
+    category_leaf = str(ozon_candidate.get("category_path") or "").rsplit(
+        "/", 1
+    )[-1].strip()
+    add(
+        "Тип",
+        category_leaf,
+        "workflow_category",
+        "ozon.category_path.leaf",
+        90,
+    )
     for key, label in (
         ("package_weight_g", "Вес с упаковкой, г"),
         ("package_length_cm", "Длина упаковки, см"),
@@ -513,9 +776,62 @@ def _generated_objective_value_is_acceptable(
         "material",
         "country",
         "gender",
+        "upper_material",
+        "lining_material",
+        "sole_material",
+        "fastening_type",
+        "target_audience",
+        "style",
+        "decorative_elements",
+        "season",
+        "fit",
+        "collection",
+        "size_information",
+        "sole_attachment",
     }:
         return True
-    return not bool(re.search(r"[\u3400-\u9fff]", str(value or "")))
+    return not _customer_facing_value_needs_normalization(
+        canonical_label,
+        value,
+    )
+
+
+_CUSTOMER_FACING_FIELDS = {
+    "model",
+    "type",
+    "package_contents",
+    "color",
+    "material",
+    "gender",
+    "upper_material",
+    "lining_material",
+    "sole_material",
+    "fastening_type",
+    "target_audience",
+    "style",
+    "decorative_elements",
+    "season",
+    "fit",
+    "collection",
+    "size_information",
+    "sole_attachment",
+}
+_SUPPLIER_FULFILLMENT_OR_PROMOTION_RE = re.compile(
+    r"(?:现货|当天发|当日发|速发|发货|包邮|一件代发|厂家直销|批发|跨境专供)"
+)
+
+
+def _customer_facing_value_needs_normalization(
+    canonical_label: str,
+    value: Any,
+) -> bool:
+    if canonical_label not in _CUSTOMER_FACING_FIELDS:
+        return False
+    text = str(value or "").strip()
+    return bool(
+        re.search(r"[\u3400-\u9fff]", text)
+        or _SUPPLIER_FULFILLMENT_OR_PROMOTION_RE.search(text)
+    )
 
 
 def _generated_field_result(value: Any) -> dict[str, Any] | None:

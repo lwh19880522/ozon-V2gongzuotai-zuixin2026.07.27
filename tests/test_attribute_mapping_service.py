@@ -2,10 +2,271 @@ from __future__ import annotations
 
 import unittest
 
-from ozon_v2.services.attribute_mapping_service import map_template_attributes
+from ozon_v2.services.attribute_mapping_service import (
+    attribute_content_score_progress,
+    map_template_attributes,
+)
 
 
 class AttributeMappingServiceTests(unittest.TestCase):
+    def test_store_fixed_grouping_flags_are_mapped_before_field_skill(self) -> None:
+        result = map_template_attributes(
+            [
+                {
+                    "attribute_id": "merge-card",
+                    "attribute_label": "Объединить на одной карточке",
+                    "is_required": True,
+                    "dictionary_id": 1001,
+                },
+                {
+                    "attribute_id": "merge-similar",
+                    "attribute_label": "Объединить в похожие товары",
+                    "is_required": False,
+                    "dictionary_id": 1002,
+                },
+            ],
+            {"attributes": {}},
+        )
+
+        fields = {field["field_key"]: field for field in result["fields"]}
+        for field_key in ("merge-card", "merge-similar"):
+            self.assertEqual("mapped", fields[field_key]["status"])
+            self.assertEqual("Нет", fields[field_key]["value"])
+            self.assertEqual("store_fixed_policy", fields[field_key]["source"])
+            self.assertEqual(
+                "workflow.defaults.disable_product_grouping",
+                fields[field_key]["evidence_ref"],
+            )
+
+    def test_category_leaf_is_a_deterministic_type_fact(self) -> None:
+        result = map_template_attributes(
+            [
+                {
+                    "attribute_id": "8229",
+                    "attribute_label": "Тип",
+                    "is_required": True,
+                }
+            ],
+            {
+                "category_path": (
+                    "Одежда, обувь и аксессуары / Женская обувь / Полусапоги"
+                ),
+                "attributes": {},
+            },
+        )
+
+        field = result["fields"][0]
+        self.assertEqual("mapped", field["status"])
+        self.assertEqual("Полусапоги", field["value"])
+        self.assertEqual("workflow_category", field["source"])
+        self.assertEqual("ozon.category_path.leaf", field["evidence_ref"])
+
+    def test_common_supplier_footwear_labels_map_to_russian_template_semantics(
+        self,
+    ) -> None:
+        result = map_template_attributes(
+            [
+                {
+                    "attribute_id": "upper",
+                    "attribute_label": "Материал верха",
+                    "is_required": False,
+                },
+                {
+                    "attribute_id": "lining",
+                    "attribute_label": "Материал подкладки обуви",
+                    "is_required": False,
+                },
+                {
+                    "attribute_id": "closure",
+                    "attribute_label": "Вид застёжки",
+                    "is_required": False,
+                },
+            ],
+            {"attributes": {}},
+            supplier_product={
+                "attributes": {
+                    "鞋面材质": "Замша",
+                    "内里材质": "Короткий ворс",
+                    "闭合方式": "Боковая молния",
+                }
+            },
+        )
+
+        fields = {field["field_key"]: field for field in result["fields"]}
+        self.assertEqual("Замша", fields["upper"]["value"])
+        self.assertEqual("Короткий ворс", fields["lining"]["value"])
+        self.assertEqual("Боковая молния", fields["closure"]["value"])
+        self.assertEqual("supplier_attributes", fields["upper"]["source"])
+
+    def test_customer_facing_supplier_fulfillment_text_requires_normalization(
+        self,
+    ) -> None:
+        schema = [
+            {
+                "attribute_id": "color",
+                "attribute_label": "Цвет товара",
+                "is_required": True,
+            }
+        ]
+        candidate = {"attributes": {}}
+        supplier_selection = {
+            "supplier_sku": {
+                "selected_options": {
+                    "颜色": "黑色+黑色鞋底（现货当天发）",
+                }
+            }
+        }
+
+        pending = map_template_attributes(
+            schema,
+            candidate,
+            supplier_selection=supplier_selection,
+        )
+        pending_field = pending["fields"][0]
+        self.assertEqual("rewrite_required", pending_field["status"])
+        self.assertEqual(
+            "customer_facing_normalization_required",
+            pending_field["mapping_method"],
+        )
+        self.assertEqual(
+            "supplier_selection.supplier_sku.selected_options.颜色",
+            pending_field["evidence_ref"],
+        )
+
+        completed = map_template_attributes(
+            schema,
+            candidate,
+            supplier_selection=supplier_selection,
+            rewritten_content={
+                "color": {
+                    "decision": "filled",
+                    "value": "Черный",
+                    "evidence_refs": [
+                        "supplier_selection.supplier_sku.selected_options.颜色"
+                    ],
+                    "reason": (
+                        "Цвет подтвержден выбранным SKU; фраза о наличии и "
+                        "скорости отправки удалена."
+                    ),
+                }
+            },
+        )
+        completed_field = completed["fields"][0]
+        self.assertEqual("mapped", completed_field["status"])
+        self.assertEqual("Черный", completed_field["value"])
+        self.assertEqual(
+            "generated_evidence_completion",
+            completed_field["source"],
+        )
+
+    def test_store_fixed_country_is_mapped_before_intelligent_field_drafting(self) -> None:
+        result = map_template_attributes(
+            [
+                {
+                    "attribute_id": "country",
+                    "attribute_label": "Страна-изготовитель",
+                    "is_required": True,
+                }
+            ],
+            {
+                "attributes": {
+                    "Страна-изготовитель": "Турция",
+                }
+            },
+            supplier_product={
+                "attributes": {
+                    "产地": "广东",
+                }
+            },
+        )
+
+        field = result["fields"][0]
+        self.assertEqual("mapped", field["status"])
+        self.assertEqual("Китай", field["value"])
+        self.assertEqual("store_fixed_policy", field["source"])
+        self.assertEqual(
+            "workflow.defaults.country_of_manufacture",
+            field["evidence_ref"],
+        )
+        self.assertEqual("store_fixed_value", field["mapping_method"])
+        self.assertTrue(result["required_attributes_ready"])
+
+    def test_full_footwear_brand_label_uses_approved_no_brand_default(self) -> None:
+        result = map_template_attributes(
+            [
+                {
+                    "attribute_id": "brand",
+                    "attribute_label": "Бренд в одежде и обуви",
+                    "dictionary_id": 28732849,
+                    "is_required": True,
+                }
+            ],
+            {"attributes": {}},
+            supplier_product={"attributes": {}},
+            supplier_selection={"supplier_sku": {"selected_options": {}}},
+        )
+
+        field = result["fields"][0]
+        self.assertEqual("mapped", field["status"])
+        self.assertEqual("Нет бренда", field["value"])
+        self.assertEqual("approved_no_brand_policy", field["source"])
+        self.assertTrue(result["required_attributes_ready"])
+
+    def test_content_score_progress_excludes_creative_and_media_fields(self) -> None:
+        fields = [
+            *[
+                {
+                    "field_key": f"mapped-{index}",
+                    "label": f"Характеристика {index}",
+                    "status": "mapped",
+                }
+                for index in range(10)
+            ],
+            *[
+                {
+                    "field_key": f"missing-{index}",
+                    "label": f"Недостающая характеристика {index}",
+                    "status": "missing_fact",
+                }
+                for index in range(11)
+            ],
+            {"field_key": "title", "label": "Название", "status": "mapped"},
+            {"field_key": "description", "label": "Аннотация", "status": "mapped"},
+            {"field_key": "hashtags", "label": "#Хештеги", "status": "mapped"},
+            {
+                "field_key": "rich",
+                "label": "Rich-контент JSON",
+                "status": "mapped",
+            },
+            *[
+                {
+                    "field_key": f"asset-{index}",
+                    "label": label,
+                    "status": "not_applicable",
+                }
+                for index, label in enumerate(
+                    (
+                        "Озон.Видеообложка: ссылка",
+                        "Название файла PDF",
+                        "Озон.Видео: товары на видео",
+                        "Документ PDF",
+                        "Озон.Видео: название",
+                        "Озон.Видео: ссылка",
+                    )
+                )
+            ],
+        ]
+
+        progress = attribute_content_score_progress(fields)
+
+        self.assertEqual(21, progress["scorable_attribute_count"])
+        self.assertEqual(10, progress["filled_attribute_count"])
+        self.assertEqual(47.6, progress["completion_percent"])
+        self.assertEqual(7.5, progress["estimated_attribute_points"])
+        self.assertEqual(1, progress["fields_to_50_percent"])
+        self.assertEqual(5, progress["fields_to_70_percent"])
+        self.assertEqual(15, progress["next_band_points"])
+
     def test_uses_complete_ozon_content_evidence_and_marks_creative_fields_for_rewrite(self) -> None:
         schema = [
             {"attribute_id": "85", "attribute_label": "Бренд", "is_required": True},
@@ -114,7 +375,7 @@ class AttributeMappingServiceTests(unittest.TestCase):
         supplier_product = {
             "attributes": {
                 "品牌": "梅芳",
-                "刃口材质": "碳钢",
+                "刃口材质": "Углеродистая сталь",
                 "型号": "全长(mm)",
                 "1020（9寸多功能三合一皮带打孔钳）": "210",
                 "全长": "全部 135 170 210 300",
@@ -143,7 +404,7 @@ class AttributeMappingServiceTests(unittest.TestCase):
         self.assertEqual("1020", fields["model"]["value"])
         self.assertEqual("confirmed_supplier_sku", fields["model"]["source"])
         self.assertEqual("missing_fact", fields["color"]["status"])
-        self.assertEqual("碳钢", fields["material"]["value"])
+        self.assertEqual("Углеродистая сталь", fields["material"]["value"])
         self.assertEqual("210毫米", fields["length"]["value"])
 
     def test_uses_evidence_backed_intelligent_field_results_without_fabricating_unresolved_facts(
@@ -276,6 +537,28 @@ class AttributeMappingServiceTests(unittest.TestCase):
 
         self.assertEqual("missing_fact", field["status"])
         self.assertIsNone(field["value"])
+
+    def test_required_brand_defaults_to_ozon_no_brand_value_when_brand_is_absent(self) -> None:
+        result = map_template_attributes(
+            [
+                {
+                    "attribute_id": "85",
+                    "attribute_label": "Бренд",
+                    "attribute_type": "String",
+                    "dictionary_id": 28732849,
+                    "is_required": True,
+                }
+            ],
+            {"attributes": {}},
+            supplier_product={"attributes": {}},
+            supplier_selection={"supplier_sku": {"selected_options": {}}},
+        )
+
+        field = result["fields"][0]
+        self.assertEqual("mapped", field["status"])
+        self.assertEqual("Нет бренда", field["value"])
+        self.assertEqual("approved_no_brand_policy", field["source"])
+        self.assertTrue(result["required_attributes_ready"])
 
 
 if __name__ == "__main__":

@@ -157,12 +157,12 @@ def test_two_workers_claim_distinct_whole_products_atomically(tmp_path: Path) ->
     assert queue.claim_next("ozon-image-worker-03", now_epoch=100, lease_seconds=30) is None
 
 
-def test_only_five_regular_workers_can_claim_and_sixth_slot_stays_reserved(
+def test_only_ten_fixed_visible_task_slots_can_claim(
     tmp_path: Path,
 ) -> None:
     queue = ImageGenerationQueue(tmp_path / "image_jobs.sqlite3")
     jobs = []
-    for index in range(1, 7):
+    for index in range(1, 12):
         receipt = selection_receipt(f"ozon-{index}", f"sku-{index}")
         jobs.append(
             queue.enqueue(
@@ -177,14 +177,180 @@ def test_only_five_regular_workers_can_claim_and_sixth_slot_stays_reserved(
             now_epoch=100,
             lease_seconds=30,
         )
-        for index in range(1, 6)
+        for index in range(1, 11)
     ]
 
     assert all(job is not None for job in claimed)
-    assert len({job["job_id"] for job in claimed if job is not None}) == 5
+    assert len({job["job_id"] for job in claimed if job is not None}) == 10
     with pytest.raises(ValueError, match="approved regular image worker"):
-        queue.claim_next("ozon-image-worker-06", now_epoch=100, lease_seconds=30)
+        queue.claim_next("ozon-image-worker-11", now_epoch=100, lease_seconds=30)
     assert queue.get_job(jobs[-1]["job_id"])["status"] == "pending"
+
+
+def test_assigned_claim_never_takes_a_different_job(tmp_path: Path) -> None:
+    queue = ImageGenerationQueue(tmp_path / "image_jobs.sqlite3")
+    first_receipt = selection_receipt("ozon-1", "sku-1")
+    second_receipt = selection_receipt("ozon-2", "sku-2")
+    first = queue.enqueue(
+        receipt=first_receipt,
+        subject_master=subject_master(tmp_path, first_receipt),
+    )
+    second = queue.enqueue(
+        receipt=second_receipt,
+        subject_master=subject_master(tmp_path, second_receipt),
+    )
+    queue.register_worker_slot("ozon-image-worker-01", "thread-01")
+    assignment = queue.dispatch_assignments(run_id="wb-image", limit=1)[0]
+
+    with pytest.raises(ValueError, match="does not match the persisted assignment"):
+        queue.claim_assigned(
+            "ozon-image-worker-01",
+            second["job_id"],
+            assignment["instruction_id"],
+            now_epoch=100,
+            lease_seconds=30,
+        )
+
+    claimed = queue.claim_assigned(
+        "ozon-image-worker-01",
+        first["job_id"],
+        assignment["instruction_id"],
+        now_epoch=100,
+        lease_seconds=30,
+    )
+    repeated = queue.claim_assigned(
+        "ozon-image-worker-01",
+        first["job_id"],
+        assignment["instruction_id"],
+        now_epoch=101,
+        lease_seconds=30,
+    )
+
+    assert claimed["job_id"] == first["job_id"]
+    assert repeated["job_id"] == first["job_id"]
+    assert repeated["lease_epoch"] == claimed["lease_epoch"]
+    assert queue.get_job(second["job_id"])["status"] == "pending"
+
+
+def test_dispatch_recovers_an_expired_in_progress_job(tmp_path: Path) -> None:
+    queue = ImageGenerationQueue(tmp_path / "image_jobs.sqlite3")
+    receipt = selection_receipt("ozon-expired", "sku-expired")
+    job = queue.enqueue(
+        receipt=receipt,
+        subject_master=subject_master(tmp_path, receipt),
+    )
+    queue.claim_next(
+        "ozon-image-worker-07",
+        now_epoch=100,
+        lease_seconds=10,
+    )
+    queue.register_worker_slot("ozon-image-worker-07", "thread-07")
+
+    assignments = queue.dispatch_assignments(
+        run_id="wb-image",
+        limit=1,
+        now_epoch=111,
+    )
+
+    assert len(assignments) == 1
+    assert assignments[0]["job_id"] == job["job_id"]
+    claimed = queue.claim_assigned(
+        assignments[0]["worker_id"],
+        assignments[0]["job_id"],
+        assignments[0]["instruction_id"],
+        now_epoch=111,
+        lease_seconds=30,
+    )
+    assert claimed["worker_id"] == "ozon-image-worker-07"
+    assert claimed["lease_epoch"] == 2
+
+
+@pytest.mark.parametrize("product_count", [30, 100])
+def test_ten_fixed_slots_keep_reusing_until_large_batch_is_exhausted(
+    tmp_path: Path,
+    product_count: int,
+) -> None:
+    queue = ImageGenerationQueue(tmp_path / "image_jobs.sqlite3")
+    for index in range(product_count):
+        receipt = selection_receipt(f"ozon-{index:03d}", f"sku-{index:03d}")
+        queue.enqueue(
+            receipt=receipt,
+            subject_master=subject_master(tmp_path, receipt),
+        )
+    for index in range(1, 11):
+        queue.register_worker_slot(
+            f"ozon-image-worker-{index:02d}",
+            f"thread-{index:02d}",
+        )
+
+    processed: list[str] = []
+    dispatch_sizes: list[int] = []
+    now_epoch = 100.0
+    while True:
+        assignments = queue.dispatch_assignments(
+            run_id="wb-image",
+            limit=10,
+            now_epoch=now_epoch,
+        )
+        if not assignments:
+            break
+        dispatch_sizes.append(len(assignments))
+        for assignment in assignments:
+            claimed = queue.claim_assigned(
+                assignment["worker_id"],
+                assignment["job_id"],
+                assignment["instruction_id"],
+                now_epoch=now_epoch,
+                lease_seconds=30,
+            )
+            processed.append(claimed["job_id"])
+            queue.stop(
+                claimed["job_id"],
+                reason="test worker completed its scheduling turn",
+                stopped_by="test_scheduler",
+            )
+        now_epoch += 1
+
+    assert len(processed) == product_count
+    assert len(set(processed)) == product_count
+    assert dispatch_sizes == [10] * (product_count // 10)
+    assert queue.dispatch_assignments(run_id="wb-image", limit=10) == []
+
+
+def test_resumed_job_returns_to_its_original_fixed_worker_slot(tmp_path: Path) -> None:
+    queue = ImageGenerationQueue(tmp_path / "image_jobs.sqlite3")
+    receipt = selection_receipt("ozon-repair", "sku-repair")
+    job = queue.enqueue(
+        receipt=receipt,
+        subject_master=subject_master(tmp_path, receipt),
+    )
+    queue.register_worker_slot("ozon-image-worker-02", "thread-02")
+    first_assignment = queue.dispatch_assignments(run_id="wb-image", limit=10)[0]
+    queue.claim_assigned(
+        first_assignment["worker_id"],
+        first_assignment["job_id"],
+        first_assignment["instruction_id"],
+        now_epoch=100,
+        lease_seconds=30,
+    )
+    queue.stop(
+        job["job_id"],
+        reason="test repair handoff",
+        stopped_by="test_scheduler",
+    )
+    queue.resume(job["job_id"])
+    queue.register_worker_slot("ozon-image-worker-01", "thread-01")
+
+    resumed_assignment = queue.dispatch_assignments(
+        run_id="wb-image",
+        limit=10,
+        now_epoch=200,
+    )
+
+    assert len(resumed_assignment) == 1
+    assert resumed_assignment[0]["worker_id"] == "ozon-image-worker-02"
+    assert resumed_assignment[0]["job_id"] == job["job_id"]
+
 
 def test_expired_lease_can_be_reclaimed_and_stop_resume_is_explicit(tmp_path: Path) -> None:
     receipt = selection_receipt()

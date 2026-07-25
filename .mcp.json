@@ -1,11 +1,10 @@
 {
   "mcpServers": {
     "ozon-v2": {
-      "command": "python",
+      "command": ".venv/Scripts/python.exe",
       "args": [
         "mcp/server.py"
       ]
     }
   }
 }
-

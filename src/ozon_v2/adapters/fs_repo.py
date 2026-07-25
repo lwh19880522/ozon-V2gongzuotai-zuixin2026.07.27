@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import random
+import re
 import shutil
 import threading
 import time
@@ -80,6 +81,10 @@ class FsRepo:
     @property
     def pricing_settings_path(self) -> Path:
         return self.config_dir / "pricing_settings.json"
+
+    @property
+    def public_media_settings_path(self) -> Path:
+        return self.config_dir / "public_media_settings.json"
 
     @property
     def credential_assistant_state_path(self) -> Path:
@@ -484,6 +489,15 @@ class FsRepo:
             return PricingPolicy.default().to_dict()
         return self._read_json(self.pricing_settings_path)
 
+    def save_public_media_settings(self, payload: dict[str, Any]) -> Path:
+        self._write_json(self.public_media_settings_path, payload)
+        return self.public_media_settings_path
+
+    def load_public_media_settings(self) -> dict[str, Any]:
+        if not self.public_media_settings_path.exists():
+            return {"base_url": ""}
+        return self._read_json(self.public_media_settings_path)
+
     def save_pricing_evidence(self, run_id: str, payload: dict[str, Any]) -> Path:
         path = self.run_dir(run_id) / "pricing_evidence.json"
         self._write_json(path, payload)
@@ -515,6 +529,43 @@ class FsRepo:
 
     def load_upload_draft(self, run_id: str) -> dict[str, Any]:
         return self._read_json(self.run_dir(run_id) / "upload_draft.json")
+
+    def save_upload_previews(self, run_id: str, payload: dict[str, Any]) -> Path:
+        path = self.run_dir(run_id) / "upload_previews.json"
+        self._write_json(path, payload)
+        return path
+
+    def load_upload_previews(self, run_id: str) -> dict[str, Any]:
+        return self._read_json(self.run_dir(run_id) / "upload_previews.json")
+
+    def save_upload_submissions(self, run_id: str, payload: dict[str, Any]) -> Path:
+        path = self.run_dir(run_id) / "upload_submissions.json"
+        self._write_json(path, payload)
+        return path
+
+    def load_upload_submissions(self, run_id: str) -> dict[str, Any]:
+        return self._read_json(self.run_dir(run_id) / "upload_submissions.json")
+
+    def image_task_pending_dir(self) -> Path:
+        path = self.runtime_root / "image_tasks" / "pending"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def save_image_task_package(
+        self,
+        package_id: str,
+        payload: dict[str, Any],
+    ) -> Path:
+        safe_package_id = re.sub(
+            r"[^A-Za-z0-9_.-]+",
+            "-",
+            str(package_id or "").strip(),
+        ).strip(".-")
+        if not safe_package_id:
+            raise ValueError("Image task package_id must contain a safe filename.")
+        path = self.image_task_pending_dir() / f"{safe_package_id}.json"
+        self._write_json(path, payload)
+        return path
 
     def save_browser_bridge_status(self, payload: dict[str, Any]) -> dict[str, Any]:
         self._initialize_runtime_once()

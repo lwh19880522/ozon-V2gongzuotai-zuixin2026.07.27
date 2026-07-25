@@ -143,41 +143,130 @@ class SellerApiAdapter:
         attribute_id: int,
         value: str,
     ) -> dict[str, Any]:
+        words = str(value or "").strip().split()
+        candidates = [
+            " ".join(words[:length])
+            for length in range(len(words), 0, -1)
+        ]
+        seen: set[str] = set()
+        for candidate in candidates:
+            target = _normalize_category_text(candidate)
+            if not target or target in seen:
+                continue
+            seen.add(target)
+            payload = self._post_json(
+                "/v1/description-category/attribute/values/search",
+                {
+                    "attribute_id": attribute_id,
+                    "description_category_id": description_category_id,
+                    "type_id": type_id,
+                    "value": candidate,
+                    "limit": 100,
+                },
+            )
+            result = payload.get("result", [])
+            if isinstance(result, dict):
+                result = result.get("values") or result.get("items") or []
+            if not isinstance(result, list):
+                raise SellerApiError(
+                    "Seller attribute dictionary response has invalid shape."
+                )
+            exact_matches = []
+            for item in result:
+                if not isinstance(item, dict):
+                    continue
+                visible_value = str(
+                    item.get("value") or item.get("name") or ""
+                ).strip()
+                value_id = (
+                    item.get("id")
+                    or item.get("value_id")
+                    or item.get("dictionary_value_id")
+                )
+                if (
+                    value_id is None
+                    or _normalize_category_text(visible_value) != target
+                ):
+                    continue
+                exact_matches.append(
+                    {
+                        "dictionary_value_id": value_id,
+                        "value": visible_value,
+                    }
+                )
+            unique_matches = {
+                str(match["dictionary_value_id"]): match
+                for match in exact_matches
+            }
+            if len(unique_matches) == 1:
+                return next(iter(unique_matches.values()))
+            if len(unique_matches) > 1:
+                break
+        raise SellerApiError(
+            f"Could not resolve one exact dictionary value for attribute {attribute_id}: {value}"
+        )
+
+    def import_products(self, items: list[dict[str, Any]]) -> dict[str, Any]:
+        if not items:
+            raise SellerApiError("At least one product is required for Seller API import.")
+        if len(items) > 100:
+            raise SellerApiError("Seller API product import accepts at most 100 products.")
+        payload = self._post_json("/v3/product/import", {"items": items})
+        result = payload.get("result", {})
+        if not isinstance(result, dict):
+            result = {}
+        task_id = result.get("task_id") or payload.get("task_id")
+        if task_id is None:
+            raise SellerApiError("Seller API product import did not return a task_id.")
+        return {"task_id": task_id}
+
+    def get_product_import_info(self, task_id: int) -> dict[str, Any]:
+        payload = self._post_json("/v1/product/import/info", {"task_id": task_id})
+        result = payload.get("result", payload)
+        if not isinstance(result, dict):
+            raise SellerApiError("Seller API product import status has invalid shape.")
+        return result
+
+    def replace_product_pictures(
+        self,
+        *,
+        product_id: int,
+        images: list[str],
+    ) -> dict[str, Any]:
+        if int(product_id) <= 0:
+            raise SellerApiError("A positive Ozon product_id is required.")
+        normalized_images = [str(url or "").strip() for url in images]
+        if not normalized_images:
+            raise SellerApiError("At least one product picture is required.")
+        if any(not url.startswith("https://") for url in normalized_images):
+            raise SellerApiError("Every product picture must use a public HTTPS URL.")
         payload = self._post_json(
-            "/v1/description-category/attribute/values/search",
+            "/v1/product/pictures/import",
             {
-                "attribute_id": attribute_id,
-                "description_category_id": description_category_id,
-                "type_id": type_id,
-                "value": value,
-                "limit": 100,
+                "product_id": int(product_id),
+                "images": normalized_images,
+                "images360": [],
             },
         )
-        result = payload.get("result", [])
-        if isinstance(result, dict):
-            result = result.get("values") or result.get("items") or []
-        if not isinstance(result, list):
-            raise SellerApiError("Seller attribute dictionary response has invalid shape.")
-        target = _normalize_category_text(value)
-        exact_matches = []
-        for item in result:
-            if not isinstance(item, dict):
-                continue
-            visible_value = str(item.get("value") or item.get("name") or "").strip()
-            value_id = item.get("id") or item.get("value_id") or item.get("dictionary_value_id")
-            if value_id is None or _normalize_category_text(visible_value) != target:
-                continue
-            exact_matches.append(
-                {
-                    "dictionary_value_id": value_id,
-                    "value": visible_value,
-                }
-            )
-        if len(exact_matches) != 1:
+        result = payload.get("result", payload)
+        if not isinstance(result, dict):
+            raise SellerApiError("Seller API picture import returned an invalid result.")
+        return result
+
+    def get_seller_currency_code(self) -> str:
+        payload = self._post_json("/v1/seller/info", {})
+        result = payload.get("result", payload)
+        company = result.get("company") if isinstance(result, dict) else None
+        currency = (
+            str(company.get("currency") or "").strip().upper()
+            if isinstance(company, dict)
+            else ""
+        )
+        if currency not in {"CNY", "RUB", "USD", "EUR"}:
             raise SellerApiError(
-                f"Could not resolve one exact dictionary value for attribute {attribute_id}: {value}"
+                "Seller API profile did not return a supported contract currency."
             )
-        return exact_matches[0]
+        return currency
 
     def _fetch_product_refs(self, page_limit: int | None = None) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []

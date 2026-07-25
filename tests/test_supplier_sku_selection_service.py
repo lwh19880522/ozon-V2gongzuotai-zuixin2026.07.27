@@ -181,6 +181,109 @@ class SupplierSkuSelectionServiceTests(RuntimeTestCase):
         self.assertFalse(selected.ok)
         self.assertEqual("supplier_sku_selection.option_missing", selected.code)
 
+    def test_single_embedded_sku_candidate_can_be_locked_without_price(self) -> None:
+        product = self.supplier_payload()["supplier_products"][0]
+        product["sku"] = {
+            "selected_options": {"visible_sku_labels": ["黑色均码"]},
+            "evidence": "visible_selected_or_available_sku_labels",
+            "evidence_source": "dom_option_labels",
+            "complete": False,
+        }
+        product["sku_options"] = []
+        product["sku_groups"] = [
+            {
+                "name": "颜色",
+                "options": [
+                    {
+                        "label": "黑色均码",
+                        "supplier_sku_id": "",
+                        "image_url": "https://cbu01.alicdn.com/img/ibank/black.jpg",
+                        "disabled": False,
+                        "selected": False,
+                        "option_index": 0,
+                    }
+                ],
+            }
+        ]
+        product["sku_option_candidates"] = [
+            {
+                "supplier_sku_id": "6229423755764",
+                "combination_key": "黑色均码",
+                "raw_label": "黑色均码",
+                "selected_options": {"颜色": "黑色均码"},
+                "set_quantity": 1,
+                "set_composition": ["黑色均码"],
+                "price": {"currency": "CNY", "amount": ""},
+                "stock": {"status": "in_stock", "quantity": 99880},
+                "image_urls": ["https://cbu01.alicdn.com/img/ibank/black.jpg"],
+                "evidence_source": "embedded_sku_map",
+                "complete": False,
+                "evidence": {"sku_map_key": "黑色均码"},
+                "validation_errors": [
+                    "price currency and amount are required",
+                    "complete supplier SKU evidence is required",
+                ],
+            }
+        ]
+        product["price"] = None
+        self._save_collected_product(product)
+
+        selected = self.service.confirm_supplier_sku(
+            self.run_id,
+            seed_id="seed-1",
+            supplier_sku_id="6229423755764",
+            differences=[],
+        )
+
+        self.assertTrue(selected.ok, selected.to_dict())
+        self.assertEqual(
+            "",
+            selected.data["receipt"]["supplier_sku"]["price"]["amount"],
+        )
+
+    def test_single_visible_supplier_option_has_user_confirmable_fallback(self) -> None:
+        product = self.supplier_payload()["supplier_products"][0]
+        product["sku"] = {
+            "selected_options": {"visible_sku_labels": ["黑色均码"]},
+            "evidence": "visible_selected_or_available_sku_labels",
+            "evidence_source": "dom_option_labels",
+            "complete": False,
+        }
+        product["sku_options"] = []
+        product.pop("sku_option_candidates", None)
+        product["sku_groups"] = [
+            {
+                "name": "颜色",
+                "options": [
+                    {
+                        "label": "黑色均码",
+                        "supplier_sku_id": "",
+                        "image_url": "https://cbu01.alicdn.com/img/ibank/black.jpg",
+                        "disabled": False,
+                        "selected": False,
+                        "option_index": 0,
+                    }
+                ],
+            }
+        ]
+        product["price"] = None
+        self._save_collected_product(product)
+
+        options = self.service._supplier_sku_options(product)
+
+        self.assertEqual(1, len(options))
+        selected = self.service.confirm_supplier_sku(
+            self.run_id,
+            seed_id="seed-1",
+            supplier_sku_id=options[0]["supplier_sku_id"],
+            differences=[],
+        )
+        self.assertTrue(selected.ok, selected.to_dict())
+        self.assertEqual(
+            {"颜色": "黑色均码"},
+            selected.data["receipt"]["supplier_sku"]["selected_options"],
+        )
+
     def test_supplier_sku_decision_uses_ozon_title_to_narrow_compound_variants(self) -> None:
         ozon_product = {
             "title": "Джиггер барный 25/50 мл, нержавеющая сталь",
@@ -279,6 +382,19 @@ class SupplierSkuSelectionServiceTests(RuntimeTestCase):
                 }
             ],
         }
+
+    def _save_collected_product(self, product: dict) -> None:
+        self.repo.save_supplier_collection_result(
+            self.run_id,
+            {
+                "run_id": self.run_id,
+                "network": {"mode": "direct", "proxy_disabled": True},
+                "supplier_products": [product],
+            },
+        )
+        run = self.repo.load_run(self.run_id)
+        run["status"] = WorkbenchState.SUPPLIER_COLLECTED.value
+        self.repo.save_run(run)
 
     def real_sku_option(self) -> dict:
         return {

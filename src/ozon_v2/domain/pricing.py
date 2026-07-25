@@ -156,6 +156,7 @@ class PricingQuote:
     total_cost_cny: Decimal
     raw_listing_price_cny: Decimal
     listing_price_cny: Decimal
+    old_price_cny: Decimal
     listing_price_rub: Decimal
     old_price_rub: Decimal
     freight_channel_code: str
@@ -170,6 +171,7 @@ class PricingQuote:
             "total_cost_cny": str(self.total_cost_cny),
             "raw_listing_price_cny": str(self.raw_listing_price_cny),
             "listing_price_cny": str(self.listing_price_cny),
+            "old_price_cny": str(self.old_price_cny),
             "listing_price_rub": str(self.listing_price_rub),
             "old_price_rub": str(self.old_price_rub),
             "freight_channel_code": self.freight_channel_code,
@@ -241,6 +243,9 @@ def calculate_listing_price(
         )
         raw_listing_price = total_cost / denominator
         listing_price_cny = round_up_to_dot_90(raw_listing_price)
+        old_price_cny = round_up_to_dot_90(
+            listing_price_cny / policy.old_price_discount_rate
+        )
         listing_price_rub = (
             listing_price_cny * policy.rub_per_cny
         ).to_integral_value(rounding=ROUND_CEILING)
@@ -254,6 +259,7 @@ def calculate_listing_price(
                 total_cost_cny=total_cost,
                 raw_listing_price_cny=raw_listing_price,
                 listing_price_cny=listing_price_cny,
+                old_price_cny=old_price_cny,
                 listing_price_rub=listing_price_rub,
                 old_price_rub=old_price_rub,
                 freight_channel_code=standard_quote.channel_code,

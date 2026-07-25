@@ -33,6 +33,9 @@ venv/
 /.superpowers/
 /.worktrees/
 /.artifacts/
+/artifacts/
+/.wrangler/
+/work/
 
 # Collected marketplace evidence and temporary image experiments
 /ozon-v2-run-*

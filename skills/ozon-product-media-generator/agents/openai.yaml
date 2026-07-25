@@ -1,4 +1,4 @@
 interface:
   display_name: "Ozon Product Media Generator"
   short_description: "Generate verified Ozon product media"
-  default_prompt: "Use $ozon-product-media-generator to claim and process the next product from the local Ozon image queue."
+  default_prompt: "Use $ozon-product-media-generator for only RUN package_id=<id> worker_id=<id>. Read the owned package from image_tasks/in_progress, generate and validate its exact eight 3:4 images, then perform direct Ozon gallery replacement and complete the package without returning generated files to the workbench."

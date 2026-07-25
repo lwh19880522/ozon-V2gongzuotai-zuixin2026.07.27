@@ -40,6 +40,7 @@ def test_first_product_uses_guoo_standard_and_rounds_up_to_dot_90() -> None:
         "55.156923"
     )
     assert quote.listing_price_cny == Decimal("55.90")
+    assert quote.old_price_cny == Decimal("69.90")
     assert quote.listing_price_rub == Decimal("671")
     assert quote.old_price_rub == Decimal("839")
     assert quote.iterations == 2
@@ -84,6 +85,7 @@ def test_pricing_input_and_quote_serialize_as_decimal_strings() -> None:
         "total_cost_cny": "35.852",
         "raw_listing_price_cny": str(quote.raw_listing_price_cny),
         "listing_price_cny": "55.90",
+        "old_price_cny": "69.90",
         "listing_price_rub": "671",
         "old_price_rub": "839",
         "freight_channel_code": "extra_small_standard",

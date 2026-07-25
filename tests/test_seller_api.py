@@ -234,3 +234,130 @@ class SellerCategoryTreeTests(TestCase):
                 attribute_id=85,
                 value="Белый",
             )
+
+    def test_dictionary_value_resolution_retries_a_leading_exact_phrase(self) -> None:
+        adapter = SellerApiAdapter()
+        calls = []
+
+        def fake_post(path, payload):
+            calls.append(payload["value"])
+            if payload["value"] == "Серебристый":
+                return {"result": [{"id": 61610, "value": "серебристый"}]}
+            return {"result": []}
+
+        adapter._post_json = fake_post
+
+        resolved = adapter.resolve_attribute_dictionary_value(
+            description_category_id=17028653,
+            type_id=92121,
+            attribute_id=10096,
+            value="Серебристый с черными элементами",
+        )
+
+        self.assertEqual(61610, resolved["dictionary_value_id"])
+        self.assertEqual("серебристый", resolved["value"])
+        self.assertEqual(
+            [
+                "Серебристый с черными элементами",
+                "Серебристый с черными",
+                "Серебристый с",
+                "Серебристый",
+            ],
+            calls,
+        )
+
+    def test_import_products_submits_one_explicit_batch_and_returns_task_id(self) -> None:
+        adapter = SellerApiAdapter()
+        calls = []
+        adapter._post_json = lambda path, payload: (
+            calls.append((path, payload))
+            or {"result": {"task_id": 321}}
+        )
+        item = {"offer_id": "OZV2-ONE", "name": "Тестовый товар"}
+
+        submitted = adapter.import_products([item])
+
+        self.assertEqual({"task_id": 321}, submitted)
+        self.assertEqual(
+            [("/v3/product/import", {"items": [item]})],
+            calls,
+        )
+
+    def test_import_products_rejects_empty_or_oversized_batches_before_network(self) -> None:
+        adapter = SellerApiAdapter()
+        adapter._post_json = lambda path, payload: self.fail("network must not be called")
+
+        with self.assertRaises(SellerApiError):
+            adapter.import_products([])
+        with self.assertRaises(SellerApiError):
+            adapter.import_products([{"offer_id": str(index)} for index in range(101)])
+
+    def test_product_import_info_returns_normalized_result(self) -> None:
+        adapter = SellerApiAdapter()
+        adapter._post_json = lambda path, payload: {
+            "result": {"items": [{"offer_id": "OZV2-ONE", "status": "imported"}]}
+        }
+
+        status = adapter.get_product_import_info(321)
+
+        self.assertEqual(
+            {"items": [{"offer_id": "OZV2-ONE", "status": "imported"}]},
+            status,
+        )
+
+    def test_replace_product_pictures_submits_complete_ordered_gallery(self) -> None:
+        adapter = SellerApiAdapter()
+        calls = []
+        adapter._post_json = lambda path, payload: (
+            calls.append((path, payload))
+            or {"result": {"pictures": [{"url": url} for url in payload["images"]]}}
+        )
+        images = [
+            f"https://media.example/ozon-v2/main-{index:02d}.jpg"
+            for index in range(1, 9)
+        ]
+
+        result = adapter.replace_product_pictures(product_id=123456, images=images)
+
+        self.assertEqual(
+            [
+                (
+                    "/v1/product/pictures/import",
+                    {"product_id": 123456, "images": images, "images360": []},
+                )
+            ],
+            calls,
+        )
+        self.assertEqual(8, len(result["pictures"]))
+
+    def test_replace_product_pictures_rejects_non_https_or_empty_gallery(self) -> None:
+        adapter = SellerApiAdapter()
+        adapter._post_json = lambda path, payload: self.fail("network must not be called")
+
+        with self.assertRaises(SellerApiError):
+            adapter.replace_product_pictures(product_id=123456, images=[])
+        with self.assertRaises(SellerApiError):
+            adapter.replace_product_pictures(
+                product_id=123456,
+                images=["http://media.example/image.jpg"],
+            )
+
+    def test_seller_contract_currency_is_read_from_seller_profile(self) -> None:
+        adapter = SellerApiAdapter()
+        calls = []
+        adapter._post_json = lambda path, payload: (
+            calls.append((path, payload))
+            or {"result": {"company": {"currency": "CNY"}}}
+        )
+
+        currency = adapter.get_seller_currency_code()
+
+        self.assertEqual("CNY", currency)
+        self.assertEqual([("/v1/seller/info", {})], calls)
+
+    def test_seller_contract_currency_rejects_missing_profile_value(self) -> None:
+        adapter = SellerApiAdapter()
+        adapter._post_json = lambda path, payload: {"result": {"company": {}}}
+
+        with self.assertRaisesRegex(SellerApiError, "currency"):
+            adapter.get_seller_currency_code()

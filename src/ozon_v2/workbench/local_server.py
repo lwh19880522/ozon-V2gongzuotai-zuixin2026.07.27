@@ -569,7 +569,6 @@ def build_home_html() -> str:
         <div class="sidebar-label">运营 (Operations)</div>
         <a class="sidebar-link active" href="/" aria-current="page"><span class="nav-mark">B</span><span>批次总览 (Batch)</span></a>
         <a id="sidebarSupplierNav" class="sidebar-link disabled" aria-disabled="true"><span class="nav-mark">S</span><span>供应商审核 (Supplier)</span></a>
-        <a id="sidebarImagesNav" class="sidebar-link disabled" aria-disabled="true"><span class="nav-mark">I</span><span>图片处理 (Images)</span></a>
         <a id="sidebarUploadNav" class="sidebar-link disabled" aria-disabled="true"><span class="nav-mark">U</span><span>上传草稿 (Upload)</span></a>
       </div>
       <div class="sidebar-group">
@@ -600,7 +599,6 @@ def build_home_html() -> str:
         <div class="stage-nav-inner">
           <a id="batchOverviewNav" class="stage-link active" aria-current="page" href="/">批次总览 (Batch)</a>
           <a id="supplierReviewNav" class="stage-link disabled" aria-disabled="true">供应商审核 (Supplier Review)</a>
-          <a id="imageProcessingNav" class="stage-link disabled" aria-disabled="true">图片处理 (Images)</a>
           <a id="uploadDraftNav" class="stage-link disabled" aria-disabled="true">上传草稿 (Upload)</a>
           <span id="stageRunId" class="stage-run">批次 -</span>
         </div>
@@ -662,14 +660,9 @@ def build_home_html() -> str:
             <div class="progress-copy"><strong>供应商审核</strong><span>等待用户提供真实 1688 同款链接</span></div>
             <span class="progress-state">未开始</span>
           </div>
-          <div id="progressImages" class="progress-row">
-            <span class="progress-number">3</span>
-            <div class="progress-copy"><strong>图片处理</strong><span>供应商采集完成后自动进入</span></div>
-            <span class="progress-state">未开始</span>
-          </div>
           <div id="progressUpload" class="progress-row">
-            <span class="progress-number">4</span>
-            <div class="progress-copy"><strong>上传草稿</strong><span>图片与字段通过门禁后生成</span></div>
+            <span class="progress-number">3</span>
+            <div class="progress-copy"><strong>上传草稿</strong><span>锁定原图、字段和价格通过后逐件提交</span></div>
             <span class="progress-state">未开始</span>
           </div>
         </div>
@@ -792,8 +785,6 @@ def build_home_html() -> str:
     function updateStageNavigation(runId) {
       const supplierNav = $("supplierReviewNav");
       const sidebarSupplierNav = $("sidebarSupplierNav");
-      const imageNav = $("imageProcessingNav");
-      const sidebarImagesNav = $("sidebarImagesNav");
       const uploadNav = $("uploadDraftNav");
       const sidebarUploadNav = $("sidebarUploadNav");
       $("stageRunId").textContent = runId ? `批次 ${runId}` : "批次 -";
@@ -805,12 +796,6 @@ def build_home_html() -> str:
         sidebarSupplierNav.removeAttribute("href");
         sidebarSupplierNav.classList.add("disabled");
         sidebarSupplierNav.setAttribute("aria-disabled", "true");
-        imageNav.removeAttribute("href");
-        imageNav.classList.add("disabled");
-        imageNav.setAttribute("aria-disabled", "true");
-        sidebarImagesNav.removeAttribute("href");
-        sidebarImagesNav.classList.add("disabled");
-        sidebarImagesNav.setAttribute("aria-disabled", "true");
         uploadNav.removeAttribute("href");
         uploadNav.classList.add("disabled");
         uploadNav.setAttribute("aria-disabled", "true");
@@ -825,12 +810,6 @@ def build_home_html() -> str:
       sidebarSupplierNav.href = supplierNav.href;
       sidebarSupplierNav.classList.remove("disabled");
       sidebarSupplierNav.removeAttribute("aria-disabled");
-      imageNav.href = `/batches/${encodeURIComponent(runId)}/images`;
-      imageNav.classList.remove("disabled");
-      imageNav.removeAttribute("aria-disabled");
-      sidebarImagesNav.href = imageNav.href;
-      sidebarImagesNav.classList.remove("disabled");
-      sidebarImagesNav.removeAttribute("aria-disabled");
       uploadNav.href = `/batches/${encodeURIComponent(runId)}/upload`;
       uploadNav.classList.remove("disabled");
       uploadNav.removeAttribute("aria-disabled");
@@ -851,14 +830,12 @@ def build_home_html() -> str:
     }
 
     function renderStageProgress(status) {
-      const orderedStages = ["progressOzon", "progressSupplier", "progressImages", "progressUpload"];
+      const orderedStages = ["progressOzon", "progressSupplier", "progressUpload"];
       const supplierStatuses = new Set(["supplier_review", "supplier_collecting", "supplier_collected", "same_product_review"]);
-      const imageStatuses = new Set(["ai_filling", "image_processing", "image_processed"]);
-      const uploadStatuses = new Set(["draft_building", "draft_ready", "publish_submitted", "done"]);
+      const uploadStatuses = new Set(["ai_filling", "image_processing", "image_processed", "draft_building", "draft_ready", "publish_submitted", "done"]);
       let currentIndex = 0;
       if (supplierStatuses.has(status)) currentIndex = 1;
-      if (imageStatuses.has(status)) currentIndex = 2;
-      if (uploadStatuses.has(status)) currentIndex = 3;
+      if (uploadStatuses.has(status)) currentIndex = 2;
       orderedStages.forEach((id, index) => {
         const row = $(id);
         const label = row.querySelector(".progress-state");
@@ -892,15 +869,20 @@ def build_home_html() -> str:
       const processed = Math.min(total, Math.max(0, Number(value.processed_count) || 0));
       const success = Math.min(total, Math.max(0, Number(value.success_count) || 0));
       const failure = Math.min(total - success, Math.max(0, Number(value.failure_count) || 0));
+      const pending = Math.max(0, Number(value.pending_count ?? (total - processed)) || 0);
       const successPercent = total ? success / total * 100 : 0;
       const failurePercent = total ? failure / total * 100 : 0;
-      $("ozonProcessed").textContent = hasProgress
-        ? `已处理 ${processed} / ${total}`
-        : "等待采集数据";
+      $("ozonProcessed").textContent = !hasProgress
+        ? "当前没有正在采集的批次"
+        : !total
+          ? "当前批次尚未生成采集任务"
+          : pending === 0
+            ? `采集完成 ${processed} / ${total}`
+            : `实时已保存 ${success} / ${total} · 已处理 ${processed}`;
       $("ozonSucceeded").textContent = String(success);
       $("ozonFailed").textContent = String(failure);
       $("ozonReplaced").textContent = String(Math.max(0, Number(value.replacement_count) || 0));
-      $("ozonPending").textContent = String(Math.max(total - processed, 0));
+      $("ozonPending").textContent = String(pending);
       const bar = $("ozonProgressBar");
       bar.setAttribute("aria-valuemax", String(total));
       bar.setAttribute("aria-valuenow", String(processed));
@@ -924,6 +906,8 @@ def build_home_html() -> str:
       "browser_candidate.exhausted": ["当前种子已耗尽", "当前种子没有找到合格候选，正在尝试补位。"],
       "browser_candidate.replaced": ["种子已替换", "失败种子已完成补位，批次继续运行。"],
       "browser_candidate.failed": ["种子最终失败", "失败种子无法补位，需要人工处理。"],
+      "supplier_review.replacement_recovery_started": ["替补商品恢复补采", "已返回替补商品尚未完成的采集阶段，其他成功商品保持不变。"],
+      "ozon_collection.replacement_checkpoint_reconciled": ["替补采集断点已清理", "已移除被拒商品遗留的采集断点，只继续采集当前替补商品。"],
     };
 
     function eventPresentation(event) {
@@ -954,12 +938,19 @@ def build_home_html() -> str:
       updateStageNavigation(runId);
       renderStageProgress(run.status || data.status || "created");
       const status = run.status || data.status || "";
-      const ozonRestartable = status === "ozon_collecting" && run.ozon_collected !== true;
+      const replacementPending =
+        Array.isArray(run.replacement_pending_seed_ids) &&
+        run.replacement_pending_seed_ids.length > 0;
+      const ozonRestartable =
+        (status === "ozon_collecting" && run.ozon_collected !== true) ||
+        replacementPending;
       const ozonComplete = run.ozon_collected === true;
       const restartButton = $("restartOzonCollection");
       restartButton.hidden = !(ozonRestartable || ozonComplete);
       restartButton.disabled = state.restartPending || !ozonRestartable;
-      restartButton.textContent = ozonComplete
+      restartButton.textContent = replacementPending
+        ? "继续补采替补商品"
+        : ozonComplete
         ? "Ozon 原商品采集已完成"
         : "重新启动 Ozon 原商品采集";
       $("ozonRestartMessage").hidden = restartButton.hidden;
@@ -1057,20 +1048,42 @@ def build_home_html() -> str:
       return status;
     }
 
-    async function loadRun() {
-      if (!state.runId) {
+    async function resolveLatestRunId() {
+      const history = await api("/api/operations/batches");
+      const latest = (history.data?.items || [])[0] || null;
+      if (!latest?.run_id) {
+        state.runId = "";
+        localStorage.removeItem("ozon_v2_workbench_run_id");
         updateStageNavigation("");
-        return;
+        renderOzonCollectionProgress(null);
+        return "";
       }
-      const result = await api(`/api/batches/${encodeURIComponent(state.runId)}`);
-      const events = await api(`/api/batches/${encodeURIComponent(state.runId)}/events`);
-      render(result, events.data.events || []);
+      state.runId = String(latest.run_id);
+      localStorage.setItem("ozon_v2_workbench_run_id", state.runId);
+      return state.runId;
+    }
+
+    async function loadRun(allowRecovery = true) {
+      if (!state.runId && !(await resolveLatestRunId())) return;
+      try {
+        const result = await api(`/api/batches/${encodeURIComponent(state.runId)}`);
+        const events = await api(`/api/batches/${encodeURIComponent(state.runId)}/events`);
+        render(result, events.data.events || []);
+      } catch (error) {
+        if (allowRecovery && error && error.code === "workbench.batch_not_found") {
+          state.runId = "";
+          localStorage.removeItem("ozon_v2_workbench_run_id");
+          if (await resolveLatestRunId()) return loadRun(false);
+          return;
+        }
+        throw error;
+      }
     }
 
     function startLivePolling() {
       if (state.pollTimer) return;
       state.pollTimer = window.setInterval(() => {
-        if (state.runId) loadRun().catch(() => {});
+        loadRun().catch(() => {});
         loadBridgeStatus().catch(() => {});
       }, 1200);
     }
@@ -1397,7 +1410,6 @@ def build_supplier_review_html(run_id: str) -> str:
         <div class="sidebar-label">运营 (Operations)</div>
         <a class="sidebar-link" href="/?run_id={run_id}"><span class="nav-mark">B</span><span>批次总览 (Batch)</span></a>
         <a class="sidebar-link active" href="/batches/{run_id}/supplier-review" aria-current="page"><span class="nav-mark">S</span><span>采集审核 (Collection)</span></a>
-        <a class="sidebar-link" href="/batches/{run_id}/images"><span class="nav-mark">I</span><span>图片处理 (Images)</span></a>
         <a class="sidebar-link" href="/batches/{run_id}/upload"><span class="nav-mark">U</span><span>上传草稿 (Upload)</span></a>
       </div>
       <div class="sidebar-group"><div class="sidebar-label">全局 (Global)</div>
@@ -1413,7 +1425,6 @@ def build_supplier_review_html(run_id: str) -> str:
         <div class="stage-nav-inner">
           <a id="batchOverviewNav" class="stage-link" href="/?run_id={run_id}">批次总览 (Batch)</a>
           <a id="supplierReviewNav" class="stage-link active" aria-current="page" href="/batches/{run_id}/supplier-review">采集审核 (Collection Review)</a>
-          <a id="imageProcessingNav" class="stage-link" href="/batches/{run_id}/images">图片处理 (Images)</a>
           <a id="uploadDraftNav" class="stage-link" href="/batches/{run_id}/upload">上传草稿 (Upload)</a>
           <span class="stage-run">批次 {run_id}</span>
         </div>
@@ -1439,7 +1450,7 @@ def build_supplier_review_html(run_id: str) -> str:
         <span id="skuDecisionStatus" class="status-pill">未锁定 (Unlocked)</span>
       </div>
       <div id="skuOptions" class="sku-options"></div>
-      <div class="sku-action-row"><span id="skuDecisionMessage" class="muted"></span><button id="reopenSupplierSku" type="button" hidden>重新选择 SKU</button><button id="lockSupplierSku" class="primary" disabled>锁定真实 SKU (Lock Real SKU)</button></div>
+      <div class="sku-action-row"><span id="skuDecisionMessage" class="muted"></span><button id="reopenSupplierSku" type="button" hidden>重新选择 SKU</button><button id="lockSingleSupplierSku" class="primary" type="button" hidden disabled>单一 SKU，直接锁定主体</button><button id="lockSupplierSku" class="primary" disabled>锁定真实 SKU (Lock Real SKU)</button></div>
       <div id="subjectMasterArea" class="subject-master-area" hidden>
         <h3>主体证据图 (Subject Evidence)</h3>
         <span class="muted">可从已锁定 SKU 图片和同一供应商商品图库中多选。这里只确认真实主体与套装，干净白底图由生图技能生成。</span>
@@ -1484,6 +1495,7 @@ def build_supplier_review_html(run_id: str) -> str:
   <script>
     const runId = {safe_run_id};
     const state = {{ items: [], status: "", collectionProgress: null, canApprove: false, evidenceIndex: 0, restartPending: false }};
+    const subjectDrafts = new Map();
     let loading = false;
     const $ = (id) => document.getElementById(id);
     $("runId").textContent = runId;
@@ -1742,7 +1754,20 @@ def build_supplier_review_html(run_id: str) -> str:
       const main = document.createElement("div"); main.className = "sku-option-main";
       const imageUrl = Array.isArray(option.image_urls) ? String(option.image_urls[0] || "") : "";
       if (imageUrl) {{
-        const image = document.createElement("img"); image.className = "sku-option-image"; image.src = imageUrl; image.alt = option.raw_label || "1688 SKU"; image.loading = "lazy";
+        const fallbackUrls = [imageUrl, ...(context.supplierFallbackImages || [])]
+          .map((value) => String(value || "").trim())
+          .filter((value, index, values) => value && values.indexOf(value) === index);
+        let fallbackIndex = 0;
+        const image = document.createElement("img"); image.className = "sku-option-image"; image.src = fallbackUrls[0]; image.alt = option.raw_label || "1688 SKU"; image.loading = "lazy"; image.referrerPolicy = "no-referrer";
+        image.addEventListener("error", () => {{
+          fallbackIndex += 1;
+          if (fallbackIndex < fallbackUrls.length) {{
+            image.src = fallbackUrls[fallbackIndex];
+            return;
+          }}
+          image.hidden = true;
+          main.classList.add("no-image");
+        }});
         main.append(image);
       }} else {{
         main.classList.add("no-image");
@@ -1787,6 +1812,20 @@ def build_supplier_review_html(run_id: str) -> str:
       return (item.supplier_sku_options || []).find((option) => option.supplier_sku_id === (selected && selected.value));
     }}
 
+    function isPageUniqueSupplierSku(item, options) {{
+      if (!Array.isArray(options) || options.length !== 1) return false;
+      const option = options[0] || {{}};
+      if (option.evidence_source === "single_sku_detail_page") return true;
+      const groups = Array.isArray(item.supplier_sku_groups) ? item.supplier_sku_groups : [];
+      if (!groups.length) return false;
+      return groups.every((group) => {{
+        const visibleOptions = Array.isArray(group && group.options)
+          ? group.options.filter((candidate) => candidate && candidate.disabled !== true)
+          : [];
+        return visibleOptions.length === 1;
+      }});
+    }}
+
     function canRecaptureSupplier(item) {{
       const stageAllowsRecapture = ["supplier_review", "supplier_collected", "image_processing"].includes(state.status);
       return stageAllowsRecapture
@@ -1798,22 +1837,27 @@ def build_supplier_review_html(run_id: str) -> str:
     function updateSkuLockButton() {{
       const item = state.items[state.evidenceIndex];
       const button = $("lockSupplierSku");
+      const singleButton = $("lockSingleSupplierSku");
       const reopenButton = $("reopenSupplierSku");
       if (!item) {{
         button.disabled = true;
+        button.hidden = false;
+        singleButton.hidden = true;
+        singleButton.disabled = true;
         reopenButton.hidden = true;
         reopenButton.disabled = true;
         return;
       }}
       const options = item.supplier_sku_options || [];
       const receipt = item.supplier_sku_selection || null;
-      const singlePageSku = options.length === 1 && options[0].evidence_source === "single_sku_detail_page";
+      const singlePageSku = isPageUniqueSupplierSku(item, options);
       button.textContent = receipt
         ? "SKU 已确认 (Confirmed)"
-        : singlePageSku
-          ? "确认页面唯一 SKU"
-          : "确认所选 SKU";
+        : "确认所选 SKU";
+      button.hidden = !!receipt || singlePageSku;
       button.disabled = !!receipt || !selectedSkuOption(item);
+      singleButton.hidden = !!receipt || !singlePageSku;
+      singleButton.disabled = !!receipt || !singlePageSku || options.length !== 1;
       reopenButton.hidden = !receipt;
       reopenButton.disabled = !receipt;
     }}
@@ -1822,6 +1866,16 @@ def build_supplier_review_html(run_id: str) -> str:
       return Array.from(document.querySelectorAll('input[name="subjectEvidence"]:checked'))
         .map((input) => input.value)
         .filter(Boolean);
+    }}
+
+    function rememberSubjectDraft(seedId) {{
+      if (!seedId) return;
+      const evidenceInputs = document.querySelectorAll('input[name="subjectEvidence"]');
+      if (!evidenceInputs.length) return;
+      subjectDrafts.set(String(seedId), {{
+        sourceImageUrls: selectedSubjectEvidenceUrls(),
+        visibleSubjectQuantity: $("visibleSubjectQuantity").value,
+      }});
     }}
 
     function updateSubjectEvidenceCount() {{
@@ -1834,18 +1888,23 @@ def build_supplier_review_html(run_id: str) -> str:
       const optionsRoot = $("skuOptions");
       const subjectRoot = $("subjectMasterImages");
       const previousItemSeedId = optionsRoot.dataset.seedId || "";
+      const previousSubjectSeedId = subjectRoot.dataset.seedId || "";
       const previousSelection = document.querySelector('input[name="supplierSku"]:checked');
       const previousInteraction = {{
         selectedSupplierSkuId: previousSelection ? previousSelection.value : "",
         otherOptionsOpen: document.querySelector("details.sku-other-options")?.open === true,
       }};
+      rememberSubjectDraft(previousSubjectSeedId);
       optionsRoot.replaceChildren();
       subjectRoot.replaceChildren();
       if (!state.items.length) {{
         optionsRoot.dataset.seedId = "";
+        subjectRoot.dataset.seedId = "";
         $("skuDecisionContext").textContent = "等待 1688 采集结果";
         $("skuDecisionMessage").textContent = "尚无可审核商品。";
         $("lockSupplierSku").disabled = true;
+        $("lockSingleSupplierSku").hidden = true;
+        $("lockSingleSupplierSku").disabled = true;
         $("subjectMasterArea").hidden = true;
         return;
       }}
@@ -1854,13 +1913,16 @@ def build_supplier_review_html(run_id: str) -> str:
         ? previousInteraction
         : {{ selectedSupplierSkuId:"", otherOptionsOpen:false }};
       optionsRoot.dataset.seedId = String(item.seed_id || "");
+      subjectRoot.dataset.seedId = String(item.seed_id || "");
       const options = item.supplier_sku_options || [];
       const skuGroups = item.supplier_sku_groups || [];
       const receipt = item.supplier_sku_selection || null;
       const lockedSku = receipt && receipt.supplier_sku ? receipt.supplier_sku : null;
       const subjectMaster = item.subject_master || null;
+      if (subjectMaster) subjectDrafts.delete(String(item.seed_id || ""));
+      const subjectDraft = subjectDrafts.get(String(item.seed_id || "")) || null;
       const skuNeedsConfirmation = !!item.supplier_product && !options.length && !receipt;
-      const singlePageSku = options.length === 1 && options[0].evidence_source === "single_sku_detail_page";
+      const singlePageSku = isPageUniqueSupplierSku(item, options);
       const analysis = analyzeSupplierSkuOptions(item, options);
       $("skuDecisionContext").textContent = `${{state.evidenceIndex + 1}} / ${{state.items.length}} · ${{item.ozon_title || item.seed_id}}`;
       $("skuDecisionStatus").textContent = subjectMaster
@@ -1895,7 +1957,16 @@ def build_supplier_review_html(run_id: str) -> str:
       optionsRoot.append(modeNote);
 
       const candidatesRoot = document.createElement("div"); candidatesRoot.className = "sku-candidate-list";
-      const candidateContext = {{ analysis, receipt, lockedSku, singlePageSku, selectedSupplierSkuId: preservedInteraction.selectedSupplierSkuId || "" }};
+      const candidateContext = {{
+        analysis,
+        receipt,
+        lockedSku,
+        singlePageSku,
+        selectedSupplierSkuId: preservedInteraction.selectedSupplierSkuId || "",
+        supplierFallbackImages: item.supplier_product && Array.isArray(item.supplier_product.images)
+          ? item.supplier_product.images
+          : []
+      }};
       const lockedCandidate = lockedSku
         ? analysis.candidates.find((candidate) => candidate.option.supplier_sku_id === lockedSku.supplier_sku_id)
         : null;
@@ -1972,44 +2043,109 @@ def build_supplier_review_html(run_id: str) -> str:
       const savedUrls = subjectMaster
         ? (subjectMaster.source_image_urls || [subjectMaster.source_image_url]).filter(Boolean)
         : [];
-      const recommendedUrls = new Set(savedUrls.length ? savedUrls : (skuImages.length ? skuImages : candidates.slice(0, 1).map((item) => item.url)));
+      const recommendedUrls = new Set(savedUrls.length
+        ? savedUrls
+        : subjectDraft ? subjectDraft.sourceImageUrls : (skuImages.length ? skuImages : candidates.slice(0, 1).map((item) => item.url)));
       candidates.forEach((candidate, index) => {{
         const url = candidate.url;
         const label = document.createElement("label"); label.className = "subject-choice";
         const checkbox = document.createElement("input"); checkbox.type = "checkbox"; checkbox.name = "subjectEvidence"; checkbox.value = url;
         checkbox.checked = recommendedUrls.has(url);
         checkbox.disabled = !!subjectMaster;
-        checkbox.addEventListener("change", updateSubjectEvidenceCount);
+        checkbox.addEventListener("change", () => {{
+          rememberSubjectDraft(String(item.seed_id || ""));
+          updateSubjectEvidenceCount();
+        }});
         const badge = document.createElement("span"); badge.className = "subject-source"; badge.textContent = candidate.sources.join(" / ");
         const image = document.createElement("img"); image.src = url; image.alt = `SKU subject ${{index + 1}}`; image.loading = "lazy"; image.referrerPolicy = "no-referrer";
         label.append(checkbox, badge, image); subjectRoot.append(label);
       }});
       if (!candidates.length) subjectRoot.append(field("供应商主体证据图片", null));
-      $("visibleSubjectQuantity").value = subjectMaster ? subjectMaster.visible_subject_quantity : lockedSku.set_quantity;
-      $("visibleSubjectQuantity").disabled = !!subjectMaster;
+      const quantityInput = $("visibleSubjectQuantity");
+      quantityInput.value = subjectMaster
+        ? subjectMaster.visible_subject_quantity
+        : subjectDraft ? subjectDraft.visibleSubjectQuantity : lockedSku.set_quantity;
+      quantityInput.disabled = !!subjectMaster;
+      quantityInput.oninput = subjectMaster
+        ? null
+        : () => rememberSubjectDraft(String(item.seed_id || ""));
       $("subjectSetComposition").textContent = (lockedSku.set_composition || []).join(" / ") || valueText(lockedSku.selected_options);
       updateSubjectEvidenceCount();
+    }}
+
+    async function submitSupplierSkuLock(item, option) {{
+      return await api(`/api/batches/${{encodeURIComponent(runId)}}/supplier-sku`, {{
+        method:"POST",
+        body:JSON.stringify({{
+          seed_id:item.seed_id,
+          supplier_sku_id:option.supplier_sku_id,
+          differences:[{{ field:"sku", ozon:item.selected_options || {{}}, supplier:option.selected_options || {{}} }}]
+        }})
+      }});
+    }}
+
+    async function persistSupplierSkuLock(item, option, button) {{
+      if (!item || !option) return;
+      button.disabled = true;
+      try {{
+        await submitSupplierSkuLock(item, option);
+        await load();
+      }} catch (error) {{
+        $("skuDecisionMessage").className = "error";
+        $("skuDecisionMessage").textContent = error.message || "SKU 锁定失败 (Lock Failed)";
+        button.disabled = false;
+      }}
     }}
 
     async function lockSupplierSku() {{
       const item = state.items[state.evidenceIndex];
       const option = selectedSkuOption(item);
-      if (!option) return;
-      $("lockSupplierSku").disabled = true;
+      await persistSupplierSkuLock(item, option, $("lockSupplierSku"));
+    }}
+
+    async function lockSingleSupplierSku() {{
+      const item = state.items[state.evidenceIndex];
+      const options = item && Array.isArray(item.supplier_sku_options)
+        ? item.supplier_sku_options
+        : [];
+      if (!isPageUniqueSupplierSku(item || {{}}, options)) return;
+      const option = options[0];
+      const subjectUrls = Array.from(new Set(
+        (Array.isArray(option.image_urls) ? option.image_urls : [])
+          .map((value) => String(value || "").trim())
+          .filter(Boolean)
+      ));
+      const button = $("lockSingleSupplierSku");
+      if (!subjectUrls.length) {{
+        $("skuDecisionMessage").className = "error";
+        $("skuDecisionMessage").textContent = "该单一 SKU 没有可锁定的供应商主体图，请重新采集。";
+        return;
+      }}
+      button.disabled = true;
+      let skuLocked = false;
       try {{
-        await api(`/api/batches/${{encodeURIComponent(runId)}}/supplier-sku`, {{
+        await submitSupplierSkuLock(item, option);
+        skuLocked = true;
+        const result = await api(`/api/batches/${{encodeURIComponent(runId)}}/subject-master`, {{
           method:"POST",
           body:JSON.stringify({{
             seed_id:item.seed_id,
-            supplier_sku_id:option.supplier_sku_id,
-            differences:[{{ field:"sku", ozon:item.selected_options || {{}}, supplier:option.selected_options || {{}} }}]
+            source_image_urls:subjectUrls,
+            visible_subject_quantity:Number(option.set_quantity || 1)
           }})
         }});
+        if (result.data.all_subject_masters_confirmed === true) {{
+          window.location.assign(`/batches/${{encodeURIComponent(runId)}}/upload`);
+          return;
+        }}
         await load();
       }} catch (error) {{
+        if (skuLocked) await load();
         $("skuDecisionMessage").className = "error";
-        $("skuDecisionMessage").textContent = error.message || "SKU 锁定失败 (Lock Failed)";
-        $("lockSupplierSku").disabled = false;
+        $("skuDecisionMessage").textContent = skuLocked
+          ? "SKU 已锁定，但主体图自动确认失败；请在下方检查并手动确认主体证据。"
+          : (error.message || "SKU 锁定失败 (Lock Failed)");
+        button.disabled = false;
       }}
     }}
 
@@ -2046,7 +2182,7 @@ def build_supplier_review_html(run_id: str) -> str:
           }})
         }});
         if (result.data.all_subject_masters_confirmed === true) {{
-          window.location.assign(`/batches/${{encodeURIComponent(runId)}}/images`);
+          window.location.assign(`/batches/${{encodeURIComponent(runId)}}/upload`);
           return;
         }}
         await load();
@@ -2165,14 +2301,14 @@ def build_supplier_review_html(run_id: str) -> str:
         $("collect").textContent = "供应商已采集 (Collected)";
         $("message").className = state.canApprove ? "success" : "error";
         $("message").textContent = state.canApprove
-          ? "Ozon 与 1688 数据已回传；请逐件锁定真实 SKU 并确认主体证据图，完成后自动进入生图。"
-          : "采集结果仍有缺失字段，不能进入图片处理。";
+          ? "Ozon 与 1688 数据已回传；请逐件锁定真实 SKU 并确认主体原图，完成后直接进入上传草稿。"
+          : "采集结果仍有缺失字段，不能进入上传草稿。";
         return;
       }}
       if (state.status === "image_processing") {{
         $("approveCollection").disabled = true;
         $("message").className = "muted";
-        $("message").textContent = "本批次已进入图片处理；当前采集结果仍可在此审阅。";
+        $("message").textContent = "本批次主体原图已锁定；请进入上传草稿完善字段、价格并逐件提交。";
         return;
       }}
       $("collect").textContent = "五通道由扩展执行 (Extension Managed)";
@@ -2274,6 +2410,7 @@ def build_supplier_review_html(run_id: str) -> str:
 
     $("collect").addEventListener("click", restartSupplierCollection);
     $("lockSupplierSku").addEventListener("click", lockSupplierSku);
+    $("lockSingleSupplierSku").addEventListener("click", lockSingleSupplierSku);
     $("reopenSupplierSku").addEventListener("click", reopenSupplierSku);
     $("confirmSubjectMaster").addEventListener("click", confirmSubjectMaster);
     $("ozonEvidencePrev").addEventListener("click", () => moveEvidence(-1));
@@ -2299,36 +2436,30 @@ def build_supplier_review_html(run_id: str) -> str:
 </html>"""
 
 
-def build_image_workspace_html(run_id: str) -> str:
-    safe_run_id = json.dumps(run_id)
+def build_image_controller_command(run_id: str) -> str:
     worker_ids = "、".join(REGULAR_IMAGE_WORKER_IDS)
-    visual_contract = (
-        "每个生图子智能体必须先读取并严格执行 skills/ozon-product-media-generator/SKILL.md；"
-        "新尝试固定使用提示词版本 ozon-image-v3，并在本地视觉回执中确认 visual_system=ozon-edge-gradient-b1；"
-        "main_01 保持无文案；其余允许文案的槽位只写有供应商锁定证据支持的自然俄文句式。"
-        "main_02 使用侧边渐变信息区，detail_01 与 detail_04 使用底部渐变，特征说明使用锚点线与柔和边缘渐变，禁止生硬的悬浮圆角文字卡；"
-        "detail_01、detail_04 固定最多 1 个事实块；detail_02、detail_03、detail_05、detail_06 只有在画面明确支持两个互不重叠的已验证事实时才可增加到 2 个，否则仍为 1 个；"
-        "逐张检查 360 像素预览，确保俄文标题是清晰的信息焦点且最小文字可读；只接受主体、数量、颜色、结构、俄文和排版均通过证据门禁的结果。"
-        "八个槽位必须使用至少 5 种环境、4 种灯光、4 种机位和 3 种景别；main_01 做干净主视觉，main_02 做真实使用价值总览，六张附图依次证明使用结果、关键结构、材质细节、第二使用场景、尺寸适配、套装或维护信息，证据不支持的角色改为另一个可证明卖点；禁止用同一室内背景和同一产品居中构图换角度凑数。"
-    )
-    controller_command = (
+    return (
         f"\u542f\u52a8 Ozon V2 \u751f\u56fe\u603b\u63a7\uff1a\u6279\u6b21 {run_id}\u3002"
-        "\u8bfb\u53d6\u5e76\u4e25\u683c\u6267\u884c\u5de5\u4f5c\u533a\u6280\u80fd skills/ozon-image-generation-controller/SKILL.md\uff1b"
-        "只在当前 Codex 总控任务内部使用 spawn_agent 创建并复用最多 5 个动态生图子智能体；子智能体名称由 Codex 动态创建，不得把任务名固定成队列 worker ID；"
-        "每轮新增数量取 5 减现有生图子智能体数、尚未分派商品数、当前空闲内部并发位数三者最小值；"
-        "\u4e25\u7981\u4f7f\u7528 create_thread\u3001fork_thread \u6216\u4efb\u4f55\u4f1a\u5728\u4fa7\u8fb9\u680f\u521b\u5efa\u7528\u6237\u53ef\u89c1\u4efb\u52a1\u6216\u7ebf\u7a0b\u7684\u63a5\u53e3\uff1b"
-        "可用并发位少于 5 时继续使用所有成功创建的子智能体，不得停机；不得因没有新增空位而停止现有子智能体；若 spawn_agent 失败则缩小到成功数量；只有当前无可用并发位且尚无现有子智能体时才不领取任务并报告等待，不得退回 create_thread 或用户可见任务；"
-        f"数据库只保留 5 个队列租约槽位：{worker_ids}；槽位只用于并发限制和租约隔离，不与固定子智能体永久绑定；"
-        "每次派发时动态分配一个当前空闲租约槽位，当前任务结束或进入人工审核后归还；复用的子智能体下一件商品可以取得不同槽位；子智能体空闲后使用 followup_task 继续派发；"
-        f"{visual_contract}"
+        "读取并严格执行工作区技能 skills/ozon-image-generation-controller/SKILL.md。"
+        "工作台只提供队列、证据和结果回写承载。"
+        "使用全局固定 10 个可见 Codex 生图工作任务，按槽位 01-10 顺序复用；"
+        f"稳定槽位为：{worker_ids}。"
+        "每个任务一次只负责一件商品，最多同时处理 10 件商品，总控任务不计入上限；"
+        "新商品复用空闲任务，返修优先回到原任务，不得为商品自动新建或替换任务；"
+        "只有用户明确要求“重新开新的任务”时，才允许替换指定槽位。"
         "manual_review_required 只暂停对应商品，必须跳过该商品并继续派发其他 pending 或含 repair_pending 的商品；"
         "未锁定 SKU 或主体证据只阻塞对应商品，不得阻塞其他已经入队的商品；"
-        "stopped 商品不阻塞其他商品，必须报告已记录的停止原因和工作台恢复入口，但不得自动恢复 stopped 商品；"
+        "stopped 商品不阻塞其他商品，不得自动恢复 stopped 商品；"
         "已验签 accepted 槽位的显示元数据异常不得停止整件商品；以冻结回执哈希、文件哈希和 visual_spec 为准，保留该槽位并继续所有 pending 槽位。只有文件或回执验签失败且无法隔离时才允许停止该商品；"
+        "每张图片验收成功后立即幂等回写，不得等八张全部完成后一次性回写；"
         "持续处理当前批次，直到没有可调度的 pending 或 repair_pending 商品、发生影响全部剩余任务的系统级故障，或用户明确停止批次；"
-        "结束时分别汇报待人工审核、已停止、缺少 SKU/主体、失败和已完成的商品数量，不得把单商品等待态称为整批完成。"
-        "不得上传，不得修改业务代码；不得创建第 6 个常规生图 worker；当运行时提供第 6 个子智能体并发位时，保留 1 个子智能体位置用于失败恢复、诊断或人工介入。"
+        "不得上传、发布、最终审批或修改业务代码。"
     )
+
+
+def build_image_workspace_html(run_id: str) -> str:
+    safe_run_id = json.dumps(run_id)
+    controller_command = build_image_controller_command(run_id)
     controller_command_html = html.escape(controller_command)
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -2407,6 +2538,9 @@ def build_image_workspace_html(run_id: str) -> str:
     .generated-review-card img {{ width:100%; height:108px; display:block; object-fit:contain; border:1px solid var(--line); border-radius:4px; background:#fff; }}
     .generated-original-link {{ display:block; margin-top:5px; color:var(--blue); text-align:center; font-size:10px; font-weight:650; text-decoration:none; }}
     .generated-original-link:hover {{ text-decoration:underline; }}
+    .slot-reference-proof {{ display:block; margin-top:5px; padding:4px 6px; border-radius:3px; color:var(--green); background:var(--green-soft); text-align:center; font-size:9px; font-weight:650; text-decoration:none; }}
+    .slot-reference-proof:hover {{ text-decoration:underline; }}
+    .slot-reference-proof.missing {{ color:var(--red); background:var(--red-soft); }}
     .repair-check {{ display:flex; align-items:flex-start; gap:6px; margin-top:7px; color:var(--text); font-size:10px; cursor:pointer; }}
     .repair-check input {{ margin:2px 0 0; accent-color:var(--red); }}
     .repair-fields {{ display:grid; gap:5px; margin-top:7px; }}
@@ -2498,7 +2632,7 @@ def build_image_workspace_html(run_id: str) -> str:
               <span id="imageControllerCopyStatus" class="copy-status" aria-live="polite">复制后粘贴到当前 Codex 对话执行</span>
             </div>
           </div>
-          </div><div class="gate-callout">最多 5 个动态 Codex 生图子智能体在总控任务内部按整件商品领取任务，名称由 Codex 动态展示；5 个数据库 worker ID 只是临时租约槽位，不再固定代表某个智能体。可用几个就调动几个；当运行时提供第 6 个子智能体并发位时，保留 1 个子智能体位置用于失败恢复、诊断或人工介入。只回传通过真实性校验的 2 张主图与 6 张副图。</div><div id="imageJobControls" class="job-controls"><div id="imageJobStatus" class="job-status">当前商品尚未入队</div><button id="approveImageJob" class="approve-submit" type="button" disabled>确认本件 8 张图片可用</button><button id="submitImageRepairs" class="repair-submit" type="button" disabled>提交选中图片返修 (Repair Selected)</button><div id="repairSelectionStatus" class="repair-selection-status" aria-live="polite"></div><button id="stopImageJob" type="button" disabled>停止生图 (Stop Generation)</button><button id="resumeImageJob" type="button" disabled>继续生图 (Resume Generation)</button></div></aside>
+          </div><div class="gate-callout">全局固定 10 个可见 Codex 生图工作任务按槽位顺序长期复用；一个任务一次只处理一件商品，最多并行 10 件，总控不计入上限。新商品不新增任务，返修回到原任务；只有用户明确要求时才替换指定槽位。工作台仅承载队列、证据与逐图回写结果，不负责复制 Skill 内部生图规则。</div><div id="imageJobControls" class="job-controls"><div id="imageJobStatus" class="job-status">当前商品尚未入队</div><button id="approveImageJob" class="approve-submit" type="button" disabled>确认本件 8 张图片可用</button><button id="submitImageRepairs" class="repair-submit" type="button" disabled>提交选中图片返修 (Repair Selected)</button><div id="repairSelectionStatus" class="repair-selection-status" aria-live="polite"></div><button id="stopImageJob" type="button" disabled>停止生图 (Stop Generation)</button><button id="resumeImageJob" type="button" disabled>继续生图 (Resume Generation)</button></div></aside>
         </div>
       </main>
     </div>
@@ -2626,6 +2760,17 @@ def build_image_workspace_html(run_id: str) -> str:
         const image = document.createElement("img"); image.src = fullImageUrl; image.alt = `${{slot.slot_id}} generated product image`; image.loading = "lazy";
         imageLink.append(image);
         const fullResolutionLink = document.createElement("a"); fullResolutionLink.className = "generated-original-link"; fullResolutionLink.href = fullImageUrl; fullResolutionLink.target = "_blank"; fullResolutionLink.rel = "noopener"; fullResolutionLink.textContent = "查看高清原图";
+        const mapping = slot.ozon_reference_mapping || {{}};
+        const referenceProof = document.createElement(mapping.reference_url ? "a" : "span");
+        referenceProof.className = `slot-reference-proof${{mapping.reference_slot_index ? "" : " missing"}}`;
+        referenceProof.textContent = mapping.reference_slot_index
+          ? `对应 Ozon 参考图 #${{mapping.reference_slot_index}}${{mapping.reference_reused ? " · 复用" : ""}}`
+          : "缺少逐槽 Ozon 参考图回执";
+        if (mapping.reference_url) {{
+          referenceProof.href = mapping.reference_url;
+          referenceProof.target = "_blank";
+          referenceProof.rel = "noopener";
+        }}
         const checkLabel = document.createElement("label"); checkLabel.className = "repair-check";
         const checkbox = document.createElement("input"); checkbox.type = "checkbox"; checkbox.disabled = job.status !== "manual_review_required" || slot.status !== "accepted" || Number(slot.repair_count || 0) >= 2;
         const checkText = document.createElement("span"); checkText.textContent = Number(slot.repair_count || 0) >= 2 ? "已达到返修上限" : "不合格，申请返修";
@@ -2639,7 +2784,7 @@ def build_image_workspace_html(run_id: str) -> str:
         fields.append(select, textarea, fieldError);
         checkbox.addEventListener("change", () => {{ card.classList.toggle("selected", checkbox.checked); fields.hidden = !checkbox.checked; if (!checkbox.checked) {{ select.value = ""; textarea.value = ""; card.classList.remove("repair-incomplete"); }} updateRepairSubmitState(); }});
         select.addEventListener("change", updateRepairSubmitState); textarea.addEventListener("input", updateRepairSubmitState);
-        card.append(cardHead, imageLink, fullResolutionLink, checkLabel, fields);
+        card.append(cardHead, imageLink, fullResolutionLink, referenceProof, checkLabel, fields);
         if (slot.status === "repair_pending") {{ const feedback = document.createElement("div"); feedback.className = "repair-feedback-summary"; feedback.textContent = `${{slot.review_issue_code || "返修"}}${{slot.review_note ? ` · ${{slot.review_note}}` : ""}}`; card.append(feedback); }}
         grid.append(card);
       }});
@@ -2717,7 +2862,8 @@ def build_image_workspace_html(run_id: str) -> str:
       const stateBanner = document.createElement("div"); stateBanner.className = "product-state-banner"; stateBanner.classList.add(presentation.tone); stateBanner.textContent = presentation.text;
       if (presentation.action) {{ const action = document.createElement("a"); action.href = `/batches/${{encodeURIComponent(runId)}}/supplier-review`; action.textContent = presentation.action; stateBanner.append(action); }}
       const sources = document.createElement("div"); sources.className = "source-grid";
-      sources.append(sourcePanel("Ozon 参考图 (Ozon Reference)", item.ozon_reference_images || [], "没有 Ozon 参考图"));
+      const ozonReferenceInputs = item.ozon_reference_inputs || [];
+      sources.append(sourcePanel("Ozon 参考图（按序供 Skill 映射）", ozonReferenceInputs.map((reference) => reference.url), "没有 Ozon 参考图"));
       sources.append(sourcePanel("供应商原图 (Supplier Source)", item.supplier_source_images || [], "等待用户核实并采集 1688 商品"));
       sources.append(generatedReviewPanel(item));
       card.append(head, stateBanner, sources); container.append(card); container.scrollTop = 0;
@@ -2732,7 +2878,7 @@ def build_image_workspace_html(run_id: str) -> str:
       renderImageItemAt(preserveIndex ? imageWorkspaceIndex : 0);
     }}
     function workspaceSignature(data) {{
-      return JSON.stringify([data.image_queue_summary || {{}}, (data.items || []).map((item) => [item.seed_id, item.generation_status, (item.image_job || {{}}).status, (item.image_job || {{}}).stop_reason, ((item.image_job || {{}}).slots || []).map((slot) => [slot.slot_id, slot.status, slot.accepted_path, slot.attempt_count, slot.repair_count, slot.review_issue_code, slot.review_requested_at])])]);
+      return JSON.stringify([data.image_queue_summary || {{}}, (data.items || []).map((item) => [item.seed_id, item.generation_status, (item.image_job || {{}}).status, (item.image_job || {{}}).stop_reason, ((item.image_job || {{}}).slots || []).map((slot) => [slot.slot_id, slot.status, slot.accepted_path, slot.attempt_count, slot.repair_count, slot.review_issue_code, slot.review_requested_at, slot.ozon_reference_mapping || null])])]);
     }}
     async function loadWorkspace(force = false) {{
       const result = await api(`/api/batches/${{encodeURIComponent(runId)}}/images`);
@@ -2809,6 +2955,16 @@ def build_upload_workspace_html(run_id: str) -> str:
         "Read and follow the workspace Skill at "
         "skills/ozon-intelligent-field-drafter/SKILL.md. "
         "Use the complete locked 1688 SKU plus existing Ozon and supplier evidence. "
+        "For visual-supported fields, inspect every visual_evidence_refs image: "
+        "first run skills/ozon-intelligent-field-drafter/scripts/"
+        "materialize_visual_evidence.py, then use view_image on every local_path. "
+        "For every visual field, identify the locked SKU primary product subject "
+        "and follow visual_target_scope. Exclude accessories, packaging, backgrounds, "
+        "text overlays, decorations, and reference variants from primary-subject "
+        "facts. Only locked original 1688 images may prove color or directly visible "
+        "package/set counts. Submit field-specific visual_analysis and "
+        "subject_analysis receipts; "
+        "generated images are never product-fact evidence. "
         "Complete every pending field decision, translate customer-facing facts into "
         "Russian, classify genuine evidence gaps, and report ready, gap, and blocked "
         "products separately. "
@@ -2842,12 +2998,14 @@ def build_upload_workspace_html(run_id: str) -> str:
     .upload-layout {{ display:grid; grid-template-columns:minmax(0,1fr) 300px; gap:14px; align-items:start; }} .panel {{ min-width:0; overflow:hidden; border:1px solid var(--line); border-radius:6px; background:var(--surface); }}
     .panel-head {{ min-height:50px; display:flex; align-items:center; justify-content:space-between; gap:10px; padding:0 14px; border-bottom:1px solid var(--line); }} .panel-head h3 {{ margin:0; font-size:14px; }}
     .draft-items {{ display:grid; gap:12px; padding:12px; }} .draft-item {{ display:grid; grid-template-columns:124px minmax(0,1fr); gap:14px; padding:12px; border:1px solid var(--line); border-radius:5px; }}
+    .draft-head-actions,.draft-pager {{ display:flex; align-items:center; gap:7px; }} .draft-pager button {{ width:28px; height:28px; display:grid; place-items:center; border:1px solid #cbd4e1; border-radius:5px; color:var(--blue); background:#fff; cursor:pointer; }} .draft-pager button:disabled {{ color:#aab3c1; background:#f4f6f9; cursor:not-allowed; }} .draft-page-label {{ min-width:128px; color:var(--muted); font-size:10px; text-align:center; }}
     .draft-item img {{ width:124px; height:124px; object-fit:contain; border:1px solid var(--line); border-radius:4px; background:#fff; }} .image-placeholder {{ width:124px; height:124px; display:grid; place-items:center; border:1px dashed #c9d1dc; border-radius:4px; color:var(--muted); background:var(--soft); font-size:11px; text-align:center; }}
     .source-label {{ color:var(--muted); font-size:10px; }} .source-title {{ margin:3px 0 9px; font-size:16px; line-height:1.35; }} .notice {{ padding:8px 10px; border-left:3px solid var(--amber); color:#74410a; background:#fff8eb; font-size:10px; }} .inline-action {{ margin-left:8px; padding:3px 7px; border:1px solid #d5a14d; border-radius:4px; color:#74410a; background:#fff; cursor:pointer; }} .inline-action:disabled {{ opacity:.55; cursor:wait; }}
     .item-gate-summary {{ display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin-top:10px; padding:8px 9px; border:1px solid #e8c98f; border-radius:4px; color:#74410a; background:#fffaf0; font-size:10px; }} .item-gate-summary.ready {{ border-color:#9dd8c7; color:var(--green); background:var(--green-soft); }} .item-gate-summary strong {{ margin-right:3px; }} .item-gate-chip {{ padding:2px 6px; border-radius:3px; color:inherit; background:rgba(255,255,255,.72); }}
     .meta-grid {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); margin-top:11px; border:1px solid var(--line); border-radius:4px; overflow:hidden; }} .meta {{ padding:8px 9px; border-right:1px solid var(--line); }} .meta:last-child {{ border-right:0; }} .meta span {{ display:block; color:var(--muted); font-size:9px; }} .meta strong {{ display:block; margin-top:3px; overflow-wrap:anywhere; font-size:10px; }}
     .upload-core {{ margin-top:10px; padding:9px; border:1px solid #b9ddcf; border-radius:5px; background:#f2fbf8; }} .upload-core-head {{ display:flex; align-items:center; justify-content:space-between; gap:10px; }} .upload-core-head strong {{ color:var(--green); font-size:11px; }} .upload-core-head span {{ color:var(--muted); font-size:9px; }} .upload-core-grid {{ display:grid; grid-template-columns:repeat(4,minmax(110px,1fr)); gap:6px; margin-top:8px; }} .upload-core-field {{ padding:7px 8px; border:1px solid #d8ebe4; border-radius:4px; background:#fff; }} .upload-core-field span {{ display:block; color:var(--muted); font-size:9px; }} .upload-core-field strong {{ display:block; margin-top:2px; color:var(--text); font-size:10px; }}
     .mapping-summary {{ display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }} .mapping-chip {{ padding:3px 7px; border-radius:4px; color:var(--green); background:var(--green-soft); font-size:10px; }} .mapping-chip.warn {{ color:var(--red); background:var(--red-soft); }}
+    .score-progress {{ margin-top:8px; padding:8px 9px; border-left:3px solid var(--blue); color:#29456f; background:#f1f5ff; font-size:10px; }}
     .attribute-grid {{ display:grid; grid-template-columns:1fr 1fr; margin-top:8px; border:1px solid var(--line); border-radius:4px; overflow:hidden; }} .attribute {{ display:grid; grid-template-columns:minmax(110px,.8fr) minmax(0,1.2fr); gap:10px; padding:8px 9px; border-right:1px solid var(--line); border-bottom:1px solid #edf0f4; font-size:10px; }} .attribute:nth-child(2n) {{ border-right:0; }} .attribute span {{ color:var(--muted); }} .attribute strong {{ overflow-wrap:anywhere; }} .attribute.missing_fact strong {{ color:var(--red); }} .attribute.rewrite_required strong {{ color:var(--amber); }} .attribute.not_applicable strong {{ color:var(--muted); font-weight:500; }} .all-mappings {{ margin-top:8px; color:var(--muted); font-size:10px; }} .all-mappings summary {{ cursor:pointer; color:var(--blue); font-weight:650; }}
     .gate-list {{ padding:6px 14px 12px; }} .gate-row {{ display:grid; grid-template-columns:22px minmax(0,1fr); gap:9px; padding:10px 0; border-bottom:1px solid #edf0f4; }} .gate-row:last-child {{ border-bottom:0; }} .gate-icon {{ width:22px; height:22px; display:grid; place-items:center; border-radius:50%; color:var(--green); background:var(--green-soft); font-size:11px; font-weight:700; }} .gate-row.blocked .gate-icon {{ color:var(--amber); background:var(--amber-soft); }} .gate-row strong {{ display:block; font-size:11px; }} .gate-row span {{ display:block; margin-top:2px; color:var(--muted); font-size:10px; }}
     .content-controller {{ margin:12px 14px; padding:11px; border:1px solid #bfd0f8; border-radius:5px; background:var(--blue-soft); }} .content-controller strong {{ display:block; font-size:11px; }} .content-controller p {{ margin:4px 0 8px; color:var(--muted); font-size:10px; }} .content-command {{ max-height:190px; overflow:auto; padding:9px; border:1px solid #c9d5ec; border-radius:4px; white-space:pre-wrap; color:#263756; background:#fff; font:10px/1.5 Consolas,"Courier New",monospace; }} .content-copy {{ width:100%; min-height:34px; margin-top:8px; border:1px solid var(--blue); border-radius:4px; color:#fff; background:var(--blue); cursor:pointer; }} .content-copy-status {{ display:block; min-height:16px; margin-top:4px; color:var(--green); font-size:10px; text-align:center; }}
@@ -2862,6 +3020,7 @@ def build_upload_workspace_html(run_id: str) -> str:
     .pricing-result {{ display:grid; grid-template-columns:repeat(6,minmax(105px,1fr)); margin-top:14px; overflow:hidden; border:1px solid var(--line); border-radius:6px; }} .pricing-result-cell {{ min-height:70px; padding:10px; border-right:1px solid var(--line); background:#fbfcfe; }} .pricing-result-cell:last-child {{ border-right:0; }} .pricing-result-cell span {{ display:block; color:var(--muted); font-size:9px; }} .pricing-result-cell strong {{ display:block; margin-top:5px; font-size:14px; }} .pricing-result-cell.price {{ background:var(--green-soft); }} .pricing-result-cell.price strong {{ color:var(--green); }}
     .publish-lock {{ margin:0 14px 12px; padding:11px 12px; border-left:3px solid var(--amber); color:#74410a; background:#fff8eb; }} .publish-lock strong {{ display:block; font-size:11px; }} .publish-lock span {{ display:block; margin-top:3px; font-size:10px; }}
     .primary {{ width:calc(100% - 28px); height:38px; margin:0 14px 14px; border:1px solid var(--blue); border-radius:5px; color:#fff; background:var(--blue); }} .primary:disabled {{ opacity:.48; cursor:not-allowed; }} .empty {{ padding:26px; color:var(--muted); text-align:center; }}
+    .product-upload-actions {{ display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-top:10px; padding:10px; border:1px solid #bfd0f8; border-radius:5px; background:#f5f8ff; }} .product-upload-actions button {{ min-height:34px; padding:0 12px; border:1px solid var(--blue); border-radius:4px; color:var(--blue); background:#fff; cursor:pointer; }} .product-upload-actions button.confirm {{ color:#fff; background:var(--blue); }} .product-upload-actions button:disabled {{ opacity:.48; cursor:not-allowed; }} .product-upload-status {{ flex:1 1 260px; color:var(--muted); font-size:10px; }} .product-upload-status.error {{ color:var(--red); }} .product-upload-status.success {{ color:var(--green); }}
     @media(max-width:1100px) {{ .pricing-form {{ grid-template-columns:repeat(2,minmax(130px,1fr)); }} .pricing-result {{ grid-template-columns:repeat(3,1fr); }} .pricing-result-cell:nth-child(3) {{ border-right:0; }} }}
     @media(max-width:1000px) {{ .upload-layout {{ grid-template-columns:1fr; }} .pricing-layout {{ grid-template-columns:250px minmax(0,1fr); }} }}
     @media(max-width:900px) {{ .app-shell {{ grid-template-columns:72px minmax(0,1fr); }} .sidebar {{ padding:14px 8px; }} .sidebar-brand {{ padding:4px 4px 16px; text-align:center; }} .sidebar-brand strong {{ font-size:14px; }} .sidebar-brand span,.sidebar-label,.sidebar-link span:last-child {{ display:none; }} .sidebar-link {{ justify-content:center; padding:0; }} .stage-nav-inner {{ overflow-x:auto; padding:0 10px; }} .stage-run {{ display:none; }} .summary {{ grid-template-columns:repeat(2,1fr); }} .metric:nth-child(2) {{ border-right:0; }} .metric:nth-child(-n+2) {{ border-bottom:1px solid var(--line); }} }}
@@ -2871,18 +3030,18 @@ def build_upload_workspace_html(run_id: str) -> str:
 <body>
   <div class="app-shell">
     <aside class="sidebar" aria-label="主菜单 (Primary Navigation)"><div class="sidebar-brand"><strong>Ozon V2</strong><span>运营驾驶舱 (Operations Cockpit)</span></div><div class="sidebar-group"><div class="sidebar-label">运营 (Operations)</div>
-      <a class="sidebar-link" href="/?run_id={run_id}"><span class="nav-mark">B</span><span>批次总览 (Batch)</span></a><a class="sidebar-link" href="/batches/{run_id}/supplier-review"><span class="nav-mark">S</span><span>供应商审核 (Supplier)</span></a><a class="sidebar-link" href="/batches/{run_id}/images"><span class="nav-mark">I</span><span>图片处理 (Images)</span></a><a class="sidebar-link active" href="/batches/{run_id}/upload" aria-current="page"><span class="nav-mark">U</span><span>上传草稿 (Upload)</span></a>
+      <a class="sidebar-link" href="/?run_id={run_id}"><span class="nav-mark">B</span><span>批次总览 (Batch)</span></a><a class="sidebar-link" href="/batches/{run_id}/supplier-review"><span class="nav-mark">S</span><span>供应商审核 (Supplier)</span></a><a class="sidebar-link active" href="/batches/{run_id}/upload" aria-current="page"><span class="nav-mark">U</span><span>上传草稿 (Upload)</span></a>
     </div><div class="sidebar-group"><div class="sidebar-label">全局 (Global)</div><a class="sidebar-link" href="/batches"><span class="nav-mark">H</span><span>批次历史 (History)</span></a><a class="sidebar-link" href="/products"><span class="nav-mark">P</span><span>商品资料库 (Products)</span></a><a class="sidebar-link" href="/store"><span class="nav-mark">K</span><span>店铺授权 (Store)</span></a><a class="sidebar-link" href="/diagnostics"><span class="nav-mark">D</span><span>诊断中心 (Diagnostics)</span></a><a class="sidebar-link" href="/settings"><span class="nav-mark">C</span><span>系统设置 (Settings)</span></a></div></aside>
-    <div class="app-main"><header class="topbar"><div><h1>Ozon V2 工具台 (Workbench)</h1><p>完整类目模板、Ozon 证据映射、90 分内容完善、图片门禁与发布锁</p></div><span class="pill">已连接 (Connected)</span></header>
-      <nav id="stageNavigation" class="stage-nav" aria-label="批次阶段 (Batch Stages)"><div class="stage-nav-inner"><a id="batchOverviewNav" class="stage-link" href="/?run_id={run_id}">批次总览 (Batch)</a><a id="supplierReviewNav" class="stage-link" href="/batches/{run_id}/supplier-review">供应商审核 (Supplier Review)</a><a id="imageProcessingNav" class="stage-link" href="/batches/{run_id}/images">图片处理 (Images)</a><a id="uploadDraftNav" class="stage-link active" aria-current="page" href="/batches/{run_id}/upload">上传草稿 (Upload)</a><span class="stage-run">批次 {run_id}</span></div></nav>
+    <div class="app-main"><header class="topbar"><div><h1>Ozon V2 工具台 (Workbench)</h1><p>完整类目模板、Ozon 证据映射、90 分内容完善、单张原图建品与发布锁</p></div><span class="pill">已连接 (Connected)</span></header>
+      <nav id="stageNavigation" class="stage-nav" aria-label="批次阶段 (Batch Stages)"><div class="stage-nav-inner"><a id="batchOverviewNav" class="stage-link" href="/?run_id={run_id}">批次总览 (Batch)</a><a id="supplierReviewNav" class="stage-link" href="/batches/{run_id}/supplier-review">供应商审核 (Supplier Review)</a><a id="uploadDraftNav" class="stage-link active" aria-current="page" href="/batches/{run_id}/upload">上传草稿 (Upload)</a><span class="stage-run">批次 {run_id}</span></div></nav>
       <main class="workspace"><div class="page-head"><div><h2>上传草稿 (Upload)</h2><p>完整读取 Seller API 类目字段，使用 Ozon 与已确认 1688 事实准备客观属性，并明确列出待原创内容和真实缺口；合格商品不等待整批。</p></div><span id="workspaceStatus" class="pill">加载中 (Loading)</span></div>
-        <section class="summary"><div class="metric"><span>商品 (Products)</span><strong id="productCount">0</strong></div><div class="metric"><span>必填已映射 (Required)</span><strong id="requiredCount">0 / 0</strong></div><div class="metric"><span>客观属性已映射 (Mapped Facts)</span><strong id="prefillCount">0</strong></div><div class="metric"><span>图片进度 (Images)</span><strong id="imageReadyCount">0 / 0</strong></div></section>
+        <section class="summary"><div class="metric"><span>商品 (Products)</span><strong id="productCount">0</strong></div><div class="metric"><span>必填已映射 (Required)</span><strong id="requiredCount">0 / 0</strong></div><div class="metric"><span>模板已填 (Template Filled)</span><strong id="prefillCount">0</strong></div><div class="metric"><span>锁定原图 (Original)</span><strong id="imageReadyCount">0 / 0</strong></div></section>
         <section id="pricingWorkspace" class="panel pricing-workspace">
           <div class="panel-head"><div><h3>价格与包装证据</h3><span class="pricing-head-note">逐件确认成本、包装尺寸、GUOO 跨境运费和 Ozon 建议上架价；确认后的包装数据会作为后续字段证据。</span></div><span id="pricingProgress" class="pill">0 / 0 已确认</span></div>
           <div class="pricing-layout"><div class="pricing-product-column"><nav id="pricingProductList" class="pricing-products" aria-label="价格证据商品清单"></nav><div id="pricingPager" class="pricing-pager"><button id="pricingPrevPage" type="button" aria-label="上一页">‹</button><span id="pricingPageLabel" class="pricing-page-label" aria-live="polite">第 1 / 1 页 · 每页 5 件</span><button id="pricingNextPage" type="button" aria-label="下一页">›</button></div></div><section id="pricingEditor" class="pricing-editor"><div class="pricing-editor-empty">正在读取商品价格证据…</div></section></div>
         </section>
-        <div class="upload-layout"><section class="panel"><div class="panel-head"><h3>类目模板自动映射结果 · 完整字段与内容完善</h3><span class="pill">Seller API Template</span></div><div id="draftItems" class="draft-items"></div></section>
-          <aside id="uploadGate" class="panel"><div class="panel-head"><h3>逐商品上传门禁 (Per-product Gate)</h3></div><div class="content-controller"><strong>智能字段草稿总控（证据约束）</strong><p>Ozon 数据用于模仿结构与写法，1688 与已锁定 SKU 用于约束客观事实；无法证明的字段明确保留为未解决，不会自动上传。</p><div id="contentControllerCommand" class="content-command">{escaped_content_controller_command}</div><button id="copyContentControllerCommand" class="content-copy" type="button">复制整批智能字段草稿命令</button><span id="contentControllerCopyStatus" class="content-copy-status"></span></div><div class="gate-list"><div id="templateGate" class="gate-row"><span class="gate-icon">1</span><div><strong>类目模板 (Category Template)</strong><span>等待检查</span></div></div><div id="attributeGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>必填属性 (Required Attributes)</strong><span>等待自动映射。</span></div></div><div id="originalContentGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>原创内容 (Original Content)</strong><span>等待利用 Ozon 证据完成俄文内容。</span></div></div><div id="imageUploadGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>图片门禁 (Image Gate)</strong><span>等待生图与用户审核。</span></div></div><div id="pricingGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>价格与包装证据 (Pricing)</strong><span>等待逐件确认成本、包装和建议上架价。</span></div></div><div id="draftGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>可独立推进 (Ready Products)</strong><span>逐件计算，不再等待整批。</span></div></div></div><div class="publish-lock"><strong>发布锁已开启 (Publish Lock Active)</strong><span>这里只准备可审核草稿，不会自动提交到 Ozon；最终发布仍需用户确认。</span></div><button id="buildDraft" class="primary" disabled>等待可独立推进的商品 (Waiting)</button></aside>
+        <div class="upload-layout"><section class="panel"><div class="panel-head"><h3>类目模板自动映射结果 · 完整字段与内容完善</h3><div class="draft-head-actions"><div id="draftPager" class="draft-pager"><button id="draftPrevPage" type="button" aria-label="上一页">‹</button><span id="draftPageLabel" class="draft-page-label" aria-live="polite">第 1 / 1 页 · 每页 5 件</span><button id="draftNextPage" type="button" aria-label="下一页">›</button></div><span class="pill">Seller API Template</span></div></div><div id="draftItems" class="draft-items"></div></section>
+          <aside id="uploadGate" class="panel"><div class="panel-head"><h3>逐商品上传门禁 · 逐商品真实上传 (Per-product Upload)</h3></div><div class="content-controller"><strong>智能字段草稿总控（证据约束）</strong><p>Ozon 数据用于模仿结构与写法，1688 与已锁定 SKU 用于约束客观事实；无法证明的字段明确保留为未解决，不会自动上传。</p><div id="contentControllerCommand" class="content-command">{escaped_content_controller_command}</div><button id="copyContentControllerCommand" class="content-copy" type="button">复制整批智能字段草稿命令</button><span id="contentControllerCopyStatus" class="content-copy-status"></span></div><div class="gate-list"><div id="templateGate" class="gate-row"><span class="gate-icon">1</span><div><strong>类目模板 (Category Template)</strong><span>等待检查</span></div></div><div id="attributeGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>必填属性 (Required Attributes)</strong><span>等待自动映射。</span></div></div><div id="originalContentGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>原创内容 (Original Content)</strong><span>等待利用 Ozon 证据完成俄文内容。</span></div></div><div id="bootstrapImageGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>锁定原图 (Locked Original)</strong><span>等待锁定一张真实 1688 主体原图。</span></div></div><div id="pricingGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>价格与包装证据 (Pricing)</strong><span>等待逐件确认成本、包装和建议上架价。</span></div></div><div id="draftGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>可独立推进 (Ready Products)</strong><span>逐件计算，不再等待整批。</span></div></div></div><div class="publish-lock"><strong>发布锁已开启 (Publish Lock Active) · 逐商品确认</strong><span>建品时只提交锁定的 1688 原图；Seller API 接受后立即输出图片生成与上传任务包，后续图片流程不再回传工作台。</span></div></aside>
         </div>
       </main>
     </div>
@@ -2891,6 +3050,9 @@ def build_upload_workspace_html(run_id: str) -> str:
     const runId = {safe_run_id}; const $ = (id) => document.getElementById(id);
     async function api(path, options={{}}) {{ const response = await fetch(path, options); const body = await response.json(); if (!response.ok) throw body; return body; }}
     const pricingState = {{ selectedSeedId:null, items:[], drafts:new Map(), previews:new Map(), page:0, pageSize:5 }};
+    const draftState = {{ page:0, pageSize:5, items:[] }};
+    const productUploadState = {{ previews:new Map(), submissions:new Map() }};
+    let latestUploadData = null;
     const pricingEndpoints = {{
       preview:`/api/batches/${{encodeURIComponent(runId)}}/pricing-evidence/preview`,
       confirm:`/api/batches/${{encodeURIComponent(runId)}}/pricing-evidence/confirm`
@@ -3016,54 +3178,170 @@ def build_upload_workspace_html(run_id: str) -> str:
       ].forEach(([label,value]) => {{ const cell = document.createElement("div"); cell.className = "upload-core-field"; const name = document.createElement("span"); name.textContent = label; const fact = document.createElement("strong"); fact.textContent = value; cell.append(name,fact); grid.append(cell); }});
       section.append(grid); container.append(section);
     }}
-    function mappingGrid(fields) {{ const statusText = {{ rewrite_required:"待原创（依据采集事实，不复制 Ozon 原文）", missing_fact:"缺少事实，需补充", not_applicable:"未提供可选素材", excluded:"不参与本阶段" }}; const grid = document.createElement("div"); grid.className = "attribute-grid"; (fields || []).forEach((field) => {{ const row = document.createElement("div"); row.className = `attribute ${{field.status || "missing_fact"}}`; const label = document.createElement("span"); label.textContent = `${{field.label || field.field_key}}${{field.required ? " *" : ""}}`; const fact = document.createElement("strong"); fact.textContent = field.status === "mapped" ? String(field.value) : (field.intelligence_decision === "unresolved" ? `证据不足：${{field.reason || "无法确认"}}` : (statusText[field.status] || "缺少事实，需补充")); row.append(label,fact); grid.append(row); }}); return grid; }}
-    function renderMapping(container, item) {{ if (!item.template_ready) {{ const summary = document.createElement("div"); summary.className = "mapping-summary"; const blocked = document.createElement("span"); blocked.className = "mapping-chip warn"; blocked.textContent = "模板错配，未执行字段映射"; summary.append(blocked); container.append(summary); return; }} const fields = item.attribute_mapping || []; const summary = document.createElement("div"); summary.className = "mapping-summary"; const ready = document.createElement("span"); ready.className = `mapping-chip${{item.required_attributes_ready ? "" : " warn"}}`; ready.textContent = `必填 ${{item.required_mapped_count || 0}} / ${{item.required_attribute_count || 0}}`; const mapped = document.createElement("span"); mapped.className = "mapping-chip"; mapped.textContent = `客观属性已映射 ${{item.mapped_attribute_count || 0}}`; const rewrite = document.createElement("span"); rewrite.className = `mapping-chip${{(item.rewrite_required_count || 0) ? " warn" : ""}}`; rewrite.textContent = `待原创 ${{item.rewrite_required_count || 0}}`; const missing = document.createElement("span"); missing.className = `mapping-chip${{(item.missing_fact_count || 0) ? " warn" : ""}}`; missing.textContent = `缺少事实 ${{item.missing_fact_count || 0}}`; const assets = document.createElement("span"); assets.className = "mapping-chip"; assets.textContent = `未提供可选素材 ${{item.not_applicable_count || 0}}`; summary.append(ready,mapped,rewrite,missing,assets); container.append(summary); const details = document.createElement("details"); details.className = "all-mappings"; details.open = true; const label = document.createElement("summary"); label.textContent = `全部模板字段 (${{fields.length}})`; details.append(label,mappingGrid(fields)); container.append(details); }}
+    function mappingGrid(fields) {{ const statusText = {{ rewrite_required:"待原创（依据采集事实，不复制 Ozon 原文）", missing_fact:"缺少事实，需补充", not_applicable:"未提供可选素材", excluded:"不参与本阶段" }}; const grid = document.createElement("div"); grid.className = "attribute-grid"; (fields || []).forEach((field) => {{ const row = document.createElement("div"); row.className = `attribute ${{field.status || "missing_fact"}}`; const label = document.createElement("span"); label.textContent = `${{field.label || field.field_key}}${{field.required ? " *" : ""}}`; const fact = document.createElement("strong"); const pendingVisual = field.status === "missing_fact" && field.visual_inference_supported; fact.textContent = field.status === "mapped" ? String(field.value) : (pendingVisual ? "可从锁定 1688 原图判定，等待智能字段 Skill 重判" : (field.intelligence_decision === "unresolved" ? `证据不足：${{field.reason || "无法确认"}}` : (statusText[field.status] || "缺少事实，需补充"))); row.append(label,fact); grid.append(row); }}); return grid; }}
+    function renderMapping(container, item) {{ if (!item.template_ready) {{ const summary = document.createElement("div"); summary.className = "mapping-summary"; const blocked = document.createElement("span"); blocked.className = "mapping-chip warn"; blocked.textContent = "模板错配，未执行字段映射"; summary.append(blocked); container.append(summary); return; }} const fields = item.attribute_mapping || []; const summary = document.createElement("div"); summary.className = "mapping-summary"; const ready = document.createElement("span"); ready.className = `mapping-chip${{item.required_attributes_ready ? "" : " warn"}}`; ready.textContent = `必填 ${{item.required_mapped_count || 0}} / ${{item.required_attribute_count || 0}}`; const mapped = document.createElement("span"); mapped.className = "mapping-chip"; mapped.textContent = `模板已填 ${{item.mapped_attribute_count || 0}}`; const rewrite = document.createElement("span"); rewrite.className = `mapping-chip${{(item.rewrite_required_count || 0) ? " warn" : ""}}`; rewrite.textContent = `待智能生成/规范 ${{item.rewrite_required_count || 0}}`; const missing = document.createElement("span"); missing.className = `mapping-chip${{(item.missing_fact_count || 0) ? " warn" : ""}}`; missing.textContent = `缺少事实 ${{item.missing_fact_count || 0}}`; const assets = document.createElement("span"); assets.className = "mapping-chip"; assets.textContent = `未提供可选素材 ${{item.not_applicable_count || 0}}`; summary.append(ready,mapped,rewrite,missing,assets); container.append(summary); const score = item.attribute_score_progress || {{}}; if (score.scorable_attribute_count) {{ const progress = document.createElement("div"); progress.className = "score-progress"; const paths = []; if (score.fields_to_50_percent > 0) paths.push(`再补 ${{score.fields_to_50_percent}} 项进入 15 分档`); if (score.fields_to_70_percent > 0) paths.push(`再补 ${{score.fields_to_70_percent}} 项进入 30 分档`); if (!paths.length) paths.push("已达到属性完整度 30 分档"); progress.textContent = `Ozon 属性分预估 ${{score.estimated_attribute_points}} / 30 · 计分属性 ${{score.filled_attribute_count}} / ${{score.scorable_attribute_count}} (${{score.completion_percent}}%) · ${{paths.join("；")}}`; container.append(progress); }} const details = document.createElement("details"); details.className = "all-mappings"; details.open = true; const label = document.createElement("summary"); label.textContent = `全部模板字段 (${{fields.length}})`; details.append(label,mappingGrid(fields)); container.append(details); }}
+    async function previewProductUpload(item, controls) {{
+      const previewButton = controls.querySelector("[data-action=preview]");
+      const confirmButton = controls.querySelector("[data-action=confirm]");
+      const status = controls.querySelector(".product-upload-status");
+      previewButton.disabled = true; confirmButton.disabled = true; status.className = "product-upload-status"; status.textContent = "正在校验字段、价格和锁定的 1688 原图，并生成单原图建品载荷…";
+      try {{
+        const result = await api(`/api/batches/${{encodeURIComponent(runId)}}/product-upload/${{encodeURIComponent(item.seed_id)}}/preview`, {{method:"POST",headers:{{"Content-Type":"application/json"}},body:"{{}}"}});
+        productUploadState.previews.set(item.seed_id,result.data);
+        const payload = result.data.seller_api_item || {{}};
+        status.className = "product-upload-status success";
+        status.textContent = `建品载荷已就绪：${{payload.name || item.source_title}} · 1 张锁定 1688 原图 · Seller API 售价 ${{payload.price || "-"}} ${{payload.currency_code || "-"}}`;
+        previewButton.textContent = "重新预览载荷";
+        confirmButton.disabled = false;
+      }} catch (error) {{
+        status.className = "product-upload-status error";
+        status.textContent = error.message || "最终上传预览生成失败";
+        previewButton.disabled = false;
+      }}
+    }}
+    function sellerUploadError(submission) {{
+      const payload = submission && submission.seller_api_status;
+      if (!payload) return "Ozon 未返回详细失败原因";
+      const codes = [];
+      const visit = (value) => {{
+        if (Array.isArray(value)) {{ value.forEach(visit); return; }}
+        if (!value || typeof value !== "object") return;
+        if (value.code) codes.push(String(value.code));
+        if (value.message) codes.push(String(value.message));
+        if (value.description) codes.push(String(value.description));
+        Object.values(value).forEach(visit);
+      }};
+      visit(payload);
+      return [...new Set(codes)].slice(0,4).join(" · ") || "Ozon 未返回详细失败原因";
+    }}
+    async function pollProductUploadStatus(item, controls, remaining=30) {{
+      const confirmButton = controls.querySelector("[data-action=confirm]");
+      const previewButton = controls.querySelector("[data-action=preview]");
+      const status = controls.querySelector(".product-upload-status");
+      try {{
+        const result = await api(`/api/batches/${{encodeURIComponent(runId)}}/product-upload/${{encodeURIComponent(item.seed_id)}}/status`, {{method:"POST",headers:{{"Content-Type":"application/json"}},body:"{{}}" }});
+        const submission = result.data || {{}};
+        productUploadState.submissions.set(item.seed_id,submission);
+        if (submission.status === "accepted_by_ozon") {{
+          status.className = "product-upload-status success";
+          status.textContent = `Ozon 已确认接收 · task_id ${{submission.task_id}} · 图片任务包 ${{submission.image_task_package_id || "已写入"}}。本商品工作台流程完成。`;
+          confirmButton.disabled = true; previewButton.disabled = true; confirmButton.textContent = "上传完成";
+          return;
+        }}
+        if (submission.status === "failed") {{
+          status.className = "product-upload-status error";
+          status.textContent = `Ozon 上传失败：${{sellerUploadError(submission)}}。修正后可重新准备并上传。`;
+          previewButton.disabled = !item.ready_to_build; confirmButton.disabled = true; previewButton.textContent = "修正后重新准备";
+          return;
+        }}
+        status.className = "product-upload-status";
+        status.textContent = `Ozon 正在处理 · task_id ${{submission.task_id}}，工作台正在自动回查…`;
+        if (remaining > 0) setTimeout(() => pollProductUploadStatus(item,controls,remaining-1),2000);
+        else {{
+          status.textContent = `Ozon 仍在处理 · task_id ${{submission.task_id}}。刷新页面会继续回查。`;
+          previewButton.disabled = true; confirmButton.disabled = true;
+        }}
+      }} catch (error) {{
+        status.className = "product-upload-status error";
+        status.textContent = `状态回查失败：${{error.message || error}}。可刷新页面重试回查，不要重复提交。`;
+      }}
+    }}
+    async function confirmProductUpload(item, controls) {{
+      const preview = productUploadState.previews.get(item.seed_id);
+      const confirmButton = controls.querySelector("[data-action=confirm]");
+      const previewButton = controls.querySelector("[data-action=preview]");
+      const status = controls.querySelector(".product-upload-status");
+      if (!preview || !preview.confirmation_token) {{ status.className = "product-upload-status error"; status.textContent = "请先生成并检查最终上传预览。"; return; }}
+      if (!window.confirm(`确认将“${{(preview.seller_api_item || {{}}).name || item.source_title}}”这一件商品提交到 Ozon？`)) return;
+      confirmButton.disabled = true; previewButton.disabled = true; status.className = "product-upload-status"; status.textContent = "正在提交这一件商品到 Ozon...";
+      try {{
+        const result = await api(`/api/batches/${{encodeURIComponent(runId)}}/product-upload/${{encodeURIComponent(item.seed_id)}}/confirm`, {{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify({{confirmation_token:preview.confirmation_token}})}});
+        productUploadState.submissions.set(item.seed_id,result.data);
+        status.className = "product-upload-status";
+        status.textContent = `Ozon 已受理任务 · task_id ${{result.data.task_id}} · 图片任务包 ${{result.data.image_task_package_id || "已写入"}}，正在确认建品结果…`;
+        confirmButton.textContent = "Ozon 处理中";
+        await pollProductUploadStatus(item,controls);
+      }} catch (error) {{
+        status.className = "product-upload-status error"; status.textContent = error.message || "上传失败";
+        confirmButton.disabled = false; previewButton.disabled = false;
+      }}
+    }}
+    function renderProductUploadActions(container,item) {{
+      const controls = document.createElement("div"); controls.className = "product-upload-actions";
+      const previewButton = document.createElement("button"); previewButton.type = "button"; previewButton.dataset.action = "preview"; previewButton.textContent = "预览单原图建品"; previewButton.disabled = !item.ready_to_build;
+      const confirmButton = document.createElement("button"); confirmButton.type = "button"; confirmButton.dataset.action = "confirm"; confirmButton.className = "confirm"; confirmButton.textContent = "确认上传到 Ozon"; confirmButton.disabled = true;
+      const status = document.createElement("span"); status.className = "product-upload-status"; status.textContent = item.ready_to_build ? "建品载荷只使用锁定的 1688 原图；确认提交后输出独立图片任务包。" : "本商品尚有门禁未完成，不能提交。";
+      if (item.upload_preview && item.upload_preview.confirmation_token) {{ productUploadState.previews.set(item.seed_id,item.upload_preview); previewButton.textContent = "重新预览载荷"; confirmButton.disabled = false; const payload = item.upload_preview.seller_api_item || {{}}; status.textContent = `已准备：1 张锁定原图 · ${{payload.price || "-"}} ${{payload.currency_code || "-"}}。`; }}
+      if (item.upload_submission && item.upload_submission.task_id != null) {{
+        productUploadState.submissions.set(item.seed_id,item.upload_submission);
+        const submissionStatus = item.upload_submission.status || "processing";
+        if (submissionStatus === "failed") {{
+          previewButton.disabled = !item.ready_to_build; confirmButton.disabled = true; previewButton.textContent = "修正后重新准备"; status.className = "product-upload-status error"; status.textContent = `上次上传失败：${{sellerUploadError(item.upload_submission)}}。`;
+        }} else if (submissionStatus === "accepted_by_ozon") {{
+          previewButton.disabled = true; confirmButton.disabled = true; confirmButton.textContent = "上传完成"; status.className = "product-upload-status success"; status.textContent = `Ozon 已确认接收 · task_id ${{item.upload_submission.task_id}} · 图片任务包 ${{item.upload_submission.image_task_package_id || "已写入"}}`;
+        }} else {{
+          previewButton.disabled = true; confirmButton.disabled = true; confirmButton.textContent = "Ozon 处理中"; status.textContent = `Ozon 正在处理 · task_id ${{item.upload_submission.task_id}}`;
+          setTimeout(() => pollProductUploadStatus(item,controls),0);
+        }}
+      }}
+      previewButton.addEventListener("click",() => previewProductUpload(item,controls)); confirmButton.addEventListener("click",() => confirmProductUpload(item,controls));
+      controls.append(previewButton,confirmButton,status); container.append(controls);
+    }}
     function setGate(id, ready, text) {{ const row = $(id); row.classList.toggle("blocked", !ready); row.querySelector(".gate-icon").textContent = ready ? "✓" : "!"; row.querySelector("span:last-child").textContent = text; }}
     function render(data) {{
+      latestUploadData = data;
       renderPricingWorkspace(data);
       const items = data.items || [];
+      draftState.items = items;
+      const draftPageCount = Math.max(1, Math.ceil(draftState.items.length / draftState.pageSize));
+      draftState.page = Math.min(Math.max(0, draftState.page), draftPageCount - 1);
+      const pageStart = draftState.page * draftState.pageSize;
+      const pageItems = draftState.items.slice(pageStart, pageStart + draftState.pageSize);
       const gates = data.gates || {{}};
       const total = gates.product_count || items.length;
       const readyCount = gates.ready_to_build_count || 0;
       $("productCount").textContent = String(items.length);
       const requiredTotal = gates.valid_required_attribute_count || 0;
       $("requiredCount").textContent = `${{gates.required_mapped_count || 0}} / ${{requiredTotal}}`;
-      $("prefillCount").textContent = `${{gates.mapped_attribute_count || 0}} 项 · 待原创 ${{gates.rewrite_required_count || 0}}`;
-      $("imageReadyCount").textContent = `${{gates.approved_product_count || 0}} / ${{total}} 件 · ${{gates.generated_image_count || 0}} 张`;
+      $("prefillCount").textContent = `${{gates.mapped_attribute_count || 0}} 项 · 待智能生成/规范 ${{gates.rewrite_required_count || 0}}`;
+      $("imageReadyCount").textContent = `${{gates.bootstrap_image_ready_count || 0}} / ${{total}} 件`;
       $("workspaceStatus").textContent = readyCount > 0 ? `${{readyCount}} 件可独立推进 (Ready)` : "暂无可推进商品 (Waiting)";
       setGate("templateGate", (gates.template_ready_count || 0) > 0, `${{gates.template_ready_count || 0}} / ${{total}} 件模板已就绪。`);
       setGate("attributeGate", (gates.required_attributes_ready_count || 0) > 0, `${{gates.required_attributes_ready_count || 0}} / ${{total}} 件必填属性已自动映射完成。`);
       setGate("originalContentGate", (gates.original_content_ready_count || 0) > 0, `${{gates.original_content_ready_count || 0}} / ${{total}} 件俄文标题、简介、标签与 Rich Content 已完善。`);
-      setGate("imageUploadGate", (gates.approved_product_count || 0) > 0, `${{gates.approved_product_count || 0}} / ${{total}} 件图片已审核，共 ${{gates.generated_image_count || 0}} 张。`);
+      setGate("bootstrapImageGate", (gates.bootstrap_image_ready_count || 0) > 0, `${{gates.bootstrap_image_ready_count || 0}} / ${{total}} 件已锁定一张 1688 主体原图。`);
       setGate("pricingGate", (gates.pricing_ready_count || 0) > 0, `${{gates.pricing_ready_count || 0}} / ${{total}} 件价格与包装证据已确认。`);
       setGate("draftGate", readyCount > 0, readyCount > 0 ? `${{readyCount}} 件已通过自身门禁，可先进入草稿阶段。` : "每件商品独立等待自身缺失项。" );
-      $("buildDraft").disabled = readyCount < 1;
-      $("buildDraft").textContent = readyCount > 0 ? `构建已就绪商品草稿 (${{readyCount}})` : "等待可独立推进的商品 (Waiting)";
       $("draftItems").replaceChildren();
-      const blockerLabels = {{ category_template:"类目模板错配", required_attributes:"必填属性", original_content:"原创俄文内容", images:"审核图片", pricing:"价格与包装证据" }};
-      items.forEach((item) => {{
+      $("draftPageLabel").textContent = `第 ${{draftState.page + 1}} / ${{draftPageCount}} 页 · 每页 5 件`;
+      $("draftPrevPage").disabled = draftState.page === 0;
+      $("draftNextPage").disabled = draftState.page >= draftPageCount - 1;
+      const blockerLabels = {{ category_template:"类目模板错配", required_attributes:"必填属性", original_content:"原创俄文内容", bootstrap_image:"锁定 1688 原图", pricing:"价格与包装证据" }};
+      pageItems.forEach((item) => {{
         const card = document.createElement("article"); card.className = "draft-item";
-        const preview = item.generated_image_url || item.source_image;
+        const preview = item.bootstrap_image_url || item.source_image;
         if (preview) {{ const image = document.createElement("img"); image.src = preview; image.alt = item.source_title || "Product image"; image.loading = "lazy"; image.referrerPolicy = "no-referrer"; card.append(image); }}
         else {{ const empty = document.createElement("div"); empty.className = "image-placeholder"; empty.textContent = "没有来源图片"; card.append(empty); }}
         const body = document.createElement("div");
-        const label = document.createElement("div"); label.className = "source-label"; label.textContent = item.generated_image_url ? `生成图片 ${{item.generated_image_count}} / 8 · ${{item.generated_images_ready ? "已审核" : "待审核"}}` : "Ozon 来源标题 (Source Evidence Only)";
+        const label = document.createElement("div"); label.className = "source-label"; label.textContent = item.bootstrap_image_ready ? "锁定 1688 原图 · 建品临时主图" : "Ozon 来源标题 (Source Evidence Only)";
         const title = document.createElement("h3"); title.className = "source-title"; title.textContent = item.source_title || item.seed_id;
-        const notice = document.createElement("div"); notice.className = "notice"; notice.textContent = item.template_ready ? `已读取完整 ${{item.attribute_schema_count || 0}} 字段模板：客观事实映射 ${{item.mapped_attribute_count || 0}} 项，待原创 ${{item.rewrite_required_count || 0}} 项，缺少真实事实 ${{item.missing_fact_count || 0}} 项，可选素材未提供 ${{item.not_applicable_count || 0}} 项。` : `检测到类目模板错配：${{item.category_path || "未知模板"}}。本件停止映射，避免把错误字段写进草稿。`; if (!item.template_ready) {{ const refresh = document.createElement("button"); refresh.type = "button"; refresh.className = "inline-action"; refresh.textContent = "重新解析正确类目模板"; refresh.addEventListener("click", async () => {{ refresh.disabled = true; refresh.textContent = "正在解析..."; try {{ await api(`/api/batches/${{encodeURIComponent(runId)}}/attribute-template/refresh`, {{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify({{seed_id:item.seed_id}})}}); window.location.reload(); }} catch (error) {{ refresh.textContent = error.message || "解析失败"; refresh.disabled = false; }} }}); notice.append(refresh); }}
+        const notice = document.createElement("div"); notice.className = "notice"; notice.textContent = item.template_ready ? `已读取完整 ${{item.attribute_schema_count || 0}} 字段模板：客观事实映射 ${{item.mapped_attribute_count || 0}} 项，待智能生成/规范 ${{item.rewrite_required_count || 0}} 项，缺少真实事实 ${{item.missing_fact_count || 0}} 项，可选素材未提供 ${{item.not_applicable_count || 0}} 项。` : `检测到类目模板错配：${{item.category_path || "未知模板"}}。本件停止映射，避免把错误字段写进草稿。`; if (!item.template_ready) {{ const refresh = document.createElement("button"); refresh.type = "button"; refresh.className = "inline-action"; refresh.textContent = "重新解析正确类目模板"; refresh.addEventListener("click", async () => {{ refresh.disabled = true; refresh.textContent = "正在解析..."; try {{ await api(`/api/batches/${{encodeURIComponent(runId)}}/attribute-template/refresh`, {{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify({{seed_id:item.seed_id}})}}); window.location.reload(); }} catch (error) {{ refresh.textContent = error.message || "解析失败"; refresh.disabled = false; }} }}); notice.append(refresh); }}
         const gateSummary = document.createElement("div"); gateSummary.className = `item-gate-summary${{item.ready_to_build ? " ready" : ""}}`;
         const gateTitle = document.createElement("strong"); gateTitle.textContent = item.ready_to_build ? "本件可独立推进" : "本件继续等待"; gateSummary.append(gateTitle);
         (item.blocking_gates || []).forEach((gate) => {{ const chip = document.createElement("span"); chip.className = "item-gate-chip"; chip.textContent = `缺少：${{blockerLabels[gate] || gate}}`; gateSummary.append(chip); }});
         if (item.ready_to_build) {{ const ready = document.createElement("span"); ready.className = "item-gate-chip"; ready.textContent = "不等待其他商品"; gateSummary.append(ready); }}
-        const meta = document.createElement("div"); meta.className = "meta-grid"; meta.innerHTML = `<div class="meta"><span>精准类目</span><strong>${{item.category_path || "-"}}</strong></div><div class="meta"><span>属性模板</span><strong>${{item.attribute_schema_count || 0}} 字段</strong></div><div class="meta"><span>图片状态</span><strong>${{item.image_generation_status || "not_queued"}} · ${{item.generated_image_count || 0}} 张</strong></div>`;
-        body.append(label,title,notice,gateSummary,meta); renderUploadCoreFields(body,item); renderMapping(body,item); card.append(body); $("draftItems").append(card);
+        const meta = document.createElement("div"); meta.className = "meta-grid"; meta.innerHTML = `<div class="meta"><span>精准类目</span><strong>${{item.category_path || "-"}}</strong></div><div class="meta"><span>属性模板</span><strong>${{item.attribute_schema_count || 0}} 字段</strong></div><div class="meta"><span>建品图片</span><strong>${{item.bootstrap_image_ready ? "锁定原图已就绪" : "缺少锁定原图"}}</strong></div>`;
+        body.append(label,title,notice,gateSummary,meta); renderUploadCoreFields(body,item); renderMapping(body,item); renderProductUploadActions(body,item); card.append(body); $("draftItems").append(card);
       }});
       if (!items.length) {{ const empty = document.createElement("div"); empty.className = "empty"; empty.textContent = "当前批次没有可用的类目模板与商品证据"; $("draftItems").append(empty); }}
     }}
+    function changeDraftPage(offset) {{ const pageCount = Math.max(1, Math.ceil(draftState.items.length / draftState.pageSize)); const nextPage = Math.min(Math.max(0, draftState.page + offset), pageCount - 1); if (nextPage === draftState.page || !latestUploadData) return; draftState.page = nextPage; render(latestUploadData); document.getElementById("draftPager").scrollIntoView({{behavior:"smooth",block:"start"}}); }}
     async function copyText(text) {{ if (navigator.clipboard && window.isSecureContext) {{ await navigator.clipboard.writeText(text); return; }} const area = document.createElement("textarea"); area.value = text; area.style.position = "fixed"; area.style.opacity = "0"; document.body.append(area); area.select(); const copied = document.execCommand("copy"); area.remove(); if (!copied) throw new Error("复制失败"); }}
     $("copyContentControllerCommand").addEventListener("click", async () => {{ const button = $("copyContentControllerCommand"); const status = $("contentControllerCopyStatus"); button.disabled = true; try {{ await copyText($("contentControllerCommand").textContent); status.textContent = "整批智能字段草稿命令已复制"; }} catch (error) {{ status.textContent = error.message || "复制失败，请手动复制"; }} finally {{ button.disabled = false; }} }});
     $("pricingPrevPage").addEventListener("click", () => changePricingPage(-1));
     $("pricingNextPage").addEventListener("click", () => changePricingPage(1));
-    $("buildDraft").addEventListener("click", async () => {{ const button = $("buildDraft"); button.disabled = true; button.textContent = "正在生成属性草稿..."; try {{ const result = await api(`/api/batches/${{encodeURIComponent(runId)}}/upload-draft`, {{method:"POST",headers:{{"Content-Type":"application/json"}},body:"{{}}"}}); button.textContent = `已生成 ${{result.data.prepared_product_count || 0}} 件属性草稿`; $("workspaceStatus").textContent = "属性草稿已准备 (Prepared)"; }} catch (error) {{ button.textContent = error.message || "生成失败"; button.disabled = false; }} }});
+    $("draftPrevPage").addEventListener("click", () => changeDraftPage(-1));
+    $("draftNextPage").addEventListener("click", () => changeDraftPage(1));
     async function loadUploadWorkspace() {{ const result = await api(`/api/batches/${{encodeURIComponent(runId)}}/upload`); render(result.data || {{}}); return result.data || {{}}; }}
     loadUploadWorkspace().catch((error) => {{ $("workspaceStatus").textContent = "加载失败 (Failed)"; $("draftItems").textContent = error.message || String(error); }});
   </script>
@@ -3236,7 +3514,7 @@ def create_handler(
                 self._send_html(build_supplier_review_html(parts[1]))
                 return
             if len(parts) == 3 and parts[0] == "batches" and parts[2] == "images":
-                self._send_html(build_image_workspace_html(parts[1]))
+                self._send_redirect(f"/batches/{parts[1]}/upload")
                 return
             if len(parts) == 3 and parts[0] == "batches" and parts[2] == "upload":
                 self._send_html(build_upload_workspace_html(parts[1]))
@@ -3489,6 +3767,13 @@ def create_handler(
                 )
                 return
             parts = self._path_parts(path)
+            if parts == ["api", "settings", "public-media"]:
+                self._send_result(
+                    service.configure_public_media_base_url(
+                        str(payload.get("base_url") or "")
+                    )
+                )
+                return
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "actions":
                 if runner.status(parts[2]).get("running"):
                     self._send_result(
@@ -3503,6 +3788,45 @@ def create_handler(
                 return
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "upload-draft":
                 self._send_result(service.build_upload_draft(parts[2]), run_id=parts[2])
+                return
+            if (
+                len(parts) == 6
+                and parts[:2] == ["api", "batches"]
+                and parts[3] == "product-upload"
+                and parts[5] == "preview"
+            ):
+                self._send_result(
+                    service.preview_product_upload(parts[2], parts[4]),
+                    run_id=parts[2],
+                )
+                return
+            if (
+                len(parts) == 6
+                and parts[:2] == ["api", "batches"]
+                and parts[3] == "product-upload"
+                and parts[5] == "confirm"
+            ):
+                self._send_result(
+                    service.submit_product_upload(
+                        parts[2],
+                        parts[4],
+                        confirmation_token=str(
+                            payload.get("confirmation_token") or ""
+                        ),
+                    ),
+                    run_id=parts[2],
+                )
+                return
+            if (
+                len(parts) == 6
+                and parts[:2] == ["api", "batches"]
+                and parts[3] == "product-upload"
+                and parts[5] == "status"
+            ):
+                self._send_result(
+                    service.refresh_product_upload_status(parts[2], parts[4]),
+                    run_id=parts[2],
+                )
                 return
             if (
                 len(parts) == 5
@@ -4087,6 +4411,13 @@ def create_handler(
             self._send_cors_headers()
             self.end_headers()
             self.wfile.write(raw)
+
+        def _send_redirect(self, location: str) -> None:
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self._send_cors_headers()
+            self.end_headers()
 
         def _send_js(self, script: str) -> None:
             raw = script.encode("utf-8")

@@ -177,27 +177,27 @@ function Start-Workbench {
         Write-LifecycleLog "state.stale_ignored pid=$($staleState.pid) recorded_project=$($staleState.project_root)"
     }
 
-    $pythonCommand = Get-Command 'python.exe' -ErrorAction SilentlyContinue
-    if ($null -eq $pythonCommand) {
-        $pythonCommand = Get-Command 'python' -ErrorAction SilentlyContinue
+    $venvPython = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
+    $pythonExecutable = if (Test-Path -LiteralPath $venvPython) {
+        $venvPython
     }
-    if ($null -eq $pythonCommand) {
+    else {
+        $pythonCommand = Get-Command 'python.exe' -ErrorAction SilentlyContinue
+        if ($null -eq $pythonCommand) {
+            $pythonCommand = Get-Command 'python' -ErrorAction SilentlyContinue
+        }
+        if ($null -ne $pythonCommand) {
+            $pythonCommand.Source
+        }
+        else {
+            $null
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($pythonExecutable)) {
         Write-LifecycleLog 'start.failed reason=python_not_found'
         Write-Output "START_FAILED PYTHON_NOT_FOUND LOG=$LifecycleLog"
         $script:ResultCode = 1
         return
-    }
-
-    $pythonExecutable = $pythonCommand.Source
-    $venvRoot = Split-Path -Parent (Split-Path -Parent $pythonCommand.Source)
-    $venvConfig = Join-Path $venvRoot 'pyvenv.cfg'
-    if (Test-Path -LiteralPath $venvConfig) {
-        $executableLine = Get-Content -LiteralPath $venvConfig -Encoding UTF8 |
-            Where-Object { $_ -match '^executable\s*=' } |
-            Select-Object -First 1
-        if ($executableLine -match '^executable\s*=\s*(.+)$') {
-            $pythonExecutable = $Matches[1].Trim()
-        }
     }
     if ([string]::IsNullOrWhiteSpace($pythonExecutable) -or -not (Test-Path -LiteralPath $pythonExecutable)) {
         Write-LifecycleLog 'start.failed reason=python_resolution_failed'

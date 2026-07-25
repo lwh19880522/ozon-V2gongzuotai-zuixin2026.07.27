@@ -13,6 +13,9 @@ class FakeSellerApiAdapter:
     def __init__(self) -> None:
         self.resolve_count = 0
         self.last_category_candidate = None
+        self.imported_items: list[dict] = []
+        self.import_task_id = 7001
+        self.seller_currency_code = "CNY"
 
     def resolve_attribute_template(self, category_candidate: dict) -> dict:
         self.resolve_count += 1
@@ -37,6 +40,75 @@ class FakeSellerApiAdapter:
                     "schema_source": "ozon_seller_api_description_category_attribute",
                     "example_value_when_visible": None,
                 }
+            ],
+        }
+
+    def resolve_attribute_dictionary_value(
+        self,
+        *,
+        description_category_id: int,
+        type_id: int,
+        attribute_id: int,
+        value: str,
+    ) -> dict:
+        return {
+            "dictionary_value_id": type_id if attribute_id == 8229 else 501,
+            "value": value,
+        }
+
+    def import_products(self, items: list[dict]) -> dict:
+        self.imported_items.extend(items)
+        return {"task_id": self.import_task_id}
+
+    def get_product_import_info(self, task_id: int) -> dict:
+        return {
+            "task_id": task_id,
+            "items": [
+                {"status": "imported", "offer_id": item.get("offer_id")}
+                for item in self.imported_items
+            ],
+        }
+
+    def get_seller_currency_code(self) -> str:
+        return self.seller_currency_code
+
+
+class FakePublicMediaPublisher:
+    def __init__(self) -> None:
+        self.published_products: list[dict] = []
+        self.failure: Exception | None = None
+
+    def publish_product(
+        self,
+        *,
+        run_id: str,
+        seed_id: str,
+        source_files: list[dict],
+        settings: dict,
+    ) -> dict:
+        if self.failure is not None:
+            raise self.failure
+        record = {
+            "run_id": run_id,
+            "seed_id": seed_id,
+            "source_files": source_files,
+            "settings": dict(settings),
+        }
+        self.published_products.append(record)
+        base_url = str(settings["base_url"]).rstrip("/")
+        urls = [
+            f"{base_url}/ozon-v2/{run_id}/{seed_id}/{item['slot_id']}.png"
+            for item in source_files
+        ]
+        return {
+            "urls": urls,
+            "items": [
+                {
+                    "slot_id": item["slot_id"],
+                    "source_path": item["path"],
+                    "public_url": url,
+                }
+                for item, url in zip(source_files, urls, strict=True)
             ],
         }
 

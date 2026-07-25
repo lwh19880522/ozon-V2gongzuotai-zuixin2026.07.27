@@ -56,22 +56,39 @@ const skuScript = {
           { name: "蓝色", imageUrl: "https://cbu01.alicdn.com/img/ibank/sku-blue.jpg" },
         ],
       },
-      { prop: "数量", value: [{ name: "4支套装" }] },
+      {
+        prop: "数量",
+        value: [
+          { name: "2支套装" },
+          { name: "4支套装" },
+        ],
+      },
     ],
-    skuMap: {
+    skuMap: [],
+    skuInfoMap: {
+      "粉色>2支套装": {
+        skuId: "sku-pink-2",
+        specAttrs: "粉色&gt;2支套装",
+        discountPrice: "11.80",
+        canBookCount: 99,
+      },
       "粉色>4支套装": {
         skuId: "sku-pink-4",
-        specAttrs: "粉色>4支套装",
+        specAttrs: "粉色&gt;4支套装",
         discountPrice: "12.80",
         canBookCount: 88,
-        imageUrl: "https://cbu01.alicdn.com/img/ibank/sku-pink.jpg",
+      },
+      "蓝色>2支套装": {
+        skuId: "sku-blue-2",
+        specAttrs: "蓝色&gt;2支套装",
+        discountPrice: "12.20",
+        canBookCount: 77,
       },
       "蓝色>4支套装": {
         skuId: "sku-blue-4",
-        specAttrs: "蓝色>4支套装",
+        specAttrs: "蓝色&gt;4支套装",
         discountPrice: "13.20",
         canBookCount: 66,
-        imageUrl: "https://cbu01.alicdn.com/img/ibank/sku-blue.jpg",
       },
     },
   })};`,
@@ -165,16 +182,16 @@ vm.runInContext(fs.readFileSync(scriptPath, "utf8"), context, { filename: script
   assert.equal(product.seller.shop_name, "广东测试供应商有限公司");
   assert.ok(product.sku.selected_options.visible_sku_labels.length);
   assert.equal(product.sku.complete, false, "visible labels must not claim a complete real SKU");
-  assert.equal(product.sku_options.length, 2, "all embedded real SKU combinations must be returned");
+  assert.equal(product.sku_options.length, 4, "all embedded multi-axis SKU combinations must be returned");
   assert.deepEqual(
     product.sku_options.map((option) => option.supplier_sku_id),
-    ["sku-pink-4", "sku-blue-4"],
+    ["sku-pink-2", "sku-pink-4", "sku-blue-2", "sku-blue-4"],
   );
-  assert.deepEqual(product.sku_options[0].selected_options, { 颜色: "粉色", 数量: "4支套装" });
-  assert.equal(product.sku_options[0].set_quantity, 4);
-  assert.deepEqual(product.sku_options[0].set_composition, ["4支套装"]);
-  assert.deepEqual(product.sku_options[0].price, { currency: "CNY", amount: "12.80" });
-  assert.deepEqual(product.sku_options[0].stock, { status: "in_stock", quantity: 88 });
+  assert.deepEqual(product.sku_options[0].selected_options, { 颜色: "粉色", 数量: "2支套装" });
+  assert.equal(product.sku_options[0].set_quantity, 2);
+  assert.deepEqual(product.sku_options[0].set_composition, ["2支套装"]);
+  assert.deepEqual(product.sku_options[0].price, { currency: "CNY", amount: "11.80" });
+  assert.deepEqual(product.sku_options[0].stock, { status: "in_stock", quantity: 99 });
   assert.deepEqual(product.sku_options[0].image_urls, ["https://cbu01.alicdn.com/img/ibank/sku-pink.jpg"]);
   assert.equal(product.sku_options[0].evidence_source, "embedded_sku_map");
   assert.equal(product.sku_options[0].complete, true);

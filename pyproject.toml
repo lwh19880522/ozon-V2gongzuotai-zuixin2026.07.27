@@ -1,10 +1,18 @@
 [project]
 name = "ozon-v2-ops-controller"
-version = "0.1.0"
-description = "Ozon V2 automation controller built around dedupe, seed sampling, and collection contracts."
+version = "0.4.0"
+description = "Ozon V2 workbench, field drafting, and post-upload image task controller."
 requires-python = ">=3.11"
+dependencies = [
+    "Pillow>=11,<13",
+    "fastmcp>=3.4,<4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<10",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
-

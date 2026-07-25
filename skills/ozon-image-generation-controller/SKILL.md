@@ -1,48 +1,85 @@
 ---
 name: ozon-image-generation-controller
-description: Use when one Ozon V2 batch needs concurrent image generation through a capacity-aware pool of zero to five internal Codex subagents.
+description: Use when an Ozon V2 batch needs concurrent image generation through ten fixed reusable user-visible Codex work tasks.
 ---
 
 # Ozon Image Generation Controller
 
 ## Scope
 
-Use this controller only after the user supplies an Ozon V2 `run_id`.
-Read queued products from that batch. The controller supervises subagents; it does not generate images itself.
+Use this controller for the fixed post-product image-task inbox. The workbench
+ends after product creation and writes one secret-free package to
+`OzonOpsV2/image_tasks/pending`. The controller schedules those packages; it
+never generates images itself, and it never returns generated files to the
+workbench.
 
-## Worker Contract
+## Fixed visible task pool
 
-1. Before each dispatch cycle, inspect the existing image-subagent pool, unassigned queued whole-product jobs, and free runtime capacity. Spawn only `min(5 - active image subagents, unassigned queued products, currently free internal subagent slots)` additional subagents; currently free slots do not include already-running image subagents.
-2. Spawn up to five internal subagents with the `spawn_agent` tool. They must be children of the current controller task, not user-visible Codex tasks or threads. Subagent names are created dynamically for the current run and must not encode or preserve a permanent lease-slot identity; Codex may show its own generated display names.
-3. The queue exposes 5 个队列租约槽位: `ozon-image-worker-01`, `ozon-image-worker-02`, `ozon-image-worker-03`, `ozon-image-worker-04`, and `ozon-image-worker-05`. These IDs are fencing and concurrency slots only. They are not worker names and are 不与固定子智能体永久绑定.
-4. Before every product dispatch, assign the selected subagent one currently free lease slot. The subagent must read and follow `skills/ozon-product-media-generator/SKILL.md`, use only that slot while it owns the current claim, and return the slot to the controller pool after the claim reaches a terminal or manual-review state. A reused subagent may receive a different free slot on a later dispatch.
-5. Reuse every successfully spawned subagent for later queued products. Send later products to idle subagents with `followup_task`; do not replace them with new tasks. 每次派发时动态分配 a free lease slot instead of restoring a fixed agent-to-slot mapping.
-6. Never use `create_thread`, `fork_thread`, or any API that creates user-visible Codex tasks. Do not create user-visible Codex tasks or threads for image workers.
-7. Never create a sixth regular image worker. When the runtime exposes a sixth child slot, keep it reserved for failure recovery, diagnosis, or human intervention.
-8. Continue with every subagent that spawned successfully; fewer than five available slots is normal, not a batch failure. If the active image-subagent pool is empty and zero internal subagent slots are available, do not claim image work; report that the controller is waiting for capacity. Existing workers continue even when no new slot is free. Never fall back to `create_thread` or user-visible tasks.
-9. Recompute demand, free agent capacity, and free lease slots each dispatch cycle. Do not shrink or stop existing workers merely because no new slot is free. Grow the pool only when unassigned products and free internal slots require it, then dispatch the next product to whichever existing subagent becomes idle.
+1. The image pool contains ten fixed user-visible Codex work tasks and is global across every Ozon V2 batch. The controller task is not counted in this limit.
+2. The stable slots are `ozon-image-worker-01`, `ozon-image-worker-02`, `ozon-image-worker-03`, `ozon-image-worker-04`, `ozon-image-worker-05`, `ozon-image-worker-06`, `ozon-image-worker-07`, `ozon-image-worker-08`, `ozon-image-worker-09`, and `ozon-image-worker-10`. These are the 10 个固定可见任务槽位 and queue lease identities.
+3. Each slot maps to one persisted opaque `thread_id`. Never derive or invent a task ID from its slot number, display name, or URL.
+4. Reuse the same ten tasks in slot order for new products，按槽位顺序复用. A task finishes product A, becomes idle, then receives product B. Each task handles one product at a time, and the pool handles at most ten products concurrently. 全局并发上限为 10.
+5. Never use hidden child agents. Never create a product-specific task. Never grow the pool above ten.
+6. Creating the initial pool or replacing an unavailable slot is allowed only when the user explicitly requests a new task. A normal batch start, continuation, retry, or repair must reuse the registered pool and must not silently create or replace tasks.
+7. If a registered task is unavailable, mark only that slot unavailable and continue with the other slots. Report the exact slot that needs the user's explicit replacement instruction.
 
-## User-Selected Repair Dispatch
+## Fixed task-package inbox
 
-When a queued product contains `repair_pending` slots, dispatch it through the same whole-product lease, but require the worker to read each selected slot's `review_issue_code` and `review_note`. The worker processes only the explicitly selected slots. Never reopen or regenerate an unselected `accepted` slot, and never repeat the first-attempt grid workflow for a repair-only claim.
+The intake source is the runtime-wide fixed task-package inbox:
+`image_tasks/pending`. A claimed package moves atomically to
+`image_tasks/in_progress`; terminal receipts live under
+`image_tasks/completed` or `image_tasks/failed`. The package's
+`seller_import_task_id` and `offer_id` identify the newly created product. The
+worker resolves `product_id` from the Seller import status before final gallery
+replacement when it is not already stored in the package.
 
-## Stop Gates
+## Dispatch contract
 
-Treat every product state independently. A product waiting for manual review is a per-product waiting state, not a batch-wide stop gate. Continue dispatching other eligible `pending` or `repair_pending` products while any remain.
+1. Read all eligible whole-product `pending` packages across every Ozon V2 batch.
+2. Reconcile the persisted fixed-task registry before dispatch. Do not recreate tasks after a controller restart.
+3. Assign packages to idle slots in ascending slot order. Use the corresponding stable worker ID while that task owns the package.
+4. Claim with `scripts/ozon_image_task_inbox.py --runtime-root <runtime> claim-next --worker <worker_id>`. Send the registered task only the short command returned from the claim: `RUN package_id=<id> worker_id=<id>`.
+5. The visible task follows `skills/ozon-product-media-generator/SKILL.md`, reads only its owned package from `image_tasks/in_progress`, generates and validates eight images, publishes them, and directly replaces the product gallery in Ozon.
+6. When the package reaches `completed` or `failed`, release the fixed slot and immediately claim the next package. A failed package does not block other products.
+7. Return repair and continuation work to the product's `preferred_slot`. If that task is busy, queue it for that same task rather than creating another task.
+8. Package claiming and completion are idempotent by `package_id`; repeated controller scans must not start duplicate generation.
+
+## Scripted dispatch loop
+
+Use the filesystem inbox and the lightweight
+`scripts/ozon_image_task_inbox.py`; do not add a daemon, another database, or
+per-product controller tasks.
+
+1. Keep the existing fixed visible-task registry. Replacing a different `thread_id` requires the user's explicit replacement instruction.
+2. Read `status`, then run `claim-next` once for each idle registered worker and send its returned `RUN package_id=... worker_id=...` command to the persisted `thread_id`.
+3. Wait for any active package to reach `completed` or `failed`. Immediately run `claim-next` for that newly idle slot; do not wait for all ten active tasks to finish.
+4. Do not stop after the first ten products. Ten is the global concurrency limit, not the batch size. A batch of 30 or 100 products keeps recycling the same ten tasks until the queue is drained.
+5. End the controller only when `pending` = 0 and `in_progress` = 0, or when the user explicitly stops the batch or a system-wide failure prevents every remaining product from running.
+
+## User-selected repair dispatch
+
+When a queued product contains `repair_pending` slots, dispatch it to its original fixed visible task. Require the task to read every selected slot's `review_issue_code` and `review_note`, and process only the explicitly selected slots. Never reopen or regenerate an unselected `accepted` slot.
+
+## Stop gates
+
+Treat every product independently. A package waiting for an explicit user repair
+instruction is a per-product waiting state, not a batch-wide stop gate. Continue
+Continue dispatching other eligible `pending` packages while any remain.
 
 A missing SKU or subject gate blocks only that product. Report the blocked product and its required user action, then continue every other eligible queued product. A `stopped` product does not stop other eligible products. Report its persisted stop reason and recovery action. Never auto-resume a stopped product because the stop may have been requested by the user.
 
-An already accepted slot is frozen evidence. If its receipt hash, source/output file hashes, and locked `visual_spec` verify, a console-rendering or display-metadata anomaly is not a product stop gate. Preserve that accepted slot and continue every remaining `pending` slot. Stop the product only when the frozen receipt or file actually fails cryptographic verification and the failure cannot be isolated to one non-accepted slot.
+An accepted slot is frozen evidence. If its receipt hash, source/output hashes, and locked `visual_spec` verify, a display-metadata anomaly is not a product stop gate. Preserve that slot and continue the remaining `pending` slots. Stop the product only when the frozen receipt or file fails verification and the failure cannot be isolated.
 
-Stop dispatching only when no eligible `pending` or `repair_pending` products remain, a system-wide queue or evidence store failure prevents all remaining work, or the user stops the batch. When stopping, report separate counts for manual review, stopped, missing SKU/subject, failed, and completed products.
-
-## Sibling field phase
-
-This controller and `skills/ozon-intelligent-field-drafter/SKILL.md` are peer executors of the same Ozon V2 workbench batch. Image workers must not change field decisions, and they must not wait for unrelated field drafting. The workbench combines accepted images and completed field decisions at each product's per-product upload gate, so one blocked product does not delay another ready product.
+Stop dispatching only when no eligible `pending` packages remain and no package is in progress, a system-wide inbox or evidence-store failure prevents all remaining work, or the user stops the batch. Report separate counts for stopped, missing SKU/subject, failed, and completed products.
 
 ## Boundaries
 
-- Never upload.
-- Never modify business source code.
+- Upload only the eight validated generated images for the package's configured
+  Ozon store and product. This is a complete gallery replacement after product
+  creation, not product creation or final business approval.
+- The controller never returns generated files to the workbench and never
+  modifies a workbench batch artifact after the package has been emitted.
+- Never modify business source code while executing an image batch.
 - Never bypass truth, SKU, subject, image-quality, or review gates.
-- Never mark a product complete until its accepted outputs are written back to the current batch.
+- Never mark a package complete until Ozon accepts the gallery-replacement
+  request and the task-package receipt is durable.

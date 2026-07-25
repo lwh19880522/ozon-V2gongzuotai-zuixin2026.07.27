@@ -14,7 +14,12 @@ from ozon_v2.domain.supplier_sku import (
 )
 from ozon_v2.images.contracts import SubjectMasterSelection
 from ozon_v2.images.queue import ImageGenerationQueue
-from ozon_v2.images.worker import SlotResultReceipt, crop_grid
+from ozon_v2.images.worker import (
+    CURRENT_PROMPT_VERSION,
+    SlotResultReceipt,
+    crop_grid,
+    file_sha256,
+)
 from ozon_v2.images.visual_design import (
     CURRENT_VISUAL_CONTRACT_VERSION,
     VisualFact,
@@ -79,6 +84,21 @@ def _slot_receipt(
     validation: dict | None = None,
     prompt_version: str = "ozon-image-v2",
 ) -> SlotResultReceipt:
+    normalized_validation = dict(
+        validation
+        or {
+            "product_truth": accepted,
+            "slot_role": slot["slot_id"],
+            "slot_role_satisfied": accepted,
+            "role_visually_demonstrated": accepted,
+            "not_plain_or_near_white_product_only": accepted,
+            "distinct_from_accepted_slots": accepted,
+            "copy_not_used_as_visual_evidence": accepted,
+        }
+    )
+    if accepted and prompt_version == CURRENT_PROMPT_VERSION:
+        normalized_validation.setdefault("visual_source_sha256", file_sha256(source_path))
+        normalized_validation.setdefault("visual_output_sha256", file_sha256(output_path))
     return SlotResultReceipt.create(
         job_id=job["job_id"],
         slot_id=slot["slot_id"],
@@ -91,16 +111,7 @@ def _slot_receipt(
         source_path=source_path,
         output_path=output_path,
         accepted=accepted,
-        validation=validation
-        or {
-            "product_truth": accepted,
-            "slot_role": slot["slot_id"],
-            "slot_role_satisfied": accepted,
-            "role_visually_demonstrated": accepted,
-            "not_plain_or_near_white_product_only": accepted,
-            "distinct_from_accepted_slots": accepted,
-            "copy_not_used_as_visual_evidence": accepted,
-        },
+        validation=normalized_validation,
         created_at="2026-07-14T01:02:00+00:00",
     )
 
@@ -110,6 +121,7 @@ def _v3_validation(
     evidence_sha256: str,
     *,
     repeated_scene: bool = False,
+    primary_ozon_reference_path: Path | None = None,
 ) -> dict:
     recipes = {
         "main_01": "clean_hero",
@@ -144,7 +156,7 @@ def _v3_validation(
         if slot_id in {"detail_02", "detail_03"}
         else (),
     )
-    return {
+    validation = {
         "product_truth": True,
         "slot_role": slot_id,
         "slot_role_satisfied": True,
@@ -158,7 +170,21 @@ def _v3_validation(
         "mobile_readability_passed": True,
         "visual_contract_version": CURRENT_VISUAL_CONTRACT_VERSION,
         "visual_spec": spec.to_dict(),
+        "reference_mapping_version": "ozon-reference-map-v1",
+        "primary_ozon_reference_sha256": "e" * 64,
+        "reference_slot_index": 1,
+        "reference_reused": False,
+        "reference_composition_followed": True,
+        "locked_subject_preserved": True,
     }
+    if primary_ozon_reference_path is not None:
+        validation["primary_ozon_reference_path"] = str(
+            primary_ozon_reference_path.resolve()
+        )
+        validation["primary_ozon_reference_sha256"] = file_sha256(
+            primary_ozon_reference_path
+        )
+    return validation
 
 
 def _rehash_receipt(receipt: SlotResultReceipt, **changes: object) -> SlotResultReceipt:
@@ -269,20 +295,133 @@ def test_accepted_slot_rejects_dark_product_on_plain_white_catalog_background(
 def test_crop_protocol_splits_one_by_two_and_one_by_three_without_overlap(tmp_path: Path) -> None:
     main_grid = tmp_path / "main-grid.png"
     detail_grid = tmp_path / "detail-grid.png"
-    _solid_grid(main_grid, ["red", "green"])
-    _solid_grid(detail_grid, ["red", "green", "blue"])
+    _solid_grid(main_grid, ["red", "green"], panel_size=(90, 120))
+    _solid_grid(detail_grid, ["red", "green", "blue"], panel_size=(90, 120))
 
     main = crop_grid(main_grid, tmp_path / "main", layout="1x2", basename="main")
     detail = crop_grid(detail_grid, tmp_path / "detail", layout="1x3", basename="detail")
 
     assert len(main) == 2
     assert len(detail) == 3
-    assert [Image.open(path).size for path in main] == [(120, 90), (120, 90)]
-    assert [Image.open(path).getpixel((60, 45)) for path in detail] == [
+    assert [Image.open(path).size for path in main] == [(90, 120), (90, 120)]
+    assert [Image.open(path).getpixel((45, 60)) for path in detail] == [
         (255, 0, 0),
         (0, 128, 0),
         (0, 0, 255),
     ]
+
+
+def test_crop_protocol_rejects_square_panels_instead_of_shipping_them(tmp_path: Path) -> None:
+    grid = tmp_path / "square-main-grid.png"
+    _solid_grid(grid, ["red", "green"], panel_size=(120, 120))
+
+    with pytest.raises(ValueError, match="3:4"):
+        crop_grid(grid, tmp_path / "main", layout="1x2", basename="main")
+
+
+def test_crop_protocol_normalizes_near_three_by_four_panels_exactly(tmp_path: Path) -> None:
+    grid = tmp_path / "near-three-by-four-grid.png"
+    _solid_grid(grid, ["red", "green"], panel_size=(91, 120))
+
+    outputs = crop_grid(grid, tmp_path / "main", layout="1x2", basename="main")
+
+    assert [Image.open(path).size for path in outputs] == [(90, 120), (90, 120)]
+    assert all(
+        Image.open(path).width * 4 == Image.open(path).height * 3
+        for path in outputs
+    )
+
+
+def test_v4_receipt_rejects_non_three_by_four_finished_slot(tmp_path: Path) -> None:
+    receipt = _receipt()
+    queue = ImageGenerationQueue(tmp_path / "queue.sqlite3")
+    queue.enqueue(receipt=receipt, subject_master=_master(tmp_path, receipt))
+    job = queue.claim_next("ozon-image-worker-01", now_epoch=100, lease_seconds=30)
+    assert job
+    slot = queue.list_slots(job["job_id"])[0]
+    source = tmp_path / "source.png"
+    output = tmp_path / "square-output.png"
+    _solid_grid(source, ["red", "green"], panel_size=(90, 120))
+    Image.new("RGB", (800, 800), "red").save(output)
+    result = _slot_receipt(
+        job=job,
+        slot=slot,
+        source_path=source,
+        output_path=output,
+        accepted=True,
+        prompt_version="ozon-image-v4",
+        validation=_v3_validation(slot["slot_id"], "f" * 64),
+    )
+
+    assert any("3:4" in error for error in result.acceptance_contract_errors())
+
+
+def test_v4_receipt_requires_slot_specific_ozon_reference_mapping(
+    tmp_path: Path,
+) -> None:
+    receipt = _receipt()
+    queue = ImageGenerationQueue(tmp_path / "queue.sqlite3")
+    queue.enqueue(receipt=receipt, subject_master=_master(tmp_path, receipt))
+    job = queue.claim_next("ozon-image-worker-01", now_epoch=100, lease_seconds=30)
+    assert job
+    slot = queue.list_slots(job["job_id"])[0]
+    source = tmp_path / "source.png"
+    output = tmp_path / "output.png"
+    _solid_grid(source, ["red", "green"], panel_size=(90, 120))
+    Image.new("RGB", (90, 120), "red").save(output)
+    validation = _v3_validation(slot["slot_id"], "f" * 64)
+    validation.pop("primary_ozon_reference_sha256")
+    result = _slot_receipt(
+        job=job,
+        slot=slot,
+        source_path=source,
+        output_path=output,
+        accepted=True,
+        prompt_version=CURRENT_PROMPT_VERSION,
+        validation=validation,
+    )
+
+    assert any(
+        "primary_ozon_reference_sha256" in error
+        for error in result.acceptance_contract_errors()
+    )
+
+
+def test_v4_receipt_rejects_unverified_or_low_resolution_reference(
+    tmp_path: Path,
+) -> None:
+    receipt = _receipt()
+    queue = ImageGenerationQueue(tmp_path / "queue.sqlite3")
+    queue.enqueue(receipt=receipt, subject_master=_master(tmp_path, receipt))
+    job = queue.claim_next("ozon-image-worker-01", now_epoch=100, lease_seconds=30)
+    assert job
+    slot = queue.list_slots(job["job_id"])[0]
+    source = tmp_path / "source.png"
+    output = tmp_path / "output.png"
+    reference = tmp_path / "reference.png"
+    _solid_grid(source, ["red", "green"], panel_size=(90, 120))
+    Image.new("RGB", (90, 120), "red").save(output)
+    Image.new("RGB", (50, 50), "blue").save(reference)
+    validation = _v3_validation(
+        slot["slot_id"],
+        "f" * 64,
+        primary_ozon_reference_path=reference,
+    )
+    validation["primary_ozon_reference_sha256"] = "0" * 64
+    result = _slot_receipt(
+        job=job,
+        slot=slot,
+        source_path=source,
+        output_path=output,
+        accepted=True,
+        prompt_version=CURRENT_PROMPT_VERSION,
+        validation=validation,
+    )
+
+    errors = result.acceptance_contract_errors()
+
+    assert any("reference SHA-256 does not match" in error for error in errors)
+    assert any("at least 512 pixels" in error for error in errors)
 
 
 def test_accepted_slot_is_frozen_and_receipt_tampering_is_detected(tmp_path: Path) -> None:
@@ -594,8 +733,10 @@ def _record_user_requested_v3_repair(
     )
     source = tmp_path / f"{slot_id}-repair-source.png"
     output = tmp_path / f"{slot_id}-repair-output.png"
-    _solid_grid(source, ["red", "green"])
-    Image.new("RGB", (120, 90), "black").save(output)
+    reference = tmp_path / f"{slot_id}-ozon-reference.png"
+    _solid_grid(source, ["red", "green"], panel_size=(90, 120))
+    Image.new("RGB", (90, 120), "black").save(output)
+    Image.new("RGB", (600, 800), "navy").save(reference)
     queue.record_slot_result(
         _slot_receipt(
             job=repair_job,
@@ -604,8 +745,12 @@ def _record_user_requested_v3_repair(
             output_path=output,
             accepted=True,
             source_kind="repair_single",
-            prompt_version="ozon-image-v3",
-            validation=_v3_validation(slot_id, master.source_sha256),
+            prompt_version=CURRENT_PROMPT_VERSION,
+            validation=_v3_validation(
+                slot_id,
+                master.source_sha256,
+                primary_ozon_reference_path=reference,
+            ),
         )
     )
     return repair_job
@@ -843,7 +988,10 @@ def test_user_requested_repair_rejects_legacy_receipt_without_state_change(
     )
     before = queue.snapshot(claimed["job_id"])
 
-    with pytest.raises(ValueError, match="user-selected repair.*ozon-image-v3"):
+    with pytest.raises(
+        ValueError,
+        match=f"user-selected repair.*{CURRENT_PROMPT_VERSION}",
+    ):
         queue.record_slot_result(legacy_repair)
 
     assert queue.snapshot(claimed["job_id"]) == before
@@ -889,7 +1037,7 @@ def test_rejected_user_requested_repair_preserves_previous_accepted_artifact(
         output_path=output,
         accepted=False,
         source_kind="repair_single",
-        prompt_version="ozon-image-v3",
+        prompt_version=CURRENT_PROMPT_VERSION,
         validation=_v3_validation("detail_03", master.source_sha256),
     )
 

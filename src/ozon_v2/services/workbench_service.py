@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import ipaddress
+import os
 import random
 import re
 from collections.abc import Callable
@@ -11,6 +14,10 @@ from urllib.parse import urlparse
 from urllib.request import ProxyHandler, Request, build_opener
 
 from ozon_v2.adapters.fs_repo import FsRepo
+from ozon_v2.adapters.public_media import (
+    CloudflareR2MediaPublisher,
+    PublicMediaError,
+)
 from ozon_v2.adapters.seller_api import (
     SellerApiAdapter,
     SellerApiError,
@@ -23,14 +30,23 @@ from ozon_v2.domain.pricing import (
     PricingInput,
     PricingPolicy,
     calculate_listing_price,
+    round_up_to_dot_90,
 )
-from ozon_v2.domain.supplier_sku import SupplierSkuOption, SupplierSkuSelectionReceipt, validate_supplier_sku_option
+from ozon_v2.domain.supplier_sku import (
+    SupplierSkuOption,
+    SupplierSkuSelectionReceipt,
+    documented_composition_quantity,
+    validate_supplier_sku_option,
+)
 from ozon_v2.domain.state_machine import allowed_workbench_actions, transition_workbench_state
 from ozon_v2.domain.validators import validate_attribute_template_result, validate_ozon_collection_result, validate_seed_ready_for_ozon
 from ozon_v2.images.contracts import SubjectMasterSelection
 from ozon_v2.images.queue import ImageGenerationQueue, ImageRepairRequestError
+from ozon_v2.images.worker import is_exact_three_by_four_image
 from ozon_v2.services.attribute_mapping_service import (
+    attribute_content_score_progress,
     canonical_attribute_label,
+    is_visual_inference_field,
     map_template_attributes,
 )
 from ozon_v2.services.collection_contract_service import (
@@ -59,6 +75,18 @@ _RUSSIAN_OBJECTIVE_FIELDS = {
     "country",
     "gender",
 }
+_INTERNAL_LIFECYCLE_ACTIONS = frozenset(
+    action for action in WorkbenchAction if action.value.startswith("mark_")
+)
+_REPLACEMENT_RECOVERY_STATES = frozenset(
+    {
+        WorkbenchState.OZON_COLLECTED,
+        WorkbenchState.SUPPLIER_REVIEW,
+        WorkbenchState.NEEDS_MANUAL_REVIEW,
+        WorkbenchState.FAILED_RETRYABLE,
+        WorkbenchState.FAILED_BLOCKED,
+    }
+)
 
 
 class WorkbenchService:
@@ -71,6 +99,7 @@ class WorkbenchService:
         collection_contract_service: CollectionContractService | None = None,
         seller_api_adapter: SellerApiAdapter | None = None,
         supplier_image_downloader: Callable[[str, Path], Path] | None = None,
+        public_media_publisher: CloudflareR2MediaPublisher | None = None,
     ) -> None:
         self.repo = repo or FsRepo()
         self.credential_service = credential_service or CredentialService(self.repo)
@@ -79,6 +108,9 @@ class WorkbenchService:
         self.collection_contract_service = collection_contract_service or CollectionContractService(self.repo)
         self.seller_api_adapter = seller_api_adapter or SellerApiAdapter(self.repo)
         self.supplier_image_downloader = supplier_image_downloader or self._download_supplier_image
+        self.public_media_publisher = (
+            public_media_publisher or CloudflareR2MediaPublisher()
+        )
 
     def start_batch(self, target_count: int) -> Result:
         if target_count <= 0:
@@ -126,8 +158,18 @@ class WorkbenchService:
         )
 
     def allowed_actions(self, run_id: str) -> Result:
-        run = self.repo.load_run(run_id)
-        if WorkbenchState(run["status"]) == WorkbenchState.OZON_COLLECTED:
+        try:
+            run = self.repo.load_run(run_id)
+        except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+            return Result.failure(
+                "workbench.batch_not_found",
+                "The requested workbench batch no longer exists.",
+                data={"run_id": run_id},
+            )
+        if (
+            WorkbenchState(run["status"]) == WorkbenchState.OZON_COLLECTED
+            and not run.get("replacement_pending_seed_ids")
+        ):
             try:
                 ozon_result = self.repo.load_ozon_collection_result(run_id)
             except FileNotFoundError:
@@ -771,6 +813,7 @@ class WorkbenchService:
 
     def restart_browser_task(self, run_id: str) -> Result:
         run = self.repo.load_run(run_id)
+        run = self._recover_pending_supplier_replacement(run)
         status = WorkbenchState(run["status"])
         recapture_seed_ids = {
             str(seed_id).strip()
@@ -799,6 +842,7 @@ class WorkbenchService:
         total_count = 0
         try:
             if task_type == "ozon_collection":
+                self._reconcile_replacement_ozon_checkpoint(run)
                 result_path = self.repo.run_dir(run_id) / "ozon_collection_result.json"
                 if result_path.exists() and not run.get("replacement_pending_seed_ids"):
                     return Result.failure(
@@ -1117,7 +1161,19 @@ class WorkbenchService:
         for candidate in candidates:
             seed_id = str(candidate.get("seed_id") or "")
             media = candidate.get("selected_sku_media") or {}
-            ozon_images = media.get("selected_sku_images") or media.get("main_gallery_images") or []
+            ozon_images = [
+                str(url)
+                for url in (
+                    media.get("selected_sku_images")
+                    or media.get("main_gallery_images")
+                    or []
+                )
+                if str(url).strip()
+            ]
+            ozon_reference_inputs = [
+                {"reference_slot_index": index, "url": url}
+                for index, url in enumerate(ozon_images, start=1)
+            ]
             supplier = suppliers_by_seed.get(seed_id, {})
             supplier_images = self._supplier_product_images(supplier)
             selection = selections.get(seed_id) if isinstance(selections, dict) else None
@@ -1134,6 +1190,18 @@ class WorkbenchService:
                     image_job = self._image_job_payload(job_id)
                 except ValueError:
                     image_job = None
+            if image_job:
+                for slot in image_job.get("slots", []):
+                    mapping = slot.get("ozon_reference_mapping")
+                    if not isinstance(mapping, dict):
+                        continue
+                    reference_index = mapping.get("reference_slot_index")
+                    if (
+                        isinstance(reference_index, int)
+                        and not isinstance(reference_index, bool)
+                        and 1 <= reference_index <= len(ozon_images)
+                    ):
+                        mapping["reference_url"] = ozon_images[reference_index - 1]
             generated_images = [
                 str(slot.get("accepted_path") or "")
                 for slot in (image_job or {}).get("slots", [])
@@ -1155,6 +1223,7 @@ class WorkbenchService:
                     "ozon_url": candidate.get("ozon_url"),
                     "selected_options": (candidate.get("target_sku") or {}).get("selected_options") or {},
                     "ozon_reference_images": ozon_images,
+                    "ozon_reference_inputs": ozon_reference_inputs,
                     "supplier_title": supplier.get("title"),
                     "supplier_url": supplier.get("supplier_url"),
                     "supplier_source_images": supplier_images,
@@ -1216,7 +1285,7 @@ class WorkbenchService:
             gate_message = "主体已确认，但本地生图任务尚未完整入列 (Image queue entry is missing)."
         elif not all_generated:
             gate_code = "waiting_for_codex_workers"
-            gate_message = "任务已进入本地队列，等待最多 5 个动态 Codex 生图子智能体按可用容量处理 (Waiting for available Codex image subagents)."
+            gate_message = "任务已进入本地队列，等待全局固定 10 个可见 Codex 生图工作任务按空闲槽位处理 (Waiting for a reusable visible image task)."
         elif not all_approved:
             gate_code = "image_review_required"
             gate_message = "八张图片已回写；请逐件审核，合格后点击“确认本件 8 张图片可用” (Review and approve each eight-image set)."
@@ -1523,6 +1592,28 @@ class WorkbenchService:
                     for seed_id, item in raw_pricing_items.items()
                     if isinstance(item, dict)
                 }
+        upload_previews: dict[str, dict[str, Any]] = {}
+        preview_path = self.repo.run_dir(run_id) / "upload_previews.json"
+        if preview_path.exists():
+            raw_previews = self.repo.load_upload_previews(run_id).get("items", {})
+            if isinstance(raw_previews, dict):
+                upload_previews = {
+                    str(seed_id): item
+                    for seed_id, item in raw_previews.items()
+                    if isinstance(item, dict)
+                }
+        upload_submissions: dict[str, dict[str, Any]] = {}
+        submission_path = self.repo.run_dir(run_id) / "upload_submissions.json"
+        if submission_path.exists():
+            raw_submissions = self.repo.load_upload_submissions(run_id).get(
+                "items", {}
+            )
+            if isinstance(raw_submissions, dict):
+                upload_submissions = {
+                    str(seed_id): item
+                    for seed_id, item in raw_submissions.items()
+                    if isinstance(item, dict)
+                }
         candidates = ozon_result.get("ozon_candidates") if isinstance(ozon_result.get("ozon_candidates"), list) else []
         items: list[dict[str, Any]] = []
         for candidate in candidates:
@@ -1533,6 +1624,7 @@ class WorkbenchService:
             seller_template = template.get("seller_attribute_template") or {}
             category_candidates = template.get("category_candidates") if isinstance(template.get("category_candidates"), list) else []
             supplier_product = suppliers_by_seed.get(seed_id) or {}
+            supplier_source_images = self._supplier_product_images(supplier_product)
             supplier_selection = supplier_selections.get(seed_id) or {}
             supplier_sku = supplier_selection.get("supplier_sku") or {}
             supplier_offer_id = (
@@ -1562,6 +1654,30 @@ class WorkbenchService:
             media = candidate.get("selected_sku_media") or {}
             images = media.get("selected_sku_images") or media.get("main_gallery_images") or []
             subject_entry = subject_items.get(seed_id) if isinstance(subject_items, dict) else None
+            subject_master = (
+                subject_entry.get("subject_master")
+                if isinstance(subject_entry, dict)
+                and isinstance(subject_entry.get("subject_master"), dict)
+                else {}
+            )
+            subject_image_urls = [
+                str(value).strip()
+                for value in (
+                    subject_master.get("source_image_urls")
+                    or [subject_master.get("source_image_url")]
+                )
+                if str(value or "").strip()
+            ]
+            bootstrap_image_url = (
+                subject_image_urls[0] if subject_image_urls else ""
+            )
+            bootstrap_image_ready = bool(
+                bootstrap_image_url
+                and _is_public_https_url(bootstrap_image_url)
+                and str(subject_master.get("run_id") or "") == run_id
+                and str(subject_master.get("product_id") or "") == seed_id
+                and str(subject_master.get("subject_master_sha256") or "")
+            )
             image_job_id = (
                 str(subject_entry.get("image_job_id") or "")
                 if isinstance(subject_entry, dict)
@@ -1642,6 +1758,7 @@ class WorkbenchService:
                     "required_mapped_count": 0,
                     "missing_required_fields": [],
                     "required_attributes_ready": False,
+                    "attribute_score_progress": attribute_content_score_progress([]),
                 }
             )
             required_attributes_ready = bool(
@@ -1657,8 +1774,8 @@ class WorkbenchService:
                 blocking_gates.append("required_attributes")
             if template_ready and not original_content_ready:
                 blocking_gates.append("original_content")
-            if not generated_images_ready:
-                blocking_gates.append("images")
+            if not bootstrap_image_ready:
+                blocking_gates.append("bootstrap_image")
             if not pricing_ready:
                 blocking_gates.append("pricing")
             items.append(
@@ -1678,12 +1795,17 @@ class WorkbenchService:
                     "supplier_selected_sku": (
                         supplier_sku
                     ),
+                    "supplier_source_images": supplier_source_images,
+                    "subject_master": subject_master,
+                    "bootstrap_image_url": bootstrap_image_url or None,
+                    "bootstrap_image_ready": bootstrap_image_ready,
                     "supplier_reference_price": supplier_sku.get("price"),
                     "supplier_selected_options": (
                         ((supplier_selections.get(seed_id) or {}).get("supplier_sku") or {}).get("selected_options")
                         or {}
                     ),
                     "source_image": images[0] if images else None,
+                    "ozon_reference_images": list(images),
                     "selected_options": (
                         (
                             (supplier_selections.get(seed_id) or {}).get(
@@ -1713,6 +1835,9 @@ class WorkbenchService:
                     "excluded_attribute_count": mapping["excluded_attribute_count"],
                     "required_mapped_count": mapping["required_mapped_count"],
                     "missing_required_fields": mapping["missing_required_fields"],
+                    "attribute_score_progress": mapping[
+                        "attribute_score_progress"
+                    ],
                     "required_attributes_ready": required_attributes_ready,
                     "original_content_ready": original_content_ready,
                     "generated_images_ready": generated_images_ready,
@@ -1739,6 +1864,15 @@ class WorkbenchService:
                         f"{slot['slot_id']}/file"
                         for slot in accepted_slots
                     ],
+                    "generated_image_files": [
+                        {
+                            "slot_id": str(slot["slot_id"]),
+                            "path": str(Path(str(slot["accepted_path"])).resolve()),
+                        }
+                        for slot in accepted_slots
+                    ],
+                    "upload_preview": upload_previews.get(seed_id),
+                    "upload_submission": upload_submissions.get(seed_id),
                 }
             )
 
@@ -1750,7 +1884,7 @@ class WorkbenchService:
             item["original_content_ready"] for item in items
         )
         images_ready = bool(items) and all(
-            item["generated_images_ready"] for item in items
+            item["bootstrap_image_ready"] for item in items
         )
         pricing_ready = bool(items) and all(
             item["pricing_ready"] for item in items
@@ -1764,6 +1898,9 @@ class WorkbenchService:
         )
         approved_product_count = sum(
             1 for item in items if item["generated_images_ready"]
+        )
+        bootstrap_image_ready_count = sum(
+            1 for item in items if item["bootstrap_image_ready"]
         )
         template_ready_count = sum(1 for item in items if item["template_ready"])
         required_attributes_ready_count = sum(
@@ -1802,6 +1939,7 @@ class WorkbenchService:
                     "required_attributes_ready": required_attributes_ready,
                     "original_content_ready": original_content_ready,
                     "images_ready": images_ready,
+                    "bootstrap_images_ready": images_ready,
                     "pricing_ready": pricing_ready,
                     "pricing_ready_count": pricing_ready_count,
                     "pricing_pending_count": len(items) - pricing_ready_count,
@@ -1809,6 +1947,9 @@ class WorkbenchService:
                     "generated_image_count": generated_image_count,
                     "generated_product_count": generated_product_count,
                     "approved_product_count": approved_product_count,
+                    "bootstrap_image_ready_count": (
+                        bootstrap_image_ready_count
+                    ),
                     "template_ready_count": template_ready_count,
                     "required_attributes_ready_count": required_attributes_ready_count,
                     "original_content_ready_count": original_content_ready_count,
@@ -1870,6 +2011,21 @@ class WorkbenchService:
                 "supplier_attributes": item.get("supplier_attributes") or {},
                 "supplier_offer_id": item.get("supplier_offer_id"),
                 "confirmed_supplier_sku": item.get("supplier_selected_sku") or {},
+                "supplier_visual_evidence": {
+                    "locked_sku_images": (
+                        (item.get("supplier_selected_sku") or {}).get(
+                            "image_urls"
+                        )
+                        or []
+                    ),
+                    "product_images": item.get("supplier_source_images") or [],
+                    "page_single_sku": (
+                        (item.get("supplier_selected_sku") or {}).get(
+                            "evidence_source"
+                        )
+                        == "single_sku_detail_page"
+                    ),
+                },
             }
             evidence_index = _content_evidence_index(evidence)
             supplier_truth_available = bool(
@@ -1886,9 +2042,18 @@ class WorkbenchService:
                     else "evidence_inference"
                 )
                 stored_result = generated_field_results.get(field_key)
+                visual_evidence_refs = _field_visual_evidence_refs(
+                    field,
+                    evidence_index,
+                    evidence,
+                )
                 completed_result = (
                     stored_result
-                    if _content_result_is_accepted(field, stored_result)
+                    if _content_result_is_accepted(
+                        field,
+                        stored_result,
+                        visual_evidence_refs=visual_evidence_refs,
+                    )
                     else None
                 )
                 field_tasks.append(
@@ -1909,6 +2074,24 @@ class WorkbenchService:
                         "required": field.get("required") is True,
                         "attribute_type": field.get("attribute_type"),
                         "dictionary_id": field.get("dictionary_id"),
+                        "allowed_values": field.get("allowed_values") or [],
+                        "visual_inference_supported": bool(
+                            field.get("visual_inference_supported")
+                        ),
+                        "visual_evidence_refs": visual_evidence_refs,
+                        "visual_evidence_roles": (
+                            _visual_evidence_roles(visual_evidence_refs)
+                        ),
+                        "visual_target_scope": _visual_target_scope(field),
+                        "visual_evidence_policy": (
+                            "Identify the locked SKU's primary product subject "
+                            "before deciding the field. Exclude accessories, "
+                            "packaging, backgrounds, overlays, and unrelated "
+                            "reference variants from primary-subject facts. "
+                            "Generated images are never product-fact evidence."
+                            if visual_evidence_refs
+                            else None
+                        ),
                         "current_mapping_status": field.get("status"),
                         "reference_evidence": field.get("reference_evidence", []),
                         "candidate_evidence_refs": _field_candidate_evidence_refs(
@@ -1970,6 +2153,8 @@ class WorkbenchService:
                         "complete_all_pending_fields": True,
                         "objective_values_require_evidence_refs": True,
                         "unverifiable_fields_must_be_unresolved": True,
+                        "visual_supported_fields_must_inspect_supplier_images": True,
+                        "generated_images_are_product_fact_evidence": False,
                         "unresolved_requires_resolution_class": True,
                         "customer_facing_text_must_be_russian": True,
                         "translation_and_exact_unit_normalization_allowed": True,
@@ -2082,6 +2267,7 @@ class WorkbenchService:
                 value = raw_value.get("value")
                 evidence_refs = raw_value.get("evidence_refs")
                 reason = str(raw_value.get("reason") or "").strip()
+                raw_visual_analysis = raw_value.get("visual_analysis")
                 resolution_class = str(
                     raw_value.get("resolution_class") or ""
                 ).strip()
@@ -2090,12 +2276,14 @@ class WorkbenchService:
                 value = raw_value
                 evidence_refs = []
                 reason = "Original Russian content generated from collected evidence."
+                raw_visual_analysis = None
                 resolution_class = ""
             else:
                 decision = ""
                 value = None
                 evidence_refs = []
                 reason = ""
+                raw_visual_analysis = None
                 resolution_class = ""
             evidence_refs = (
                 [
@@ -2112,6 +2300,31 @@ class WorkbenchService:
                     f"{label}: decision must be filled or unresolved."
                 )
                 continue
+            unknown_refs = [
+                reference
+                for reference in evidence_refs
+                if reference not in evidence_index
+            ]
+            if unknown_refs:
+                errors.append(
+                    f"{label}: unknown evidence_refs: {', '.join(unknown_refs)}"
+                )
+            visual_evidence_refs = set(field.get("visual_evidence_refs") or [])
+            if visual_evidence_refs and not visual_evidence_refs.intersection(
+                evidence_refs
+            ):
+                errors.append(
+                    f"{label}: inspect and cite a locked 1688 visual evidence_ref."
+                )
+            visual_analysis, visual_errors = _validated_visual_analysis(
+                field,
+                raw_visual_analysis,
+                sorted(visual_evidence_refs),
+                decision,
+                value=value,
+                resolution_class=resolution_class,
+            )
+            errors.extend(visual_errors)
             if decision == "unresolved":
                 if mode == "creative_rewrite":
                     errors.append(f"{label}: creative content must be completed.")
@@ -2136,14 +2349,19 @@ class WorkbenchService:
                         errors.append(
                             f"{label}: evidence_refs are required for objective fields."
                         )
-                    unknown_refs = [
-                        reference
-                        for reference in evidence_refs
-                        if reference not in evidence_index
-                    ]
-                    if unknown_refs:
+                    allowed_values = field.get("allowed_values") or []
+                    if (
+                        visual_evidence_refs
+                        and allowed_values
+                        and str(value or "").casefold()
+                        not in {
+                            str(allowed).casefold()
+                            for allowed in allowed_values
+                        }
+                    ):
                         errors.append(
-                            f"{label}: unknown evidence_refs: {', '.join(unknown_refs)}"
+                            f"{label}: visual value must match an allowed Seller "
+                            "API dictionary value."
                         )
                     if field.get("supplier_truth_required") is True and not any(
                         reference.startswith(
@@ -2173,7 +2391,31 @@ class WorkbenchService:
                 "resolution_class": (
                     resolution_class if decision == "unresolved" else None
                 ),
+                "visual_analysis": visual_analysis,
             }
+
+        visual_signatures: dict[tuple[str, str], tuple[str, str]] = {}
+        for field_key, field_result in normalized_results.items():
+            visual_analysis = field_result.get("visual_analysis")
+            if not isinstance(visual_analysis, dict):
+                continue
+            field = expected.get(field_key) or {}
+            canonical_label = canonical_attribute_label(field.get("label"))
+            signature = (
+                _normalize_content_text(field_result.get("reason")),
+                _normalize_content_text(visual_analysis.get("field_finding")),
+            )
+            previous = visual_signatures.get(signature)
+            if previous and previous[0] != canonical_label:
+                errors.append(
+                    f"{field_result.get('label')}: visual reason and field_finding "
+                    f"duplicate the unrelated field {previous[1]}."
+                )
+            else:
+                visual_signatures[signature] = (
+                    canonical_label,
+                    str(field_result.get("label") or field_key),
+                )
 
         source_title = str(evidence.get("ozon_title_style_reference") or "")
         description_blocks = (
@@ -2346,13 +2588,17 @@ class WorkbenchService:
         for item in ready_items:
             draft_attributes = []
             unresolved_required_dictionaries = []
+            omitted_optional_dictionary_fields = []
             for field in item.get("attribute_mapping", []):
                 if field.get("status") != "mapped":
                     continue
+                upload_value = _dictionary_upload_value(item, field)
+                if canonical_attribute_label(field.get("label")) == "rich_content":
+                    upload_value = _normalize_ozon_rich_content_value(upload_value)
                 draft_attribute = {
                     "attribute_id": field["field_key"],
                     "label": field["label"],
-                    "value": field["value"],
+                    "value": upload_value,
                     "dictionary_id": field.get("dictionary_id"),
                     "dictionary_value_id": None,
                     "dictionary_resolution_required": field.get(
@@ -2366,7 +2612,7 @@ class WorkbenchService:
                             description_category_id=int(item["description_category_id"]),
                             type_id=int(item["type_id"]),
                             attribute_id=int(field["field_key"]),
-                            value=str(field["value"]),
+                            value=str(upload_value),
                         )
                     except (SellerApiError, TypeError, ValueError) as exc:
                         draft_attribute["dictionary_resolution_error"] = str(exc)
@@ -2375,15 +2621,26 @@ class WorkbenchService:
                                 {
                                     "field_key": field["field_key"],
                                     "label": field["label"],
-                                    "value": field["value"],
+                                    "value": upload_value,
                                     "error": str(exc),
                                 }
                             )
+                        else:
+                            omitted_optional_dictionary_fields.append(
+                                {
+                                    "field_key": field["field_key"],
+                                    "label": field["label"],
+                                    "value": upload_value,
+                                    "error": str(exc),
+                                }
+                            )
+                            continue
                     else:
                         draft_attribute["dictionary_value_id"] = resolved[
                             "dictionary_value_id"
                         ]
                         draft_attribute["dictionary_value"] = resolved["value"]
+                        draft_attribute["value"] = resolved["value"]
                 draft_attributes.append(draft_attribute)
             if unresolved_required_dictionaries:
                 blocked_items.append(
@@ -2402,8 +2659,13 @@ class WorkbenchService:
                     "type_id": item.get("type_id"),
                     "category_path": item.get("category_path"),
                     "source_title": item.get("source_title"),
+                    "supplier_offer_id": item.get("supplier_offer_id"),
                     "upload_core_fields": item.get("upload_core_fields"),
+                    "pricing_evidence": item.get("pricing_evidence"),
                     "attributes": draft_attributes,
+                    "omitted_optional_dictionary_fields": (
+                        omitted_optional_dictionary_fields
+                    ),
                     "content_optimization": {
                         "target_score": 90,
                         "status": (
@@ -2436,8 +2698,16 @@ class WorkbenchService:
                             "Do not copy Ozon title, description, or rich content."
                         ),
                     },
-                    "image_job_id": item.get("image_job_id"),
-                    "reviewed_image_urls": item.get("generated_image_urls", []),
+                    "bootstrap_image_url": item.get("bootstrap_image_url"),
+                    "subject_master": item.get("subject_master") or {},
+                    "locked_supplier_sku": item.get(
+                        "supplier_selected_sku"
+                    )
+                    or {},
+                    "ozon_reference_images": item.get(
+                        "ozon_reference_images"
+                    )
+                    or [],
                 }
             )
         payload = {
@@ -2473,6 +2743,427 @@ class WorkbenchService:
             "upload_draft.prepared",
             "Ready product attribute drafts were prepared. Nothing was submitted to Ozon.",
             {**payload, "draft_path": str(path), "last_event": event.to_dict()},
+        )
+
+    def public_media_configuration(self) -> dict[str, Any]:
+        saved = self.repo.load_public_media_settings()
+        configured = str(
+            os.environ.get("OZON_V2_PUBLIC_MEDIA_BASE_URL")
+            or saved.get("base_url")
+            or ""
+        ).strip()
+        if configured.startswith("http://"):
+            configured = "https://" + configured.removeprefix("http://")
+        return {
+            "base_url": configured,
+            "provider": "cloudflare_r2_direct",
+            "r2_bucket": str(
+                os.environ.get("OZON_V2_R2_BUCKET")
+                or saved.get("r2_bucket")
+                or "yandex-media"
+            ).strip(),
+            "object_prefix": str(
+                saved.get("object_prefix") or "ozon-v2"
+            ).strip(),
+            "upload_timeout_seconds": int(
+                saved.get("upload_timeout_seconds") or 1200
+            ),
+            "public_probe_timeout_seconds": int(
+                saved.get("public_probe_timeout_seconds") or 30
+            ),
+            "ready": _is_public_https_url(configured),
+            "source": (
+                "environment"
+                if os.environ.get("OZON_V2_PUBLIC_MEDIA_BASE_URL")
+                else "workbench_settings"
+                if configured
+                else "not_configured"
+            ),
+        }
+
+    def configure_public_media_base_url(self, base_url: str) -> Result:
+        normalized = str(base_url or "").strip().rstrip("/")
+        if normalized.startswith("http://"):
+            normalized = "https://" + normalized.removeprefix("http://")
+        if not _is_public_https_url(normalized):
+            return Result.failure(
+                "public_media.invalid_base_url",
+                "请输入 Ozon 能从公网访问的 HTTPS 图片地址；localhost 和内网地址不能用于上传。",
+                data={"base_url": normalized, "ready": False},
+            )
+        path = self.repo.save_public_media_settings(
+            {
+                "base_url": normalized,
+                "provider": "cloudflare_r2_direct",
+                "r2_bucket": "yandex-media",
+                "object_prefix": "ozon-v2",
+                "upload_timeout_seconds": 1200,
+                "public_probe_timeout_seconds": 30,
+                "updated_at": utc_now_iso(),
+            }
+        )
+        return Result.success(
+            "public_media.configured",
+            "Cloudflare R2 公网图片通道已保存；准备上传时会先真实发布并逐张验证。",
+            {
+                "base_url": normalized,
+                "r2_bucket": "yandex-media",
+                "ready": True,
+                "settings_path": str(path),
+            },
+        )
+
+    def preview_product_upload(self, run_id: str, seed_id: str) -> Result:
+        draft = self.build_upload_draft(run_id)
+        draft_item = next(
+            (
+                item
+                for item in draft.data.get("items", [])
+                if str(item.get("seed_id") or "") == seed_id
+            ),
+            None,
+        )
+        if draft_item is None:
+            blocked_item = next(
+                (
+                    item
+                    for item in draft.data.get("blocked_items", [])
+                    if str(item.get("seed_id") or "") == seed_id
+                ),
+                None,
+            )
+            return Result.failure(
+                "product_upload.product_not_ready",
+                "This product does not yet pass its own upload gates.",
+                data={
+                    "run_id": run_id,
+                    "seed_id": seed_id,
+                    "draft_code": draft.code,
+                    "blocked_item": blocked_item,
+                },
+            )
+        bootstrap_image_url = str(
+            draft_item.get("bootstrap_image_url") or ""
+        ).strip()
+        if not _is_public_https_url(bootstrap_image_url):
+            return Result.failure(
+                "product_upload.bootstrap_image_required",
+                "Lock one public 1688 original subject image before preparing the Ozon product.",
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+        image_urls = [bootstrap_image_url]
+        try:
+            currency_code = self.seller_api_adapter.get_seller_currency_code()
+        except SellerApiError as exc:
+            return Result.failure(
+                "product_upload.seller_currency_failed",
+                str(exc),
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+        upload_core_fields = _pricing_upload_core_fields(
+            draft_item.get("pricing_evidence") or {},
+            currency_code=currency_code,
+        )
+        if upload_core_fields is None:
+            return Result.failure(
+                "product_upload.pricing_currency_unsupported",
+                "Confirmed pricing evidence cannot be converted to the store contract currency.",
+                data={
+                    "run_id": run_id,
+                    "seed_id": seed_id,
+                    "currency_code": currency_code,
+                },
+            )
+        draft_item = {**draft_item, "upload_core_fields": upload_core_fields}
+        seller_api_item = _seller_api_import_item(draft_item, image_urls)
+        canonical = json.dumps(
+            seller_api_item,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        confirmation_token = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        preview = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "seed_id": seed_id,
+            "prepared_at": utc_now_iso(),
+            "confirmation_token": confirmation_token,
+            "seller_api_item": seller_api_item,
+            "bootstrap_image": {
+                "source": "locked_1688_subject_original",
+                "url": bootstrap_image_url,
+            },
+            "image_task_context": {
+                "subject_master": draft_item.get("subject_master") or {},
+                "locked_supplier_sku": draft_item.get(
+                    "locked_supplier_sku"
+                )
+                or {},
+                "ozon_reference_images": draft_item.get(
+                    "ozon_reference_images"
+                )
+                or [],
+            },
+            "status": "awaiting_user_confirmation",
+        }
+        previews = {"schema_version": 1, "run_id": run_id, "items": {}}
+        try:
+            saved = self.repo.load_upload_previews(run_id)
+        except FileNotFoundError:
+            saved = None
+        if isinstance(saved, dict):
+            previews.update(saved)
+        if not isinstance(previews.get("items"), dict):
+            previews["items"] = {}
+        previews["items"][seed_id] = preview
+        path = self.repo.save_upload_previews(run_id, previews)
+        event = self.repo.append_run_event(
+            run_id,
+            "product_upload.preview_ready",
+            "A final Seller API payload was prepared for one product and is awaiting user confirmation.",
+            {
+                "seed_id": seed_id,
+                "offer_id": seller_api_item["offer_id"],
+                "image_count": len(image_urls),
+                "preview_path": str(path),
+            },
+        )
+        return Result.success(
+            "product_upload.preview_ready",
+            "Final product upload payload is ready for explicit confirmation.",
+            {**preview, "preview_path": str(path), "last_event": event.to_dict()},
+        )
+
+    def _emit_image_task_package(
+        self,
+        *,
+        run_id: str,
+        seed_id: str,
+        seller_import_task_id: int,
+        preview: dict[str, Any],
+    ) -> dict[str, str]:
+        package_id = "ozon-image-" + hashlib.sha256(
+            f"{run_id}:{seed_id}:{seller_import_task_id}".encode("utf-8")
+        ).hexdigest()[:24]
+        seller_api_item = preview.get("seller_api_item") or {}
+        image_task_context = preview.get("image_task_context") or {}
+        subject_master = image_task_context.get("subject_master") or {}
+        bootstrap_image = preview.get("bootstrap_image") or {}
+        package = {
+            "schema_version": 1,
+            "kind": "ozon_product_image_generation_and_upload",
+            "package_id": package_id,
+            "status": "pending",
+            "created_at": utc_now_iso(),
+            "run_id": run_id,
+            "seed_id": seed_id,
+            "store_target": {
+                "credential_ref": "configured_store",
+                "seller_import_task_id": seller_import_task_id,
+                "offer_id": seller_api_item.get("offer_id"),
+                "product_id": None,
+            },
+            "bootstrap_image": {
+                "source": "locked_1688_subject_original",
+                "url": bootstrap_image.get("url"),
+                "subject_master_sha256": subject_master.get(
+                    "subject_master_sha256"
+                ),
+            },
+            "generation_contract": {
+                "slot_count": 8,
+                "aspect_ratio": "3:4",
+                "direct_ozon_upload": True,
+                "replace_complete_gallery": True,
+                "return_to_workbench": False,
+            },
+            "evidence": {
+                "subject_master": subject_master,
+                "locked_supplier_sku": image_task_context.get(
+                    "locked_supplier_sku"
+                )
+                or {},
+                "ozon_reference_images": image_task_context.get(
+                    "ozon_reference_images"
+                )
+                or [],
+            },
+        }
+        path = self.repo.save_image_task_package(package_id, package)
+        return {
+            "image_task_package_id": package_id,
+            "image_task_package_path": str(path),
+        }
+
+    def submit_product_upload(
+        self,
+        run_id: str,
+        seed_id: str,
+        *,
+        confirmation_token: str,
+    ) -> Result:
+        try:
+            previews = self.repo.load_upload_previews(run_id)
+        except FileNotFoundError:
+            return Result.failure(
+                "product_upload.preview_required",
+                "Prepare and review the final product payload before uploading.",
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+        preview = (previews.get("items") or {}).get(seed_id)
+        if not isinstance(preview, dict):
+            return Result.failure(
+                "product_upload.preview_required",
+                "Prepare and review the final product payload before uploading.",
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+        expected_token = str(preview.get("confirmation_token") or "")
+        if not confirmation_token or confirmation_token != expected_token:
+            return Result.failure(
+                "product_upload.confirmation_mismatch",
+                "The upload preview changed or was not explicitly confirmed.",
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+        submissions = {"schema_version": 1, "run_id": run_id, "items": {}}
+        try:
+            saved = self.repo.load_upload_submissions(run_id)
+        except FileNotFoundError:
+            saved = None
+        if isinstance(saved, dict):
+            submissions.update(saved)
+        if not isinstance(submissions.get("items"), dict):
+            submissions["items"] = {}
+        existing = submissions["items"].get(seed_id)
+        existing_status = (
+            str(existing.get("status") or "").casefold()
+            if isinstance(existing, dict)
+            else ""
+        )
+        if (
+            isinstance(existing, dict)
+            and existing.get("task_id") is not None
+            and existing_status not in {"failed", "error", "declined"}
+        ):
+            if not existing.get("image_task_package_id"):
+                existing.update(
+                    self._emit_image_task_package(
+                        run_id=run_id,
+                        seed_id=seed_id,
+                        seller_import_task_id=int(existing["task_id"]),
+                        preview=preview,
+                    )
+                )
+                submissions["items"][seed_id] = existing
+                self.repo.save_upload_submissions(run_id, submissions)
+            return Result.success(
+                "product_upload.already_submitted",
+                "This product upload is already being processed or was accepted.",
+                existing,
+            )
+        seller_api_item = preview.get("seller_api_item")
+        if not isinstance(seller_api_item, dict):
+            return Result.failure(
+                "product_upload.preview_invalid",
+                "The saved upload preview is invalid; prepare it again.",
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+        try:
+            submitted = self.seller_api_adapter.import_products([seller_api_item])
+        except SellerApiError as exc:
+            return Result.failure(
+                "product_upload.seller_api_failed",
+                str(exc),
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+        record = {
+            "run_id": run_id,
+            "seed_id": seed_id,
+            "offer_id": seller_api_item.get("offer_id"),
+            "confirmation_token": expected_token,
+            "task_id": submitted["task_id"],
+            "status": "submitted",
+            "submitted_at": utc_now_iso(),
+        }
+        record.update(
+            self._emit_image_task_package(
+                run_id=run_id,
+                seed_id=seed_id,
+                seller_import_task_id=int(submitted["task_id"]),
+                preview=preview,
+            )
+        )
+        if isinstance(existing, dict) and existing.get("task_id") is not None:
+            history = [
+                item
+                for item in existing.get("attempt_history") or []
+                if isinstance(item, dict)
+            ]
+            history.append(
+                {
+                    key: value
+                    for key, value in existing.items()
+                    if key != "attempt_history"
+                }
+            )
+            record["attempt_history"] = history
+        submissions["items"][seed_id] = record
+        path = self.repo.save_upload_submissions(run_id, submissions)
+        event = self.repo.append_run_event(
+            run_id,
+            "product_upload.submitted",
+            "One explicitly confirmed product was submitted to Ozon Seller API.",
+            {
+                "seed_id": seed_id,
+                "offer_id": record["offer_id"],
+                "task_id": record["task_id"],
+                "submission_path": str(path),
+                "image_task_package_path": record[
+                    "image_task_package_path"
+                ],
+            },
+        )
+        return Result.success(
+            "product_upload.submitted",
+            "The confirmed product was submitted to Ozon.",
+            {**record, "submission_path": str(path), "last_event": event.to_dict()},
+        )
+
+    def refresh_product_upload_status(self, run_id: str, seed_id: str) -> Result:
+        try:
+            submissions = self.repo.load_upload_submissions(run_id)
+        except FileNotFoundError:
+            return Result.failure(
+                "product_upload.not_submitted",
+                "This product has not been submitted yet.",
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+        record = (submissions.get("items") or {}).get(seed_id)
+        if not isinstance(record, dict) or record.get("task_id") is None:
+            return Result.failure(
+                "product_upload.not_submitted",
+                "This product has not been submitted yet.",
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+        try:
+            seller_status = self.seller_api_adapter.get_product_import_info(
+                int(record["task_id"])
+            )
+        except (SellerApiError, TypeError, ValueError) as exc:
+            return Result.failure(
+                "product_upload.status_failed",
+                str(exc),
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+        record["seller_api_status"] = seller_status
+        record["status"] = _product_import_status(seller_status)
+        record["status_checked_at"] = utc_now_iso()
+        submissions["items"][seed_id] = record
+        self.repo.save_upload_submissions(run_id, submissions)
+        return Result.success(
+            "product_upload.status_loaded",
+            "The latest Ozon import status was loaded.",
+            record,
         )
 
     def batch_history(self) -> Result:
@@ -3087,6 +3778,7 @@ class WorkbenchService:
             item for item in ozon_payload.get("ozon_candidates", []) if str(item.get("seed_id") or "") != seed_id
         ]
         self.repo.save_ozon_collection_result(run_id, ozon_payload)
+        (self.repo.run_dir(run_id) / "ozon_collection_draft.json").unlink(missing_ok=True)
         review["items"] = [
             item for item in review.get("items", []) if str(item.get("seed_id") or "") != seed_id
         ]
@@ -3151,7 +3843,6 @@ class WorkbenchService:
             "seller",
             "sku",
             "images",
-            "price",
             "domestic_shipping_evidence",
         ]
         if not allow_user_confirmed_partial_sku:
@@ -3234,7 +3925,6 @@ class WorkbenchService:
                 "seller": product.get("seller"),
                 "sku": product.get("sku"),
                 "images": product.get("images"),
-                "price": product.get("price"),
                 "domestic_shipping_evidence": product.get("domestic_shipping_evidence"),
             }
             if not allow_deferred_sku:
@@ -3435,6 +4125,25 @@ class WorkbenchService:
                 data={"run_id": run_id, "seed_id": seed_id},
             )
 
+        try:
+            submissions = self.repo.load_upload_submissions(run_id)
+        except FileNotFoundError:
+            submissions = {}
+        submission = (submissions.get("items") or {}).get(seed_id)
+        if isinstance(submission, dict) and submission.get("task_id") is not None:
+            return Result.failure(
+                "supplier_sku_selection.reopen_blocked",
+                "The product was already submitted to Ozon; its locked supplier SKU cannot be reopened.",
+                data={
+                    "run_id": run_id,
+                    "seed_id": seed_id,
+                    "seller_import_task_id": submission.get("task_id"),
+                    "image_task_package_id": submission.get(
+                        "image_task_package_id"
+                    ),
+                },
+            )
+
         subject_path = self.repo.run_dir(run_id) / "subject_masters.json"
         subjects = self.repo.load_subject_masters(run_id) if subject_path.exists() else {
             "schema_version": 1,
@@ -3443,10 +4152,10 @@ class WorkbenchService:
         }
         subject_entry = subjects.get("items", {}).get(seed_id)
         job_id = str(subject_entry.get("image_job_id") or "") if isinstance(subject_entry, dict) else ""
-        if isinstance(subject_entry, dict):
+        if isinstance(subject_entry, dict) and job_id:
             queue = self._image_generation_queue()
-            if not job_id or not queue.stop_unstarted(job_id):
-                job = queue.get_job(job_id) if job_id else None
+            if not queue.stop_unstarted(job_id):
+                job = queue.get_job(job_id)
                 return Result.failure(
                     "supplier_sku_selection.reopen_blocked",
                     "The image job has already started; its locked SKU evidence cannot be reopened.",
@@ -3635,11 +4344,9 @@ class WorkbenchService:
                 data={"run_id": run_id, "seed_id": seed_id},
             )
 
-        queue = self._image_generation_queue()
-        job = queue.enqueue(receipt=receipt, subject_master=subject_master)
         stored.setdefault("items", {})[seed_id] = {
             "subject_master": subject_master.to_dict(),
-            "image_job_id": job["job_id"],
+            "image_task_mode": "post_upload_package",
         }
         stored["updated_at"] = utc_now_iso()
         self.repo.save_subject_masters(run_id, stored)
@@ -3657,29 +4364,28 @@ class WorkbenchService:
             ).value
             self.repo.save_run(run)
 
-        image_job = self._image_job_payload(str(job["job_id"]))
         event = self.repo.append_run_event(
             run_id,
             "subject_master.confirmed",
-            "The exact supplier SKU subject evidence was locked and queued for image generation.",
+            "The exact supplier SKU subject evidence was locked for one-image product creation.",
             {
                 "seed_id": seed_id,
                 "supplier_sku_id": receipt.supplier_sku_id,
                 "set_quantity": receipt.supplier_sku.set_quantity,
                 "subject_master_sha256": subject_master.subject_master_sha256,
-                "image_job_id": job["job_id"],
-                "image_stage_started": all_confirmed,
+                "image_task_mode": "post_upload_package",
+                "upload_stage_ready": all_confirmed,
             },
         )
         return Result.success(
             "subject_master.confirmed",
-            "The exact supplier subject evidence was locked and queued.",
+            "The exact supplier subject evidence was locked for product upload.",
             self._response_payload(
                 run,
                 event,
                 {
                     "subject_master": subject_master.to_dict(),
-                    "image_job": image_job,
+                    "image_task_mode": "post_upload_package",
                     "all_subject_masters_confirmed": all_confirmed,
                 },
             ),
@@ -3864,6 +4570,7 @@ class WorkbenchService:
                     history,
                 )
             run = self.repo.load_run(run_id)
+            run = self._recover_pending_supplier_replacement(run)
             state = WorkbenchState(run["status"])
             if state == WorkbenchState.CREATED:
                 credentials = self.credential_service.status()
@@ -3998,8 +4705,8 @@ class WorkbenchService:
             if state == WorkbenchState.IMAGE_PROCESSING:
                 return self._autopilot_blocked(
                     run_id,
-                    "image_processing_worker_required",
-                    "Supplier collection is complete; image processing is the next independent stage.",
+                    "upload_preparation_required",
+                    "Supplier subject evidence is locked; complete fields and pricing, then submit ready products individually.",
                     history,
                 )
 
@@ -4051,6 +4758,25 @@ class WorkbenchService:
                 "workbench.unknown_action",
                 "Unknown workbench action.",
                 data={"run_id": run_id, "status": current.value, "gates": self._gate_status(), "last_event": event.to_dict()},
+            )
+        if parsed_action in _INTERNAL_LIFECYCLE_ACTIONS:
+            event = self.repo.append_run_event(
+                run_id,
+                "workbench.action_rejected",
+                "Internal lifecycle transitions cannot be invoked as operator actions.",
+                {"action": parsed_action.value, "status": current.value},
+            )
+            return Result.failure(
+                "workbench.internal_action_forbidden",
+                "This lifecycle transition is applied only after its evidence has been validated.",
+                data={
+                    "run_id": run_id,
+                    "status": current.value,
+                    "action": parsed_action.value,
+                    "allowed_actions": self._allowed_action_values(run),
+                    "gates": self._gate_status(),
+                    "last_event": event.to_dict(),
+                },
             )
         if parsed_action == WorkbenchAction.CHECK_CREDENTIALS:
             return self._check_credentials(run)
@@ -4167,7 +4893,102 @@ class WorkbenchService:
     def _allowed_action_values(self, run: dict) -> list[str]:
         state = WorkbenchState(run["status"])
         actions = allowed_workbench_actions(state, publish_locked=run.get("publish_locked", True))
-        return [action.value for action in actions]
+        return [
+            action.value
+            for action in actions
+            if action not in _INTERNAL_LIFECYCLE_ACTIONS
+        ]
+
+    def _recover_pending_supplier_replacement(self, run: dict[str, Any]) -> dict[str, Any]:
+        pending_seed_ids = [
+            str(seed_id).strip()
+            for seed_id in run.get("replacement_pending_seed_ids") or []
+            if str(seed_id).strip()
+        ]
+        current = WorkbenchState(run["status"])
+        if not pending_seed_ids or current not in _REPLACEMENT_RECOVERY_STATES:
+            return run
+
+        if run.get("ozon_collection_contract_ready"):
+            target = WorkbenchState.OZON_COLLECTING
+        elif run.get("attribute_template_collected"):
+            target = WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTED
+        elif run.get("attribute_template_contract_ready"):
+            target = WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTING
+        else:
+            target = WorkbenchState.SEED_SELECTED
+
+        run["status"] = target.value
+        run["ozon_collected"] = False
+        run["browser_task_cancelled"] = False
+        run.pop("browser_task_cancelled_at", None)
+        run.pop("browser_task_cancel_reason", None)
+        self.repo.save_run(run)
+        if target == WorkbenchState.OZON_COLLECTING:
+            try:
+                self._reconcile_replacement_ozon_checkpoint(run)
+            except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+                pass
+        self.repo.append_run_event(
+            run["run_id"],
+            "supplier_review.replacement_recovery_started",
+            "A pending replacement product was restored to its verified collection stage.",
+            {
+                "from_status": current.value,
+                "to_status": target.value,
+                "replacement_pending_seed_ids": pending_seed_ids,
+            },
+        )
+        return run
+
+    def _reconcile_replacement_ozon_checkpoint(self, run: dict[str, Any]) -> None:
+        pending_seed_ids = {
+            str(seed_id).strip()
+            for seed_id in run.get("replacement_pending_seed_ids") or []
+            if str(seed_id).strip()
+        }
+        draft_path = self.repo.run_dir(run["run_id"]) / "ozon_collection_draft.json"
+        if not pending_seed_ids or not draft_path.exists():
+            return
+
+        contract = self.repo.load_ozon_collection_contract(run["run_id"])
+        payload = contract.get("payload")
+        seeds = payload.get("seeds") if isinstance(payload, dict) else None
+        if not isinstance(seeds, list):
+            return
+        contract_seed_ids = {
+            str(seed.get("seed_id") or "").strip()
+            for seed in seeds
+            if isinstance(seed, dict) and str(seed.get("seed_id") or "").strip()
+        }
+        draft = self.repo.load_ozon_collection_draft(run["run_id"])
+        candidates = draft.get("ozon_candidates")
+        if not isinstance(candidates, list):
+            return
+        retained = [
+            candidate
+            for candidate in candidates
+            if isinstance(candidate, dict)
+            and str(candidate.get("seed_id") or "").strip() in contract_seed_ids
+        ]
+        if len(retained) == len(candidates):
+            return
+        if retained:
+            draft["ozon_candidates"] = retained
+            draft["updated_at"] = utc_now_iso()
+            self.repo.save_ozon_collection_draft(run["run_id"], draft)
+        else:
+            draft_path.unlink(missing_ok=True)
+        self.repo.append_run_event(
+            run["run_id"],
+            "ozon_collection.replacement_checkpoint_reconciled",
+            "Stale checkpoint items from the rejected product were removed before replacement collection resumed.",
+            {
+                "removed_count": len(candidates) - len(retained),
+                "retained_count": len(retained),
+                "replacement_pending_seed_ids": sorted(pending_seed_ids),
+            },
+        )
 
     def _select_seeds(self, run: dict) -> Result:
         if not self._action_is_allowed(run, WorkbenchAction.SELECT_SEEDS):
@@ -4689,10 +5510,27 @@ class WorkbenchService:
         if final_path.exists():
             success = len(self.repo.load_ozon_collection_result(run["run_id"]).get("ozon_candidates", []))
         else:
-            try:
-                success = int(live.get("success_count", 0) or 0)
-            except (TypeError, ValueError):
-                success = 0
+            draft_path = self.repo.run_dir(run["run_id"]) / "ozon_collection_draft.json"
+            durable_seed_ids: set[str] = set()
+            if draft_path.exists():
+                try:
+                    draft = self.repo.load_ozon_collection_draft(run["run_id"])
+                    expected_seed_ids = {seed.seed_id for seed in seeds}
+                    durable_seed_ids = {
+                        str(candidate.get("seed_id") or "")
+                        for candidate in draft.get("ozon_candidates", [])
+                        if isinstance(candidate, dict)
+                        and str(candidate.get("seed_id") or "") in expected_seed_ids
+                    }
+                except (json.JSONDecodeError, OSError, TypeError, ValueError):
+                    durable_seed_ids = set()
+            if durable_seed_ids:
+                success = len(durable_seed_ids)
+            else:
+                try:
+                    success = int(live.get("success_count", 0) or 0)
+                except (TypeError, ValueError):
+                    success = 0
         success = min(total, max(0, success))
         failure = min(len(failed), max(total - success, 0))
         processed = min(total, success + failure)
@@ -4769,9 +5607,43 @@ class WorkbenchService:
 
     def _image_job_payload(self, job_id: str) -> dict[str, Any]:
         snapshot = self._image_generation_queue().snapshot(job_id)
+        slots: list[dict[str, Any]] = []
+        mapping_keys = (
+            "reference_mapping_version",
+            "primary_ozon_reference_sha256",
+            "reference_slot_index",
+            "reference_reused",
+            "reference_composition_followed",
+            "locked_subject_preserved",
+        )
+        for raw_slot in snapshot["slots"]:
+            slot = dict(raw_slot)
+            raw_receipt = slot.get("receipt_json")
+            try:
+                receipt = (
+                    json.loads(raw_receipt)
+                    if isinstance(raw_receipt, str) and raw_receipt.strip()
+                    else raw_receipt
+                )
+            except json.JSONDecodeError:
+                receipt = None
+            validation = (
+                receipt.get("validation")
+                if isinstance(receipt, dict)
+                and isinstance(receipt.get("validation"), dict)
+                else {}
+            )
+            mapping = {
+                key: validation[key]
+                for key in mapping_keys
+                if key in validation
+            }
+            if mapping:
+                slot["ozon_reference_mapping"] = mapping
+            slots.append(slot)
         return {
             **snapshot["job"],
-            "slots": snapshot["slots"],
+            "slots": slots,
             "attempts": snapshot["attempts"],
         }
 
@@ -5002,7 +5874,6 @@ class WorkbenchService:
                     "seller": supplier.get("seller"),
                     "sku": supplier.get("sku"),
                     "images": supplier.get("images"),
-                    "price": supplier.get("price"),
                     "attributes": supplier.get("attributes"),
                     "domestic_shipping": supplier.get("domestic_shipping_evidence"),
                 },
@@ -5169,7 +6040,6 @@ class WorkbenchService:
             "seller": product.get("seller"),
             "sku": product.get("sku"),
             "images": product.get("images"),
-            "price": product.get("price"),
             "domestic_shipping_evidence": product.get("domestic_shipping_evidence"),
         }
         return [field for field, value in required.items() if value in (None, "", [], {})]
@@ -5204,10 +6074,14 @@ class WorkbenchService:
         seen_supplier_sku_ids: set[str] = set()
         for index, raw_option in enumerate(raw_options):
             if not isinstance(raw_option, dict):
+                normalized_option_payload: dict[str, Any] | None = None
                 option_errors = ["must be an object"]
             else:
+                normalized_option_payload = WorkbenchService._normalize_supplier_sku_selection_option(
+                    raw_option
+                )
                 try:
-                    option = SupplierSkuOption.from_dict(raw_option)
+                    option = SupplierSkuOption.from_dict(normalized_option_payload)
                 except (TypeError, ValueError) as exc:
                     option_errors = [f"could not be parsed: {exc}"]
                 else:
@@ -5219,7 +6093,11 @@ class WorkbenchService:
                         valid_options.append(option.to_dict())
                         continue
             if allow_deferred_sku:
-                candidate = dict(raw_option) if isinstance(raw_option, dict) else {"raw_value": raw_option}
+                candidate = (
+                    dict(normalized_option_payload)
+                    if normalized_option_payload is not None
+                    else {"raw_value": raw_option}
+                )
                 candidate["validation_errors"] = option_errors
                 candidates.append(candidate)
             else:
@@ -5233,6 +6111,71 @@ class WorkbenchService:
             "complete" if valid_options and not candidates else "manual_confirmation_required"
         )
         return normalized, errors
+
+    @staticmethod
+    def _repair_supplier_sku_option_quantity(
+        raw_option: dict[str, Any],
+    ) -> dict[str, Any]:
+        normalized = dict(raw_option)
+        composition = [
+            str(value).strip()
+            for value in normalized.get("set_composition") or []
+            if str(value).strip()
+        ]
+        documented_quantity = documented_composition_quantity(composition)
+        if documented_quantity is None:
+            return normalized
+        try:
+            current_quantity = int(normalized.get("set_quantity") or 0)
+        except (TypeError, ValueError):
+            current_quantity = 0
+        if current_quantity == documented_quantity:
+            return normalized
+        normalized["set_quantity"] = documented_quantity
+        evidence = (
+            dict(normalized.get("evidence") or {})
+            if isinstance(normalized.get("evidence"), dict)
+            else {}
+        )
+        evidence["set_quantity_recovered_from_composition"] = True
+        evidence["captured_set_quantity"] = current_quantity
+        normalized["evidence"] = evidence
+        normalized.pop("validation_errors", None)
+        return normalized
+
+    @staticmethod
+    def _normalize_supplier_sku_selection_option(
+        raw_option: dict[str, Any],
+    ) -> dict[str, Any]:
+        normalized = WorkbenchService._repair_supplier_sku_option_quantity(
+            raw_option
+        )
+        if normalized.get("complete") is True:
+            return normalized
+        if str(normalized.get("evidence_source") or "") not in {
+            "embedded_sku_map",
+            "dom_single_group_sku",
+            "dom_single_axis_sku",
+            "dom_specification_table",
+            "single_sku_detail_page",
+            "single_visible_sku_combination",
+        }:
+            return normalized
+        promoted = dict(normalized)
+        promoted["complete"] = True
+        promoted.pop("validation_errors", None)
+        evidence = (
+            dict(promoted.get("evidence") or {})
+            if isinstance(promoted.get("evidence"), dict)
+            else {}
+        )
+        evidence["price_independent_sku_selection"] = True
+        promoted["evidence"] = evidence
+        try:
+            option = SupplierSkuOption.from_dict(promoted)
+        except (TypeError, ValueError):
+            return normalized
+        return promoted if not validate_supplier_sku_option(option) else normalized
 
     @staticmethod
     def _recover_specification_table_skus(
@@ -5331,7 +6274,7 @@ class WorkbenchService:
             if str(value).strip()
             and not re.search(r"\.svg(?:[?#]|$)|-55-tps-|_sum\.(?:jpg|jpeg|png|webp)(?:[?#]|$)", str(value), re.I)
         ]
-        if not offer_id or not amount or not images:
+        if not offer_id or not images:
             return [], cleaned_attributes
 
         options: list[dict[str, Any]] = []
@@ -5372,15 +6315,206 @@ class WorkbenchService:
             )
         return options, cleaned_attributes
 
+    def _single_visible_supplier_sku_option(
+        self,
+        product: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        sku_groups = product.get("sku_groups")
+        if not isinstance(sku_groups, list) or not sku_groups:
+            return None
+        selected_options: dict[str, str] = {}
+        selected_group_options: list[dict[str, Any]] = []
+        for index, raw_group in enumerate(sku_groups):
+            if not isinstance(raw_group, dict):
+                return None
+            raw_group_options = raw_group.get("options")
+            if not isinstance(raw_group_options, list):
+                return None
+            enabled_options = [
+                option
+                for option in raw_group_options
+                if isinstance(option, dict) and option.get("disabled") is not True
+            ]
+            if len(enabled_options) != 1:
+                return None
+            selected = enabled_options[0]
+            group_name = str(
+                raw_group.get("name")
+                or raw_group.get("label")
+                or raw_group.get("group_name")
+                or f"规格{index + 1}"
+            ).strip()
+            label = str(
+                selected.get("label")
+                or selected.get("value")
+                or selected.get("name")
+                or ""
+            ).strip()
+            if not group_name or not label:
+                return None
+            selected_options[group_name] = label
+            selected_group_options.append(selected)
+
+        raw_candidates = [
+            candidate
+            for candidate in product.get("sku_option_candidates") or []
+            if isinstance(candidate, dict)
+        ]
+        candidate = raw_candidates[0] if len(raw_candidates) == 1 else {}
+        native_ids = {
+            str(option.get("supplier_sku_id") or "").strip()
+            for option in selected_group_options
+            if str(option.get("supplier_sku_id") or "").strip()
+        }
+        supplier_sku_id = str(candidate.get("supplier_sku_id") or "").strip()
+        if not supplier_sku_id and len(native_ids) == 1:
+            supplier_sku_id = next(iter(native_ids))
+
+        offer_id = str(
+            product.get("offer_id")
+            or product.get("supplier_product_id")
+            or ""
+        ).strip()
+        if not offer_id:
+            supplier_url = str(
+                product.get("final_url")
+                or product.get("supplier_url")
+                or ""
+            )
+            offer_match = re.search(r"/offer/(\d+)\.html", supplier_url)
+            offer_id = offer_match.group(1) if offer_match else ""
+        combination_key = str(candidate.get("combination_key") or "").strip()
+        if not combination_key:
+            combination_key = "|".join(
+                f"{name}>{value}" for name, value in selected_options.items()
+            )
+        if not supplier_sku_id and offer_id:
+            digest = hashlib.sha256(
+                combination_key.encode("utf-8")
+            ).hexdigest()[:12]
+            supplier_sku_id = f"visible-{offer_id}-{digest}"
+        if not supplier_sku_id:
+            return None
+
+        image_urls: list[str] = []
+        for raw_url in [
+            *(option.get("image_url") for option in selected_group_options),
+            *(candidate.get("image_urls") or []),
+            *self._supplier_product_images(product),
+        ]:
+            url = str(raw_url or "").strip()
+            if url and url not in image_urls:
+                image_urls.append(url)
+        if not image_urls:
+            return None
+
+        composition = [
+            str(value).strip()
+            for value in candidate.get("set_composition") or []
+            if str(value).strip()
+        ] or list(selected_options.values())
+        documented_quantity = documented_composition_quantity(composition)
+        try:
+            candidate_quantity = int(candidate.get("set_quantity") or 0)
+        except (TypeError, ValueError):
+            candidate_quantity = 0
+        set_quantity = documented_quantity or candidate_quantity or 1
+        price = (
+            dict(candidate.get("price") or {})
+            if isinstance(candidate.get("price"), dict)
+            else (
+                dict(product.get("price") or {})
+                if isinstance(product.get("price"), dict)
+                else {}
+            )
+        )
+        stock = (
+            dict(candidate.get("stock") or {})
+            if isinstance(candidate.get("stock"), dict)
+            else {}
+        )
+        if not str(stock.get("status") or "").strip():
+            stock["status"] = "unknown"
+            stock.setdefault("quantity", None)
+        evidence = (
+            dict(candidate.get("evidence") or {})
+            if isinstance(candidate.get("evidence"), dict)
+            else {}
+        )
+        evidence.update(
+            {
+                "single_visible_combination": True,
+                "group_names": list(selected_options),
+                "native_supplier_sku_id": bool(
+                    candidate.get("supplier_sku_id") or native_ids
+                ),
+                "user_confirmation_required": True,
+                "price_independent_sku_selection": True,
+            }
+        )
+        option = SupplierSkuOption(
+            supplier_sku_id=supplier_sku_id,
+            combination_key=combination_key,
+            raw_label=str(candidate.get("raw_label") or "").strip()
+            or " / ".join(selected_options.values()),
+            selected_options=selected_options,
+            set_quantity=set_quantity,
+            set_composition=composition,
+            price=price,
+            stock=stock,
+            image_urls=image_urls,
+            evidence_source=str(candidate.get("evidence_source") or "").strip()
+            or "single_visible_sku_combination",
+            complete=True,
+            evidence=evidence,
+        )
+        return option.to_dict() if not validate_supplier_sku_option(option) else None
+
     def _supplier_sku_options(self, product: dict[str, Any]) -> list[dict[str, Any]]:
         raw_options = product.get("sku_options")
         if isinstance(raw_options, list) and raw_options:
-            return [dict(option) for option in raw_options if isinstance(option, dict)]
+            normalized_options: list[dict[str, Any]] = []
+            for raw_option in raw_options:
+                if not isinstance(raw_option, dict):
+                    continue
+                normalized = self._normalize_supplier_sku_selection_option(
+                    raw_option
+                )
+                try:
+                    option = SupplierSkuOption.from_dict(normalized)
+                except (TypeError, ValueError):
+                    continue
+                if not validate_supplier_sku_option(option):
+                    normalized_options.append(option.to_dict())
+            if normalized_options:
+                return normalized_options
+        raw_candidates = product.get("sku_option_candidates")
+        if isinstance(raw_candidates, list) and raw_candidates:
+            recovered_candidates: list[dict[str, Any]] = []
+            for raw_candidate in raw_candidates:
+                if not isinstance(raw_candidate, dict):
+                    continue
+                repaired = self._normalize_supplier_sku_selection_option(
+                    raw_candidate
+                )
+                try:
+                    option = SupplierSkuOption.from_dict(repaired)
+                except (TypeError, ValueError):
+                    continue
+                if not validate_supplier_sku_option(option):
+                    recovered_candidates.append(option.to_dict())
+            if recovered_candidates:
+                return recovered_candidates
         recovered_options, _cleaned_attributes = self._recover_specification_table_skus(product)
         if recovered_options:
             return recovered_options
         sku_groups = product.get("sku_groups")
         if isinstance(sku_groups, list) and sku_groups:
+            single_visible_option = self._single_visible_supplier_sku_option(
+                product
+            )
+            if single_visible_option:
+                return [single_visible_option]
             return []
         sku = product.get("sku") if isinstance(product.get("sku"), dict) else {}
         selected = sku.get("selected_options") if isinstance(sku.get("selected_options"), dict) else {}
@@ -5406,7 +6540,7 @@ class WorkbenchService:
             amount_match = re.search(r"\d+(?:\.\d+)?", visible_price.replace(",", ""))
             amount = amount_match.group(0) if amount_match else ""
         images = self._supplier_product_images(product)
-        if not offer_id or not amount or not images:
+        if not offer_id or not images:
             return []
 
         quantity = 1
@@ -5570,6 +6704,14 @@ def _content_evidence_index(evidence: dict[str, Any]) -> dict[str, Any]:
                     f"set_composition.{index_number}",
                     value,
                 )
+        image_urls = confirmed_supplier_sku.get("image_urls")
+        if isinstance(image_urls, list):
+            for index_number, value in enumerate(image_urls):
+                add(
+                    "supplier_selection.supplier_sku."
+                    f"image_urls.{index_number}",
+                    value,
+                )
         for group_name in ("price", "stock"):
             group = confirmed_supplier_sku.get(group_name)
             if not isinstance(group, dict):
@@ -5579,6 +6721,12 @@ def _content_evidence_index(evidence: dict[str, Any]) -> dict[str, Any]:
                     f"supplier_selection.supplier_sku.{group_name}.{key}",
                     value,
                 )
+    supplier_visual_evidence = evidence.get("supplier_visual_evidence")
+    if isinstance(supplier_visual_evidence, dict):
+        product_images = supplier_visual_evidence.get("product_images")
+        if isinstance(product_images, list):
+            for index_number, value in enumerate(product_images):
+                add(f"supplier.images.{index_number}", value)
     return index
 
 
@@ -5607,15 +6755,386 @@ def _field_candidate_evidence_refs(
     return list(dict.fromkeys(candidates))
 
 
+def _field_visual_evidence_refs(
+    field: dict[str, Any],
+    evidence_index: dict[str, Any],
+    evidence: dict[str, Any],
+) -> list[str]:
+    if not is_visual_inference_field(field.get("label")):
+        return []
+    refs = [
+        reference
+        for reference in evidence_index
+        if reference.startswith(
+            "supplier_selection.supplier_sku.image_urls."
+        )
+    ]
+    supplier_visual_evidence = evidence.get("supplier_visual_evidence")
+    if (
+        isinstance(supplier_visual_evidence, dict)
+        and supplier_visual_evidence.get("page_single_sku") is True
+    ):
+        refs.extend(
+            reference
+            for reference in evidence_index
+            if reference.startswith("supplier.images.")
+        )
+    return list(dict.fromkeys(refs))
+
+
+def _visual_evidence_roles(references: list[str]) -> dict[str, str]:
+    return {
+        reference: (
+            "locked_sku_primary"
+            if reference.startswith(
+                "supplier_selection.supplier_sku.image_urls."
+            )
+            else "single_sku_gallery"
+        )
+        for reference in references
+    }
+
+
+def _visual_target_scope(field: dict[str, Any]) -> str | None:
+    return {
+        "color": "primary_product",
+        "factory_package_count": "factory_packaging",
+        "set_item_count": "complete_set",
+    }.get(canonical_attribute_label(field.get("label")))
+
+
+def _validated_visual_analysis(
+    field: dict[str, Any],
+    raw_analysis: Any,
+    expected_refs: list[str],
+    decision: str,
+    *,
+    value: Any = None,
+    resolution_class: str = "",
+) -> tuple[dict[str, Any] | None, list[str]]:
+    if not expected_refs:
+        return None, []
+    label = str(field.get("label") or field.get("field_key") or "Visual field")
+    if not isinstance(raw_analysis, dict):
+        return None, [
+            f"{label}: visual_analysis is required after actual locked-image inspection."
+        ]
+    result = str(raw_analysis.get("result") or "").strip()
+    confidence = str(raw_analysis.get("confidence") or "").strip()
+    field_finding = str(raw_analysis.get("field_finding") or "").strip()
+    raw_subject_analysis = raw_analysis.get("subject_analysis")
+    inspected_refs = [
+        str(reference)
+        for reference in (raw_analysis.get("inspected_refs") or [])
+        if str(reference or "").strip()
+    ]
+    raw_observations = raw_analysis.get("observations")
+    observations: list[dict[str, str]] = []
+    errors: list[str] = []
+    if result not in {"observed", "not_visible", "ambiguous", "conflict"}:
+        errors.append(
+            f"{label}: visual_analysis.result must be observed, not_visible, "
+            "ambiguous, or conflict."
+        )
+    if decision == "filled" and result != "observed":
+        errors.append(
+            f"{label}: a filled visual decision requires result=observed."
+        )
+    if confidence not in {"high", "medium", "low"}:
+        errors.append(
+            f"{label}: visual_analysis.confidence must be high, medium, or low."
+        )
+    if len(field_finding) < 10:
+        errors.append(
+            f"{label}: visual_analysis.field_finding must describe this field."
+        )
+    expected_set = set(expected_refs)
+    inspected_set = set(inspected_refs)
+    if inspected_set != expected_set:
+        missing = sorted(expected_set - inspected_set)
+        unexpected = sorted(inspected_set - expected_set)
+        details = []
+        if missing:
+            details.append(f"missing {', '.join(missing)}")
+        if unexpected:
+            details.append(f"unexpected {', '.join(unexpected)}")
+        errors.append(
+            f"{label}: visual_analysis.inspected_refs must cover every locked "
+            f"image ({'; '.join(details)})."
+        )
+    if not isinstance(raw_observations, list):
+        errors.append(
+            f"{label}: visual_analysis.observations must describe every image."
+        )
+    else:
+        for observation in raw_observations:
+            if not isinstance(observation, dict):
+                errors.append(
+                    f"{label}: each visual observation must be an object."
+                )
+                continue
+            evidence_ref = str(observation.get("evidence_ref") or "").strip()
+            finding = str(observation.get("finding") or "").strip()
+            if evidence_ref not in expected_set:
+                errors.append(
+                    f"{label}: visual observation uses unknown evidence_ref "
+                    f"{evidence_ref or '<empty>'}."
+                )
+            if len(finding) < 10:
+                errors.append(
+                    f"{label}: every visual observation needs a concrete finding."
+                )
+            observations.append(
+                {
+                    "evidence_ref": evidence_ref,
+                    "finding": finding,
+                }
+            )
+        observed_refs = {
+            observation["evidence_ref"]
+            for observation in observations
+            if observation["evidence_ref"]
+        }
+        if observed_refs != expected_set:
+            errors.append(
+                f"{label}: visual observations must cover every locked image."
+            )
+    subject_analysis, subject_errors = _validated_visual_subject_analysis(
+        field,
+        raw_subject_analysis,
+        expected_refs,
+        decision,
+        result,
+        value=value,
+        resolution_class=resolution_class,
+    )
+    errors.extend(subject_errors)
+    normalized = {
+        "result": result,
+        "confidence": confidence,
+        "field_finding": field_finding,
+        "inspected_refs": inspected_refs,
+        "observations": observations,
+        "subject_analysis": subject_analysis,
+    }
+    return normalized, errors
+
+
+def _validated_visual_subject_analysis(
+    field: dict[str, Any],
+    raw_subject: Any,
+    expected_refs: list[str],
+    decision: str,
+    result: str,
+    *,
+    value: Any = None,
+    resolution_class: str = "",
+) -> tuple[dict[str, Any] | None, list[str]]:
+    label = str(field.get("label") or field.get("field_key") or "Visual field")
+    if not isinstance(raw_subject, dict):
+        return None, [
+            f"{label}: visual_analysis.subject_analysis is required to "
+            "separate the primary subject from accessories and packaging."
+        ]
+    primary_subject = str(raw_subject.get("primary_subject") or "").strip()
+    target_scope = str(raw_subject.get("target_scope") or "").strip()
+    basis_refs = [
+        str(reference)
+        for reference in (raw_subject.get("basis_refs") or [])
+        if str(reference or "").strip()
+    ]
+    raw_excluded = raw_subject.get("excluded_elements")
+    excluded_elements: list[dict[str, Any]] = []
+    errors: list[str] = []
+    expected_scope = _visual_target_scope(field)
+    expected_set = set(expected_refs)
+    if len(primary_subject) < 3:
+        errors.append(
+            f"{label}: subject_analysis.primary_subject must identify the "
+            "locked SKU's product subject."
+        )
+    if target_scope != expected_scope:
+        errors.append(
+            f"{label}: subject_analysis.target_scope must be {expected_scope}."
+        )
+    if not basis_refs or not set(basis_refs).issubset(expected_set):
+        errors.append(
+            f"{label}: subject_analysis.basis_refs must cite inspected locked "
+            "SKU images."
+        )
+    allowed_roles = {
+        "accessory",
+        "packaging",
+        "background",
+        "decoration",
+        "text_overlay",
+        "reference_variant",
+    }
+    if not isinstance(raw_excluded, list):
+        errors.append(
+            f"{label}: subject_analysis.excluded_elements must be a list."
+        )
+    else:
+        for excluded in raw_excluded:
+            if not isinstance(excluded, dict):
+                errors.append(
+                    f"{label}: each excluded visual element must be an object."
+                )
+                continue
+            element = str(excluded.get("element") or "").strip()
+            role = str(excluded.get("role") or "").strip()
+            colors = [
+                str(color).strip()
+                for color in (excluded.get("colors") or [])
+                if str(color or "").strip()
+            ]
+            if len(element) < 3:
+                errors.append(
+                    f"{label}: excluded visual elements need a concrete name."
+                )
+            if role not in allowed_roles:
+                errors.append(
+                    f"{label}: excluded visual element role must be one of "
+                    f"{', '.join(sorted(allowed_roles))}."
+                )
+            excluded_elements.append(
+                {
+                    "element": element,
+                    "role": role,
+                    "colors": colors,
+                }
+            )
+
+    canonical_label = canonical_attribute_label(field.get("label"))
+    subject_state = str(raw_subject.get("subject_state") or "").strip()
+    subject_colors = [
+        str(color).strip()
+        for color in (raw_subject.get("subject_colors") or [])
+        if str(color or "").strip()
+    ]
+    normalized_value = str(raw_subject.get("normalized_value") or "").strip()
+    if canonical_label == "color":
+        allowed_states = {
+            "single_color",
+            "multi_color",
+            "variant_conflict",
+            "not_visible",
+        }
+        if subject_state not in allowed_states:
+            errors.append(
+                f"{label}: color subject_state must be single_color, "
+                "multi_color, variant_conflict, or not_visible."
+            )
+        if subject_state in {"single_color", "multi_color"}:
+            if not subject_colors or not normalized_value:
+                errors.append(
+                    f"{label}: an observed subject color requires "
+                    "subject_colors and normalized_value."
+                )
+            if result != "observed":
+                errors.append(
+                    f"{label}: {subject_state} is an observed primary-subject "
+                    "fact, not an ambiguous accessory conflict."
+                )
+            allowed_values = [
+                str(allowed).strip()
+                for allowed in (field.get("allowed_values") or [])
+                if str(allowed or "").strip()
+            ]
+            normalized_allowed = {
+                allowed.casefold(): allowed for allowed in allowed_values
+            }
+            permitted_value = (
+                not allowed_values
+                or normalized_value.casefold() in normalized_allowed
+            )
+            if decision == "filled":
+                if str(value or "").strip().casefold() != normalized_value.casefold():
+                    errors.append(
+                        f"{label}: filled value must equal the normalized "
+                        "primary-subject color."
+                    )
+            elif permitted_value:
+                errors.append(
+                    f"{label}: {subject_state} with a permitted normalized "
+                    "value must be filled."
+                )
+            elif resolution_class != "dictionary_value_missing":
+                errors.append(
+                    f"{label}: an observed color outside the Seller API "
+                    "dictionary must use dictionary_value_missing."
+                )
+        elif subject_state == "variant_conflict":
+            if decision != "unresolved" or resolution_class != "evidence_conflict":
+                errors.append(
+                    f"{label}: variant_conflict must remain unresolved with "
+                    "evidence_conflict."
+                )
+            if result not in {"ambiguous", "conflict"}:
+                errors.append(
+                    f"{label}: variant_conflict requires result=ambiguous or conflict."
+                )
+        elif subject_state == "not_visible":
+            if decision != "unresolved" or result != "not_visible":
+                errors.append(
+                    f"{label}: not_visible must remain an unresolved "
+                    "not_visible result."
+                )
+    elif decision == "unresolved" and result == "observed":
+        errors.append(
+            f"{label}: an observed visual fact cannot be submitted as unresolved."
+        )
+
+    return (
+        {
+            "primary_subject": primary_subject,
+            "target_scope": target_scope,
+            "basis_refs": basis_refs,
+            "excluded_elements": excluded_elements,
+            "subject_state": subject_state,
+            "subject_colors": subject_colors,
+            "normalized_value": normalized_value,
+        },
+        errors,
+    )
+
+
 def _content_result_is_accepted(
     field: dict[str, Any],
     result: dict[str, Any] | None,
+    *,
+    visual_evidence_refs: list[str] | None = None,
 ) -> bool:
     if not isinstance(result, dict):
         return False
     decision = str(result.get("decision") or "")
+    current_visual_refs = list(visual_evidence_refs or [])
+    if current_visual_refs:
+        _visual_analysis, visual_errors = _validated_visual_analysis(
+            field,
+            result.get("visual_analysis"),
+            current_visual_refs,
+            decision,
+            value=result.get("value"),
+            resolution_class=str(result.get("resolution_class") or ""),
+        )
+        if visual_errors:
+            return False
     if decision == "unresolved":
-        return str(result.get("resolution_class") or "") in _CONTENT_RESOLUTION_CLASSES
+        if (
+            str(result.get("resolution_class") or "")
+            not in _CONTENT_RESOLUTION_CLASSES
+        ):
+            return False
+        current_visual_refs_set = set(current_visual_refs)
+        prior_refs = {
+            str(reference)
+            for reference in (result.get("evidence_refs") or [])
+            if str(reference or "").strip()
+        }
+        return not current_visual_refs_set or bool(
+            current_visual_refs_set.intersection(prior_refs)
+        )
     if decision != "filled" or not _has_content_value(result.get("value")):
         return False
     if (
@@ -5662,8 +7181,275 @@ def _candidate_sale_rub(candidate: dict[str, Any]) -> str:
     return normalized
 
 
+def _dictionary_upload_value(
+    item: dict[str, Any],
+    field: dict[str, Any],
+) -> Any:
+    value = field.get("value")
+    canonical = canonical_attribute_label(field.get("label"))
+    if str(field.get("field_key") or "") == "8229" or canonical == "type":
+        category_leaf = str(item.get("category_path") or "").rsplit("/", 1)[-1].strip()
+        if category_leaf:
+            return category_leaf
+    if canonical == "brand" and re.search(r"[\u3400-\u9fff]", str(value or "")):
+        return "Нет бренда"
+    return value
+
+
+def _public_reviewed_image_urls(
+    values: list[Any],
+    *,
+    base_url: str = "",
+) -> list[str]:
+    base_url = str(base_url or "").strip()
+    public_base = base_url.rstrip("/") if _is_public_http_url(base_url) else ""
+    result: list[str] = []
+    for value in values:
+        url = str(value or "").strip()
+        if not url:
+            continue
+        if _is_public_http_url(url):
+            result.append(url)
+        elif public_base and url.startswith("/"):
+            result.append(f"{public_base}/{url.lstrip('/')}")
+    return result
+
+
+def _is_public_http_url(value: str) -> bool:
+    try:
+        parsed = urlparse(str(value or "").strip())
+    except ValueError:
+        return False
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return False
+    hostname = parsed.hostname.casefold()
+    if hostname in {"localhost", "localhost.localdomain"} or hostname.endswith(".local"):
+        return False
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return True
+    return not (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_reserved
+        or address.is_unspecified
+    )
+
+
+def _is_public_https_url(value: str) -> bool:
+    try:
+        parsed = urlparse(str(value or "").strip())
+    except ValueError:
+        return False
+    return parsed.scheme == "https" and _is_public_http_url(value)
+
+
+def _normalize_ozon_rich_content_value(value: Any) -> str:
+    if isinstance(value, str):
+        try:
+            payload = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Rich Content must be valid JSON.") from exc
+    else:
+        payload = value
+    if (
+        isinstance(payload, dict)
+        and payload.get("version") == 0.3
+        and isinstance(payload.get("content"), list)
+        and payload["content"]
+        and all(
+            isinstance(widget, dict)
+            and str(widget.get("widgetName") or "").strip()
+            and isinstance(widget.get("blocks"), list)
+            and widget["blocks"]
+            for widget in payload["content"]
+        )
+    ):
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    fragments: list[str] = []
+
+    def collect(node: Any) -> None:
+        if isinstance(node, str):
+            text = re.sub(r"\s+", " ", node).strip()
+            if text:
+                fragments.append(text)
+            return
+        if isinstance(node, list):
+            for item in node:
+                collect(item)
+            return
+        if not isinstance(node, dict):
+            return
+        prioritized_keys = (
+            "title",
+            "description",
+            "heading",
+            "text",
+            "detail",
+            "items",
+            "content",
+            "blocks",
+        )
+        for key in prioritized_keys:
+            if key in node:
+                collect(node[key])
+
+    collect(payload)
+    unique_fragments: list[str] = []
+    seen_fragments: set[str] = set()
+    for fragment in fragments:
+        normalized = _normalize_content_text(fragment)
+        if normalized in seen_fragments:
+            continue
+        seen_fragments.add(normalized)
+        unique_fragments.append(fragment)
+    if not unique_fragments:
+        raise ValueError("Rich Content JSON contains no customer-facing text.")
+    text = " ".join(
+        fragment
+        if fragment.endswith((".", "!", "?", ":", ";"))
+        else fragment + "."
+        for fragment in unique_fragments
+    )
+    ozon_payload = {
+        "content": [
+            {
+                "widgetName": "raTextBlock",
+                "theme": "default",
+                "blocks": [{"text": text}],
+            }
+        ],
+        "version": 0.3,
+    }
+    return json.dumps(
+        ozon_payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _seller_api_import_item(
+    draft_item: dict[str, Any],
+    image_urls: list[str],
+) -> dict[str, Any]:
+    core = draft_item.get("upload_core_fields")
+    if not isinstance(core, dict):
+        raise ValueError("Confirmed price, dimensions, and weight are required.")
+    attributes = [
+        _seller_api_attribute(attribute)
+        for attribute in draft_item.get("attributes", [])
+        if isinstance(attribute, dict)
+    ]
+    attributes = [attribute for attribute in attributes if attribute is not None]
+    title = _draft_attribute_value(draft_item, "title") or str(
+        draft_item.get("source_title") or ""
+    ).strip()
+    offer_id = _draft_attribute_value(draft_item, "seller_code") or _seller_offer_id(
+        draft_item
+    )
+    return {
+        "attributes": attributes,
+        "barcode": "",
+        "complex_attributes": [],
+        "currency_code": str(core["currency_code"]),
+        "depth": float(core["depth"]),
+        "description_category_id": int(draft_item["description_category_id"]),
+        "dimension_unit": str(core["dimension_unit"]),
+        "height": float(core["height"]),
+        "images": image_urls,
+        "name": title,
+        "offer_id": offer_id,
+        "old_price": str(core["old_price"]),
+        "pdf_list": [],
+        "premium_price": "",
+        "price": str(core["price"]),
+        "primary_image": image_urls[0],
+        "type_id": int(draft_item["type_id"]),
+        "vat": "0",
+        "weight": float(core["weight"]),
+        "weight_unit": str(core["weight_unit"]),
+        "width": float(core["width"]),
+    }
+
+
+def _seller_api_attribute(attribute: dict[str, Any]) -> dict[str, Any] | None:
+    attribute_id = str(attribute.get("attribute_id") or "").strip()
+    value = attribute.get("value")
+    if not attribute_id or not _has_content_value(value):
+        return None
+    dictionary_value_id = attribute.get("dictionary_value_id")
+    seller_value = {"value": str(value)}
+    if dictionary_value_id is not None:
+        seller_value["dictionary_value_id"] = int(dictionary_value_id)
+    return {
+        "complex_id": 0,
+        "id": int(attribute_id),
+        "values": [seller_value],
+    }
+
+
+def _draft_attribute_value(
+    draft_item: dict[str, Any],
+    canonical_label: str,
+) -> str | None:
+    for attribute in draft_item.get("attributes", []):
+        if not isinstance(attribute, dict):
+            continue
+        if canonical_attribute_label(attribute.get("label")) != canonical_label:
+            continue
+        value = str(attribute.get("value") or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _seller_offer_id(draft_item: dict[str, Any]) -> str:
+    supplier_offer_id = re.sub(
+        r"[^A-Za-z0-9_-]+",
+        "-",
+        str(draft_item.get("supplier_offer_id") or "").strip(),
+    ).strip("-")
+    seed_id = re.sub(
+        r"[^A-Za-z0-9_-]+",
+        "-",
+        str(draft_item.get("seed_id") or "").strip(),
+    ).strip("-")
+    suffix = supplier_offer_id or seed_id or hashlib.sha256(
+        str(draft_item.get("source_title") or "").encode("utf-8")
+    ).hexdigest()[:16]
+    return f"OZV2-{suffix}"[:50]
+
+
+def _product_import_status(payload: dict[str, Any]) -> str:
+    items = payload.get("items")
+    if not isinstance(items, list) or not items:
+        return "processing"
+    statuses = {
+        str(item.get("status") or item.get("state") or "").casefold()
+        for item in items
+        if isinstance(item, dict)
+    }
+    if any(value in {"failed", "error", "declined"} for value in statuses):
+        return "failed"
+    if statuses and all(
+        value in {"imported", "success", "processed", "moderating"}
+        for value in statuses
+    ):
+        return "accepted_by_ozon"
+    return "processing"
+
+
 def _pricing_upload_core_fields(
     pricing_record: dict[str, Any],
+    *,
+    currency_code: str = "RUB",
 ) -> dict[str, str] | None:
     inputs = pricing_record.get("inputs")
     calculation = pricing_record.get("calculation")
@@ -5675,10 +7461,29 @@ def _pricing_upload_core_fields(
         "package_height_cm",
         "package_weight_g",
     )
-    required_calculation = ("listing_price_rub", "old_price_rub")
     if any(inputs.get(key) in (None, "") for key in required_inputs):
         return None
-    if any(calculation.get(key) in (None, "") for key in required_calculation):
+    normalized_currency = str(currency_code or "").strip().upper()
+    if normalized_currency == "CNY":
+        price_value = calculation.get("listing_price_cny")
+        old_price_value = calculation.get("old_price_cny")
+        if old_price_value in (None, "") and price_value not in (None, ""):
+            snapshot = pricing_record.get("parameter_snapshot")
+            discount_rate = (
+                snapshot.get("old_price_discount_rate")
+                if isinstance(snapshot, dict)
+                else None
+            )
+            if discount_rate not in (None, ""):
+                old_price_value = round_up_to_dot_90(
+                    Decimal(str(price_value)) / Decimal(str(discount_rate))
+                )
+    elif normalized_currency == "RUB":
+        price_value = calculation.get("listing_price_rub")
+        old_price_value = calculation.get("old_price_rub")
+    else:
+        return None
+    if price_value in (None, "") or old_price_value in (None, ""):
         return None
 
     def normalized(value: Any) -> str:
@@ -5688,9 +7493,9 @@ def _pricing_upload_core_fields(
         return normalized(Decimal(str(inputs[key])) * Decimal("10"))
 
     return {
-        "price": normalized(calculation["listing_price_rub"]),
-        "old_price": normalized(calculation["old_price_rub"]),
-        "currency_code": "RUB",
+        "price": normalized(price_value),
+        "old_price": normalized(old_price_value),
+        "currency_code": normalized_currency,
         "depth": millimeters("package_length_cm"),
         "width": millimeters("package_width_cm"),
         "height": millimeters("package_height_cm"),

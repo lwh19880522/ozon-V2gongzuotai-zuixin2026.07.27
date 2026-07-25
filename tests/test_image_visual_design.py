@@ -13,6 +13,7 @@ from ozon_v2.images.visual_design import (
     validate_visual_set,
     validate_visual_spec,
 )
+from ozon_v2.images.worker import file_sha256
 
 
 LOCKED_HASH = "a" * 64
@@ -507,6 +508,9 @@ def test_render_visual_renders_verified_russian_integrated_rail(tmp_path: Path) 
     assert receipt["safe_area_passed"] is True
     assert receipt["mobile_readability_passed"] is True
     assert receipt["visual_system"] == "ozon-edge-gradient-b1"
+    assert receipt["visual_source_sha256"] == file_sha256(source)
+    assert receipt["visual_output_sha256"] == file_sha256(output)
+    assert receipt["visual_source_sha256"] != receipt["visual_output_sha256"]
 
 
 def test_integrated_rail_uses_mobile_prominent_russian_type(

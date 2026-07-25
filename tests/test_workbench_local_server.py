@@ -10,6 +10,8 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from PIL import Image
+
 from ozon_v2.adapters.fs_repo import FsRepo
 from ozon_v2.domain.models import SeedProduct
 from ozon_v2.domain.models import WorkbenchAction, WorkbenchState
@@ -18,10 +20,13 @@ from ozon_v2.images.contracts import SubjectMasterSelection
 from ozon_v2.images.queue import ImageGenerationQueue
 from ozon_v2.services.collection_contract_service import CollectionContractService
 from ozon_v2.services.attribute_mapping_service import map_template_attributes
-from ozon_v2.services.workbench_service import WorkbenchService
+from ozon_v2.services.workbench_service import (
+    WorkbenchService,
+    _normalize_ozon_rich_content_value,
+)
 from ozon_v2.workbench.local_server import create_handler
 
-from tests.helpers import FakeSellerApiAdapter, RuntimeTestCase
+from tests.helpers import FakePublicMediaPublisher, FakeSellerApiAdapter, RuntimeTestCase
 
 
 class FakeBusyRunner:
@@ -185,7 +190,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         with queue._connect() as connection:
             for slot in queue.list_slots(job["job_id"]):
                 output = self.tmpdir / f"{seed_id}-{slot['slot_id']}.png"
-                output.write_bytes(slot["slot_id"].encode("utf-8"))
+                Image.new("RGB", (600, 800), (34, 58, 78)).save(output)
                 connection.execute(
                     "UPDATE image_slots SET status = 'accepted', accepted_path = ? "
                     "WHERE job_id = ? AND slot_id = ?",
@@ -205,6 +210,55 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         }
         self.repo.save_subject_masters(run_id, {"run_id": run_id, "items": subject_items})
         return job
+
+    def attach_locked_subject_master(self, run_id: str, seed_id: str) -> dict:
+        sku = SupplierSkuOption(
+            supplier_sku_id=f"locked-{seed_id}",
+            combination_key=f"locked>{seed_id}",
+            raw_label=f"locked {seed_id}",
+            selected_options={"颜色": "黑色"},
+            set_quantity=1,
+            set_composition=["1 件"],
+            price={"currency": "CNY", "amount": "12.80"},
+            stock={"status": "in_stock", "quantity": 10},
+            image_urls=[f"https://cbu01.alicdn.com/img/ibank/{seed_id}.jpg"],
+            evidence_source="trusted_sku_map",
+            complete=True,
+        )
+        receipt = SupplierSkuSelectionReceipt.confirmed(
+            run_id=run_id,
+            product_id=seed_id,
+            supplier_offer_id=f"offer-{seed_id}",
+            supplier_sku=sku,
+            ozon_target_sku={"sku_id": f"ozon-{seed_id}", "selected_options": {}},
+            differences=[],
+            confirmed_at="2026-07-25T00:00:00+00:00",
+        )
+        subject_path = self.tmpdir / f"{seed_id}-locked-subject.bin"
+        subject_path.write_bytes(f"locked-subject-{seed_id}".encode("utf-8"))
+        subject = SubjectMasterSelection.create(
+            receipt=receipt,
+            source_path=subject_path,
+            source_image_url=sku.image_urls[0],
+            visible_subject_quantity=1,
+            white_background_confirmed=False,
+            confirmed_at="2026-07-25T00:01:00+00:00",
+        )
+        subject_items: dict = {}
+        subject_path_json = self.repo.run_dir(run_id) / "subject_masters.json"
+        if subject_path_json.exists():
+            subject_items = dict(
+                self.repo.load_subject_masters(run_id).get("items") or {}
+            )
+        subject_items[seed_id] = {
+            "subject_master": subject.to_dict(),
+            "image_task_mode": "post_upload_package",
+        }
+        self.repo.save_subject_masters(
+            run_id,
+            {"run_id": run_id, "items": subject_items},
+        )
+        return subject.to_dict()
 
     def prepare_pricing_sources(self, run_id: str, seed_id: str) -> None:
         supplier_product = self.supplier_product_payload(seed_id)
@@ -262,6 +316,23 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             payload,
         )
         self.assertTrue((self.repo.run_dir(run["run_id"]) / "run.json").exists())
+
+    def test_image_task_package_repository_uses_fixed_pending_directory(self) -> None:
+        payload = {
+            "schema_version": 1,
+            "package_id": "img-task:test/seed",
+            "status": "pending",
+        }
+
+        first = self.repo.save_image_task_package(payload["package_id"], payload)
+        second = self.repo.save_image_task_package(payload["package_id"], payload)
+
+        self.assertEqual(first, second)
+        self.assertEqual(
+            self.context.runtime_root / "image_tasks" / "pending",
+            first.parent,
+        )
+        self.assertEqual(payload, json.loads(first.read_text(encoding="utf-8")))
 
     def test_pricing_settings_use_fixed_store_defaults_and_round_trip(self) -> None:
         defaults = self.repo.load_pricing_settings()
@@ -364,6 +435,8 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn("function eventPresentation(event)", body)
         self.assertIn("采集已入库", body)
         self.assertIn("后台执行器已启动", body)
+        self.assertIn("替补商品恢复补采", body)
+        self.assertIn("替补采集断点已清理", body)
         self.assertIn("系统事件（查看原始信息）", body)
         self.assertIn("event.event_type", body)
         self.assertIn("textContent", body)
@@ -371,7 +444,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn('id="supplierReviewNav"', body)
         self.assertIn('new URLSearchParams(window.location.search).get("run_id")', body)
         self.assertIn("供应商审核 (Supplier Review)", body)
-        self.assertIn("图片处理 (Images)", body)
+        self.assertNotIn("图片处理 (Images)", body)
         self.assertIn("上传草稿 (Upload)", body)
         self.assertIn('supplierNav.href = `/batches/${encodeURIComponent(runId)}/supplier-review`;', body)
         self.assertIn('const AUTO_ADVANCE_RUN_KEY = "ozon_v2_auto_advance_run_id";', body)
@@ -379,10 +452,46 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn('localStorage.getItem(AUTO_ADVANCE_RUN_KEY) === runId', body)
         self.assertIn("localStorage.removeItem(AUTO_ADVANCE_RUN_KEY);", body)
         self.assertIn('window.location.assign(`/batches/${encodeURIComponent(runId)}/supplier-review`);', body)
+        self.assertIn("async function resolveLatestRunId()", body)
+        self.assertIn("/api/operations/batches", body)
+        self.assertIn('error.code === "workbench.batch_not_found"', body)
+        self.assertIn('localStorage.removeItem("ozon_v2_workbench_run_id");', body)
         self.assertIn('$("startBatch").disabled = !ready;', body)
         self.assertIn("请在 Edge 扩展页面重新加载", body)
         self.assertNotIn("宸ュ叿", body)
         self.assertNotIn("鍏嶈垂", body)
+
+    def test_unknown_batch_returns_structured_failure(self) -> None:
+        result = WorkbenchService(self.repo).allowed_actions("wb-deleted-or-stale")
+
+        self.assertFalse(result.ok)
+        self.assertEqual("workbench.batch_not_found", result.code)
+        self.assertEqual("wb-deleted-or-stale", result.data["run_id"])
+
+    def test_allowed_actions_hide_internal_lifecycle_transitions(self) -> None:
+        run_id, _seeds = self.prepare_ozon_collecting_run(count=1)
+
+        result = WorkbenchService(self.repo).allowed_actions(run_id)
+
+        self.assertTrue(result.ok)
+        self.assertFalse(
+            [action for action in result.data["allowed_actions"] if action.startswith("mark_")]
+        )
+
+    def test_dispatch_rejects_internal_lifecycle_transition(self) -> None:
+        run_id, _seeds = self.prepare_ozon_collecting_run(count=1)
+
+        result = WorkbenchService(self.repo).dispatch(
+            run_id,
+            WorkbenchAction.MARK_OZON_COLLECTED.value,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual("workbench.internal_action_forbidden", result.code)
+        self.assertEqual(
+            WorkbenchState.OZON_COLLECTING.value,
+            self.repo.load_run(run_id)["status"],
+        )
 
     def test_home_page_contains_stage_specific_ozon_restart_control(self) -> None:
         page = self.get_text("/")
@@ -392,6 +501,8 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn("已完成商品及其原始属性字段不会重复采集", page)
         self.assertIn("/browser-task/restart", page)
         self.assertIn('status === "ozon_collecting"', page)
+        self.assertIn("replacement_pending_seed_ids", page)
+        self.assertIn("继续补采替补商品", page)
 
     def test_runtime_status_reports_service_extension_and_task(self) -> None:
         result = self.get_json("/api/runtime/status")
@@ -873,6 +984,41 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             draft["ozon_candidates"][1]["content_score_evidence"]["attribute_table"],
         )
 
+    def test_ozon_collection_progress_uses_durable_checkpoint_after_status_is_overwritten(
+        self,
+    ) -> None:
+        run_id, seeds = self.prepare_ozon_collecting_run(count=2)
+        candidate = self.ozon_candidate_for_seed(seeds[0], "ozon-progress-durable")
+        saved = self.post_json(
+            f"/api/batches/{run_id}/ozon-collection-progress",
+            {
+                "run_id": run_id,
+                "worker": "workbench_browser_bridge",
+                "source": "test_browser_checkpoint",
+                "ozon_candidate": candidate,
+            },
+        )
+        self.assertTrue(saved["ok"])
+        self.repo.save_browser_bridge_status(
+            {
+                "source": "background_interval",
+                "run_id": run_id,
+                "task_type": "ozon_collection",
+                "stage": "poll_failed",
+                "code": "browser_bridge.poll_failed",
+                "message": "A later heartbeat must not erase durable progress.",
+                "details": None,
+            }
+        )
+
+        progress = self.get_json(f"/api/batches/{run_id}")["data"]["progress"][
+            "ozon_collection_progress"
+        ]
+
+        self.assertEqual(1, progress["success_count"])
+        self.assertEqual(1, progress["processed_count"])
+        self.assertEqual(1, progress["pending_count"])
+
     def test_ozon_collection_progress_rejects_run_seed_and_candidate_conflicts(self) -> None:
         run_id, seeds = self.prepare_ozon_collecting_run(count=2)
         first = self.ozon_candidate_for_seed(seeds[0], "ozon-progress-1")
@@ -1057,6 +1203,84 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual(
             "browser_task.user_restart_requested",
             self.repo.load_run_events(run_id)[-1].event_type,
+        )
+
+    def test_autopilot_recovers_failed_batch_with_pending_replacement(self) -> None:
+        run_id, seeds = self.prepare_ozon_collecting_run(count=1)
+        stale_candidate = self.ozon_candidate_for_seed(seeds[0], "ozon-stale-autopilot")
+        stale_candidate["seed_id"] = "seed-rejected-before-replacement"
+        self.repo.save_ozon_collection_draft(
+            run_id,
+            {
+                "schema_version": 1,
+                "run_id": run_id,
+                "worker": "workbench_browser_bridge",
+                "source": "stale_rejected_product",
+                "ozon_candidates": [stale_candidate],
+                "created_at": "2026-07-24T00:00:00+00:00",
+                "updated_at": "2026-07-24T00:00:00+00:00",
+            },
+        )
+        run = self.repo.load_run(run_id)
+        run["status"] = WorkbenchState.FAILED_BLOCKED.value
+        run["replacement_pending_seed_ids"] = [seeds[0].seed_id]
+        self.repo.save_run(run)
+
+        result = WorkbenchService(self.repo).run_until_blocked(run_id)
+
+        self.assertTrue(result.ok)
+        self.assertEqual("collection_worker_required", result.data["blocked_reason"])
+        self.assertEqual(
+            WorkbenchState.OZON_COLLECTING.value,
+            self.repo.load_run(run_id)["status"],
+        )
+        self.assertIn(
+            "supplier_review.replacement_recovery_started",
+            [event.event_type for event in self.repo.load_run_events(run_id)],
+        )
+        self.assertFalse(
+            (self.repo.run_dir(run_id) / "ozon_collection_draft.json").exists()
+        )
+
+    def test_restart_browser_task_recovers_failed_replacement_and_discards_stale_draft(self) -> None:
+        run_id, seeds = self.prepare_ozon_collecting_run(count=2)
+        stale_candidate = self.ozon_candidate_for_seed(seeds[0], "ozon-stale")
+        self.repo.save_ozon_collection_draft(
+            run_id,
+            {
+                "schema_version": 1,
+                "run_id": run_id,
+                "worker": "workbench_browser_bridge",
+                "source": "stale_rejected_product",
+                "ozon_candidates": [stale_candidate],
+                "created_at": "2026-07-24T00:00:00+00:00",
+                "updated_at": "2026-07-24T00:00:00+00:00",
+            },
+        )
+        contract = self.repo.load_ozon_collection_contract(run_id)
+        contract["payload"]["seeds"] = [
+            seed
+            for seed in contract["payload"]["seeds"]
+            if seed["seed_id"] == seeds[1].seed_id
+        ]
+        self.repo.save_ozon_collection_contract(run_id, contract)
+        run = self.repo.load_run(run_id)
+        run["status"] = WorkbenchState.FAILED_BLOCKED.value
+        run["replacement_pending_seed_ids"] = [seeds[1].seed_id]
+        self.repo.save_run(run)
+
+        result = WorkbenchService(self.repo).restart_browser_task(run_id)
+
+        self.assertTrue(result.ok)
+        self.assertEqual("ozon_collection", result.data["task_type"])
+        self.assertEqual(0, result.data["completed_count"])
+        self.assertEqual(1, result.data["pending_count"])
+        self.assertEqual(
+            WorkbenchState.OZON_COLLECTING.value,
+            self.repo.load_run(run_id)["status"],
+        )
+        self.assertFalse(
+            (self.repo.run_dir(run_id) / "ozon_collection_draft.json").exists()
         )
 
     def test_restart_browser_task_maps_supplier_review_and_keeps_only_pending_channels(self) -> None:
@@ -1554,7 +1778,16 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         review = self.get_json(f"/api/batches/{run_id}/supplier-review")
         item = review["data"]["items"][0]
         self.assertEqual("颜色", item["supplier_sku_groups"][0]["name"])
-        self.assertEqual([], item["supplier_sku_options"])
+        self.assertEqual(1, len(item["supplier_sku_options"]))
+        self.assertEqual(
+            "single_visible_sku_combination",
+            item["supplier_sku_options"][0]["evidence_source"],
+        )
+        self.assertEqual(
+            {"颜色": "黑色"},
+            item["supplier_sku_options"][0]["selected_options"],
+        )
+        self.assertTrue(item["supplier_sku_options"][0]["complete"])
         self.assertEqual(WorkbenchState.SUPPLIER_COLLECTED.value, self.repo.load_run(run_id)["status"])
 
     def test_supplier_selection_capture_exposes_page_unique_sku_for_confirmation(self) -> None:
@@ -1591,6 +1824,146 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual("single_sku_detail_page", options[0]["evidence_source"])
         self.assertTrue(selected["ok"])
         self.assertTrue(selected["data"]["selection_status"]["complete"])
+
+    def test_supplier_selection_capture_repairs_page_unique_composite_quantity(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        supplier_product = self.supplier_product_payload(seed.seed_id)
+        supplier_product["sku"] = {
+            "selected_options": {"visible_sku_labels": ["清洁剂100ml*2+刷子*1"]},
+            "evidence": "visible_selected_or_available_sku_labels",
+            "evidence_source": "dom_option_labels",
+            "complete": False,
+        }
+        supplier_product["sku_groups"] = [
+            {
+                "name": "颜色分类",
+                "options": [
+                    {
+                        "label": "清洁剂100ml*2+刷子*1",
+                        "supplier_sku_id": "",
+                        "image_url": "https://cbu01.alicdn.com/img/ibank/cleaning-kit.jpg",
+                        "disabled": False,
+                        "selected": False,
+                        "option_index": 0,
+                    }
+                ],
+            }
+        ]
+        supplier_product["sku_options"] = [
+            {
+                "supplier_sku_id": "visible-123456789012-cleaning-kit",
+                "combination_key": "颜色分类>清洁剂100ml*2+刷子*1",
+                "raw_label": "清洁剂100ml*2+刷子*1",
+                "selected_options": {"颜色分类": "清洁剂100ml*2+刷子*1"},
+                "set_quantity": 1,
+                "set_composition": ["清洁剂100ml*2+刷子*1"],
+                "price": {"currency": "CNY", "amount": "10.00"},
+                "stock": {"status": "in_stock", "quantity": None},
+                "image_urls": ["https://cbu01.alicdn.com/img/ibank/cleaning-kit.jpg"],
+                "evidence_source": "dom_single_group_sku",
+                "complete": True,
+                "evidence": {
+                    "group_names": ["颜色分类"],
+                    "option_index": 0,
+                    "native_supplier_sku_id": False,
+                },
+            }
+        ]
+
+        captured = self.post_json(
+            f"/api/batches/{run_id}/supplier-selection/capture",
+            {
+                "channel_index": 0,
+                "seed_id": seed.seed_id,
+                "ozon_product_id": "ozon-1",
+                "supplier_product": supplier_product,
+            },
+        )
+        stored = self.repo.load_supplier_collection_result(run_id)["supplier_products"][0]
+        review = self.get_json(f"/api/batches/{run_id}/supplier-review")
+        option = review["data"]["items"][0]["supplier_sku_options"][0]
+        selected = self.post_json(
+            f"/api/batches/{run_id}/supplier-sku",
+            {
+                "seed_id": seed.seed_id,
+                "supplier_sku_id": "visible-123456789012-cleaning-kit",
+                "differences": [],
+            },
+        )
+
+        self.assertTrue(captured["ok"])
+        self.assertEqual("complete", stored["sku_matrix_status"])
+        self.assertEqual(3, stored["sku_options"][0]["set_quantity"])
+        self.assertEqual(3, option["set_quantity"])
+        self.assertTrue(selected["ok"])
+
+    def test_supplier_review_recovers_existing_page_unique_composite_candidate(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        supplier_product = self.supplier_product_payload(seed.seed_id)
+        supplier_product["sku_options"] = []
+        supplier_product["sku_groups"] = [
+            {
+                "name": "颜色分类",
+                "options": [
+                    {
+                        "label": "清洁剂100ml*2+刷子*1",
+                        "supplier_sku_id": "",
+                        "image_url": "https://cbu01.alicdn.com/img/ibank/cleaning-kit.jpg",
+                        "disabled": False,
+                        "selected": False,
+                        "option_index": 0,
+                    }
+                ],
+            }
+        ]
+        supplier_product["sku_option_candidates"] = [
+            {
+                "supplier_sku_id": "visible-123456789012-cleaning-kit",
+                "combination_key": "颜色分类>清洁剂100ml*2+刷子*1",
+                "raw_label": "清洁剂100ml*2+刷子*1",
+                "selected_options": {"颜色分类": "清洁剂100ml*2+刷子*1"},
+                "set_quantity": 1,
+                "set_composition": ["清洁剂100ml*2+刷子*1"],
+                "price": {"currency": "CNY", "amount": "10.00"},
+                "stock": {"status": "in_stock", "quantity": None},
+                "image_urls": ["https://cbu01.alicdn.com/img/ibank/cleaning-kit.jpg"],
+                "evidence_source": "dom_single_group_sku",
+                "complete": True,
+                "evidence": {
+                    "group_names": ["颜色分类"],
+                    "option_index": 0,
+                    "native_supplier_sku_id": False,
+                },
+                "validation_errors": ["set_composition quantity must match set_quantity"],
+            }
+        ]
+        supplier_product["sku_matrix_status"] = "manual_confirmation_required"
+        self.repo.save_supplier_collection_result(
+            run_id,
+            {
+                "run_id": run_id,
+                "network": {"mode": "direct", "proxy_disabled": True},
+                "supplier_products": [supplier_product],
+            },
+        )
+        run = self.repo.load_run(run_id)
+        run["status"] = WorkbenchState.SUPPLIER_COLLECTED.value
+        self.repo.save_run(run)
+
+        review = self.get_json(f"/api/batches/{run_id}/supplier-review")
+        option = review["data"]["items"][0]["supplier_sku_options"][0]
+        selected = self.post_json(
+            f"/api/batches/{run_id}/supplier-sku",
+            {
+                "seed_id": seed.seed_id,
+                "supplier_sku_id": "visible-123456789012-cleaning-kit",
+                "differences": [],
+            },
+        )
+
+        self.assertEqual("visible-123456789012-cleaning-kit", option["supplier_sku_id"])
+        self.assertEqual(3, option["set_quantity"])
+        self.assertTrue(selected["ok"])
 
     def test_supplier_selection_capture_recovers_skus_from_specification_matrix(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
@@ -1747,7 +2120,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
     def test_extension_manifest_registers_1688_supplier_content_script(self) -> None:
         manifest_path = self.project_root / "browser_extension" / "ozon_v2_bridge" / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self.assertEqual("0.1.61", manifest["version"])
+        self.assertEqual("0.1.63", manifest["version"])
 
         supplier_scripts = [
             item
@@ -1894,7 +2267,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn(f'href="/?run_id={run_id}"', page)
         self.assertIn(f'href="/batches/{run_id}/supplier-review"', page)
         self.assertIn('aria-current="page"', page)
-        self.assertIn("图片处理 (Images)", page)
+        self.assertNotIn("图片处理 (Images)", page)
         self.assertIn("上传草稿 (Upload)", page)
         self.assertNotIn('window.setTimeout(() => window.location.assign("/"), 800);', page)
         self.assertEqual(seed.seed_id, row["seed_id"])
@@ -1914,6 +2287,28 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn('selectedSupplierSkuId: preservedInteraction.selectedSupplierSkuId || ""', page)
         self.assertIn('context.selectedSupplierSkuId === option.supplier_sku_id', page)
         self.assertIn('otherDetails.open = preservedInteraction.otherOptionsOpen === true;', page)
+        self.assertIn("function isPageUniqueSupplierSku(item, options)", page)
+        self.assertIn('id="lockSingleSupplierSku"', page)
+        self.assertIn("function lockSingleSupplierSku()", page)
+        self.assertIn("单一 SKU，直接锁定主体", page)
+        self.assertIn("await submitSupplierSkuLock(item, option);", page)
+        self.assertIn("source_image_urls:subjectUrls", page)
+        self.assertIn("visible_subject_quantity:Number(option.set_quantity || 1)", page)
+        self.assertNotIn('option.evidence_source !== "dom_single_group_sku"', page)
+
+    def test_supplier_review_poll_preserves_unsubmitted_subject_evidence_draft(self) -> None:
+        run_id, _seed = self.prepare_supplier_review_run()
+
+        page = self.get_text(f"/batches/{run_id}/supplier-review")
+
+        self.assertIn("const subjectDrafts = new Map();", page)
+        self.assertIn("function rememberSubjectDraft(seedId)", page)
+        self.assertIn("sourceImageUrls: selectedSubjectEvidenceUrls()", page)
+        self.assertIn("rememberSubjectDraft(previousSubjectSeedId);", page)
+        self.assertIn('const subjectDraft = subjectDrafts.get(String(item.seed_id || "")) || null;', page)
+        self.assertIn("subjectDraft ? subjectDraft.sourceImageUrls", page)
+        self.assertIn("subjectDraft.visibleSubjectQuantity", page)
+        self.assertIn('checkbox.addEventListener("change", () => {', page)
 
     def test_supplier_review_evidence_uses_single_item_pagers(self) -> None:
         run_id, _seed = self.prepare_supplier_review_run()
@@ -2117,7 +2512,8 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn("Ozon 原商品目标", page)
         self.assertIn("1688 可采购规格", page)
         self.assertIn("页面只有一个真实 SKU，无需选择规格", page)
-        self.assertIn("确认页面唯一 SKU", page)
+        self.assertIn('id="lockSingleSupplierSku"', page)
+        self.assertIn("单一 SKU，直接锁定主体", page)
         self.assertIn("确认所选 SKU", page)
         self.assertIn('id="reopenSupplierSku"', page)
         self.assertIn("重新选择 SKU", page)
@@ -2133,6 +2529,9 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn("function renderSupplierSkuCandidate", page)
         self.assertIn("function renderSupplierSkuGroup", page)
         self.assertIn('image.className = "sku-option-image"', page)
+        self.assertIn('image.referrerPolicy = "no-referrer"', page)
+        self.assertIn('image.addEventListener("error"', page)
+        self.assertIn("supplierFallbackImages", page)
         self.assertIn("matchingCandidates", page)
         self.assertIn("otherCandidates", page)
         self.assertIn("strongestScore", page)
@@ -2197,117 +2596,11 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         workspace = self.get_json(f"/api/batches/{run_id}/images")
         item = workspace["data"]["items"][0]
 
-        self.assertIn("图片处理 (Images)", page)
-        self.assertIn('class="app-shell"', page)
-        self.assertIn('class="sidebar"', page)
-        self.assertIn('class="topbar"', page)
-        self.assertIn('class="workspace"', page)
-        self.assertIn('id="imageProcessingNav"', page)
-        self.assertIn('id="imageItems"', page)
-        self.assertIn('id="previousImageItem"', page)
-        self.assertIn('id="nextImageItem"', page)
-        self.assertIn('id="imageItemPosition"', page)
-        self.assertIn('class="image-items image-items-viewport"', page)
-        self.assertIn("function renderImageItemAt(index)", page)
-        self.assertNotIn("items.forEach((item) =>", page)
-        self.assertIn("images.forEach((src) =>", page)
-        self.assertNotIn("images.slice(0, 6)", page)
-        self.assertIn(".image-product { height:100%;", page)
-        self.assertIn("grid-template-rows:auto auto minmax(0,1fr)", page)
-        self.assertIn("grid-template-columns:repeat(2,minmax(0,1fr))", page)
-        self.assertIn("overflow-y:auto", page)
-        self.assertIn('id="batchGenerationOverview"', page)
-        self.assertIn('className = "product-state-banner"', page)
-        self.assertIn("未进入生图队列：尚未锁定真实 1688 SKU", page)
-        self.assertIn("等待人工审核不会阻塞其他商品继续生图", page)
-        self.assertIn("旧任务未记录停止原因", page)
-        self.assertIn('id="imageGate"', page)
-        self.assertIn('aria-current="page"', page)
-        self.assertIn("Ozon 参考图 (Ozon Reference)", page)
-        self.assertIn("供应商原图 (Supplier Source)", page)
-        self.assertIn('id="imageJobControls"', page)
-        self.assertIn(".generated-review-card", page)
-        self.assertIn('checkbox.type = "checkbox"', page)
-        self.assertIn('select.className = "repair-issue"', page)
-        self.assertIn('textarea.className = "repair-note"', page)
-        self.assertIn('id="submitImageRepairs"', page)
-        self.assertIn('id="approveImageJob"', page)
-        self.assertIn("确认本件 8 张图片可用", page)
-        self.assertIn("提交选中图片返修 (Repair Selected)", page)
-        self.assertIn("还需为 ${missingIssue.length} 张图片选择问题类型", page)
-        self.assertIn("还需为 ${missingOtherNote.length} 张“其他问题”填写说明", page)
-        self.assertIn("repair-incomplete", page)
-        self.assertIn("repair-field-error", page)
-        self.assertIn("已填写完整，可以提交", page)
-        self.assertIn(".job-controls .repair-submit:disabled", page)
-        self.assertIn("issue_code: issue.value", page)
-        self.assertIn("review_issue_code", page)
-        self.assertIn("/repair`,", page)
-        self.assertIn("slot.attempt_count", page)
-        self.assertIn("slot.review_requested_at", page)
-        self.assertNotIn(
-            'sources.append(sourcePanel("生成结果 (Generated)", generatedImageUrls(item)',
-            page,
-        )
-        self.assertIn('id="imageControllerCommand"', page)
-        self.assertIn('id="copyImageControllerCommand"', page)
-        self.assertNotIn('id="imageTrialCommand"', page)
-        self.assertNotIn('id="copyImageTrialCommand"', page)
-        self.assertNotIn("单件试图命令 (Single-Product Trial Command)", page)
-        self.assertNotIn("本次只允许领取 1 件", page)
-        self.assertNotIn("不得预领、并发领取或继续领取第二件", page)
-        self.assertNotIn("进入 manual_review_required 后立即停止", page)
-        self.assertNotIn('id="startGeneration"', page)
-        self.assertIn("生图总控命令 (Production Controller Command)", page)
-        self.assertIn("复制整批生图命令 (Copy Production Command)", page)
-        self.assertIn("复制继续返修生图命令 (Copy Repair Command)", page)
-        self.assertIn("命令已复制，请粘贴到当前 Codex 对话执行", page)
-        self.assertIn("返修已入队。点击上方“复制继续返修生图命令”", page)
-        self.assertIn("skills/ozon-image-generation-controller/SKILL.md", page)
-        self.assertIn("skills/ozon-product-media-generator/SKILL.md", page)
-        self.assertIn("ozon-image-v3", page)
-        self.assertIn("ozon-edge-gradient-b1", page)
-        self.assertIn("detail_02、detail_03、detail_05、detail_06", page)
-        self.assertIn("detail_01、detail_04", page)
-        self.assertIn("360 像素预览", page)
-        self.assertIn("不得上传", page)
-        for index in range(1, 6):
-            self.assertIn(f"ozon-image-worker-{index:02d}", page)
-        self.assertNotIn("ozon-image-worker-06", page)
-        self.assertIn("spawn_agent", page)
-        self.assertIn("create_thread", page)
-        self.assertIn("\u6700\u591a 5 \u4e2a\u52a8\u6001 Codex \u751f\u56fe\u5b50\u667a\u80fd\u4f53", page)
-        self.assertIn("5 个队列租约槽位", page)
-        self.assertIn("不与固定子智能体永久绑定", page)
-        self.assertIn("子智能体名称由 Codex 动态创建", page)
-        self.assertIn("每次派发时动态分配一个当前空闲租约槽位", page)
-        self.assertNotIn("ozon_image_worker_01 -&gt; ozon-image-worker-01", page)
-        self.assertIn("\u6bcf\u8f6e\u65b0\u589e\u6570\u91cf\u53d6", page)
-        self.assertIn("\u4e0d\u5f97\u56e0\u6ca1\u6709\u65b0\u589e\u7a7a\u4f4d\u800c\u505c\u6b62\u73b0\u6709\u5b50\u667a\u80fd\u4f53", page)
-        self.assertIn("\u53ef\u7528\u5e76\u53d1\u4f4d\u5c11\u4e8e 5 \u65f6\u7ee7\u7eed", page)
-        self.assertIn("\u4e0d\u5f97\u9000\u56de create_thread", page)
-        self.assertNotIn("5 \u4e2a\u56fa\u5b9a Codex \u751f\u56fe\u5b50\u667a\u80fd\u4f53", page)
-        self.assertNotIn("5 \u4e2a\u56fa\u5b9a\u751f\u56fe\u5de5\u4f5c\u4efb\u52a1", page)
-        self.assertNotIn("Codex \u751f\u56fe\u7ebf\u7a0b", page)
-        self.assertIn("\u4e0d\u5f97\u521b\u5efa\u7b2c 6 \u4e2a\u5e38\u89c4\u751f\u56fe worker", page)
-        self.assertIn("\u4fdd\u7559 1 \u4e2a\u5b50\u667a\u80fd\u4f53\u4f4d\u7f6e\u7528\u4e8e\u5931\u8d25\u6062\u590d\u3001\u8bca\u65ad\u6216\u4eba\u5de5\u4ecb\u5165", page)
-        self.assertIn(run_id, page)
-        self.assertIn("navigator.clipboard.writeText", page)
-        self.assertIn('document.execCommand("copy")', page)
-        self.assertNotIn("copyTrialCommand", page)
-        self.assertNotIn("复制单件试图命令 (Copy Trial Command)", page)
-        self.assertNotIn("整批生图命令 (Full-Batch Command)", page)
-        self.assertIn("copyControllerCommand", page)
-        self.assertIn("manual_review_required 只暂停对应商品", page)
-        self.assertIn("继续派发其他 pending 或含 repair_pending 的商品", page)
-        self.assertIn("未锁定 SKU 或主体证据只阻塞对应商品", page)
-        self.assertIn("stopped 商品不阻塞其他商品", page)
-        self.assertIn("不得自动恢复 stopped 商品", page)
-        self.assertIn("已验签 accepted 槽位的显示元数据异常不得停止整件商品", page)
-        self.assertIn("直到没有可调度的 pending 或 repair_pending 商品", page)
-        self.assertIn("停止生图 (Stop Generation)", page)
-        self.assertIn("继续生图 (Resume Generation)", page)
-        self.assertIn("/image-job/", page)
+        self.assertIn("上传草稿 (Upload)", page)
+        self.assertNotIn("图片处理 (Images)", page)
+        self.assertNotIn('id="imageProcessingNav"', page)
+        self.assertNotIn('id="imageItems"', page)
+        self.assertIn("单原图", page)
         self.assertEqual(["https://img.example/main.jpg"], item["ozon_reference_images"])
         self.assertEqual(
             [
@@ -2344,12 +2637,57 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         ) as response:
             original_bytes = response.read()
 
-        self.assertIn("最终成图总览 (Final Gallery)", page)
-        self.assertIn("点击图片查看高清原图", page)
-        self.assertIn("const fullImageUrl = generatedImageUrl(job, slot);", page)
-        self.assertIn('imageLink.href = fullImageUrl; imageLink.target = "_blank";', page)
-        self.assertIn('fullResolutionLink.textContent = "查看高清原图";', page)
+        self.assertIn("上传草稿 (Upload)", page)
+        self.assertNotIn("最终成图总览 (Final Gallery)", page)
         self.assertEqual(f"accepted-{slot['slot_id']}".encode("utf-8"), original_bytes)
+
+    def test_image_workspace_carries_ordered_references_and_slot_mapping_receipts(
+        self,
+    ) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        job = self.attach_completed_image_job(run_id, seed.seed_id)
+        queue = ImageGenerationQueue(
+            self.context.runtime_root / "image_generation" / "ozon_image_jobs.sqlite3"
+        )
+        first_slot = queue.list_slots(job["job_id"])[0]
+        with queue._connect() as connection:
+            connection.execute(
+                "UPDATE image_slots SET receipt_json = ? "
+                "WHERE job_id = ? AND slot_id = ?",
+                (
+                    json.dumps(
+                        {
+                            "validation": {
+                                "reference_mapping_version": "ozon-reference-map-v1",
+                                "primary_ozon_reference_sha256": "a" * 64,
+                                "reference_slot_index": 1,
+                                "reference_reused": False,
+                                "reference_composition_followed": True,
+                                "locked_subject_preserved": True,
+                            }
+                        }
+                    ),
+                    job["job_id"],
+                    first_slot["slot_id"],
+                ),
+            )
+
+        workspace = self.get_json(f"/api/batches/{run_id}/images")["data"]
+        item = workspace["items"][0]
+        mapping = item["image_job"]["slots"][0]["ozon_reference_mapping"]
+        page = self.get_text(f"/batches/{run_id}/images")
+
+        self.assertEqual(
+            [
+                {"reference_slot_index": 1, "url": item["ozon_reference_images"][0]}
+            ],
+            item["ozon_reference_inputs"],
+        )
+        self.assertEqual(1, mapping["reference_slot_index"])
+        self.assertEqual(item["ozon_reference_images"][0], mapping["reference_url"])
+        self.assertEqual("a" * 64, mapping["primary_ozon_reference_sha256"])
+        self.assertIn("上传草稿 (Upload)", page)
+        self.assertNotIn("对应 Ozon 参考图", page)
 
     def test_image_repair_api_requeues_only_selected_slots_and_records_event(self) -> None:
         run_id, job_id, queue = self.prepare_reviewable_image_job()
@@ -2468,7 +2806,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn('id="uploadDraftNav"', page)
         self.assertIn('id="draftItems"', page)
         self.assertIn('id="uploadGate"', page)
-        self.assertIn('id="buildDraft"', page)
+        self.assertNotIn('id="buildDraft"', page)
         self.assertIn('id="pricingWorkspace"', page)
         self.assertIn('id="pricingProductList"', page)
         self.assertIn('id="pricingEditor"', page)
@@ -2498,7 +2836,10 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn("required_attributes", page)
         self.assertIn("ready_to_build_count", page)
         self.assertIn("item.blocking_gates", page)
-        self.assertIn('id="buildDraft" class="primary" disabled', page)
+        self.assertIn("预览单原图建品", page)
+        self.assertIn("确认上传到 Ozon", page)
+        self.assertIn("确认提交后输出独立图片任务包", page)
+        self.assertNotIn('href="/images"', page)
         self.assertEqual(seed.seed_id, item["seed_id"])
         self.assertEqual(1, item["required_attribute_count"])
         self.assertEqual(1, item["prefill_plan_count"])
@@ -2526,6 +2867,31 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         )
         self.assertIn("每页 5 件", page)
         self.assertIn(".pricing-product-column { height:470px;", page)
+
+    def test_upload_mapping_results_use_fixed_five_item_pages(self) -> None:
+        run_id, _seed = self.prepare_supplier_review_run()
+
+        page = self.get_text(f"/batches/{run_id}/upload")
+
+        self.assertIn('id="draftPager"', page)
+        self.assertIn('id="draftPrevPage"', page)
+        self.assertIn('id="draftPageLabel"', page)
+        self.assertIn('id="draftNextPage"', page)
+        self.assertIn(
+            "const draftState = { page:0, pageSize:5, items:[] }",
+            page,
+        )
+        self.assertIn(
+            "slice(pageStart, pageStart + draftState.pageSize)",
+            page,
+        )
+        self.assertIn(
+            "Math.ceil(draftState.items.length / draftState.pageSize)",
+            page,
+        )
+        self.assertIn("第 1 / 1 页 · 每页 5 件", page)
+        self.assertIn("changeDraftPage(-1)", page)
+        self.assertIn("changeDraftPage(1)", page)
 
     def test_pricing_preview_is_side_effect_free_and_confirm_persists_one_product(
         self,
@@ -2771,7 +3137,10 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual([], items[seed.seed_id]["blocking_gates"])
         self.assertEqual("mapped", items[seed.seed_id]["attribute_mapping"][0]["status"])
         self.assertFalse(items["seed-blocked"]["ready_to_build"])
-        self.assertIn("images", items["seed-blocked"]["blocking_gates"])
+        self.assertIn(
+            "bootstrap_image",
+            items["seed-blocked"]["blocking_gates"],
+        )
         self.assertTrue(workspace["gates"]["ready_to_build"])
         self.assertEqual(1, workspace["gates"]["ready_to_build_count"])
         self.assertEqual(1, workspace["gates"]["blocked_product_count"])
@@ -2962,6 +3331,9 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn("复制整批智能字段草稿命令", page)
         self.assertIn("$ozon-intelligent-field-drafter", page)
         self.assertIn("skills/ozon-intelligent-field-drafter/SKILL.md", page)
+        self.assertIn("identify the locked SKU primary product subject", page)
+        self.assertIn("subject_analysis", page)
+        self.assertIn("accessories, packaging, backgrounds", page)
         self.assertNotIn("yandex", page.casefold())
 
     def test_intelligent_field_tasks_cover_missing_objective_fields_and_require_evidence(
@@ -3156,6 +3528,393 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual(
             "Белый",
             task["evidence_index"]["ozon.target_sku.selected_options.Цвет"],
+        )
+
+    def test_content_tasks_reopen_polluted_mapped_field_for_normalization(
+        self,
+    ) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        self.repo.save_supplier_sku_selections(
+            run_id,
+            {
+                "run_id": run_id,
+                "selections": {
+                    seed.seed_id: {
+                        "supplier_offer_id": "559479796544",
+                        "supplier_sku": {
+                            "supplier_sku_id": "sku-black",
+                            "combination_key": "颜色=黑色",
+                            "raw_label": "黑色+黑色鞋底（现货当天发）",
+                            "selected_options": {
+                                "颜色": "黑色+黑色鞋底（现货当天发）",
+                            },
+                            "set_quantity": 1,
+                            "set_composition": ["单件商品"],
+                            "complete": True,
+                        },
+                    }
+                },
+            },
+        )
+        template_result = self.repo.load_attribute_template_result(run_id)
+        template_result["seed_templates"][0]["upload_attribute_schema"] = [
+            {
+                "attribute_id": "color",
+                "attribute_label": "Цвет товара",
+                "is_required": True,
+            }
+        ]
+        self.repo.save_attribute_template_result(run_id, template_result)
+
+        task = self.get_json(f"/api/batches/{run_id}/content-tasks")["data"][
+            "items"
+        ][0]
+        field = task["field_tasks"][0]
+
+        self.assertEqual("color", field["field_key"])
+        self.assertEqual("evidence_inference", field["mode"])
+        self.assertEqual("rewrite_required", field["current_mapping_status"])
+        self.assertIn(
+            "supplier_selection.supplier_sku.selected_options.颜色",
+            field["candidate_evidence_refs"],
+        )
+        self.assertEqual(
+            "黑色+黑色鞋底（现货当天发）",
+            task["evidence_index"][
+                "supplier_selection.supplier_sku.selected_options.颜色"
+            ],
+        )
+
+    def test_content_tasks_reopen_visual_fields_and_expose_only_supplier_images(
+        self,
+    ) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        supplier_image = "https://cbu01.alicdn.com/img/ibank/locked-sku.jpg"
+        second_supplier_image = (
+            "https://cbu01.alicdn.com/img/ibank/locked-sku-detail.jpg"
+        )
+        self.repo.save_supplier_collection_result(
+            run_id,
+            {
+                "run_id": run_id,
+                "supplier_products": [
+                    {
+                        "seed_id": seed.seed_id,
+                        "offer_id": "559479796544",
+                        "title": "两用打孔钳",
+                        "attributes": {},
+                        "images": [supplier_image, second_supplier_image],
+                    }
+                ],
+            },
+        )
+        self.repo.save_supplier_sku_selections(
+            run_id,
+            {
+                "run_id": run_id,
+                "selections": {
+                    seed.seed_id: {
+                        "supplier_offer_id": "559479796544",
+                        "supplier_sku": {
+                            "supplier_sku_id": "559479796544",
+                            "combination_key": "页面唯一 SKU",
+                            "raw_label": "页面唯一 SKU（无需选择规格）",
+                            "selected_options": {"规格": "页面唯一 SKU"},
+                            "set_quantity": 1,
+                            "set_composition": ["单件商品"],
+                            "image_urls": [supplier_image],
+                            "evidence_source": "single_sku_detail_page",
+                            "complete": True,
+                        },
+                    }
+                },
+            },
+        )
+        template_result = self.repo.load_attribute_template_result(run_id)
+        template_result["seed_templates"][0]["upload_attribute_schema"] = [
+            {
+                "attribute_id": "10096",
+                "attribute_label": "Цвет товара",
+                "is_required": False,
+                "dictionary_id": 100,
+                "allowed_values": ["Серебристый", "Черный"],
+            },
+            {
+                "attribute_id": "10097",
+                "attribute_label": "Название цвета",
+                "is_required": False,
+            },
+            {
+                "attribute_id": "11650",
+                "attribute_label": "Количество заводских упаковок",
+                "is_required": False,
+            },
+            {
+                "attribute_id": "9285",
+                "attribute_label": "Количество инструментов в наборе, шт.",
+                "is_required": False,
+            },
+        ]
+        self.repo.save_attribute_template_result(run_id, template_result)
+        unresolved = {
+            field_key: {
+                "decision": "unresolved",
+                "value": None,
+                "evidence_refs": [],
+                "reason": "В структурированных данных нет подтвержденного значения.",
+                "mode": "evidence_inference",
+                "resolution_class": "source_fact_missing",
+            }
+            for field_key in ("10096", "10097", "11650", "9285")
+        }
+        self.repo.save_generated_content_result(
+            run_id,
+            {
+                "schema_version": 2,
+                "run_id": run_id,
+                "items": {
+                    seed.seed_id: {
+                        "status": "completed_with_gaps",
+                        "field_results": unresolved,
+                    }
+                },
+            },
+        )
+
+        task = self.get_json(f"/api/batches/{run_id}/content-tasks")["data"][
+            "items"
+        ][0]
+        fields = {field["field_key"]: field for field in task["field_tasks"]}
+
+        self.assertTrue(task["evidence"]["supplier_visual_evidence"]["page_single_sku"])
+        self.assertEqual(
+            supplier_image,
+            task["evidence_index"][
+                "supplier_selection.supplier_sku.image_urls.0"
+            ],
+        )
+        self.assertEqual(
+            second_supplier_image,
+            task["evidence_index"]["supplier.images.1"],
+        )
+        self.assertNotIn("generated.images.0", task["evidence_index"])
+        for field_key in ("10096", "10097", "11650", "9285"):
+            self.assertEqual("pending", fields[field_key]["status"])
+            self.assertTrue(fields[field_key]["visual_inference_supported"])
+            self.assertIn(
+                "supplier_selection.supplier_sku.image_urls.0",
+                fields[field_key]["visual_evidence_refs"],
+            )
+            self.assertEqual(
+                "locked_sku_primary",
+                fields[field_key]["visual_evidence_roles"][
+                    "supplier_selection.supplier_sku.image_urls.0"
+                ],
+            )
+            self.assertEqual(
+                "single_sku_gallery",
+                fields[field_key]["visual_evidence_roles"]["supplier.images.1"],
+            )
+        self.assertEqual(
+            "primary_product",
+            fields["10096"]["visual_target_scope"],
+        )
+        self.assertEqual(
+            "factory_packaging",
+            fields["11650"]["visual_target_scope"],
+        )
+        self.assertEqual(
+            "complete_set",
+            fields["9285"]["visual_target_scope"],
+        )
+        self.assertEqual(
+            ["Серебристый", "Черный"],
+            fields["10096"]["allowed_values"],
+        )
+
+    def test_visual_field_requires_a_complete_field_specific_analysis_receipt(
+        self,
+    ) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        supplier_image = "https://cbu01.alicdn.com/img/ibank/locked-sku.jpg"
+        self.repo.save_supplier_collection_result(
+            run_id,
+            {
+                "run_id": run_id,
+                "supplier_products": [
+                    {
+                        "seed_id": seed.seed_id,
+                        "offer_id": "559479796544",
+                        "title": "银色两用打孔钳",
+                        "attributes": {},
+                        "images": [supplier_image],
+                    }
+                ],
+            },
+        )
+        selections = {
+            "run_id": run_id,
+            "selections": {
+                seed.seed_id: {
+                    "supplier_offer_id": "559479796544",
+                    "supplier_sku": {
+                        "supplier_sku_id": "559479796544",
+                        "combination_key": "页面唯一 SKU",
+                        "raw_label": "页面唯一 SKU（无需选择规格）",
+                        "selected_options": {"规格": "页面唯一 SKU"},
+                        "set_quantity": 1,
+                        "set_composition": ["单件商品"],
+                        "image_urls": [supplier_image],
+                        "evidence_source": "dom_option_labels",
+                        "complete": True,
+                    },
+                }
+            },
+        }
+        self.repo.save_supplier_sku_selections(run_id, selections)
+        template_result = self.repo.load_attribute_template_result(run_id)
+        template_result["seed_templates"][0]["upload_attribute_schema"] = [
+            {
+                "attribute_id": "10096",
+                "attribute_label": "Цвет товара",
+                "is_required": False,
+                "dictionary_id": 100,
+                "allowed_values": ["Серебристый", "Черный"],
+            }
+        ]
+        self.repo.save_attribute_template_result(run_id, template_result)
+        evidence_ref = "supplier_selection.supplier_sku.image_urls.0"
+        base_field = {
+            "decision": "filled",
+            "value": "Серебристый",
+            "evidence_refs": [evidence_ref],
+            "reason": "На оригинальном фото выбранного SKU виден серебристый металл.",
+        }
+
+        invalid = self.post_json(
+            f"/api/batches/{run_id}/content-tasks/complete",
+            {
+                "seed_id": seed.seed_id,
+                "fields": {"10096": base_field},
+            },
+            ok=False,
+        )
+
+        self.assertTrue(
+            any("visual_analysis" in error for error in invalid["errors"]),
+            invalid,
+        )
+
+        field_specific_analysis = {
+            "result": "observed",
+            "confidence": "high",
+            "field_finding": (
+                "Рабочие части и корпус имеют серебристый "
+                "металлический цвет."
+            ),
+            "inspected_refs": [evidence_ref],
+            "observations": [
+                {
+                    "evidence_ref": evidence_ref,
+                    "finding": (
+                        "На полном изображении locked SKU виден "
+                        "серебристый металлический инструмент."
+                    ),
+                }
+            ],
+        }
+        missing_subject_scope = self.post_json(
+            f"/api/batches/{run_id}/content-tasks/complete",
+            {
+                "seed_id": seed.seed_id,
+                "fields": {
+                    "10096": {
+                        **base_field,
+                        "visual_analysis": field_specific_analysis,
+                    }
+                },
+            },
+            ok=False,
+        )
+        self.assertTrue(
+            any(
+                "subject_analysis" in error
+                for error in missing_subject_scope["errors"]
+            ),
+            missing_subject_scope,
+        )
+
+        subject_analysis = {
+            "primary_subject": "Двухфункциональный ручной пробойник",
+            "target_scope": "primary_product",
+            "basis_refs": [evidence_ref],
+            "excluded_elements": [
+                {
+                    "element": "Люверсы рядом с инструментом",
+                    "role": "accessory",
+                    "colors": ["Золотистый"],
+                }
+            ],
+            "subject_state": "single_color",
+            "subject_colors": ["Серебристый"],
+            "normalized_value": "Серебристый",
+        }
+        unresolved_observed_subject = self.post_json(
+            f"/api/batches/{run_id}/content-tasks/complete",
+            {
+                "seed_id": seed.seed_id,
+                "fields": {
+                    "10096": {
+                        "decision": "unresolved",
+                        "value": None,
+                        "evidence_refs": [evidence_ref],
+                        "reason": (
+                            "Серебристый корпус и золотистые аксессуары "
+                            "ошибочно сочтены конфликтом цвета."
+                        ),
+                        "resolution_class": "supplier_identity_missing",
+                        "visual_analysis": {
+                            **field_specific_analysis,
+                            "result": "ambiguous",
+                            "subject_analysis": subject_analysis,
+                        },
+                    }
+                },
+            },
+            ok=False,
+        )
+        self.assertTrue(
+            any(
+                "single_color" in error and "filled" in error
+                for error in unresolved_observed_subject["errors"]
+            ),
+            unresolved_observed_subject,
+        )
+
+        completed = self.post_json(
+            f"/api/batches/{run_id}/content-tasks/complete",
+            {
+                "seed_id": seed.seed_id,
+                "fields": {
+                    "10096": {
+                        **base_field,
+                        "visual_analysis": {
+                            **field_specific_analysis,
+                            "subject_analysis": subject_analysis,
+                        },
+                    }
+                },
+            },
+        )["data"]
+        saved = self.repo.load_generated_content_result(run_id)["items"][
+            seed.seed_id
+        ]["field_results"]["10096"]
+
+        self.assertEqual("completed", completed["status"])
+        self.assertEqual("observed", saved["visual_analysis"]["result"])
+        self.assertEqual(
+            "single_color",
+            saved["visual_analysis"]["subject_analysis"]["subject_state"],
         )
 
     def test_content_task_rejects_chinese_customer_facing_objective_text(
@@ -3475,6 +4234,431 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             attribute_id=85,
             value="белый",
         )
+
+    def test_upload_draft_omits_an_unresolved_optional_dictionary_value(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        template_result = self.repo.load_attribute_template_result(run_id)
+        required_field = template_result["seed_templates"][0][
+            "upload_attribute_schema"
+        ][0]
+        required_field["dictionary_id"] = 100
+        field = {
+            "attribute_id": "10096",
+            "attribute_label": "Цвет товара",
+            "is_required": False,
+            "dictionary_id": 101,
+        }
+        template_result["seed_templates"][0]["upload_attribute_schema"].append(field)
+        self.repo.save_attribute_template_result(run_id, template_result)
+        self.attach_completed_image_job(run_id, seed.seed_id)
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+        service = WorkbenchService(self.repo)
+        self.assertTrue(
+            service.confirm_pricing_evidence(
+                run_id,
+                self.pricing_input_payload(seed.seed_id),
+            ).ok
+        )
+
+        def resolve_dictionary(**kwargs):
+            if kwargs["attribute_id"] == 10096:
+                raise ValueError("no exact dictionary value")
+            return {"dictionary_value_id": 501, "value": kwargs["value"]}
+
+        with patch.object(
+            service.seller_api_adapter,
+            "resolve_attribute_dictionary_value",
+            side_effect=resolve_dictionary,
+        ):
+            result = service.build_upload_draft(run_id)
+
+        self.assertTrue(result.ok, result.to_dict())
+        item = result.data["items"][0]
+        self.assertNotIn(
+            field["attribute_id"],
+            {attribute["attribute_id"] for attribute in item["attributes"]},
+        )
+        self.assertEqual(
+            field["attribute_id"],
+            item["omitted_optional_dictionary_fields"][0]["field_key"],
+        )
+
+    def test_rich_content_is_serialized_to_the_ozon_widget_schema(self) -> None:
+        source = json.dumps(
+            {
+                "title": "Пробойник-щипцы для кожи",
+                "description": "Ручной инструмент для аккуратной работы с кожей.",
+                "blocks": [
+                    {
+                        "type": "facts",
+                        "heading": "Характеристики",
+                        "items": ["Длина: 210 мм", "Материал: сталь"],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        )
+
+        normalized = json.loads(_normalize_ozon_rich_content_value(source))
+
+        self.assertEqual(0.3, normalized["version"])
+        self.assertEqual("raTextBlock", normalized["content"][0]["widgetName"])
+        self.assertEqual("default", normalized["content"][0]["theme"])
+        text = normalized["content"][0]["blocks"][0]["text"]
+        self.assertIn("Пробойник-щипцы для кожи", text)
+        self.assertIn("Длина: 210 мм", text)
+
+    def test_upload_draft_uses_category_leaf_for_type_and_no_brand_for_supplier_name(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        ozon_result = self.repo.load_ozon_collection_result(run_id)
+        candidate = ozon_result["ozon_candidates"][0]
+        candidate["attributes"] = {
+            "Тип": "Инструмент для работы с кожей, мехом",
+            "Бренд": "梅芳",
+        }
+        self.repo.save_ozon_collection_result(run_id, ozon_result)
+        template_result = self.repo.load_attribute_template_result(run_id)
+        template = template_result["seed_templates"][0]
+        template["category_candidates"][0]["category_path"] = (
+            "Строительство и ремонт / Инструменты / Просекатель"
+        )
+        template["category_candidates"][0]["leaf_category"] = "Просекатель"
+        template["seller_attribute_template"]["matched_category_path"] = (
+            "Строительство и ремонт / Инструменты / Просекатель"
+        )
+        template["upload_attribute_schema"] = [
+            {
+                "attribute_id": "8229",
+                "attribute_label": "Тип",
+                "is_required": True,
+                "dictionary_id": 1960,
+            },
+            {
+                "attribute_id": "85",
+                "attribute_label": "Бренд",
+                "is_required": True,
+                "dictionary_id": 28732849,
+            },
+        ]
+        self.repo.save_attribute_template_result(run_id, template_result)
+        self.attach_completed_image_job(run_id, seed.seed_id)
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+        supplier_result = self.repo.load_supplier_collection_result(run_id)
+        supplier_result["supplier_products"][0]["attributes"]["品牌"] = "梅芳"
+        self.repo.save_supplier_collection_result(run_id, supplier_result)
+        service = WorkbenchService(self.repo, seller_api_adapter=FakeSellerApiAdapter())
+        self.assertTrue(
+            service.confirm_pricing_evidence(
+                run_id,
+                self.pricing_input_payload(seed.seed_id),
+            ).ok
+        )
+
+        result = service.build_upload_draft(run_id)
+
+        self.assertTrue(result.ok, result.to_dict())
+        attributes = {
+            item["attribute_id"]: item
+            for item in result.data["items"][0]["attributes"]
+        }
+        self.assertEqual("Просекатель", attributes["8229"]["value"])
+        self.assertEqual("Нет бренда", attributes["85"]["value"])
+
+    def test_upload_no_longer_waits_for_generated_images(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        self.attach_locked_subject_master(run_id, seed.seed_id)
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+        service = WorkbenchService(
+            self.repo,
+            seller_api_adapter=FakeSellerApiAdapter(),
+        )
+        self.assertTrue(
+            service.confirm_pricing_evidence(
+                run_id,
+                self.pricing_input_payload(seed.seed_id),
+            ).ok
+        )
+
+        item = service.upload_workspace(run_id).data["items"][0]
+
+        self.assertTrue(item["bootstrap_image_ready"])
+        self.assertFalse(item["generated_images_ready"])
+        self.assertNotIn("images", item["blocking_gates"])
+        self.assertTrue(item["ready_to_build"])
+
+    def test_product_upload_uses_one_locked_original_and_emits_one_task_package(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        ozon_result = self.repo.load_ozon_collection_result(run_id)
+        ozon_result["ozon_candidates"][0]["attributes"]["Цвет"] = "белый"
+        self.repo.save_ozon_collection_result(run_id, ozon_result)
+        subject = self.attach_locked_subject_master(run_id, seed.seed_id)
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+        adapter = FakeSellerApiAdapter()
+        publisher = FakePublicMediaPublisher()
+        service = WorkbenchService(
+            self.repo,
+            seller_api_adapter=adapter,
+            public_media_publisher=publisher,
+        )
+        self.assertTrue(
+            service.confirm_pricing_evidence(
+                run_id,
+                self.pricing_input_payload(seed.seed_id),
+            ).ok
+        )
+
+        with patch.dict(os.environ, {}, clear=False):
+            preview = service.preview_product_upload(run_id, seed.seed_id)
+            self.assertTrue(preview.ok, preview.to_dict())
+            self.assertEqual(seed.seed_id, preview.data["seed_id"])
+            self.assertEqual(
+                [subject["source_image_url"]],
+                preview.data["seller_api_item"]["images"],
+            )
+            self.assertEqual(
+                subject["source_image_url"],
+                preview.data["seller_api_item"]["primary_image"],
+            )
+            self.assertEqual([], adapter.imported_items)
+            self.assertEqual([], publisher.published_products)
+            self.assertEqual(
+                "CNY",
+                preview.data["seller_api_item"]["currency_code"],
+            )
+            self.assertEqual("55.9", preview.data["seller_api_item"]["price"])
+            self.assertEqual("69.9", preview.data["seller_api_item"]["old_price"])
+
+            rejected = service.submit_product_upload(
+                run_id,
+                seed.seed_id,
+                confirmation_token="wrong-token",
+            )
+            self.assertFalse(rejected.ok)
+            self.assertEqual([], adapter.imported_items)
+
+            submitted = service.submit_product_upload(
+                run_id,
+                seed.seed_id,
+                confirmation_token=preview.data["confirmation_token"],
+            )
+
+        self.assertTrue(submitted.ok, submitted.to_dict())
+        self.assertEqual(7001, submitted.data["task_id"])
+        package_path = self.context.runtime_root / "image_tasks" / "pending" / (
+            submitted.data["image_task_package_id"] + ".json"
+        )
+        self.assertEqual(
+            str(package_path),
+            submitted.data["image_task_package_path"],
+        )
+        package = json.loads(package_path.read_text(encoding="utf-8"))
+        self.assertEqual("pending", package["status"])
+        self.assertEqual(
+            7001,
+            package["store_target"]["seller_import_task_id"],
+        )
+        self.assertEqual(
+            subject["source_image_url"],
+            package["bootstrap_image"]["url"],
+        )
+        self.assertFalse(
+            package["generation_contract"]["return_to_workbench"],
+        )
+        self.assertEqual(1, len(adapter.imported_items))
+        self.assertEqual(
+            preview.data["seller_api_item"]["offer_id"],
+            adapter.imported_items[0]["offer_id"],
+        )
+        repeated = service.submit_product_upload(
+            run_id,
+            seed.seed_id,
+            confirmation_token=preview.data["confirmation_token"],
+        )
+        self.assertTrue(repeated.ok)
+        self.assertEqual(
+            submitted.data["image_task_package_id"],
+            repeated.data["image_task_package_id"],
+        )
+        self.assertEqual(
+            1,
+            len(
+                list(
+                    (self.context.runtime_root / "image_tasks" / "pending").glob(
+                        "*.json"
+                    )
+                )
+            ),
+        )
+        reloaded_item = service.upload_workspace(run_id).data["items"][0]
+        self.assertEqual(
+            preview.data["confirmation_token"],
+            reloaded_item["upload_preview"]["confirmation_token"],
+        )
+        self.assertEqual(7001, reloaded_item["upload_submission"]["task_id"])
+
+    def test_product_upload_ignores_legacy_generated_image_aspect_ratio(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        job = self.attach_completed_image_job(run_id, seed.seed_id)
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+        queue = ImageGenerationQueue(
+            self.context.runtime_root / "image_generation" / "ozon_image_jobs.sqlite3"
+        )
+        first_slot = queue.list_slots(job["job_id"])[0]
+        Image.new("RGB", (800, 800), "navy").save(first_slot["accepted_path"])
+        publisher = FakePublicMediaPublisher()
+        service = WorkbenchService(
+            self.repo,
+            seller_api_adapter=FakeSellerApiAdapter(),
+            public_media_publisher=publisher,
+        )
+        self.assertTrue(
+            service.confirm_pricing_evidence(
+                run_id,
+                self.pricing_input_payload(seed.seed_id),
+            ).ok
+        )
+        self.assertTrue(
+            service.configure_public_media_base_url(
+                "https://media.example.test"
+            ).ok
+        )
+
+        preview = service.preview_product_upload(run_id, seed.seed_id)
+
+        self.assertTrue(preview.ok, preview.to_dict())
+        self.assertEqual(
+            [f"https://cbu01.alicdn.com/img/ibank/{seed.seed_id}.jpg"],
+            preview.data["seller_api_item"]["images"],
+        )
+        self.assertEqual([], publisher.published_products)
+
+    def test_product_upload_does_not_call_public_media_publisher(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        ozon_result = self.repo.load_ozon_collection_result(run_id)
+        ozon_result["ozon_candidates"][0]["attributes"]["Цвет"] = "белый"
+        self.repo.save_ozon_collection_result(run_id, ozon_result)
+        self.attach_completed_image_job(run_id, seed.seed_id)
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+        adapter = FakeSellerApiAdapter()
+        publisher = FakePublicMediaPublisher()
+        publisher.failure = RuntimeError("public image returned HTTP 404")
+        service = WorkbenchService(
+            self.repo,
+            seller_api_adapter=adapter,
+            public_media_publisher=publisher,
+        )
+        self.assertTrue(
+            service.confirm_pricing_evidence(
+                run_id,
+                self.pricing_input_payload(seed.seed_id),
+            ).ok
+        )
+        self.assertTrue(
+            service.configure_public_media_base_url(
+                "https://media.example.test"
+            ).ok
+        )
+
+        preview = service.preview_product_upload(run_id, seed.seed_id)
+
+        self.assertTrue(preview.ok, preview.to_dict())
+        self.assertEqual([], publisher.published_products)
+        self.assertEqual([], adapter.imported_items)
+
+    def test_failed_ozon_submission_can_be_reprepared_and_retried(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        ozon_result = self.repo.load_ozon_collection_result(run_id)
+        ozon_result["ozon_candidates"][0]["attributes"]["Цвет"] = "белый"
+        self.repo.save_ozon_collection_result(run_id, ozon_result)
+        self.attach_completed_image_job(run_id, seed.seed_id)
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+        adapter = FakeSellerApiAdapter()
+        publisher = FakePublicMediaPublisher()
+        service = WorkbenchService(
+            self.repo,
+            seller_api_adapter=adapter,
+            public_media_publisher=publisher,
+        )
+        self.assertTrue(
+            service.confirm_pricing_evidence(
+                run_id,
+                self.pricing_input_payload(seed.seed_id),
+            ).ok
+        )
+        self.assertTrue(
+            service.configure_public_media_base_url(
+                "https://media.example.test"
+            ).ok
+        )
+        preview = service.preview_product_upload(run_id, seed.seed_id)
+        first = service.submit_product_upload(
+            run_id,
+            seed.seed_id,
+            confirmation_token=preview.data["confirmation_token"],
+        )
+        submissions = self.repo.load_upload_submissions(run_id)
+        submissions["items"][seed.seed_id]["status"] = "failed"
+        submissions["items"][seed.seed_id]["seller_api_status"] = {
+            "items": [
+                {
+                    "status": "failed",
+                    "errors": [
+                        {"code": "currency_differs_from_contract"}
+                    ],
+                }
+            ]
+        }
+        self.repo.save_upload_submissions(run_id, submissions)
+        adapter.import_task_id = 7002
+        second_preview = service.preview_product_upload(run_id, seed.seed_id)
+
+        retried = service.submit_product_upload(
+            run_id,
+            seed.seed_id,
+            confirmation_token=second_preview.data["confirmation_token"],
+        )
+
+        self.assertTrue(first.ok)
+        self.assertTrue(retried.ok, retried.to_dict())
+        self.assertEqual(7002, retried.data["task_id"])
+        self.assertEqual(2, len(adapter.imported_items))
+        self.assertEqual(1, len(retried.data["attempt_history"]))
+
+    def test_upload_page_exposes_per_product_preview_and_confirm_controls(self) -> None:
+        run_id, _seed = self.prepare_supplier_review_run()
+
+        page = self.get_text(f"/batches/{run_id}/upload")
+
+        self.assertIn("逐商品真实上传", page)
+        self.assertIn("previewProductUpload", page)
+        self.assertIn("confirmProductUpload", page)
+        self.assertIn("确认上传到 Ozon", page)
+        self.assertIn("预览单原图建品", page)
+        self.assertIn("Seller API 接受后立即输出图片生成与上传任务包", page)
+        self.assertNotIn('id="publicMediaBaseUrl"', page)
+        self.assertNotIn("/api/settings/public-media", page)
+        self.assertNotIn("图片门禁 (Image Gate)", page)
+        self.assertNotIn(f"/batches/{run_id}/images", page)
+        self.assertNotIn('id="buildDraft"', page)
+        self.assertIn("pollProductUploadStatus", page)
+
+    def test_public_media_base_url_rejects_localhost_and_persists_public_https(self) -> None:
+        service = WorkbenchService(self.repo)
+
+        rejected = service.configure_public_media_base_url(
+            "http://127.0.0.1:8765"
+        )
+        accepted = service.configure_public_media_base_url(
+            "https://media.example.test/ozon-v2"
+        )
+
+        self.assertFalse(rejected.ok)
+        self.assertTrue(accepted.ok, accepted.to_dict())
+        self.assertEqual(
+            "https://media.example.test/ozon-v2",
+            self.repo.load_public_media_settings()["base_url"],
+        )
+        self.assertTrue(service.public_media_configuration()["ready"])
 
     def test_refresh_attribute_template_replaces_only_the_mismatched_product(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
@@ -4308,10 +5492,10 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
                 {
                     "supplier_sku_id": "sku-black-1",
                     "combination_key": "black-1",
-                    "raw_label": "黑色 1 件",
-                    "selected_options": {"颜色": "黑色", "数量": "1"},
+                    "raw_label": "Черный, 1 шт.",
+                    "selected_options": {"颜色": "Черный", "数量": "1"},
                     "set_quantity": 1,
-                    "set_composition": ["黑色", "1 件"],
+                    "set_composition": ["Черный", "1 шт."],
                     "price": {"currency": "CNY", "amount": "12.80"},
                     "stock": {"status": "in_stock", "quantity": 100},
                     "image_urls": ["https://cbu01.alicdn.com/img/ibank/test.jpg"],
@@ -4322,7 +5506,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             ],
             "images": ["https://cbu01.alicdn.com/img/ibank/test.jpg"],
             "price": {"currency": "CNY", "visible_text": "¥12.80"},
-            "attributes": {"颜色": "黑色"},
+            "attributes": {"颜色": "Черный"},
             "domestic_shipping_evidence": {
                 "visible_text": "包邮",
                 "fee": 0,

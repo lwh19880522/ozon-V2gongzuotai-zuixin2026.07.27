@@ -53,7 +53,7 @@ function imageNode(url) {
 }
 
 const body = textNode(
-  "Test Supplier \u6709\u9650\u516c\u53f8 Test Product \u00a510.00 \u9001\u81f3 \u798f\u5efa\u6cc9\u5dde \u8fd0\u8d395\u5143",
+  "Test Supplier \u6709\u9650\u516c\u53f8 Test Product \u9001\u81f3 \u798f\u5efa\u6cc9\u5dde \u8fd0\u8d395\u5143",
 );
 const document = {
   title: "Test Product - 1688",
@@ -68,7 +68,7 @@ const document = {
       return textNode("Test Supplier \u6709\u9650\u516c\u53f8");
     }
     if (selector === "h1") return textNode("Test Product");
-    if (selector.includes("price") || selector.includes("Price")) return textNode("\u00a510.00");
+    if (selector.includes("price") || selector.includes("Price")) return null;
     if (selector.includes("logistics") || selector.includes("freight")) {
       return textNode("\u9001\u81f3 \u798f\u5efa\u6cc9\u5dde \u8fd0\u8d395\u5143");
     }
@@ -174,6 +174,7 @@ vm.runInContext(fs.readFileSync(scriptPath, "utf8"), context, { filename: script
   assert.equal(option.evidence_source, "single_sku_detail_page");
   assert.equal(option.evidence.no_visible_variant_selector, true);
   assert.equal(option.complete, true);
+  assert.equal(option.price.amount, "");
   process.stdout.write("supplier managed capture with single SKU fallback: OK\n");
 })().catch((error) => {
   console.error(error);

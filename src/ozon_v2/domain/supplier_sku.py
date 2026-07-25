@@ -55,14 +55,29 @@ class SupplierSkuOption:
         return asdict(self)
 
 
-def _documented_composition_quantity(values: list[str]) -> int | None:
+def documented_composition_quantity(values: list[str]) -> int | None:
     quantities: list[int] = []
     for value in values:
-        match = re.search(r"(?:x|×|\*)\s*(\d+)\b", value, flags=re.IGNORECASE)
-        if not match:
-            match = re.search(r"(\d+)\s*(?:支|件|个|只|套)", value)
-        if match:
-            quantities.append(int(match.group(1)))
+        multipliers = [
+            int(match)
+            for match in re.findall(
+                r"(?:x|×|\*)\s*(\d+)\b",
+                value,
+                flags=re.IGNORECASE,
+            )
+        ]
+        if multipliers:
+            quantities.append(sum(multipliers))
+            continue
+        documented_counts = [
+            int(match)
+            for match in re.findall(
+                r"(\d+)\s*(?:支|件|个|只|套|枚|片|瓶|包|组)",
+                value,
+            )
+        ]
+        if documented_counts:
+            quantities.append(sum(documented_counts))
     return sum(quantities) if quantities else None
 
 
@@ -80,13 +95,11 @@ def validate_supplier_sku_option(option: SupplierSkuOption) -> list[str]:
         errors.append("set_quantity must be at least 1")
     if not option.set_composition:
         errors.append("set_composition is required")
-    documented_quantity = _documented_composition_quantity(option.set_composition)
+    documented_quantity = documented_composition_quantity(option.set_composition)
     if documented_quantity is not None and documented_quantity != option.set_quantity:
         errors.append("set_composition quantity must match set_quantity")
     if option.set_quantity > 1 and documented_quantity is None:
         errors.append("set_composition must document the set quantity")
-    if not str(option.price.get("currency") or "").strip() or not str(option.price.get("amount") or "").strip():
-        errors.append("price currency and amount are required")
     if not str(option.stock.get("status") or "").strip():
         errors.append("stock status is required")
     if not option.image_urls:

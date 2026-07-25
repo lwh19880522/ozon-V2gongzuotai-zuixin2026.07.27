@@ -12,14 +12,17 @@ from ozon_v2.images.visual_design import VisualSpec, validate_visual_set, valida
 from ozon_v2.images.worker import (
     CURRENT_PROMPT_VERSION,
     LEGACY_PROMPT_VERSION,
+    PREVIOUS_PROMPT_VERSION,
     SlotResultReceipt,
+    VISUAL_PROMPT_VERSIONS,
     validate_output_diversity,
 )
 
 
 REGULAR_IMAGE_WORKER_IDS = tuple(
-    f"ozon-image-worker-{index:02d}" for index in range(1, 6)
+    f"ozon-image-worker-{index:02d}" for index in range(1, 11)
 )
+DEFAULT_IMAGE_LEASE_SECONDS = 1800
 REPAIR_ISSUE_CODES = frozenset(
     {
         "product_truth",
@@ -32,7 +35,7 @@ REPAIR_ISSUE_CODES = frozenset(
 )
 MAX_REVIEW_NOTE_LENGTH = 500
 HISTORICAL_PROMPT_VERSIONS = frozenset(
-    {"ozon-image-v1", LEGACY_PROMPT_VERSION}
+    {"ozon-image-v1", LEGACY_PROMPT_VERSION, PREVIOUS_PROMPT_VERSION}
 )
 
 SLOT_DEFINITIONS = (
@@ -83,6 +86,7 @@ class ImageGenerationQueue:
                     lease_expires REAL,
                     heartbeat_at REAL,
                     lease_epoch INTEGER NOT NULL DEFAULT 0,
+                    preferred_worker_id TEXT,
                     stop_reason TEXT,
                     stopped_by TEXT,
                     stopped_at REAL,
@@ -119,9 +123,22 @@ class ImageGenerationQueue:
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(job_id, slot_id) REFERENCES image_slots(job_id, slot_id) ON DELETE CASCADE
                 );
+
+                CREATE TABLE IF NOT EXISTS image_worker_slots (
+                    worker_id TEXT PRIMARY KEY,
+                    thread_id TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL,
+                    current_job_id TEXT,
+                    instruction_id TEXT,
+                    skill_sha256 TEXT,
+                    assigned_at REAL,
+                    updated_at REAL NOT NULL,
+                    FOREIGN KEY(current_job_id) REFERENCES image_jobs(job_id) ON DELETE SET NULL
+                );
                 """
             )
             self._ensure_lease_epoch_column(connection)
+            self._ensure_preferred_worker_column(connection)
             self._ensure_stop_metadata_columns(connection)
             self._ensure_repair_count_column(connection)
             self._ensure_review_feedback_columns(connection)
@@ -135,6 +152,16 @@ class ImageGenerationQueue:
             connection.execute(
                 "ALTER TABLE image_jobs "
                 "ADD COLUMN lease_epoch INTEGER NOT NULL DEFAULT 0"
+            )
+
+    @staticmethod
+    def _ensure_preferred_worker_column(connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(image_jobs)")
+        }
+        if "preferred_worker_id" not in columns:
+            connection.execute(
+                "ALTER TABLE image_jobs ADD COLUMN preferred_worker_id TEXT"
             )
 
     @staticmethod
@@ -246,6 +273,217 @@ class ImageGenerationQueue:
         with self._connect() as connection:
             row = connection.execute("SELECT COUNT(*) AS count FROM image_jobs").fetchone()
         return int(row["count"])
+
+    def register_worker_slot(
+        self,
+        worker_id: str,
+        thread_id: str,
+        *,
+        skill_sha256: str = "",
+        replace: bool = False,
+    ) -> dict[str, Any]:
+        worker_id = str(worker_id or "").strip()
+        thread_id = str(thread_id or "").strip()
+        skill_sha256 = str(skill_sha256 or "").strip()
+        if worker_id not in REGULAR_IMAGE_WORKER_IDS:
+            raise ValueError("worker_id must identify an approved regular image worker")
+        if not thread_id:
+            raise ValueError("thread_id is required")
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                "SELECT * FROM image_worker_slots WHERE worker_id = ?",
+                (worker_id,),
+            ).fetchone()
+            if current is not None and current["thread_id"] != thread_id and not replace:
+                connection.rollback()
+                raise ValueError(
+                    "the fixed worker slot already has a different thread_id; "
+                    "explicit replacement is required"
+                )
+            if current is None:
+                connection.execute(
+                    """
+                    INSERT INTO image_worker_slots (
+                        worker_id, thread_id, status, current_job_id,
+                        instruction_id, skill_sha256, assigned_at, updated_at
+                    ) VALUES (?, ?, 'idle', NULL, NULL, ?, NULL, ?)
+                    """,
+                    (worker_id, thread_id, skill_sha256 or None, now),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE image_worker_slots
+                    SET thread_id = ?,
+                        skill_sha256 = CASE
+                            WHEN ? = '' THEN skill_sha256
+                            ELSE ?
+                        END,
+                        updated_at = ?
+                    WHERE worker_id = ?
+                    """,
+                    (thread_id, skill_sha256, skill_sha256, now, worker_id),
+                )
+            row = connection.execute(
+                "SELECT * FROM image_worker_slots WHERE worker_id = ?",
+                (worker_id,),
+            ).fetchone()
+            connection.commit()
+        return dict(row)
+
+    def list_worker_slots(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM image_worker_slots ORDER BY worker_id"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    @staticmethod
+    def _release_finished_worker_slots(
+        connection: sqlite3.Connection,
+        *,
+        now: float,
+    ) -> None:
+        connection.execute(
+            """
+            UPDATE image_worker_slots
+            SET status = 'idle', current_job_id = NULL, instruction_id = NULL,
+                assigned_at = NULL, updated_at = ?
+            WHERE status = 'assigned'
+              AND (
+                    current_job_id IS NULL
+                    OR NOT EXISTS (
+                        SELECT 1
+                        FROM image_jobs
+                        WHERE image_jobs.job_id = image_worker_slots.current_job_id
+                          AND image_jobs.status IN ('pending', 'in_progress')
+                    )
+              )
+            """,
+            (now,),
+        )
+
+    def dispatch_assignments(
+        self,
+        *,
+        run_id: str | None = None,
+        limit: int = 10,
+        now_epoch: float | None = None,
+    ) -> list[dict[str, Any]]:
+        run_id = str(run_id or "").strip()
+        if limit <= 0 or limit > len(REGULAR_IMAGE_WORKER_IDS):
+            raise ValueError("limit must be between 1 and 10")
+        now = time.time() if now_epoch is None else float(now_epoch)
+        assignments: list[dict[str, Any]] = []
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._release_finished_worker_slots(connection, now=now)
+            idle_slots = connection.execute(
+                """
+                SELECT * FROM image_worker_slots
+                WHERE status = 'idle'
+                ORDER BY worker_id
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            for slot in idle_slots:
+                parameters: list[Any] = [now]
+                run_filter = ""
+                if run_id:
+                    run_filter = "AND jobs.run_id = ?"
+                    parameters.append(run_id)
+                job = connection.execute(
+                    f"""
+                    SELECT jobs.*
+                    FROM image_jobs AS jobs
+                    WHERE (
+                            jobs.status = 'pending'
+                            OR (
+                                jobs.status = 'in_progress'
+                                AND jobs.lease_expires < ?
+                            )
+                          )
+                      {run_filter}
+                      AND jobs.preferred_worker_id = ?
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM image_worker_slots AS occupied
+                          WHERE occupied.current_job_id = jobs.job_id
+                            AND occupied.status = 'assigned'
+                      )
+                    ORDER BY jobs.created_at, jobs.job_id
+                    LIMIT 1
+                    """,
+                    (*parameters, slot["worker_id"]),
+                ).fetchone()
+                if job is None:
+                    job = connection.execute(
+                        f"""
+                        SELECT jobs.*
+                        FROM image_jobs AS jobs
+                        WHERE (
+                                jobs.status = 'pending'
+                                OR (
+                                    jobs.status = 'in_progress'
+                                    AND jobs.lease_expires < ?
+                                )
+                              )
+                          {run_filter}
+                          AND jobs.preferred_worker_id IS NULL
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM image_worker_slots AS occupied
+                              WHERE occupied.current_job_id = jobs.job_id
+                                AND occupied.status = 'assigned'
+                          )
+                        ORDER BY jobs.created_at, jobs.job_id
+                        LIMIT 1
+                        """,
+                        tuple(parameters),
+                    ).fetchone()
+                if job is None:
+                    continue
+                instruction_id = "assign-" + stable_sha256(
+                    {
+                        "job_id": job["job_id"],
+                        "worker_id": slot["worker_id"],
+                        "job_updated_at": job["updated_at"],
+                    }
+                )[:20]
+                connection.execute(
+                    """
+                    UPDATE image_worker_slots
+                    SET status = 'assigned', current_job_id = ?,
+                        instruction_id = ?, assigned_at = ?, updated_at = ?
+                    WHERE worker_id = ? AND status = 'idle'
+                    """,
+                    (
+                        job["job_id"],
+                        instruction_id,
+                        now,
+                        now,
+                        slot["worker_id"],
+                    ),
+                )
+                assignments.append(
+                    {
+                        "worker_id": slot["worker_id"],
+                        "thread_id": slot["thread_id"],
+                        "run_id": job["run_id"],
+                        "job_id": job["job_id"],
+                        "product_id": job["product_id"],
+                        "instruction_id": instruction_id,
+                        "command": (
+                            f"RUN instruction_id={instruction_id} "
+                            f"job_id={job['job_id']} worker_id={slot['worker_id']}"
+                        ),
+                    }
+                )
+            connection.commit()
+        return assignments
 
     def list_slots(self, job_id: str) -> list[dict[str, Any]]:
         with self._connect() as connection:
@@ -436,7 +674,7 @@ class ImageGenerationQueue:
         worker_id: str,
         *,
         now_epoch: float | None = None,
-        lease_seconds: float = 120,
+        lease_seconds: float = DEFAULT_IMAGE_LEASE_SECONDS,
     ) -> dict[str, Any] | None:
         worker_id = worker_id.strip()
         if not worker_id:
@@ -451,8 +689,16 @@ class ImageGenerationQueue:
             row = connection.execute(
                 """
                 SELECT * FROM image_jobs
-                WHERE status = 'pending'
-                   OR (status = 'in_progress' AND lease_expires < ?)
+                WHERE (
+                        status = 'pending'
+                        OR (status = 'in_progress' AND lease_expires < ?)
+                      )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM image_worker_slots
+                      WHERE image_worker_slots.current_job_id = image_jobs.job_id
+                        AND image_worker_slots.status = 'assigned'
+                  )
                 ORDER BY created_at, job_id
                 LIMIT 1
                 """,
@@ -466,10 +712,18 @@ class ImageGenerationQueue:
                 UPDATE image_jobs
                 SET status = 'in_progress', worker_id = ?,
                     lease_expires = ?, heartbeat_at = ?, updated_at = ?,
-                    lease_epoch = lease_epoch + 1
+                    lease_epoch = lease_epoch + 1,
+                    preferred_worker_id = COALESCE(preferred_worker_id, ?)
                 WHERE job_id = ?
                 """,
-                (worker_id, now + lease_seconds, now, now, row["job_id"]),
+                (
+                    worker_id,
+                    now + lease_seconds,
+                    now,
+                    now,
+                    worker_id,
+                    row["job_id"],
+                ),
             )
             claimed = connection.execute(
                 "SELECT * FROM image_jobs WHERE job_id = ?",
@@ -478,6 +732,81 @@ class ImageGenerationQueue:
             connection.commit()
         return self._row(claimed)
 
+    def claim_assigned(
+        self,
+        worker_id: str,
+        job_id: str,
+        instruction_id: str,
+        *,
+        now_epoch: float | None = None,
+        lease_seconds: float = DEFAULT_IMAGE_LEASE_SECONDS,
+    ) -> dict[str, Any]:
+        worker_id = str(worker_id or "").strip()
+        job_id = str(job_id or "").strip()
+        instruction_id = str(instruction_id or "").strip()
+        if worker_id not in REGULAR_IMAGE_WORKER_IDS:
+            raise ValueError("worker_id must identify an approved regular image worker")
+        if not job_id or not instruction_id:
+            raise ValueError("job_id and instruction_id are required")
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        now = time.time() if now_epoch is None else float(now_epoch)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            slot = connection.execute(
+                "SELECT * FROM image_worker_slots WHERE worker_id = ?",
+                (worker_id,),
+            ).fetchone()
+            if (
+                slot is None
+                or slot["status"] != "assigned"
+                or slot["current_job_id"] != job_id
+                or slot["instruction_id"] != instruction_id
+            ):
+                connection.rollback()
+                raise ValueError(
+                    "job_id or instruction_id does not match the persisted assignment"
+                )
+            job = connection.execute(
+                "SELECT * FROM image_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if job is None:
+                connection.rollback()
+                raise ValueError("the assigned image job does not exist")
+            if (
+                job["status"] == "in_progress"
+                and job["worker_id"] == worker_id
+                and job["lease_expires"] is not None
+                and float(job["lease_expires"]) >= now
+            ):
+                connection.commit()
+                return dict(job)
+            if job["status"] != "pending" and not (
+                job["status"] == "in_progress"
+                and job["lease_expires"] is not None
+                and float(job["lease_expires"]) < now
+            ):
+                connection.rollback()
+                raise ValueError("the assigned image job is not claimable")
+            connection.execute(
+                """
+                UPDATE image_jobs
+                SET status = 'in_progress', worker_id = ?,
+                    lease_expires = ?, heartbeat_at = ?, updated_at = ?,
+                    lease_epoch = lease_epoch + 1,
+                    preferred_worker_id = COALESCE(preferred_worker_id, ?)
+                WHERE job_id = ?
+                """,
+                (worker_id, now + lease_seconds, now, now, worker_id, job_id),
+            )
+            claimed = connection.execute(
+                "SELECT * FROM image_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            connection.commit()
+        return dict(claimed)
+
     def heartbeat(
         self,
         job_id: str,
@@ -485,7 +814,7 @@ class ImageGenerationQueue:
         lease_epoch: int,
         *,
         now_epoch: float | None = None,
-        lease_seconds: float = 120,
+        lease_seconds: float = DEFAULT_IMAGE_LEASE_SECONDS,
     ) -> dict[str, Any]:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
@@ -572,7 +901,10 @@ class ImageGenerationQueue:
                     f"{CURRENT_PROMPT_VERSION}"
                 )
 
-            if receipt.accepted and receipt.prompt_version == CURRENT_PROMPT_VERSION:
+            if (
+                receipt.accepted
+                and receipt.prompt_version in VISUAL_PROMPT_VERSIONS
+            ):
                 try:
                     subject_master = SubjectMasterSelection.from_dict(
                         json.loads(job["subject_master_json"])
@@ -767,11 +1099,14 @@ class ImageGenerationQueue:
             if prompt_versions == {"ozon-image-v1"}:
                 connection.rollback()
                 raise ValueError("accepted slot receipt has an unknown prompt version")
-            if prompt_versions == {CURRENT_PROMPT_VERSION} or migration_allowed:
+            if (
+                len(prompt_versions) == 1
+                and prompt_versions <= VISUAL_PROMPT_VERSIONS
+            ) or migration_allowed:
                 specs: list[VisualSpec] = []
                 errors: list[str] = []
                 for stored, receipt in zip(accepted_receipts, receipts, strict=True):
-                    if receipt.prompt_version != CURRENT_PROMPT_VERSION:
+                    if receipt.prompt_version not in VISUAL_PROMPT_VERSIONS:
                         continue
                     try:
                         spec = VisualSpec.from_dict(receipt.validation["visual_spec"])
@@ -787,7 +1122,10 @@ class ImageGenerationQueue:
                 if errors:
                     connection.rollback()
                     raise ValueError("visual set validation failed: " + "; ".join(errors))
-            elif prompt_versions != {LEGACY_PROMPT_VERSION}:
+            elif prompt_versions not in (
+                {LEGACY_PROMPT_VERSION},
+                {PREVIOUS_PROMPT_VERSION},
+            ):
                 connection.rollback()
                 raise ValueError("accepted slot receipt has an unknown prompt version")
             connection.execute(
@@ -849,7 +1187,7 @@ class ImageGenerationQueue:
                 ):
                     connection.rollback()
                     raise ValueError("accepted slot does not match the frozen image contract")
-                if receipt.prompt_version == CURRENT_PROMPT_VERSION:
+                if receipt.prompt_version in VISUAL_PROMPT_VERSIONS:
                     try:
                         current_specs.append(
                             VisualSpec.from_dict(receipt.validation["visual_spec"])
@@ -878,6 +1216,15 @@ class ImageGenerationQueue:
                 """,
                 (now, job_id),
             )
+            connection.execute(
+                """
+                UPDATE image_worker_slots
+                SET status = 'idle', current_job_id = NULL, instruction_id = NULL,
+                    assigned_at = NULL, updated_at = ?
+                WHERE current_job_id = ?
+                """,
+                (now, job_id),
+            )
             updated = connection.execute(
                 "SELECT * FROM image_jobs WHERE job_id = ?", (job_id,)
             ).fetchone()
@@ -900,6 +1247,15 @@ class ImageGenerationQueue:
                 WHERE job_id = ? AND status NOT IN ('completed', 'failed')
                 """,
                 (reason, stopped_by, now, now, job_id),
+            )
+            connection.execute(
+                """
+                UPDATE image_worker_slots
+                SET status = 'idle', current_job_id = NULL, instruction_id = NULL,
+                    assigned_at = NULL, updated_at = ?
+                WHERE current_job_id = ?
+                """,
+                (now, job_id),
             )
 
     def stop_unstarted(self, job_id: str) -> bool:

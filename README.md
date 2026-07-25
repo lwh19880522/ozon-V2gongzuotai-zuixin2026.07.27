@@ -2,14 +2,19 @@
 
 本仓库包含 Ozon V2 工具台的完整可复现程序本体：本地工具台服务、浏览器扩展、MCP 控制器、采集与生图队列、Codex 技能、Windows 一键启动脚本、测试和设计文档。
 
+完整文档：
+
+- [详细安装说明](docs/INSTALLATION.md)
+- [完整使用流程](docs/USER_GUIDE.md)
+
 ## 一键启动 (One-click launch)
 
 运行环境：Windows、PowerShell 5.1+、Python 3.11+。
 
-首次在当前目录创建桌面入口：
+首次安装依赖、创建桌面入口并启动：
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\create_workbench_shortcut.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_ozon_v2.ps1
 ```
 
 之后双击桌面的“`Ozon V2 工具台`”即可启动服务并打开：
@@ -33,10 +38,11 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\workbench_cont
 
 ## 生图并发契约 (Image worker contract)
 
-- 可用生图身份为 `ozon_image_worker_01` 至 `ozon_image_worker_05`，分别映射队列 worker ID `ozon-image-worker-01` 至 `ozon-image-worker-05`。
-- 总控通过 `spawn_agent` 按待处理商品数和当前空闲并发位动态启用 0–5 个内部子智能体；可用几个就使用几个，只增补空位、不缩减现有池，不因少于 5 个而停止。
-- 常规生图最多使用 5 个子智能体；运行时提供第 6 个子智能体位置时，将其保留给失败恢复、诊断或人工介入。不得使用 `create_thread` 或创建用户可见的侧边栏任务。
-- 生图队列按整件商品原子领取，保留租约、续租、停止、恢复和结果回写边界。
+- 可用生图身份为 `ozon-image-worker-01` 至 `ozon-image-worker-10`，分别对应全局固定的 10 个用户可见 Codex 生图工作任务。
+- 总控按槽位顺序复用这 10 个任务；一个任务一次只处理一件商品，全局最多并发处理 10 件商品，总控本身不计入并发数。
+- 新商品、继续生图和返修都复用已有任务；返修优先回到原任务。只有用户明确要求“重新开新的任务”时，才允许替换指定槽位，替换后总数仍为 10。
+- 工作台用一张已锁定的 1688 原图完成建品，随后把无密钥任务包写入固定 `image_tasks/pending` 目录；图片页不再参与工作台流程。
+- 生图任务按整件商品原子领取，生成 8 张 3:4 图片后直接替换对应 Ozon 商品图库，结果只写入图片任务区，不回传工作台。
 
 ## 验证 (Verification)
 
