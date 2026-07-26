@@ -1,6 +1,6 @@
 {
   "name": "ozon-v2-ops-controller",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Ozon V2 controller for verified collection, intelligent field drafting, and evidence-locked image generation.",
   "author": {
     "name": "Ozon V2"
@@ -29,7 +29,7 @@
       "Write"
     ],
     "defaultPrompt": [
-      "启动 Ozon V2 工作台并检查本机运行环境。",
+      "完整安装 Ozon V2：只安装 Skill 不算完成；必须验证 http://127.0.0.1:8765/api/health 与桌面启动入口。",
       "使用 $ozon-intelligent-field-drafter 完成批次的证据约束字段草稿。",
       "使用 $ozon-image-generation-controller 处理已建商品的独立生图任务包。"
     ],

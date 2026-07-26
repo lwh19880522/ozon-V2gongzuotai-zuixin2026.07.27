@@ -148,7 +148,7 @@ def test_plugin_versions_workbench_and_both_skill_phases_as_one_product() -> Non
         (ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
     )
 
-    assert plugin["version"] == "0.4.0"
+    assert plugin["version"] == "0.4.1"
     assert "field-drafting" in plugin["keywords"]
     description = plugin["interface"]["longDescription"]
     prompts = "\n".join(plugin["interface"]["defaultPrompt"])

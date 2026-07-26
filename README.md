@@ -7,23 +7,39 @@
 - [详细安装说明](docs/INSTALLATION.md)
 - [完整使用流程](docs/USER_GUIDE.md)
 
-## 一键启动 (One-click launch)
+## 新电脑一键安装与启动
 
 运行环境：Windows、PowerShell 5.1+、Python 3.11+。
 
-首次安装依赖、创建桌面入口并启动：
+下载或克隆完整仓库后，直接双击仓库根目录的：
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_ozon_v2.ps1
+```text
+安装并启动 Ozon V2.cmd
 ```
 
-之后双击桌面的“`Ozon V2 工具台`”即可启动服务并打开：
+它会一次完成工作台依赖、3 个配套 Skill、桌面快捷方式、本地服务启动和真实健康检查，并自动打开：
 
 ```text
 http://127.0.0.1:8765/
 ```
 
+也可以在仓库根目录执行同一安装器：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_ozon_v2.ps1
+```
+
+之后双击桌面的“`Ozon V2 工具台`”或仓库根目录的“`启动 Ozon V2.cmd`”即可启动。
+
+> 只安装 Skill 或复制 `ozon-product-media-generator`、`ozon-intelligent-field-drafter`、`ozon-image-generation-controller` 这 3 个目录，不代表工作台安装完成。完整安装必须同时通过本地健康接口、桌面启动入口、运行依赖和 Skill 版本一致性检查。
+
 工具台右上角的一体化运行胶囊提供真实服务、Edge 扩展和当前任务状态，并支持快速重启、停止和诊断。
+
+严格检查完整安装：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify_ozon_v2_install.ps1
+```
 
 ## 生命周期控制 (Lifecycle control)
 
