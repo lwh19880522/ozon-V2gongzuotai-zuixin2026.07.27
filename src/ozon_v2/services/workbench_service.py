@@ -1671,11 +1671,17 @@ class WorkbenchService:
             bootstrap_image_url = (
                 subject_image_urls[0] if subject_image_urls else ""
             )
+            expected_subject_product_ids = {
+                seed_id,
+                str(candidate.get("ozon_product_id") or "").strip(),
+            }
+            expected_subject_product_ids.discard("")
             bootstrap_image_ready = bool(
                 bootstrap_image_url
                 and _is_public_https_url(bootstrap_image_url)
                 and str(subject_master.get("run_id") or "") == run_id
-                and str(subject_master.get("product_id") or "") == seed_id
+                and str(subject_master.get("product_id") or "")
+                in expected_subject_product_ids
                 and str(subject_master.get("subject_master_sha256") or "")
             )
             image_job_id = (

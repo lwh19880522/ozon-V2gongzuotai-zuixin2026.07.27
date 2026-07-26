@@ -4386,6 +4386,61 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertNotIn("images", item["blocking_gates"])
         self.assertTrue(item["ready_to_build"])
 
+    def test_upload_recognizes_subject_locked_through_real_supplier_sku_flow(
+        self,
+    ) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        supplier_product = self.supplier_product_payload(seed.seed_id)
+        self.repo.save_supplier_collection_result(
+            run_id,
+            {
+                "run_id": run_id,
+                "supplier_products": [supplier_product],
+            },
+        )
+        run = self.repo.load_run(run_id)
+        run["status"] = WorkbenchState.SUPPLIER_COLLECTED.value
+        self.repo.save_run(run)
+
+        def download_subject(_url, target):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"locked supplier subject")
+            return target
+
+        service = WorkbenchService(
+            self.repo,
+            supplier_image_downloader=download_subject,
+        )
+        selected = service.confirm_supplier_sku(
+            run_id,
+            seed_id=seed.seed_id,
+            supplier_sku_id="sku-black-1",
+        )
+        self.assertTrue(selected.ok, selected.to_dict())
+        self.assertEqual("ozon-1", selected.data["receipt"]["product_id"])
+        self.assertNotEqual(seed.seed_id, selected.data["receipt"]["product_id"])
+        confirmed = service.confirm_subject_master(
+            run_id,
+            seed_id=seed.seed_id,
+            source_image_urls=supplier_product["images"],
+            visible_subject_quantity=1,
+        )
+        self.assertTrue(confirmed.ok, confirmed.to_dict())
+
+        workspace = service.upload_workspace(run_id)
+        item = workspace.data["items"][0]
+
+        self.assertTrue(item["bootstrap_image_ready"])
+        self.assertEqual(
+            supplier_product["images"][0],
+            item["bootstrap_image_url"],
+        )
+        self.assertNotIn("bootstrap_image", item["blocking_gates"])
+        self.assertEqual(
+            1,
+            workspace.data["gates"]["bootstrap_image_ready_count"],
+        )
+
     def test_product_upload_uses_one_locked_original_and_emits_one_task_package(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
         ozon_result = self.repo.load_ozon_collection_result(run_id)
