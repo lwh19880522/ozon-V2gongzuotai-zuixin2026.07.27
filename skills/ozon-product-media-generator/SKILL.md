@@ -8,76 +8,156 @@ description: Use when a claimed Ozon V2 post-product task package needs resumabl
 ## Core contract
 
 Process one owned package from `image_tasks/in_progress`. Preserve the exact
-user-locked supplier SKU, every locked subject-evidence image, and its SHA-256.
-The workbench has already created the Ozon product with one locked 1688 original;
-this Skill generates the final gallery, a simple scrolling slideshow video and
-its cover, publishes them through the user-configured R2 channel, and uploads
-the media to the same Ozon product. New attempts use receipt prompt version `ozon-image-v6`; read
-`ozon-image-v2`, `ozon-image-v3`, `ozon-image-v4`, and `ozon-image-v5` only as historical receipt compatibility
-formats.
+user-locked 1688 SKU, selected quantity, set composition, subject evidence, and
+SHA-256 values. The workbench has already created the Ozon product with one
+locked 1688 original. This Skill generates eight final images, a scrolling
+slideshow video and cover, publishes them through the configured R2 channel,
+and uploads that media directly to the same Ozon product.
 
-The white-background subject is an intermediate identity anchor. It must never become one of the eight finished slots, and its plain white catalog background must not propagate into a finished image. The first attempt uses exactly four mandatory image-generation calls: one white subject, one 1x2 main grid, and two 1x3 supporting grids.
+New attempts use `ozon-image-v8`; versions v2-v7 are historical receipt
+compatibility only. The first attempt uses the fixed 2+3+3 structure and exactly
+four mandatory image-generation calls:
 
-Use `reference_mapping_version=ozon-reference-map-v1`. When enough valid Ozon product images exist, bind one `primary_ozon_reference` to every slot from `main_01` through `detail_06`. The reference-guided first-attempt visual bundle is one white identity anchor, eight slot-specific Ozon references, and the locked supplier evidence used for truth validation. The white anchor fixes the target product; each Ozon reference supplies only that slot's composition, camera, background, lighting, negative space, and information hierarchy. When valid Ozon references are absent or insufficient, switch the uncovered slots to `ozon_aesthetic_fallback`; missing references must not stop generation.
+1. one verified white-background subject anchor;
+2. one horizontal 1x2 grid for `main_01` and `main_02`;
+3. one horizontal 1x3 grid for `detail_01` through `detail_03`;
+4. one horizontal 1x3 grid for `detail_04` through `detail_06`.
 
-Use `imagegen` only for bitmap scenes. Use `scripts/ozon_image_worker.py` for
-deterministic crop, `render-visual`, and slot receipts. Use
-`scripts/ozon_image_task_inbox.py` for package ownership and the final public
-media plus direct Ozon gallery replacement.
+The white anchor is persistent and immutable. After it is verified, every
+finished-grid call and every scene-repair call must use the exact one-item array
+`referenced_image_paths=[<same verified white anchor path>]`. That file is
+Reference Image 1, the only image input, and the only product-identity source.
+Do not attach Reference Image 2, Ozon product images, supplier evidence images,
+unselected variants, previous generated scenes, or conversation images. Do not
+use `num_last_images_to_include`.
+
+Use `reference_mapping_version=none` and
+`guidance_mode=fixed_prompt_white_anchor`. The fixed commercial prompt and
+eight slot blueprints provide all composition, camera, scene, lighting,
+negative-space, information-hierarchy, and Russian-copy direction. Use
+`imagegen` only for bitmap scenes. Use `scripts/ozon_image_worker.py` for crop,
+local copy repair, checkpoints, and slot receipts. Use
+`scripts/ozon_image_task_inbox.py` for ownership, R2 publication, slideshow,
+and direct Ozon media upload.
 
 ## Worker flow
 
-Identity validation always includes the exact set quantity and set composition.
-
-1. Run only inside one of the controller's ten fixed user-visible Codex work tasks: `ozon-image-worker-01`, `ozon-image-worker-02`, `ozon-image-worker-03`, `ozon-image-worker-04`, `ozon-image-worker-05`, `ozon-image-worker-06`, `ozon-image-worker-07`, `ozon-image-worker-08`, `ozon-image-worker-09`, and `ozon-image-worker-10`. Accept only `RUN package_id=<id> worker_id=<id>`. One task processes one package at a time. Do not create another task; after completion, remain available for reuse.
-2. Load exactly that package from `image_tasks/in_progress` with `scripts/ozon_image_task_inbox.py`. Verify that `assignment.worker_id`, `package_id`, `status=in_progress`, `generation_contract.slot_count=8`, `aspect_ratio=3:4`, `direct_ozon_upload=true`, `r2_preflight_required=true`, `video.required=true`, `video_cover.required=true`, and `return_to_workbench=false` all match. If any value differs, make no package state change and report the mismatch.
-R2 precondition. Before any image-generation call, and therefore before any image-generation call can consume quota, run `scripts/ozon_image_task_inbox.py --runtime-root <runtime> media-preflight`. This is a hard precondition: the user must first provide and save a public R2 channel address and accessible bucket. When the user provides a new address, save `{"base_url":"https://..."}` through the local workbench `/api/settings/public-media` endpoint before preflight; do not invent or infer an address. If the preflight fails, call `release --package <id> --worker <id> --reason public_media_channel_required`, generate nothing, upload nothing, and tell the user to configure the public R2 channel. Never consume image-generation work before this succeeds.
-3. Read the package's locked `subject_master`, selection hash, exact set quantity and composition, all locked subject evidence images, and ordered Ozon references. Verify every local 1688 evidence path and SHA-256 before generation. Run `materialize-references` before using any Ozon gallery URL: upgrade thumbnail URLs, decode the pixels, reject any image whose shorter edge is below 512 pixels, and pixel-deduplicate it. A manifest with too few valid references is a composition-guidance warning, not a product-truth failure: continue in `ozon_aesthetic_fallback`.
-4. Read [prompt-contract.md](references/prompt-contract.md). Load [white-subject-prompt.txt](assets/white-subject-prompt.txt), [ozon-commercial-infographic-core-prompt.txt](assets/ozon-commercial-infographic-core-prompt.txt), [main-grid-prompt.txt](assets/main-grid-prompt.txt), [detail-grid-a-prompt.txt](assets/detail-grid-a-prompt.txt), [detail-grid-b-prompt.txt](assets/detail-grid-b-prompt.txt), and [repair-slot-prompt.txt](assets/repair-slot-prompt.txt) byte-for-byte. The shared commercial-infographic core is fixed; prepend it byte-for-byte to each finished-grid or scene-repair wrapper, but never prepend it to the white-anchor call.
-5. From locked 1688 evidence, generate one reusable clean white-background subject and verify it. The user-confirmed locked 1688 SKU and subject evidence are authoritative for identity, color, selected variant, visible sales unit, and set composition; Ozon evidence and unselected supplier variants never create a conflict. If stale numeric metadata mistakes an age, size, or model number for quantity but the selected 1688 SKU images and option label consistently prove the sales unit, record a `locked_metadata_normalization` warning and follow the selected 1688 evidence instead of stopping. Stop only when the locked selected-SKU 1688 evidence itself is missing or internally contradictory. Record the anchor path and SHA-256.
-6. Read usable Ozon references only from `reference_manifest.json`. Exclude a reference only when the materializer or pixel inspection proves that it cannot load, is pixel-identical to an earlier reference, is not product media, or has no legible composition. Classify every accepted reference by its reference-layout archetype: hero, lifestyle, functional infographic, annotated feature, instructional steps, material close-up, dimension or fit, comparison, or set contents. Map each slot to the best distinct archetype for its buyer question instead of blindly following gallery order. A reference-guided slot must reproduce the mapped reference's layout grammar—subject scale and placement, crop, camera, visible proof, foreground/background relationship, title alignment, information density, annotation geometry, and negative-space balance—not merely its background. Reuse a reference only when fewer than eight valid references exist. Any uncovered slot uses an explicit missing archetype in `ozon_aesthetic_fallback`, not a stop gate.
-7. Before generation, write one composition blueprint per slot with optional `reference_path` and `reference_sha256`, plus `guidance_mode`, `reference_layout_archetype`, `core_theme`, `subject_position`, `subject_scale`, `camera_family`, `shot_scale`, `background_family`, `lighting_family`, `negative_space`, `copy_zone`, `headline_alignment`, `annotation_style`, `copy_mode=imagegen_integrated`, one exact verified 3-7-word Russian `headline`, one exact verified Russian `subtitle` of at most 14 words, and 2-4 exact verified Russian `functional_labels`. Every fact cites locked evidence and every number is copied exactly from verified data. The fixed storyboard is: `main_01` core selling point infographic; `main_02` real-use value overview; `detail_01` real-use demonstration; `detail_02` annotated feature or mechanism; `detail_03` material/structure close-up; `detail_04` instructional or result scene; `detail_05` dimension, fit, comparison, target user, or scale; `detail_06` set contents, care, storage, or remaining buyer question. all eight finished panels contain natural integrated Russian copy. Fallback blueprints use polished Ozon marketplace aesthetics and the same structural diversity. Across eight slots use at least six reference-layout archetypes; a background swap or camera-angle-only change is not diversity.
-8. Make exactly four mandatory image-generation calls for the first attempt: one white subject, one 1x2 main grid, and two 1x3 supporting grids. This is the fixed 2+3+3 finished-image structure. Every finished slot is exactly 3:4 portrait. Therefore request the whole 1x2 grid at 3:2 and each whole 1x3 grid at 9:4; never request a square grid or square panel. The white-anchor call uses only `white-subject-prompt.txt`. For each of the other three calls, prepend `ozon-commercial-infographic-core-prompt.txt` byte-for-byte to the matching grid wrapper, then append the white anchor, each panel's mapped Ozon reference when available, and that panel's exact verified Russian headline, subtitle, and 2-4 functional labels in panel order. Generate the natural Russian labels during the first scene-generation call as part of the composition; never make a second image-generation call merely to add Russian labels. Label the mapping explicitly so references and copy never bleed across panels. The white subject transfers identity and geometry only; locked supplier evidence remains final truth. Send a 30-minute heartbeat immediately before every blocking image-generation call. Run `checkpoint-asset` immediately after each image-generation call; for grids this command must crop the panels at once and atomically record their paths, dimensions, and hashes.
-9. Crop the main grid with `crop-grid --layout 1x2` into `main_01` and `main_02`. Crop each supporting grid with `crop-grid --layout 1x3` into `detail_01` through `detail_06`. The deterministic crop rejects panels outside the near-3:4 input tolerance and normalizes only a small framing deviation to exact 3:4. Freeze an accepted slot immediately.
-10. After crop and any conservative upscale, inspect the Russian copy already integrated into each generated scene and merge its measured safe-area/mobile-readability validation into the slot receipt. Do not run a second scene-generation pass for typography. `render-visual` is a repair-only tool for correcting a spelling or safe-area defect on the existing bitmap without regenerating its scene.
-11. Inspect pixels against locked 1688 evidence, the slot's blueprint, any mapped Ozon reference, and accepted slots. Confirm the locked product remains exact. In reference-guided mode verify both `reference_composition_followed` and `reference_layout_followed`: the result must retain the mapped reference's subject scale, visual proof, information archetype, title alignment, and annotation geometry; matching only its color or background fails. In fallback mode it must satisfy the declared Ozon-aesthetic blueprint. Reject an output that copies a reference product, exact text, brand, watermark, price, unsupported accessory, or unsupported function. All eight finished slots must already contain their supplied verified Russian headline, subtitle, and 2-4 functional labels from the first scene-generation call. Each fact cites a locked supplier SHA-256, and a number requires `numeric_verified=true`. Use natural Russian sentence case except for standard abbreviations. The headline is part of the composition, contains 3-7 Russian words, and is at least 7 percent of panel height in the 360-pixel preview; the subtitle contains at most 14 Russian words, and supporting copy remains at least 16 pixels. Each panel has at most four explanation zones. Match the reference's information style—editorial headline, annotated feature, steps, dimension diagram, comparison, or set layout—without forcing a uniform edge-gradient template. Reject tiny floating labels, text crossing the subject, weak contrast, or the same label layout repeated across the gallery.
-12. A copy-only failure repairs only the existing bitmap with local deterministic typography and never consumes an image-generation attempt. Repair only a scene or product-truth failure with one replacement image for that failed slot; that replacement generation must include the exact Russian copy in the same call, preserve its buyer question and original `primary_ozon_reference`, and use [repair-slot-prompt.txt](assets/repair-slot-prompt.txt). Change the reference only when the user explicitly requests it. Allow at most two scene repairs per slot.
-13. At claim or resume, run `checkpoint-status` and reuse every hash-verified checkpoint instead of making a duplicate image-generation call. Renew the package heartbeat before each long generation call and after each returned result. A stale ownership record must stop immediately without writing. When all eight slots are accepted, use `view_image` on all eight accepted_path files. raw imagegen grids are never the final preview. Confirm that all eight accepted images visibly contain their first-pass Russian headline, subtitle, and functional labels.
-14. Run `scripts/ozon_image_task_inbox.py ... build-slideshow` with the same eight accepted files in slot order and a product-local output directory. It must create `slideshow.mp4`, a simple smooth horizontal scrolling playback of all eight accepted images, and `video_cover.jpg`, an exact 3:4 cover derived locally from `main_01`. This step makes no additional image-generation call.
-15. Invoke `scripts/ozon_image_task_inbox.py ... upload-gallery` with the eight accepted local files, `--video <.../slideshow.mp4>`, and `--video-cover <.../video_cover.jpg>`. The command rechecks the R2 preflight, validates exact 3:4 images and cover, publishes all ten media files, resolves all eight ordered public image URLs, calls `replace_product_pictures` for direct Ozon gallery replacement, and submits the video URL through the product's Seller API video template fields. Mark the package complete only after both Ozon submissions are accepted. Ozon may still moderate the video asynchronously. Never return generated files to the workbench and never wait for a workbench callback.
+1. Run only inside one of the controller's ten fixed reusable tasks
+   `ozon-image-worker-01` through `ozon-image-worker-10`. Accept only
+   `RUN package_id=<id> worker_id=<id>`. One task processes one package at a
+   time and remains available for reuse. Never create another task.
+2. Load exactly that package from `image_tasks/in_progress`. Require
+   `schema_version=2`, an active matching assignment, `status=in_progress`,
+   `slot_count=8`, `aspect_ratio=3:4`, `direct_ozon_upload=true`,
+   `return_to_workbench=false`, `r2_preflight_required=true`,
+   `video.required=true`, and `video_cover.required=true`.
+3. Require the package identity contract to contain:
+   `required=true`, `source=generated_white_anchor`, `reference_index=1`,
+   `reference_count=1`, `additional_image_references_allowed=false`,
+   `reuse_for_all_finished_calls=true`, `reuse_for_repairs=true`,
+   `product_identity_source=white_anchor_only`, and
+   `composition_source=fixed_skill_prompt_only`. A mismatch makes no package
+   state change.
+4. Before any image-generation call, run
+   `scripts/ozon_image_task_inbox.py --runtime-root <runtime> media-preflight`.
+   The user must provide and save the public R2 base URL. Never invent it. If
+   preflight fails, release the package with
+   `public_media_channel_required`; generate and upload nothing.
+5. Verify the package's locked `subject_master`, selection hash, exact sales
+   unit, exact set quantity and composition, every local 1688 evidence path,
+   and every SHA-256. The package intentionally contains no Ozon
+   reference-image list. Do not fetch or materialize Ozon gallery images.
+6. Read [prompt-contract.md](references/prompt-contract.md). Load
+   [white-subject-prompt.txt](assets/white-subject-prompt.txt),
+   [ozon-commercial-infographic-core-prompt.txt](assets/ozon-commercial-infographic-core-prompt.txt),
+   [main-grid-prompt.txt](assets/main-grid-prompt.txt),
+   [detail-grid-a-prompt.txt](assets/detail-grid-a-prompt.txt),
+   [detail-grid-b-prompt.txt](assets/detail-grid-b-prompt.txt), and
+   [repair-slot-prompt.txt](assets/repair-slot-prompt.txt) byte-for-byte.
+   Prepend the shared core byte-for-byte to finished-grid and scene-repair
+   wrappers, never to the white-anchor call.
+7. Use all locked subject evidence images to generate one reusable clean white-background subject
+   from the selected 1688 SKU. Preserve the exact set quantity and set composition.
+   If its hash-verified checkpoint exists, reuse
+   it. Stop only when the locked selected-SKU evidence itself is missing or
+   internally contradictory. Freeze the anchor path and SHA-256 for the whole
+   package.
+8. Write one prompt-only blueprint per slot with
+   `guidance_mode=fixed_prompt_white_anchor`,
+   `reference_mapping_version=none`, a supported `layout_archetype`,
+   `core_theme`, `subject_position`, `subject_scale`, `camera_family`,
+   `shot_scale`, `background_family`, `lighting_family`, `negative_space`,
+   `copy_zone`, `headline_alignment`, `annotation_style`,
+   `copy_mode=imagegen_integrated`, one verified 3-7-word Russian headline,
+   one verified Russian subtitle of at most 14 words, and 2-4 verified Russian
+   functional labels. Ozon reference fields and reference-slot fields are
+   null; `reference_reused=false`.
+9. Use the fixed storyboard: `main_01` core selling point; `main_02` real-use
+   value; `detail_01` real-use demonstration; `detail_02` feature or mechanism;
+   `detail_03` material or structure; `detail_04` instruction or result;
+   `detail_05` dimension, fit, target user, or scale; `detail_06` set contents,
+   care, storage, or another proved buyer question. Use at least six layout
+   archetypes across the gallery; changing only background or angle is invalid.
+10. Make the four mandatory calls. Request the 1x2 grid at 3:2 and each 1x3
+    grid at 9:4 so every cropped panel is 3:4. Every finished call uses only
+    `referenced_image_paths=[<same frozen anchor>]`. Include each panel's exact
+    verified Russian copy in the first scene-generation prompt. Never consume a
+    second image-generation call merely to add labels. If a scene would change
+    the anchor shape, simplify the scene.
+11. Heartbeat immediately before each blocking generation call. Immediately
+    checkpoint every result; crop grids atomically with `crop-grid --layout
+    1x2` or `1x3`. Reuse every hash-verified checkpoint on resume.
+12. Inspect every cropped panel against locked 1688 truth, the frozen anchor,
+    its prompt-only blueprint, and accepted slots. Reject changed identity,
+    silhouette, geometry, quantity, parts, color, material appearance,
+    selected variant, unsupported facts, unreadable Russian copy, wrong 3:4
+    ratio, plain white catalog treatment, or duplicate scene structure.
+13. A copy-only defect uses local deterministic `render-visual`; it never
+    consumes another scene-generation call. A scene or product-truth repair
+    may regenerate only the failed slot, again using the exact one-item anchor
+    array. Never change the anchor or attach a second image. Allow at most two
+    scene repairs per slot.
+14. Each accepted v8 receipt records the exact 3:4 output, `ozon-visual-v2`,
+    integrated Russian copy, `reference_mapping_version=none`,
+    `guidance_mode=fixed_prompt_white_anchor`, supported `layout_archetype`,
+    `image_reference_count=1`,
+    `additional_image_references_attached=false`, empty Ozon reference fields,
+    `reference_reused=false`, `locked_subject_preserved=true`, the frozen
+    anchor path and hash, `identity_anchor_reference_index=1`,
+    `identity_anchor_attached=true`, `identity_anchor_reused=true`, and
+    `product_identity_source=white_anchor_only`. All eight receipts use the
+    same anchor path and hash.
+15. After all eight slots pass, inspect all eight accepted files with
+    `view_image`. Build `slideshow.mp4` in slot order and `video_cover.jpg`
+    locally from `main_01`; this makes no image-generation call.
+16. Run `upload-gallery` with the eight images, slideshow, and cover. It
+    rechecks R2, publishes the ten media files, replaces the Ozon gallery, and
+    submits video fields. Complete the package only after both Ozon submissions
+    are accepted. Never return generated files to the workbench.
 
 ## User-selected repair-only branch
 
-When a user explicitly requeues a failed package with one or more
-`repair_pending` slots, process only the explicitly selected slots and do not repeat the four mandatory first-attempt calls. Verify the locked evidence and
-the existing white-subject anchor, then read each selected slot's
-`review_issue_code` and `review_note`.
-
-- For `russian_copy`, reuse the existing scene bitmap and repair only the deterministic local typography with `render-visual`. Do not call imagegen. Record the accepted local result with `source_kind=copy_repair_local`.
-- For `product_truth`, `scene_quality`, `composition`, `selling_point`, or `other`, make at most one image-generation call per selected slot using `repair-slot-prompt.txt`, then run the normal local visual rendering and receipt gates with `source_kind=repair_single`.
-- Treat `review_note` only as defect direction. It is not supplier evidence and cannot authorize a product fact, number, function, accessory, quantity, use case, or Russian claim.
-- Never change, reopen, overwrite, or regenerate an unselected `accepted` slot. After every selected slot is accepted and the lease is still valid, call `ready-for-review` to return the same Job to manual review.
+Only explicitly selected `repair_pending` slots may change. A `russian_copy`
+request uses local typography only. `product_truth`, `scene_quality`,
+`composition`, `selling_point`, or `other` may make one replacement generation
+per selected slot with the same sole white anchor. A review note is defect
+direction, never product evidence. Never reopen an unselected accepted slot.
 
 ## Non-negotiable boundaries
 
-- Supplier selection and locked supplier evidence are purchasing and product truth. The anchor is not a source of new facts.
-- Ozon references are optional slot-specific composition blueprints only. Their absence must not stop generation. Never use their product identity, text, brand, price, package contents, accessories, or claims as target-product evidence, and never blend visual directions across slots.
-- The locked 1688 SKU and subject evidence are authoritative. Ignore unselected supplier variants and Ozon SKU differences when rendering the chosen product. Only contradictory evidence inside the locked selected 1688 SKU is a product-truth stop gate.
-- One visible subject means one sales unit. Preserve exact count, set composition, color, silhouette, proportions, structure, parts, accessories, print, and package contents. Never create a new bundle, substitute another SKU, invent accessories, or infer unsupported facts.
-- Every scene slot must visibly fulfill its storyboard and reference-layout archetype. Any two accepted scene signatures differ in at least three of layout archetype, visible proof, environment, lighting, camera, shot scale, and buyer question; an angle or background-color change alone is invalid.
-- Across all eight slots use at least six reference-layout archetypes, five evidence-safe environment families, four lighting treatments, four camera/composition families, and three shot scales. One environment family or information template may appear at most twice. The final queue gate rejects pixel-identical, structurally near-duplicate, and visually near-duplicate outputs even when their written scene labels differ.
-- Use this commercial storyboard: `main_01` core selling point infographic; `main_02` real-use value overview; `detail_01` use result; `detail_02` mechanism or key structure; `detail_03` material/build detail; `detail_04` a second evidence-safe use context; `detail_05` scale, fit, target user, or compatibility; `detail_06` set contents, care, storage, or another evidence-backed buyer question. If evidence cannot support a listed role, substitute a different provable buyer question rather than inventing a claim.
-- Except for the exact supplied verified Russian headline/detail, the model must not render extra text, numbers, icons, logos, badges, watermarks, prices, discounts, panel labels, or collage borders. Russian copy is generated with the scene on the first pass; it is not a separate image-generation stage.
-- Every accepted finished bitmap is exact 3:4 portrait at the pixel level. A square, landscape, or other aspect ratio is a hard failure and must never reach review, public media, or Ozon upload.
-- Copy must follow the mapped reference's information design instead of a fixed overlay system. Editorial headlines, instructional steps, dimension lines, feature callouts, comparisons, and small evidence-safe pictograms are allowed when their facts are verified. Detached generic text cards, tiny floating labels, text crossing the product, weak contrast, and one repeated edge-gradient template are forbidden. Reject copy that is not comfortably readable in a 360-pixel preview.
-- Reject every finished slot that is a plain or near-white product-only catalog view, copies the anchor background, lacks visible proof, or duplicates an accepted scene. Copy never substitutes for visual proof.
-- An accepted v6 receipt names its `slot_role`, contains an `ozon-visual-v2` `visual_spec`, proves an exact 3:4 output, records `copy_mode=imagegen_integrated`, the exact Russian headline, subtitle, 2-4 functional labels, `reference_mapping_version=ozon-reference-map-v1`, `guidance_mode`, `reference_layout_archetype`, `reference_layout_followed`, optional primary-reference fields, and `locked_subject_preserved`, and sets `visual_design_passed`, `russian_copy_passed`, `safe_area_passed`, and `mobile_readability_passed` to true, along with the marketing-scene flags in the prompt contract. When `guidance_mode=reference_guided`, the reference path must be a decoded local file of at least 512 pixels on its shorter edge and its live hash must equal the receipt hash. When `guidance_mode=ozon_aesthetic_fallback`, the primary-reference fields are null and `reference_composition_followed` is not required. Never assert a flag without inspecting the pixels.
-- Do not overwrite an accepted slot or continue after stop, lease loss, subject-evidence mismatch, generated-subject mismatch, or receipt failure. Do not report progress unless a real claim, file, crop, receipt, or accepted slot exists.
-- Upload only the complete ordered eight-image gallery, slideshow video, and
-  video cover for the package's resolved Ozon product. Never edit business
-  attributes, price, inventory, or final approval; only the category template's
-  Ozon video media URL fields may be added by this Skill.
-- Store generation, video-build, R2-publication, Ozon picture-import, and Ozon video-import receipts under
-  `image_tasks`; never return generated files to the workbench.
+- Locked selected 1688 SKU evidence is purchasing and product truth. The white
+  anchor is a derived identity image, not a source of new facts.
+- Ozon reference images are not inputs. Do not fetch, inspect, materialize, or
+  attach them.
+- Preserve exact sales unit, count, set composition, color, silhouette,
+  proportions, structure, parts, accessories, print, and package contents.
+- All finished images are exact 3:4 portrait, visually distinct, commercial
+  scenes or infographics with first-pass natural Russian copy.
+- Do not overwrite an accepted slot or continue after lease loss, evidence
+  mismatch, anchor mismatch, or receipt failure.
+- Upload only the complete eight-image gallery, slideshow video, and cover for
+  the resolved Ozon product. Never edit price, inventory, business attributes,
+  or final approval.
 
-Append only task identity and verified values allowed by the prompt contract. Do not rewrite fixed prompt bodies.
+Append only task identity and verified values allowed by the prompt contract.
+Do not rewrite fixed prompt bodies.

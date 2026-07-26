@@ -3241,7 +3241,7 @@ class WorkbenchService:
         subject_master = image_task_context.get("subject_master") or {}
         bootstrap_image = preview.get("bootstrap_image") or {}
         package = {
-            "schema_version": 1,
+            "schema_version": 2,
             "kind": "ozon_product_image_generation_and_upload",
             "package_id": package_id,
             "status": "pending",
@@ -3273,6 +3273,17 @@ class WorkbenchService:
                 "replace_complete_gallery": True,
                 "return_to_workbench": False,
                 "r2_preflight_required": True,
+                "identity_reference": {
+                    "required": True,
+                    "source": "generated_white_anchor",
+                    "reference_index": 1,
+                    "reference_count": 1,
+                    "additional_image_references_allowed": False,
+                    "reuse_for_all_finished_calls": True,
+                    "reuse_for_repairs": True,
+                    "product_identity_source": "white_anchor_only",
+                    "composition_source": "fixed_skill_prompt_only",
+                },
                 "video": {
                     "required": True,
                     "source": "eight_accepted_images",
@@ -3292,10 +3303,6 @@ class WorkbenchService:
                     "locked_supplier_sku"
                 )
                 or {},
-                "ozon_reference_images": image_task_context.get(
-                    "ozon_reference_images"
-                )
-                or [],
             },
         }
         path = self.repo.save_image_task_package(package_id, package)

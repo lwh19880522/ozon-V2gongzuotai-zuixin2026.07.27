@@ -19,6 +19,7 @@ from ozon_v2.images.worker import (
     SlotResultReceipt,
     crop_grid,
     file_sha256,
+    validate_identity_anchor_consistency,
     validate_reference_layout_diversity,
 )
 from ozon_v2.images.visual_design import (
@@ -98,9 +99,49 @@ def _slot_receipt(
             "copy_not_used_as_visual_evidence": accepted,
         }
     )
-    if accepted and prompt_version == CURRENT_PROMPT_VERSION:
+    if accepted and prompt_version in {"ozon-image-v7", CURRENT_PROMPT_VERSION}:
         normalized_validation.setdefault("visual_source_sha256", file_sha256(source_path))
         normalized_validation.setdefault("visual_output_sha256", file_sha256(output_path))
+        subject_master = SubjectMasterSelection.from_dict(
+            json.loads(job["subject_master_json"])
+        )
+        identity_anchor_path = Path(subject_master.source_path)
+        normalized_validation.setdefault(
+            "identity_anchor_path", str(identity_anchor_path.resolve())
+        )
+        normalized_validation.setdefault(
+            "identity_anchor_sha256", file_sha256(identity_anchor_path)
+        )
+        normalized_validation.setdefault("identity_anchor_reference_index", 1)
+        normalized_validation.setdefault("identity_anchor_attached", True)
+        normalized_validation.setdefault("identity_anchor_reused", True)
+        normalized_validation.setdefault(
+            "product_identity_source", "white_anchor_only"
+        )
+    if accepted and prompt_version == CURRENT_PROMPT_VERSION:
+        normalized_validation.setdefault("reference_mapping_version", "none")
+        normalized_validation.setdefault(
+            "guidance_mode", "fixed_prompt_white_anchor"
+        )
+        normalized_validation.setdefault("image_reference_count", 1)
+        normalized_validation.setdefault(
+            "additional_image_references_attached", False
+        )
+        normalized_validation.setdefault("reference_reused", False)
+        normalized_validation.setdefault("locked_subject_preserved", True)
+        normalized_validation.setdefault(
+            "layout_archetype",
+            {
+                "main_01": "hero",
+                "main_02": "functional_infographic",
+                "detail_01": "lifestyle",
+                "detail_02": "annotated_feature",
+                "detail_03": "material_closeup",
+                "detail_04": "instructional_steps",
+                "detail_05": "dimension_fit",
+                "detail_06": "set_contents",
+            }[slot["slot_id"]],
+        )
     return SlotResultReceipt.create(
         job_id=job["job_id"],
         slot_id=slot["slot_id"],
@@ -125,6 +166,7 @@ def _v3_validation(
     repeated_scene: bool = False,
     primary_ozon_reference_path: Path | None = None,
     visual_contract_version: str = HISTORICAL_VISUAL_CONTRACT_VERSION,
+    historical_reference: bool = False,
 ) -> dict:
     is_current_visual_contract = (
         visual_contract_version == CURRENT_VISUAL_CONTRACT_VERSION
@@ -213,6 +255,27 @@ def _v3_validation(
         validation["primary_ozon_reference_sha256"] = file_sha256(
             primary_ozon_reference_path
         )
+    if is_current_visual_contract and not historical_reference:
+        validation.update(
+            {
+                "reference_mapping_version": "none",
+                "guidance_mode": "fixed_prompt_white_anchor",
+                "layout_archetype": archetypes[slot_id],
+                "image_reference_count": 1,
+                "additional_image_references_attached": False,
+                "reference_reused": False,
+                "locked_subject_preserved": True,
+            }
+        )
+        for field in (
+            "primary_ozon_reference_path",
+            "primary_ozon_reference_sha256",
+            "reference_slot_index",
+            "reference_composition_followed",
+            "reference_layout_archetype",
+            "reference_layout_followed",
+        ):
+            validation.pop(field, None)
     return validation
 
 
@@ -385,7 +448,7 @@ def test_v4_receipt_rejects_non_three_by_four_finished_slot(tmp_path: Path) -> N
     assert any("3:4" in error for error in result.acceptance_contract_errors())
 
 
-def test_v4_receipt_requires_slot_specific_ozon_reference_mapping(
+def test_v8_receipt_rejects_ozon_reference_mapping_and_second_image(
     tmp_path: Path,
 ) -> None:
     receipt = _receipt()
@@ -403,7 +466,16 @@ def test_v4_receipt_requires_slot_specific_ozon_reference_mapping(
         "f" * 64,
         visual_contract_version=CURRENT_VISUAL_CONTRACT_VERSION,
     )
-    validation.pop("primary_ozon_reference_sha256")
+    validation.update(
+        {
+            "reference_mapping_version": "ozon-reference-map-v1",
+            "guidance_mode": "reference_guided",
+            "image_reference_count": 2,
+            "additional_image_references_attached": True,
+            "primary_ozon_reference_sha256": "e" * 64,
+            "reference_slot_index": 1,
+        }
+    )
     result = _slot_receipt(
         job=job,
         slot=slot,
@@ -414,13 +486,103 @@ def test_v4_receipt_requires_slot_specific_ozon_reference_mapping(
         validation=validation,
     )
 
+    errors = result.acceptance_contract_errors()
+
+    assert "reference_mapping_version must be none" in errors
+    assert "guidance_mode must be fixed_prompt_white_anchor" in errors
+    assert "image_reference_count must be 1" in errors
+    assert "additional_image_references_attached must be false" in errors
     assert any(
-        "primary_ozon_reference_sha256" in error
-        for error in result.acceptance_contract_errors()
+        error.startswith("primary_ozon_reference_sha256 must be empty")
+        for error in errors
+    )
+    assert any(
+        error.startswith("reference_slot_index must be empty")
+        for error in errors
     )
 
 
-def test_v4_receipt_rejects_unverified_or_low_resolution_reference(
+def test_v7_receipt_requires_frozen_white_anchor_as_reference_one(
+    tmp_path: Path,
+) -> None:
+    receipt = _receipt()
+    queue = ImageGenerationQueue(tmp_path / "queue.sqlite3")
+    queue.enqueue(receipt=receipt, subject_master=_master(tmp_path, receipt))
+    job = queue.claim_next("ozon-image-worker-01", now_epoch=100, lease_seconds=30)
+    assert job
+    slot = queue.list_slots(job["job_id"])[0]
+    source = tmp_path / "source.png"
+    output = tmp_path / "output.png"
+    _solid_grid(source, ["red", "green"], panel_size=(90, 120))
+    Image.new("RGB", (90, 120), "red").save(output)
+    result = _slot_receipt(
+        job=job,
+        slot=slot,
+        source_path=source,
+        output_path=output,
+        accepted=True,
+        prompt_version=CURRENT_PROMPT_VERSION,
+        validation=_v3_validation(
+            slot["slot_id"],
+            "f" * 64,
+            visual_contract_version=CURRENT_VISUAL_CONTRACT_VERSION,
+        ),
+    )
+    broken_validation = dict(result.validation)
+    broken_validation["identity_anchor_attached"] = False
+    broken_validation["identity_anchor_reference_index"] = 2
+    broken = _rehash_receipt(result, validation=broken_validation)
+
+    errors = broken.acceptance_contract_errors()
+
+    assert "identity_anchor_attached must be true" in errors
+    assert "identity_anchor_reference_index must be 1" in errors
+
+
+def test_v7_gallery_rejects_different_identity_anchors(
+    tmp_path: Path,
+) -> None:
+    first_anchor = tmp_path / "anchor-1.png"
+    second_anchor = tmp_path / "anchor-2.png"
+    Image.new("RGB", (90, 120), "white").save(first_anchor)
+    Image.new("RGB", (90, 120), "ivory").save(second_anchor)
+    base = SlotResultReceipt(
+        job_id="job",
+        slot_id="main_01",
+        worker_id="ozon-image-worker-01",
+        lease_epoch=1,
+        selection_sha256="a" * 64,
+        subject_master_sha256="b" * 64,
+        prompt_version=CURRENT_PROMPT_VERSION,
+        source_kind="main_1x2",
+        source_path=str(first_anchor),
+        source_sha256=file_sha256(first_anchor),
+        output_path=str(first_anchor),
+        output_sha256=file_sha256(first_anchor),
+        accepted=True,
+        validation={
+            "identity_anchor_path": str(first_anchor),
+            "identity_anchor_sha256": file_sha256(first_anchor),
+        },
+        created_at="2026-07-26T00:00:00+00:00",
+        receipt_sha256="c" * 64,
+    )
+    changed = replace(
+        base,
+        slot_id="main_02",
+        validation={
+            "identity_anchor_path": str(second_anchor),
+            "identity_anchor_sha256": file_sha256(second_anchor),
+        },
+    )
+
+    errors = validate_identity_anchor_consistency((base, changed))
+
+    assert "all accepted slots must reuse the same identity anchor path" in errors
+    assert "all accepted slots must reuse the same identity anchor SHA-256" in errors
+
+
+def test_v7_receipt_rejects_unverified_or_low_resolution_reference(
     tmp_path: Path,
 ) -> None:
     receipt = _receipt()
@@ -440,6 +602,7 @@ def test_v4_receipt_rejects_unverified_or_low_resolution_reference(
         "f" * 64,
         primary_ozon_reference_path=reference,
         visual_contract_version=CURRENT_VISUAL_CONTRACT_VERSION,
+        historical_reference=True,
     )
     validation["primary_ozon_reference_sha256"] = "0" * 64
     result = _slot_receipt(
@@ -448,7 +611,7 @@ def test_v4_receipt_rejects_unverified_or_low_resolution_reference(
         source_path=source,
         output_path=output,
         accepted=True,
-        prompt_version=CURRENT_PROMPT_VERSION,
+        prompt_version="ozon-image-v7",
         validation=validation,
     )
 
@@ -458,7 +621,7 @@ def test_v4_receipt_rejects_unverified_or_low_resolution_reference(
     assert any("at least 512 pixels" in error for error in errors)
 
 
-def test_v5_fallback_accepts_a_declared_layout_without_an_ozon_reference(
+def test_v7_fallback_accepts_a_declared_layout_without_an_ozon_reference(
     tmp_path: Path,
 ) -> None:
     receipt = _receipt()
@@ -475,6 +638,7 @@ def test_v5_fallback_accepts_a_declared_layout_without_an_ozon_reference(
         slot["slot_id"],
         "f" * 64,
         visual_contract_version=CURRENT_VISUAL_CONTRACT_VERSION,
+        historical_reference=True,
     )
     validation.update(
         {
@@ -489,14 +653,14 @@ def test_v5_fallback_accepts_a_declared_layout_without_an_ozon_reference(
         source_path=source,
         output_path=output,
         accepted=True,
-        prompt_version=CURRENT_PROMPT_VERSION,
+        prompt_version="ozon-image-v7",
         validation=validation,
     )
 
     assert result.acceptance_contract_errors() == []
 
 
-def test_v5_gallery_rejects_background_swap_layouts_and_reference_overuse(
+def test_v7_gallery_rejects_background_swap_layouts_and_reference_overuse(
     tmp_path: Path,
 ) -> None:
     receipt = _receipt()
@@ -515,11 +679,12 @@ def test_v5_gallery_rejects_background_swap_layouts_and_reference_overuse(
         source_path=source,
         output_path=output,
         accepted=True,
-        prompt_version=CURRENT_PROMPT_VERSION,
+        prompt_version="ozon-image-v7",
         validation=_v3_validation(
             slot["slot_id"],
             "f" * 64,
             visual_contract_version=CURRENT_VISUAL_CONTRACT_VERSION,
+            historical_reference=True,
         ),
     )
     repeated = tuple(
@@ -850,10 +1015,8 @@ def _record_user_requested_v3_repair(
     )
     source = tmp_path / f"{slot_id}-repair-source.png"
     output = tmp_path / f"{slot_id}-repair-output.png"
-    reference = tmp_path / f"{slot_id}-ozon-reference.png"
     _solid_grid(source, ["red", "green"], panel_size=(90, 120))
     Image.new("RGB", (90, 120), "black").save(output)
-    Image.new("RGB", (600, 800), "navy").save(reference)
     queue.record_slot_result(
         _slot_receipt(
             job=repair_job,
@@ -866,7 +1029,6 @@ def _record_user_requested_v3_repair(
             validation=_v3_validation(
                 slot_id,
                 master.source_sha256,
-                primary_ozon_reference_path=reference,
                 visual_contract_version=CURRENT_VISUAL_CONTRACT_VERSION,
             ),
         )

@@ -34,12 +34,13 @@ class ImageTaskInbox:
         pending = self.directory("pending")
         in_progress = self.directory("in_progress")
         for source in sorted(pending.glob("*.json"), key=lambda path: path.name):
+            payload = _read_json(source)
+            _validate_package_contract(payload, source.stem)
             target = in_progress / source.name
             try:
                 source.replace(target)
             except FileNotFoundError:
                 continue
-            payload = _read_json(target)
             if payload.get("status") != "pending":
                 _write_json(target, payload)
                 raise ImageTaskInboxError(
@@ -105,6 +106,7 @@ class ImageTaskInbox:
 
     def load_in_progress(self, package_id: str, worker_id: str) -> dict[str, Any]:
         payload, source = self._owned_package(package_id, worker_id)
+        _validate_package_contract(payload, source.stem)
         return {**payload, "package_path": str(source.resolve())}
 
     def _owned_package(
@@ -144,6 +146,50 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
         encoding="utf-8",
     )
     temp.replace(path)
+
+
+def _validate_package_contract(
+    payload: dict[str, Any],
+    package_id: str,
+) -> None:
+    if payload.get("schema_version") != 2:
+        raise ImageTaskInboxError(
+            f"Package {package_id} must use image task schema_version=2."
+        )
+    if payload.get("kind") != "ozon_product_image_generation_and_upload":
+        raise ImageTaskInboxError(f"Package {package_id} has an unsupported kind.")
+    contract = payload.get("generation_contract")
+    if not isinstance(contract, dict):
+        raise ImageTaskInboxError(
+            f"Package {package_id} has no generation contract."
+        )
+    identity = contract.get("identity_reference")
+    if not isinstance(identity, dict):
+        raise ImageTaskInboxError(
+            f"Package {package_id} has no identity-reference contract."
+        )
+    required_identity = {
+        "required": True,
+        "source": "generated_white_anchor",
+        "reference_index": 1,
+        "reference_count": 1,
+        "additional_image_references_allowed": False,
+        "reuse_for_all_finished_calls": True,
+        "reuse_for_repairs": True,
+        "product_identity_source": "white_anchor_only",
+        "composition_source": "fixed_skill_prompt_only",
+    }
+    for field, expected in required_identity.items():
+        if identity.get(field) != expected:
+            raise ImageTaskInboxError(
+                f"Package {package_id} identity_reference.{field} must be "
+                f"{expected!r}."
+            )
+    evidence = payload.get("evidence")
+    if isinstance(evidence, dict) and evidence.get("ozon_reference_images"):
+        raise ImageTaskInboxError(
+            f"Package {package_id} must not send Ozon images to generation."
+        )
 
 
 def _package_id(value: str) -> str:

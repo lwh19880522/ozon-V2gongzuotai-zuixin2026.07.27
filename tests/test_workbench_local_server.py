@@ -4652,6 +4652,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             submitted.data["image_task_package_path"],
         )
         package = json.loads(package_path.read_text(encoding="utf-8"))
+        self.assertEqual(2, package["schema_version"])
         self.assertEqual("pending", package["status"])
         self.assertEqual(
             7001,
@@ -4667,6 +4668,21 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertTrue(
             package["generation_contract"]["r2_preflight_required"],
         )
+        self.assertEqual(
+            {
+                "required": True,
+                "source": "generated_white_anchor",
+                "reference_index": 1,
+                "reference_count": 1,
+                "additional_image_references_allowed": False,
+                "reuse_for_all_finished_calls": True,
+                "reuse_for_repairs": True,
+                "product_identity_source": "white_anchor_only",
+                "composition_source": "fixed_skill_prompt_only",
+            },
+            package["generation_contract"]["identity_reference"],
+        )
+        self.assertNotIn("ozon_reference_images", package["evidence"])
         self.assertEqual(
             {
                 "required": True,

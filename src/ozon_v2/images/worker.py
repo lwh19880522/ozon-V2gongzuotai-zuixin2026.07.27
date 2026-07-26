@@ -21,13 +21,17 @@ LEGACY_PROMPT_VERSION = "ozon-image-v2"
 VISUAL_PROMPT_VERSION = "ozon-image-v3"
 PREVIOUS_PROMPT_VERSION = "ozon-image-v4"
 REFERENCE_LAYOUT_PROMPT_VERSION = "ozon-image-v5"
-CURRENT_PROMPT_VERSION = "ozon-image-v6"
+INTEGRATED_COPY_PROMPT_VERSION = "ozon-image-v6"
+IDENTITY_ANCHOR_PROMPT_VERSION = "ozon-image-v7"
+CURRENT_PROMPT_VERSION = "ozon-image-v8"
 SUPPORTED_PROMPT_VERSIONS = frozenset(
     {
         LEGACY_PROMPT_VERSION,
         VISUAL_PROMPT_VERSION,
         PREVIOUS_PROMPT_VERSION,
         REFERENCE_LAYOUT_PROMPT_VERSION,
+        INTEGRATED_COPY_PROMPT_VERSION,
+        IDENTITY_ANCHOR_PROMPT_VERSION,
         CURRENT_PROMPT_VERSION,
     }
 )
@@ -36,6 +40,8 @@ VISUAL_PROMPT_VERSIONS = frozenset(
         VISUAL_PROMPT_VERSION,
         PREVIOUS_PROMPT_VERSION,
         REFERENCE_LAYOUT_PROMPT_VERSION,
+        INTEGRATED_COPY_PROMPT_VERSION,
+        IDENTITY_ANCHOR_PROMPT_VERSION,
         CURRENT_PROMPT_VERSION,
     }
 )
@@ -81,22 +87,44 @@ REFERENCE_PROMPT_VERSIONS = frozenset(
     {
         PREVIOUS_PROMPT_VERSION,
         REFERENCE_LAYOUT_PROMPT_VERSION,
-        CURRENT_PROMPT_VERSION,
+        INTEGRATED_COPY_PROMPT_VERSION,
+        IDENTITY_ANCHOR_PROMPT_VERSION,
     }
 )
 ADAPTIVE_REFERENCE_PROMPT_VERSIONS = frozenset(
-    {REFERENCE_LAYOUT_PROMPT_VERSION, CURRENT_PROMPT_VERSION}
+    {
+        REFERENCE_LAYOUT_PROMPT_VERSION,
+        INTEGRATED_COPY_PROMPT_VERSION,
+        IDENTITY_ANCHOR_PROMPT_VERSION,
+    }
 )
-INTEGRATED_COPY_PROMPT_VERSIONS = ADAPTIVE_REFERENCE_PROMPT_VERSIONS
+INTEGRATED_COPY_PROMPT_VERSIONS = frozenset(
+    {*ADAPTIVE_REFERENCE_PROMPT_VERSIONS, CURRENT_PROMPT_VERSION}
+)
+CURRENT_VISUAL_PROMPT_VERSIONS = frozenset(
+    {
+        INTEGRATED_COPY_PROMPT_VERSION,
+        IDENTITY_ANCHOR_PROMPT_VERSION,
+        CURRENT_PROMPT_VERSION,
+    }
+)
+IDENTITY_ANCHOR_PROMPT_VERSIONS = frozenset(
+    {IDENTITY_ANCHOR_PROMPT_VERSION, CURRENT_PROMPT_VERSION}
+)
+FINISHED_SCENE_PROMPT_VERSIONS = frozenset(
+    {*REFERENCE_PROMPT_VERSIONS, CURRENT_PROMPT_VERSION}
+)
 V5_GUIDANCE_MODES = frozenset(
     {"reference_guided", "ozon_aesthetic_fallback"}
 )
+PROMPT_ONLY_GUIDANCE_MODE = "fixed_prompt_white_anchor"
+PROMPT_ONLY_MAPPING_VERSION = "none"
 MINIMUM_OZON_REFERENCE_EDGE = 512
 _RUSSIAN_WORD = re.compile(r"[А-Яа-яЁё]+(?:-[А-Яа-яЁё]+)?")
 _HAN_CHARACTER = re.compile(r"[\u3400-\u9fff]")
 
 
-def _validate_v6_copy_payload(
+def _validate_integrated_copy_payload(
     validation: Mapping[str, Any], errors: list[str]
 ) -> None:
     headline = str(validation.get("russian_headline") or "").strip()
@@ -132,6 +160,102 @@ def _validate_v6_copy_payload(
         normalized_labels
     ):
         errors.append("russian_functional_labels must not repeat")
+
+
+def _validate_identity_anchor_payload(
+    validation: Mapping[str, Any], errors: list[str]
+) -> None:
+    anchor_path_value = str(validation.get("identity_anchor_path") or "").strip()
+    anchor_sha256 = str(validation.get("identity_anchor_sha256") or "").lower()
+    if not anchor_path_value:
+        errors.append("identity_anchor_path is required")
+    else:
+        anchor_path = Path(anchor_path_value)
+        if not anchor_path.is_file():
+            errors.append("identity anchor file does not exist")
+        elif file_sha256(anchor_path) != anchor_sha256:
+            errors.append("identity anchor SHA-256 does not match")
+    if (
+        len(anchor_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in anchor_sha256)
+    ):
+        errors.append("identity_anchor_sha256 must be a lowercase SHA-256 digest")
+    if validation.get("identity_anchor_reference_index") != 1:
+        errors.append("identity_anchor_reference_index must be 1")
+    if validation.get("identity_anchor_attached") is not True:
+        errors.append("identity_anchor_attached must be true")
+    if validation.get("identity_anchor_reused") is not True:
+        errors.append("identity_anchor_reused must be true")
+    if validation.get("product_identity_source") != "white_anchor_only":
+        errors.append("product_identity_source must be white_anchor_only")
+
+
+def _validate_prompt_only_anchor_payload(
+    validation: Mapping[str, Any], errors: list[str]
+) -> None:
+    if validation.get("reference_mapping_version") != PROMPT_ONLY_MAPPING_VERSION:
+        errors.append("reference_mapping_version must be none")
+    if validation.get("guidance_mode") != PROMPT_ONLY_GUIDANCE_MODE:
+        errors.append(
+            "guidance_mode must be fixed_prompt_white_anchor"
+        )
+    if validation.get("image_reference_count") != 1:
+        errors.append("image_reference_count must be 1")
+    if validation.get("additional_image_references_attached") is not False:
+        errors.append("additional_image_references_attached must be false")
+    for key in (
+        "primary_ozon_reference_path",
+        "primary_ozon_reference_sha256",
+        "reference_slot_index",
+    ):
+        if validation.get(key) not in (None, ""):
+            errors.append(f"{key} must be empty for fixed_prompt_white_anchor")
+    if validation.get("reference_reused") not in (False, None):
+        errors.append(
+            "reference_reused must be false for fixed_prompt_white_anchor"
+        )
+    for key in (
+        "reference_composition_followed",
+        "reference_layout_followed",
+    ):
+        if validation.get(key) not in (False, None):
+            errors.append(f"{key} must not be asserted without an Ozon reference")
+    if validation.get("locked_subject_preserved") is not True:
+        errors.append("locked_subject_preserved must be true")
+    layout_archetype = (
+        str(validation.get("layout_archetype") or "")
+        .strip()
+        .lower()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+    if layout_archetype not in REFERENCE_LAYOUT_ARCHETYPES:
+        errors.append("layout_archetype must be a supported layout archetype")
+
+
+def _validate_current_visual_payload(
+    validation: Mapping[str, Any],
+    output_sha256: str,
+    errors: list[str],
+) -> None:
+    visual_spec = validation.get("visual_spec")
+    facts = visual_spec.get("facts", []) if isinstance(visual_spec, dict) else []
+    russian_text = " ".join(
+        str(fact.get(key, ""))
+        for fact in facts
+        if isinstance(fact, dict)
+        for key in ("headline", "detail")
+    )
+    if not re.search(r"[\u0400-\u04ff]", russian_text):
+        errors.append("finished slot must contain verified Russian labels")
+    output_digest = str(validation.get("visual_output_sha256") or "").lower()
+    if output_digest != output_sha256:
+        errors.append("visual_output_sha256 must match the accepted output")
+    if validation.get("copy_mode") != "imagegen_integrated":
+        errors.append("copy_mode must be imagegen_integrated")
+    if validation.get("russian_copy_integrated") is not True:
+        errors.append("russian_copy_integrated must be true")
+    _validate_integrated_copy_payload(validation, errors)
 
 
 def looks_plain_or_near_white_product_only(path: str | Path) -> bool:
@@ -392,7 +516,7 @@ class SlotResultReceipt:
                 errors.append("visual_spec is required")
             expected_visual_contract = (
                 CURRENT_VISUAL_CONTRACT_VERSION
-                if self.prompt_version == CURRENT_PROMPT_VERSION
+                if self.prompt_version in CURRENT_VISUAL_PROMPT_VERSIONS
                 else HISTORICAL_VISUAL_CONTRACT_VERSION
             )
             if self.validation.get("visual_contract_version") != expected_visual_contract:
@@ -522,7 +646,7 @@ class SlotResultReceipt:
             visual_spec = self.validation.get("visual_spec")
             facts = visual_spec.get("facts", []) if isinstance(visual_spec, dict) else []
             slot_requires_integrated_copy = (
-                self.prompt_version == CURRENT_PROMPT_VERSION
+                self.prompt_version in CURRENT_VISUAL_PROMPT_VERSIONS
                 or (
                     self.prompt_version == REFERENCE_LAYOUT_PROMPT_VERSION
                     and self.slot_id != "main_01"
@@ -556,11 +680,23 @@ class SlotResultReceipt:
                             "supporting slot must persist a locally rendered "
                             "Russian label layer"
                         )
-                if self.prompt_version == CURRENT_PROMPT_VERSION:
-                    _validate_v6_copy_payload(self.validation, errors)
+                if self.prompt_version in CURRENT_VISUAL_PROMPT_VERSIONS:
+                    _validate_integrated_copy_payload(self.validation, errors)
+            if self.prompt_version in IDENTITY_ANCHOR_PROMPT_VERSIONS:
+                _validate_identity_anchor_payload(self.validation, errors)
+            if self.prompt_version == CURRENT_PROMPT_VERSION:
+                _validate_prompt_only_anchor_payload(self.validation, errors)
+        if self.prompt_version == CURRENT_PROMPT_VERSION:
+            _validate_current_visual_payload(
+                self.validation,
+                self.output_sha256,
+                errors,
+            )
+            _validate_identity_anchor_payload(self.validation, errors)
+            _validate_prompt_only_anchor_payload(self.validation, errors)
         if (
             isinstance(self.prompt_version, str)
-            and self.prompt_version in REFERENCE_PROMPT_VERSIONS
+            and self.prompt_version in FINISHED_SCENE_PROMPT_VERSIONS
             and not is_exact_three_by_four_image(self.output_path)
         ):
             errors.append("output must be exactly 3:4 portrait")
@@ -573,6 +709,32 @@ class SlotResultReceipt:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def validate_identity_anchor_consistency(
+    receipts: tuple[SlotResultReceipt, ...],
+) -> list[str]:
+    current_receipts = tuple(
+        receipt
+        for receipt in receipts
+        if receipt.prompt_version in IDENTITY_ANCHOR_PROMPT_VERSIONS
+    )
+    if not current_receipts:
+        return []
+    anchor_paths = {
+        str(Path(str(receipt.validation.get("identity_anchor_path") or "")).resolve())
+        for receipt in current_receipts
+    }
+    anchor_hashes = {
+        str(receipt.validation.get("identity_anchor_sha256") or "").lower()
+        for receipt in current_receipts
+    }
+    errors: list[str] = []
+    if len(anchor_paths) != 1:
+        errors.append("all accepted slots must reuse the same identity anchor path")
+    if len(anchor_hashes) != 1:
+        errors.append("all accepted slots must reuse the same identity anchor SHA-256")
+    return errors
 
 
 def validate_output_diversity(
@@ -610,12 +772,13 @@ def validate_reference_layout_diversity(
     minimum_unique_archetypes: int = 6,
     maximum_reference_reuse: int = 2,
 ) -> list[str]:
-    """Reject v5 galleries that only swap backgrounds or over-reuse one reference."""
+    """Reject galleries that repeat layouts or over-reuse a historical reference."""
     current = tuple(
         receipt
         for receipt in receipts
         if (
-            receipt.prompt_version in ADAPTIVE_REFERENCE_PROMPT_VERSIONS
+            receipt.prompt_version
+            in {*ADAPTIVE_REFERENCE_PROMPT_VERSIONS, CURRENT_PROMPT_VERSION}
             and receipt.accepted
         )
     )
@@ -623,7 +786,14 @@ def validate_reference_layout_diversity(
         return []
     errors: list[str] = []
     archetypes = [
-        str(receipt.validation.get("reference_layout_archetype") or "")
+        str(
+            receipt.validation.get(
+                "layout_archetype"
+                if receipt.prompt_version == CURRENT_PROMPT_VERSION
+                else "reference_layout_archetype"
+            )
+            or ""
+        )
         .strip()
         .lower()
         .replace("-", "_")
@@ -632,8 +802,8 @@ def validate_reference_layout_diversity(
     ]
     if len(set(archetypes)) < minimum_unique_archetypes:
         errors.append(
-            "v5 eight-slot set must use at least "
-            f"{minimum_unique_archetypes} reference-layout archetypes"
+            "eight-slot set must use at least "
+            f"{minimum_unique_archetypes} layout archetypes"
         )
     reference_counts = Counter(
         str(receipt.validation.get("primary_ozon_reference_sha256") or "").lower()

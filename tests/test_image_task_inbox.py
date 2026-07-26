@@ -14,10 +14,24 @@ def write_package(runtime_root: Path, package_id: str) -> Path:
     path.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "kind": "ozon_product_image_generation_and_upload",
                 "package_id": package_id,
                 "status": "pending",
+                "generation_contract": {
+                    "identity_reference": {
+                        "required": True,
+                        "source": "generated_white_anchor",
+                        "reference_index": 1,
+                        "reference_count": 1,
+                        "additional_image_references_allowed": False,
+                        "reuse_for_all_finished_calls": True,
+                        "reuse_for_repairs": True,
+                        "product_identity_source": "white_anchor_only",
+                        "composition_source": "fixed_skill_prompt_only",
+                    }
+                },
+                "evidence": {},
             }
         ),
         encoding="utf-8",
@@ -40,6 +54,27 @@ def test_image_task_inbox_claims_oldest_package_and_moves_it_atomically(
     assert claimed["assignment"]["worker_id"] == "ozon-image-worker-01"
     assert not (tmp_path / "image_tasks" / "pending" / "ozon-image-001.json").exists()
     assert (tmp_path / "image_tasks" / "in_progress" / "ozon-image-001.json").is_file()
+
+
+def test_image_task_inbox_rejects_ozon_reference_images_before_claim(
+    tmp_path: Path,
+) -> None:
+    package = write_package(tmp_path, "ozon-image-001")
+    payload = json.loads(package.read_text(encoding="utf-8"))
+    payload["evidence"]["ozon_reference_images"] = ["https://example.test/ozon.jpg"]
+    package.write_text(json.dumps(payload), encoding="utf-8")
+    inbox = ImageTaskInbox(tmp_path)
+
+    with pytest.raises(
+        ImageTaskInboxError,
+        match="must not send Ozon images to generation",
+    ):
+        inbox.claim_next("ozon-image-worker-01")
+
+    assert package.is_file()
+    assert not (
+        tmp_path / "image_tasks" / "in_progress" / "ozon-image-001.json"
+    ).exists()
 
 
 def test_image_task_inbox_completion_is_owned_and_never_returns_to_workbench(

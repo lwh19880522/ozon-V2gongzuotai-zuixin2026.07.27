@@ -11,12 +11,15 @@ from ozon_v2.images.contracts import SubjectMasterSelection
 from ozon_v2.images.visual_design import VisualSpec, validate_visual_set, validate_visual_spec
 from ozon_v2.images.worker import (
     CURRENT_PROMPT_VERSION,
+    IDENTITY_ANCHOR_PROMPT_VERSION,
+    INTEGRATED_COPY_PROMPT_VERSION,
     LEGACY_PROMPT_VERSION,
     PREVIOUS_PROMPT_VERSION,
     REFERENCE_LAYOUT_PROMPT_VERSION,
     VISUAL_PROMPT_VERSION,
     SlotResultReceipt,
     VISUAL_PROMPT_VERSIONS,
+    validate_identity_anchor_consistency,
     validate_output_diversity,
     validate_reference_layout_diversity,
 )
@@ -44,6 +47,8 @@ HISTORICAL_PROMPT_VERSIONS = frozenset(
         VISUAL_PROMPT_VERSION,
         PREVIOUS_PROMPT_VERSION,
         REFERENCE_LAYOUT_PROMPT_VERSION,
+        INTEGRATED_COPY_PROMPT_VERSION,
+        IDENTITY_ANCHOR_PROMPT_VERSION,
     }
 )
 
@@ -1130,6 +1135,9 @@ class ImageGenerationQueue:
                     errors.extend(validate_output_diversity(tuple(receipts)))
                     errors.extend(
                         validate_reference_layout_diversity(tuple(receipts))
+                    )
+                    errors.extend(
+                        validate_identity_anchor_consistency(tuple(receipts))
                     )
                 if errors:
                     connection.rollback()
