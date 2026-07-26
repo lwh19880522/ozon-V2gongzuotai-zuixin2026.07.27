@@ -10,6 +10,49 @@ from ozon_v2.adapters.public_media import (
 )
 
 
+def test_cloudflare_publisher_preflight_requires_public_r2_channel() -> None:
+    commands: list[list[str]] = []
+    publisher = CloudflareR2MediaPublisher(
+        command_runner=lambda command, timeout_seconds: (
+            commands.append(command)
+            or {
+                "returncode": 0,
+                "stdout": '[{"name":"ozon-media"}]',
+                "stderr": "",
+            }
+        ),
+        public_probe=lambda url, timeout_seconds: None,
+        wrangler_command=["wrangler"],
+    )
+
+    result = publisher.preflight(
+        {
+            "base_url": "https://media.example.test",
+            "r2_bucket": "ozon-media",
+            "object_prefix": "ozon-v2",
+        }
+    )
+
+    assert result["ready"] is True
+    assert result["base_url"] == "https://media.example.test"
+    assert result["bucket"] == "ozon-media"
+    assert commands == [["wrangler", "r2", "bucket", "list", "--json"]]
+
+
+def test_cloudflare_publisher_preflight_rejects_missing_public_url() -> None:
+    publisher = CloudflareR2MediaPublisher(
+        command_runner=lambda command, timeout_seconds: {
+            "returncode": 0,
+            "stdout": "[]",
+            "stderr": "",
+        },
+        wrangler_command=["wrangler"],
+    )
+
+    with pytest.raises(PublicMediaError, match="public HTTPS"):
+        publisher.preflight({"r2_bucket": "ozon-media"})
+
+
 def test_cloudflare_publisher_uploads_every_reviewed_image_and_probes_public_urls(
     tmp_path: Path,
 ) -> None:
@@ -46,17 +89,27 @@ def test_cloudflare_publisher_uploads_every_reviewed_image_and_probes_public_url
     assert len(result["urls"]) == 2
     assert probed == result["urls"]
     assert all(url.startswith("https://media.example.test/ozon-v2/wb-one/seed-one/") for url in result["urls"])
-    assert commands[0][:5] == [
+    assert commands[0] == [
+        "npx.cmd",
+        "--yes",
+        "wrangler",
+        "r2",
+        "bucket",
+        "list",
+        "--json",
+    ]
+    assert commands[1][:5] == [
         "npx.cmd",
         "--yes",
         "wrangler",
         "r2",
         "object",
     ]
-    assert commands[0][5] == "put"
-    assert commands[0][6].startswith("yandex-media/ozon-v2/wb-one/seed-one/main_01-")
-    assert "--remote" in commands[0]
-    assert "--content-type" in commands[0]
+    assert commands[1][5] == "put"
+    assert commands[1][6].startswith("yandex-media/ozon-v2/wb-one/seed-one/main_01-")
+    assert "--remote" in commands[1]
+    assert "--content-type" in commands[1]
+    assert result["items"][0]["content_type"] == "image/png"
 
 
 def test_cloudflare_publisher_stops_before_ozon_when_public_probe_fails(

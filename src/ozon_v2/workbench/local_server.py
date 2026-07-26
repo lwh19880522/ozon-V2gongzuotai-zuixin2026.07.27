@@ -3006,6 +3006,7 @@ def build_upload_workspace_html(run_id: str) -> str:
     .upload-core {{ margin-top:10px; padding:9px; border:1px solid #b9ddcf; border-radius:5px; background:#f2fbf8; }} .upload-core-head {{ display:flex; align-items:center; justify-content:space-between; gap:10px; }} .upload-core-head strong {{ color:var(--green); font-size:11px; }} .upload-core-head span {{ color:var(--muted); font-size:9px; }} .upload-core-grid {{ display:grid; grid-template-columns:repeat(4,minmax(110px,1fr)); gap:6px; margin-top:8px; }} .upload-core-field {{ padding:7px 8px; border:1px solid #d8ebe4; border-radius:4px; background:#fff; }} .upload-core-field span {{ display:block; color:var(--muted); font-size:9px; }} .upload-core-field strong {{ display:block; margin-top:2px; color:var(--text); font-size:10px; }}
     .mapping-summary {{ display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }} .mapping-chip {{ padding:3px 7px; border-radius:4px; color:var(--green); background:var(--green-soft); font-size:10px; }} .mapping-chip.warn {{ color:var(--red); background:var(--red-soft); }}
     .score-progress {{ margin-top:8px; padding:8px 9px; border-left:3px solid var(--blue); color:#29456f; background:#f1f5ff; font-size:10px; }}
+    .required-field-editor {{ margin-top:10px; padding:10px; border:1px solid #efbd68; border-radius:5px; background:#fffaf0; }} .required-field-editor h4 {{ margin:0; color:#74410a; font-size:12px; }} .required-field-editor p {{ margin:3px 0 9px; color:var(--muted); font-size:10px; }} .required-field-grid {{ display:grid; grid-template-columns:repeat(2,minmax(180px,1fr)); gap:8px; }} .required-field-input {{ display:grid; gap:4px; }} .required-field-input label {{ color:#74410a; font-size:10px; font-weight:650; }} .required-field-input input,.required-field-input select {{ width:100%; height:34px; padding:0 8px; border:1px solid #d7b574; border-radius:4px; color:var(--text); background:#fff; }} .required-field-actions {{ display:flex; align-items:center; gap:9px; margin-top:9px; }} .required-field-actions button {{ min-height:34px; padding:0 13px; border:1px solid var(--blue); border-radius:4px; color:#fff; background:var(--blue); cursor:pointer; }} .required-field-actions button:disabled {{ opacity:.5; cursor:wait; }} .required-field-status {{ color:var(--muted); font-size:10px; }} .required-field-status.error {{ color:var(--red); }} .required-field-status.success {{ color:var(--green); }}
     .attribute-grid {{ display:grid; grid-template-columns:1fr 1fr; margin-top:8px; border:1px solid var(--line); border-radius:4px; overflow:hidden; }} .attribute {{ display:grid; grid-template-columns:minmax(110px,.8fr) minmax(0,1.2fr); gap:10px; padding:8px 9px; border-right:1px solid var(--line); border-bottom:1px solid #edf0f4; font-size:10px; }} .attribute:nth-child(2n) {{ border-right:0; }} .attribute span {{ color:var(--muted); }} .attribute strong {{ overflow-wrap:anywhere; }} .attribute.missing_fact strong {{ color:var(--red); }} .attribute.rewrite_required strong {{ color:var(--amber); }} .attribute.not_applicable strong {{ color:var(--muted); font-weight:500; }} .all-mappings {{ margin-top:8px; color:var(--muted); font-size:10px; }} .all-mappings summary {{ cursor:pointer; color:var(--blue); font-weight:650; }}
     .gate-list {{ padding:6px 14px 12px; }} .gate-row {{ display:grid; grid-template-columns:22px minmax(0,1fr); gap:9px; padding:10px 0; border-bottom:1px solid #edf0f4; }} .gate-row:last-child {{ border-bottom:0; }} .gate-icon {{ width:22px; height:22px; display:grid; place-items:center; border-radius:50%; color:var(--green); background:var(--green-soft); font-size:11px; font-weight:700; }} .gate-row.blocked .gate-icon {{ color:var(--amber); background:var(--amber-soft); }} .gate-row strong {{ display:block; font-size:11px; }} .gate-row span {{ display:block; margin-top:2px; color:var(--muted); font-size:10px; }}
     .content-controller {{ margin:12px 14px; padding:11px; border:1px solid #bfd0f8; border-radius:5px; background:var(--blue-soft); }} .content-controller strong {{ display:block; font-size:11px; }} .content-controller p {{ margin:4px 0 8px; color:var(--muted); font-size:10px; }} .content-command {{ max-height:190px; overflow:auto; padding:9px; border:1px solid #c9d5ec; border-radius:4px; white-space:pre-wrap; color:#263756; background:#fff; font:10px/1.5 Consolas,"Courier New",monospace; }} .content-copy {{ width:100%; min-height:34px; margin-top:8px; border:1px solid var(--blue); border-radius:4px; color:#fff; background:var(--blue); cursor:pointer; }} .content-copy-status {{ display:block; min-height:16px; margin-top:4px; color:var(--green); font-size:10px; text-align:center; }}
@@ -3021,10 +3022,11 @@ def build_upload_workspace_html(run_id: str) -> str:
     .publish-lock {{ margin:0 14px 12px; padding:11px 12px; border-left:3px solid var(--amber); color:#74410a; background:#fff8eb; }} .publish-lock strong {{ display:block; font-size:11px; }} .publish-lock span {{ display:block; margin-top:3px; font-size:10px; }}
     .primary {{ width:calc(100% - 28px); height:38px; margin:0 14px 14px; border:1px solid var(--blue); border-radius:5px; color:#fff; background:var(--blue); }} .primary:disabled {{ opacity:.48; cursor:not-allowed; }} .empty {{ padding:26px; color:var(--muted); text-align:center; }}
     .product-upload-actions {{ display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-top:10px; padding:10px; border:1px solid #bfd0f8; border-radius:5px; background:#f5f8ff; }} .product-upload-actions button {{ min-height:34px; padding:0 12px; border:1px solid var(--blue); border-radius:4px; color:var(--blue); background:#fff; cursor:pointer; }} .product-upload-actions button.confirm {{ color:#fff; background:var(--blue); }} .product-upload-actions button:disabled {{ opacity:.48; cursor:not-allowed; }} .product-upload-status {{ flex:1 1 260px; color:var(--muted); font-size:10px; }} .product-upload-status.error {{ color:var(--red); }} .product-upload-status.success {{ color:var(--green); }}
+    .batch-upload-controller {{ margin:0 14px 12px; padding:11px; border:1px solid #bfd0f8; border-radius:5px; background:#f5f8ff; }} .batch-upload-controller strong {{ display:block; font-size:11px; }} .batch-upload-controller p {{ margin:4px 0 8px; color:var(--muted); font-size:10px; }} .batch-upload-controller button {{ width:100%; min-height:38px; border:1px solid var(--blue); border-radius:4px; color:#fff; background:var(--blue); cursor:pointer; }} .batch-upload-controller button:disabled {{ opacity:.5; cursor:wait; }} .batch-upload-status {{ display:block; min-height:17px; margin-top:6px; color:var(--muted); font-size:10px; }} .batch-upload-status.error {{ color:var(--red); }} .batch-upload-status.success {{ color:var(--green); }}
     @media(max-width:1100px) {{ .pricing-form {{ grid-template-columns:repeat(2,minmax(130px,1fr)); }} .pricing-result {{ grid-template-columns:repeat(3,1fr); }} .pricing-result-cell:nth-child(3) {{ border-right:0; }} }}
     @media(max-width:1000px) {{ .upload-layout {{ grid-template-columns:1fr; }} .pricing-layout {{ grid-template-columns:250px minmax(0,1fr); }} }}
     @media(max-width:900px) {{ .app-shell {{ grid-template-columns:72px minmax(0,1fr); }} .sidebar {{ padding:14px 8px; }} .sidebar-brand {{ padding:4px 4px 16px; text-align:center; }} .sidebar-brand strong {{ font-size:14px; }} .sidebar-brand span,.sidebar-label,.sidebar-link span:last-child {{ display:none; }} .sidebar-link {{ justify-content:center; padding:0; }} .stage-nav-inner {{ overflow-x:auto; padding:0 10px; }} .stage-run {{ display:none; }} .summary {{ grid-template-columns:repeat(2,1fr); }} .metric:nth-child(2) {{ border-right:0; }} .metric:nth-child(-n+2) {{ border-bottom:1px solid var(--line); }} }}
-    @media(max-width:620px) {{ .app-shell {{ display:block; }} .sidebar {{ position:static; width:100%; height:auto; display:flex; align-items:center; gap:6px; overflow-x:auto; }} .sidebar-brand {{ min-width:92px; padding:0 8px; border:0; }} .sidebar-group {{ display:flex; gap:4px; margin:0; }} .sidebar-link {{ width:38px; flex:0 0 38px; }} .workspace {{ padding:10px; }} .page-head {{ align-items:flex-start; flex-direction:column; }} .pricing-layout {{ display:block; }} .pricing-product-column {{ height:138px; grid-template-rows:94px 44px; border-right:0; border-bottom:1px solid var(--line); }} .pricing-products {{ display:flex; gap:8px; overflow:hidden; }} .pricing-product {{ min-width:230px; margin-bottom:0; }} .pricing-form {{ grid-template-columns:1fr; }} .pricing-result {{ grid-template-columns:repeat(2,1fr); }} .pricing-result-cell:nth-child(2n) {{ border-right:0; }} .draft-item {{ grid-template-columns:1fr; }} .draft-item img,.image-placeholder {{ width:100%; height:180px; }} .attribute-grid {{ grid-template-columns:1fr; }} .attribute {{ border-right:0; }} }}
+    @media(max-width:620px) {{ .app-shell {{ display:block; }} .sidebar {{ position:static; width:100%; height:auto; display:flex; align-items:center; gap:6px; overflow-x:auto; }} .sidebar-brand {{ min-width:92px; padding:0 8px; border:0; }} .sidebar-group {{ display:flex; gap:4px; margin:0; }} .sidebar-link {{ width:38px; flex:0 0 38px; }} .workspace {{ padding:10px; }} .page-head {{ align-items:flex-start; flex-direction:column; }} .pricing-layout {{ display:block; }} .pricing-product-column {{ height:138px; grid-template-rows:94px 44px; border-right:0; border-bottom:1px solid var(--line); }} .pricing-products {{ display:flex; gap:8px; overflow:hidden; }} .pricing-product {{ min-width:230px; margin-bottom:0; }} .pricing-form,.required-field-grid {{ grid-template-columns:1fr; }} .pricing-result {{ grid-template-columns:repeat(2,1fr); }} .pricing-result-cell:nth-child(2n) {{ border-right:0; }} .draft-item {{ grid-template-columns:1fr; }} .draft-item img,.image-placeholder {{ width:100%; height:180px; }} .attribute-grid {{ grid-template-columns:1fr; }} .attribute {{ border-right:0; }} }}
   </style>
 </head>
 <body>
@@ -3041,7 +3043,7 @@ def build_upload_workspace_html(run_id: str) -> str:
           <div class="pricing-layout"><div class="pricing-product-column"><nav id="pricingProductList" class="pricing-products" aria-label="价格证据商品清单"></nav><div id="pricingPager" class="pricing-pager"><button id="pricingPrevPage" type="button" aria-label="上一页">‹</button><span id="pricingPageLabel" class="pricing-page-label" aria-live="polite">第 1 / 1 页 · 每页 5 件</span><button id="pricingNextPage" type="button" aria-label="下一页">›</button></div></div><section id="pricingEditor" class="pricing-editor"><div class="pricing-editor-empty">正在读取商品价格证据…</div></section></div>
         </section>
         <div class="upload-layout"><section class="panel"><div class="panel-head"><h3>类目模板自动映射结果 · 完整字段与内容完善</h3><div class="draft-head-actions"><div id="draftPager" class="draft-pager"><button id="draftPrevPage" type="button" aria-label="上一页">‹</button><span id="draftPageLabel" class="draft-page-label" aria-live="polite">第 1 / 1 页 · 每页 5 件</span><button id="draftNextPage" type="button" aria-label="下一页">›</button></div><span class="pill">Seller API Template</span></div></div><div id="draftItems" class="draft-items"></div></section>
-          <aside id="uploadGate" class="panel"><div class="panel-head"><h3>逐商品上传门禁 · 逐商品真实上传 (Per-product Upload)</h3></div><div class="content-controller"><strong>智能字段草稿总控（证据约束）</strong><p>Ozon 数据用于模仿结构与写法，1688 与已锁定 SKU 用于约束客观事实；无法证明的字段明确保留为未解决，不会自动上传。</p><div id="contentControllerCommand" class="content-command">{escaped_content_controller_command}</div><button id="copyContentControllerCommand" class="content-copy" type="button">复制整批智能字段草稿命令</button><span id="contentControllerCopyStatus" class="content-copy-status"></span></div><div class="gate-list"><div id="templateGate" class="gate-row"><span class="gate-icon">1</span><div><strong>类目模板 (Category Template)</strong><span>等待检查</span></div></div><div id="attributeGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>必填属性 (Required Attributes)</strong><span>等待自动映射。</span></div></div><div id="originalContentGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>原创内容 (Original Content)</strong><span>等待利用 Ozon 证据完成俄文内容。</span></div></div><div id="bootstrapImageGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>锁定原图 (Locked Original)</strong><span>等待锁定一张真实 1688 主体原图。</span></div></div><div id="pricingGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>价格与包装证据 (Pricing)</strong><span>等待逐件确认成本、包装和建议上架价。</span></div></div><div id="draftGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>可独立推进 (Ready Products)</strong><span>逐件计算，不再等待整批。</span></div></div></div><div class="publish-lock"><strong>发布锁已开启 (Publish Lock Active) · 逐商品确认</strong><span>建品时只提交锁定的 1688 原图；Seller API 接受后立即输出图片生成与上传任务包，后续图片流程不再回传工作台。</span></div></aside>
+          <aside id="uploadGate" class="panel"><div class="panel-head"><h3>逐商品上传门禁 · 逐商品真实上传 (Per-product Upload)</h3></div><div class="content-controller"><strong>智能字段草稿总控（证据约束）</strong><p>Ozon 数据用于模仿结构与写法，1688 与已锁定 SKU 用于约束客观事实；无法证明的字段明确保留为未解决，不会自动上传。</p><div id="contentControllerCommand" class="content-command">{escaped_content_controller_command}</div><button id="copyContentControllerCommand" class="content-copy" type="button">复制整批智能字段草稿命令</button><span id="contentControllerCopyStatus" class="content-copy-status"></span></div><div class="gate-list"><div id="templateGate" class="gate-row"><span class="gate-icon">1</span><div><strong>类目模板 (Category Template)</strong><span>等待检查</span></div></div><div id="attributeGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>必填属性 (Required Attributes)</strong><span>等待自动映射。</span></div></div><div id="originalContentGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>原创内容 (Original Content)</strong><span>等待利用 Ozon 证据完成俄文内容。</span></div></div><div id="bootstrapImageGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>锁定原图 (Locked Original)</strong><span>等待锁定一张真实 1688 主体原图。</span></div></div><div id="pricingGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>价格与包装证据 (Pricing)</strong><span>等待逐件确认成本、包装和建议上架价。</span></div></div><div id="draftGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>可独立推进 (Ready Products)</strong><span>逐件计算，不再等待整批。</span></div></div></div><div class="batch-upload-controller"><strong>批量独立校验与上传</strong><p>最多同时处理 4 件；合格商品直接上传，缺字段或模板异常的商品单独保留，不拖住其他商品。</p><button id="batchUploadProducts" type="button">批量校验并上传可用商品</button><span id="batchUploadStatus" class="batch-upload-status"></span></div><div class="publish-lock"><strong>发布锁已开启 (Publish Lock Active) · 逐商品确认</strong><span>建品时只提交锁定的 1688 原图；Seller API 接受后立即输出图片生成与上传任务包，后续图片流程不再回传工作台。</span></div></aside>
         </div>
       </main>
     </div>
@@ -3179,6 +3181,49 @@ def build_upload_workspace_html(run_id: str) -> str:
       section.append(grid); container.append(section);
     }}
     function mappingGrid(fields) {{ const statusText = {{ rewrite_required:"待原创（依据采集事实，不复制 Ozon 原文）", missing_fact:"缺少事实，需补充", not_applicable:"未提供可选素材", excluded:"不参与本阶段" }}; const grid = document.createElement("div"); grid.className = "attribute-grid"; (fields || []).forEach((field) => {{ const row = document.createElement("div"); row.className = `attribute ${{field.status || "missing_fact"}}`; const label = document.createElement("span"); label.textContent = `${{field.label || field.field_key}}${{field.required ? " *" : ""}}`; const fact = document.createElement("strong"); const pendingVisual = field.status === "missing_fact" && field.visual_inference_supported; fact.textContent = field.status === "mapped" ? String(field.value) : (pendingVisual ? "可从锁定 1688 原图判定，等待智能字段 Skill 重判" : (field.intelligence_decision === "unresolved" ? `证据不足：${{field.reason || "无法确认"}}` : (statusText[field.status] || "缺少事实，需补充"))); row.append(label,fact); grid.append(row); }}); return grid; }}
+    function requiredOptionValue(option) {{ if (option && typeof option === "object") return String(option.id ?? option.value ?? option.name ?? option.label ?? ""); return String(option ?? ""); }}
+    function requiredOptionLabel(option) {{ if (option && typeof option === "object") return String(option.name ?? option.label ?? option.value ?? option.id ?? ""); return String(option ?? ""); }}
+    function renderRequiredAttributeEditor(container,item) {{
+      const fields = (item.missing_required_fields || []).filter((field) => field && field.field_key);
+      if (!item.template_ready || !fields.length) return;
+      const editor = document.createElement("section"); editor.className = "required-field-editor";
+      const title = document.createElement("h4"); title.textContent = "补充缺失必填字段";
+      const note = document.createElement("p"); note.textContent = "这里只显示 Seller API 当前仍缺失的必填项；填写值会作为用户确认的字段证据，不会覆盖已映射字段。";
+      const grid = document.createElement("div"); grid.className = "required-field-grid";
+      fields.forEach((field) => {{
+        const wrapper = document.createElement("div"); wrapper.className = "required-field-input";
+        const label = document.createElement("label"); label.textContent = field.label || field.field_key; label.htmlFor = `required-${{item.seed_id}}-${{field.field_key}}`;
+        const options = Array.isArray(field.allowed_values) ? field.allowed_values : [];
+        const input = options.length ? document.createElement("select") : document.createElement("input");
+        input.id = label.htmlFor; input.dataset.fieldKey = field.field_key;
+        if (options.length) {{
+          const placeholder = document.createElement("option"); placeholder.value = ""; placeholder.textContent = "请选择"; input.append(placeholder);
+          options.forEach((option) => {{ const choice = document.createElement("option"); choice.value = requiredOptionValue(option); choice.textContent = requiredOptionLabel(option); input.append(choice); }});
+        }} else {{
+          input.type = field.attribute_type === "integer" || field.attribute_type === "decimal" ? "number" : "text";
+          input.placeholder = field.reason ? `缺失：${{field.reason}}` : "请输入真实值";
+        }}
+        wrapper.append(label,input); grid.append(wrapper);
+      }});
+      const actions = document.createElement("div"); actions.className = "required-field-actions";
+      const save = document.createElement("button"); save.type = "button"; save.textContent = "保存必填证据";
+      const status = document.createElement("span"); status.className = "required-field-status";
+      save.addEventListener("click", async () => {{
+        const values = {{}};
+        editor.querySelectorAll("[data-field-key]").forEach((input) => {{ const value = String(input.value || "").trim(); if (value) values[input.dataset.fieldKey] = value; }});
+        if (!Object.keys(values).length) {{ status.className = "required-field-status error"; status.textContent = "请至少填写一项真实必填字段。"; return; }}
+        save.disabled = true; status.className = "required-field-status"; status.textContent = "正在保存并重新计算本商品门禁…";
+        try {{
+          const result = await api(`/api/batches/${{encodeURIComponent(runId)}}/required-attributes/${{encodeURIComponent(item.seed_id)}}`, {{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify({{values}})}});
+          status.className = "required-field-status success"; status.textContent = `已保存 ${{(result.data.saved_field_keys || []).length}} 项真实证据。`;
+          await loadUploadWorkspace();
+        }} catch (error) {{
+          status.className = "required-field-status error"; status.textContent = error.message || (error.errors || []).join("；") || "保存失败";
+          save.disabled = false;
+        }}
+      }});
+      actions.append(save,status); editor.append(title,note,grid,actions); container.append(editor);
+    }}
     function renderMapping(container, item) {{ if (!item.template_ready) {{ const summary = document.createElement("div"); summary.className = "mapping-summary"; const blocked = document.createElement("span"); blocked.className = "mapping-chip warn"; blocked.textContent = "模板错配，未执行字段映射"; summary.append(blocked); container.append(summary); return; }} const fields = item.attribute_mapping || []; const summary = document.createElement("div"); summary.className = "mapping-summary"; const ready = document.createElement("span"); ready.className = `mapping-chip${{item.required_attributes_ready ? "" : " warn"}}`; ready.textContent = `必填 ${{item.required_mapped_count || 0}} / ${{item.required_attribute_count || 0}}`; const mapped = document.createElement("span"); mapped.className = "mapping-chip"; mapped.textContent = `模板已填 ${{item.mapped_attribute_count || 0}}`; const rewrite = document.createElement("span"); rewrite.className = `mapping-chip${{(item.rewrite_required_count || 0) ? " warn" : ""}}`; rewrite.textContent = `待智能生成/规范 ${{item.rewrite_required_count || 0}}`; const missing = document.createElement("span"); missing.className = `mapping-chip${{(item.missing_fact_count || 0) ? " warn" : ""}}`; missing.textContent = `缺少事实 ${{item.missing_fact_count || 0}}`; const assets = document.createElement("span"); assets.className = "mapping-chip"; assets.textContent = `未提供可选素材 ${{item.not_applicable_count || 0}}`; summary.append(ready,mapped,rewrite,missing,assets); container.append(summary); const score = item.attribute_score_progress || {{}}; if (score.scorable_attribute_count) {{ const progress = document.createElement("div"); progress.className = "score-progress"; const paths = []; if (score.fields_to_50_percent > 0) paths.push(`再补 ${{score.fields_to_50_percent}} 项进入 15 分档`); if (score.fields_to_70_percent > 0) paths.push(`再补 ${{score.fields_to_70_percent}} 项进入 30 分档`); if (!paths.length) paths.push("已达到属性完整度 30 分档"); progress.textContent = `Ozon 属性分预估 ${{score.estimated_attribute_points}} / 30 · 计分属性 ${{score.filled_attribute_count}} / ${{score.scorable_attribute_count}} (${{score.completion_percent}}%) · ${{paths.join("；")}}`; container.append(progress); }} const details = document.createElement("details"); details.className = "all-mappings"; details.open = true; const label = document.createElement("summary"); label.textContent = `全部模板字段 (${{fields.length}})`; details.append(label,mappingGrid(fields)); container.append(details); }}
     async function previewProductUpload(item, controls) {{
       const previewButton = controls.querySelector("[data-action=preview]");
@@ -3287,6 +3332,26 @@ def build_upload_workspace_html(run_id: str) -> str:
       previewButton.addEventListener("click",() => previewProductUpload(item,controls)); confirmButton.addEventListener("click",() => confirmProductUpload(item,controls));
       controls.append(previewButton,confirmButton,status); container.append(controls);
     }}
+    async function batchUploadProducts() {{
+      const button = $("batchUploadProducts"); const status = $("batchUploadStatus");
+      const items = (latestUploadData && latestUploadData.items) || [];
+      const seedIds = items.filter((item) => !item.upload_submission || ["failed","error","declined"].includes(String(item.upload_submission.status || "").toLowerCase())).map((item) => item.seed_id);
+      if (!seedIds.length) {{ status.className = "batch-upload-status success"; status.textContent = "当前批次没有待提交商品。"; return; }}
+      if (!window.confirm(`确认并发校验这 ${{seedIds.length}} 件商品，并把通过自身门禁的商品提交到 Ozon？未通过的商品会单独保留。`)) return;
+      button.disabled = true; status.className = "batch-upload-status"; status.textContent = `正在并发校验并上传 ${{seedIds.length}} 件商品（最多 4 件同时处理）…`;
+      try {{
+        const result = await api(`/api/batches/${{encodeURIComponent(runId)}}/product-upload/batch`, {{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify({{seed_ids:seedIds,confirmed:true,max_workers:4}})}});
+        const data = result.data || {{}};
+        status.className = "batch-upload-status success";
+        status.textContent = `已提交 ${{data.submitted_product_count || 0}} 件，已提交过 ${{data.already_submitted_product_count || 0}} 件，保留待补 ${{data.failed_or_blocked_product_count || 0}} 件。`;
+        await loadUploadWorkspace();
+      }} catch (error) {{
+        const data = error.data || {{}};
+        status.className = "batch-upload-status error";
+        status.textContent = error.message || `没有商品通过校验；保留待补 ${{data.failed_or_blocked_product_count || seedIds.length}} 件。`;
+        await loadUploadWorkspace();
+      }} finally {{ button.disabled = false; }}
+    }}
     function setGate(id, ready, text) {{ const row = $(id); row.classList.toggle("blocked", !ready); row.querySelector(".gate-icon").textContent = ready ? "✓" : "!"; row.querySelector("span:last-child").textContent = text; }}
     function render(data) {{
       latestUploadData = data;
@@ -3331,7 +3396,7 @@ def build_upload_workspace_html(run_id: str) -> str:
         (item.blocking_gates || []).forEach((gate) => {{ const chip = document.createElement("span"); chip.className = "item-gate-chip"; chip.textContent = `缺少：${{blockerLabels[gate] || gate}}`; gateSummary.append(chip); }});
         if (item.ready_to_build) {{ const ready = document.createElement("span"); ready.className = "item-gate-chip"; ready.textContent = "不等待其他商品"; gateSummary.append(ready); }}
         const meta = document.createElement("div"); meta.className = "meta-grid"; meta.innerHTML = `<div class="meta"><span>精准类目</span><strong>${{item.category_path || "-"}}</strong></div><div class="meta"><span>属性模板</span><strong>${{item.attribute_schema_count || 0}} 字段</strong></div><div class="meta"><span>建品图片</span><strong>${{item.bootstrap_image_ready ? "锁定原图已就绪" : "缺少锁定原图"}}</strong></div>`;
-        body.append(label,title,notice,gateSummary,meta); renderUploadCoreFields(body,item); renderMapping(body,item); renderProductUploadActions(body,item); card.append(body); $("draftItems").append(card);
+        body.append(label,title,notice,gateSummary,meta); renderUploadCoreFields(body,item); renderRequiredAttributeEditor(body,item); renderMapping(body,item); renderProductUploadActions(body,item); card.append(body); $("draftItems").append(card);
       }});
       if (!items.length) {{ const empty = document.createElement("div"); empty.className = "empty"; empty.textContent = "当前批次没有可用的类目模板与商品证据"; $("draftItems").append(empty); }}
     }}
@@ -3342,6 +3407,7 @@ def build_upload_workspace_html(run_id: str) -> str:
     $("pricingNextPage").addEventListener("click", () => changePricingPage(1));
     $("draftPrevPage").addEventListener("click", () => changeDraftPage(-1));
     $("draftNextPage").addEventListener("click", () => changeDraftPage(1));
+    $("batchUploadProducts").addEventListener("click", batchUploadProducts);
     async function loadUploadWorkspace() {{ const result = await api(`/api/batches/${{encodeURIComponent(runId)}}/upload`); render(result.data || {{}}); return result.data || {{}}; }}
     loadUploadWorkspace().catch((error) => {{ $("workspaceStatus").textContent = "加载失败 (Failed)"; $("draftItems").textContent = error.message || String(error); }});
   </script>
@@ -3788,6 +3854,42 @@ def create_handler(
                 return
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "upload-draft":
                 self._send_result(service.build_upload_draft(parts[2]), run_id=parts[2])
+                return
+            if (
+                len(parts) == 5
+                and parts[:2] == ["api", "batches"]
+                and parts[3:] == ["product-upload", "batch"]
+            ):
+                raw_seed_ids = payload.get("seed_ids")
+                seed_ids = (
+                    [str(seed_id) for seed_id in raw_seed_ids]
+                    if isinstance(raw_seed_ids, list)
+                    else None
+                )
+                self._send_result(
+                    service.batch_upload_products(
+                        parts[2],
+                        seed_ids=seed_ids,
+                        confirmed=payload.get("confirmed") is True,
+                        max_workers=int(payload.get("max_workers") or 4),
+                    ),
+                    run_id=parts[2],
+                )
+                return
+            if (
+                len(parts) == 5
+                and parts[:2] == ["api", "batches"]
+                and parts[3] == "required-attributes"
+            ):
+                values = payload.get("values")
+                self._send_result(
+                    service.save_required_attribute_evidence(
+                        parts[2],
+                        parts[4],
+                        values if isinstance(values, dict) else {},
+                    ),
+                    run_id=parts[2],
+                )
                 return
             if (
                 len(parts) == 6

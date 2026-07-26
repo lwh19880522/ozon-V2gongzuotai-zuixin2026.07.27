@@ -342,6 +342,53 @@ class SellerCategoryTreeTests(TestCase):
                 images=["http://media.example/image.jpg"],
             )
 
+    def test_attach_product_video_assets_reimports_same_offer_with_video_fields(
+        self,
+    ) -> None:
+        adapter = SellerApiAdapter()
+        calls = []
+        adapter._post_json = lambda path, payload: (
+            calls.append((path, payload))
+            or {"result": {"task_id": 9090}}
+        )
+        gallery = [
+            f"https://media.example/slot-{index:02d}.jpg"
+            for index in range(1, 9)
+        ]
+
+        result = adapter.attach_product_video_assets(
+            seller_api_item={
+                "offer_id": "OZV2-ONE",
+                "attributes": [
+                    {"complex_id": 0, "id": 10, "values": [{"value": "existing"}]}
+                ],
+                "images": ["https://old.example/one.jpg"],
+                "primary_image": "https://old.example/one.jpg",
+            },
+            video_url="https://media.example/slideshow.mp4",
+            video_cover_url="https://media.example/video-cover.jpg",
+            video_template_fields=[
+                {"attribute_id": "21845", "kind": "video_cover_url"},
+                {"attribute_id": "21846", "kind": "video_url"},
+                {"attribute_id": "21847", "kind": "video_title"},
+            ],
+            image_urls=gallery,
+        )
+
+        self.assertEqual("/v3/product/import", calls[0][0])
+        item = calls[0][1]["items"][0]
+        self.assertEqual("OZV2-ONE", item["offer_id"])
+        self.assertEqual(gallery, item["images"])
+        self.assertEqual(gallery[0], item["primary_image"])
+        values = {
+            attribute["id"]: attribute["values"][0]["value"]
+            for attribute in item["attributes"]
+        }
+        self.assertEqual("https://media.example/slideshow.mp4", values[21845])
+        self.assertEqual("https://media.example/slideshow.mp4", values[21846])
+        self.assertEqual("Видео о товаре", values[21847])
+        self.assertEqual(9090, result["task_id"])
+
     def test_seller_contract_currency_is_read_from_seller_profile(self) -> None:
         adapter = SellerApiAdapter()
         calls = []

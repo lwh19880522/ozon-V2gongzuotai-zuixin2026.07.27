@@ -132,16 +132,25 @@ def materialize_ozon_references(
             }
         )
 
-    ready = len(accepted) >= minimum_valid
+    reference_guidance_ready = len(accepted) >= minimum_valid
     manifest_path = destination / "reference_manifest.json"
     result = {
         "contract_version": "ozon-reference-materialization-v1",
         "minimum_edge": minimum_edge,
         "minimum_valid": minimum_valid,
-        "ready": ready,
-        "stop_reason": (
-            None if ready else "insufficient_distinct_legible_ozon_references"
+        "ready": True,
+        "reference_guidance_ready": reference_guidance_ready,
+        "generation_mode": (
+            "reference_guided"
+            if reference_guidance_ready
+            else "ozon_aesthetic_fallback"
         ),
+        "warning_reason": (
+            None
+            if reference_guidance_ready
+            else "insufficient_distinct_legible_ozon_references"
+        ),
+        "stop_reason": None,
         "accepted": accepted,
         "rejected": rejected,
         "manifest_path": str(manifest_path),

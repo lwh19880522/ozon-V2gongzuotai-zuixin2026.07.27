@@ -20,8 +20,19 @@ workbench.
 3. Each slot maps to one persisted opaque `thread_id`. Never derive or invent a task ID from its slot number, display name, or URL.
 4. Reuse the same ten tasks in slot order for new products，按槽位顺序复用. A task finishes product A, becomes idle, then receives product B. Each task handles one product at a time, and the pool handles at most ten products concurrently. 全局并发上限为 10.
 5. Never use hidden child agents. Never create a product-specific task. Never grow the pool above ten.
-6. Creating the initial pool or replacing an unavailable slot is allowed only when the user explicitly requests a new task. A normal batch start, continuation, retry, or repair must reuse the registered pool and must not silently create or replace tasks.
-7. If a registered task is unavailable, mark only that slot unavailable and continue with the other slots. Report the exact slot that needs the user's explicit replacement instruction.
+6. The initial empty registry is a one-time pool bootstrap, not a batch-time
+   replacement. When the registered pool is empty and the user directly asks
+   to start, continue, or process Ozon image tasks, that request authorizes
+   creation of exactly the missing fixed tasks through
+   `ozon-image-worker-10`. Do not ask the user to repeat a magic confirmation phrase such as “create ten tasks”; create and register the fixed pool once,
+   then dispatch the queued packages. If initialization was interrupted before
+   all ten task IDs were durably registered, resume only the missing slot
+   numbers.
+7. After the pool has been initialized, a normal batch start, continuation,
+   retry, repair, or controller restart must reuse the registered tasks and
+   must not silently create or replace tasks. Replacing an unavailable
+   registered task is allowed only when the user explicitly requests a new task.
+8. If a registered task is unavailable, mark only that slot unavailable and continue with the other slots. Report the exact slot that needs the user's explicit replacement instruction.
 
 ## Fixed task-package inbox
 
@@ -39,8 +50,8 @@ replacement when it is not already stored in the package.
 2. Reconcile the persisted fixed-task registry before dispatch. Do not recreate tasks after a controller restart.
 3. Assign packages to idle slots in ascending slot order. Use the corresponding stable worker ID while that task owns the package.
 4. Claim with `scripts/ozon_image_task_inbox.py --runtime-root <runtime> claim-next --worker <worker_id>`. Send the registered task only the short command returned from the claim: `RUN package_id=<id> worker_id=<id>`.
-5. The visible task follows `skills/ozon-product-media-generator/SKILL.md`, reads only its owned package from `image_tasks/in_progress`, generates and validates eight images, publishes them, and directly replaces the product gallery in Ozon.
-6. When the package reaches `completed` or `failed`, release the fixed slot and immediately claim the next package. A failed package does not block other products.
+5. The visible task follows `skills/ozon-product-media-generator/SKILL.md`, reads only its owned package from `image_tasks/in_progress`, loads the fixed commercial-infographic core plus the 2+3+3 grid wrappers from that Skill, generates and validates eight 3:4 images, publishes them, and directly replaces the product gallery in Ozon. The controller must never paste or reconstruct the long image prompt inside a worker command.
+6. When the package reaches `completed` or `failed`, release the fixed slot and immediately claim the next package. Continue dispatching other eligible `pending` packages. A failed package does not block other products.
 7. Return repair and continuation work to the product's `preferred_slot`. If that task is busy, queue it for that same task rather than creating another task.
 8. Package claiming and completion are idempotent by `package_id`; repeated controller scans must not start duplicate generation.
 
@@ -50,7 +61,20 @@ Use the filesystem inbox and the lightweight
 `scripts/ozon_image_task_inbox.py`; do not add a daemon, another database, or
 per-product controller tasks.
 
-1. Keep the existing fixed visible-task registry. Replacing a different `thread_id` requires the user's explicit replacement instruction.
+0. Before claiming any package, require the user to provide the public R2 HTTPS
+   channel address. If it is supplied but not saved, POST
+   `{"base_url":"https://..."}` to the local workbench
+   `/api/settings/public-media` endpoint, then run
+   `scripts/ozon_image_task_inbox.py --runtime-root <runtime> media-preflight`.
+   If the address is absent, the bucket is inaccessible, or public preflight
+   fails, claim nothing and ask the user to configure it. Do not start image
+   generation.
+1. Read the fixed-task registry before claiming packages. On a registered pool,
+   keep every existing task. On an empty or interrupted first-install pool,
+   apply the one-time pool bootstrap above, persist each returned opaque
+   `thread_id` immediately, and continue without another user round trip.
+   Replacing a different registered `thread_id` still requires the user's
+   explicit replacement instruction.
 2. Read `status`, then run `claim-next` once for each idle registered worker and send its returned `RUN package_id=... worker_id=...` command to the persisted `thread_id`.
 3. Wait for any active package to reach `completed` or `failed`. Immediately run `claim-next` for that newly idle slot; do not wait for all ten active tasks to finish.
 4. Do not stop after the first ten products. Ten is the global concurrency limit, not the batch size. A batch of 30 or 100 products keeps recycling the same ten tasks until the queue is drained.
@@ -64,7 +88,7 @@ When a queued product contains `repair_pending` slots, dispatch it to its origin
 
 Treat every product independently. A package waiting for an explicit user repair
 instruction is a per-product waiting state, not a batch-wide stop gate. Continue
-Continue dispatching other eligible `pending` packages while any remain.
+dispatching other eligible `pending` packages while any remain.
 
 A missing SKU or subject gate blocks only that product. Report the blocked product and its required user action, then continue every other eligible queued product. A `stopped` product does not stop other eligible products. Report its persisted stop reason and recovery action. Never auto-resume a stopped product because the stop may have been requested by the user.
 

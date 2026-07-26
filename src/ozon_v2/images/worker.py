@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -10,17 +11,33 @@ from typing import Any
 from PIL import Image, ImageChops, ImageStat
 
 from ozon_v2.domain.supplier_sku import stable_sha256
-from ozon_v2.images.visual_design import CURRENT_VISUAL_CONTRACT_VERSION
+from ozon_v2.images.visual_design import (
+    CURRENT_VISUAL_CONTRACT_VERSION,
+    HISTORICAL_VISUAL_CONTRACT_VERSION,
+)
 
 
 LEGACY_PROMPT_VERSION = "ozon-image-v2"
-PREVIOUS_PROMPT_VERSION = "ozon-image-v3"
-CURRENT_PROMPT_VERSION = "ozon-image-v4"
+VISUAL_PROMPT_VERSION = "ozon-image-v3"
+PREVIOUS_PROMPT_VERSION = "ozon-image-v4"
+REFERENCE_LAYOUT_PROMPT_VERSION = "ozon-image-v5"
+CURRENT_PROMPT_VERSION = "ozon-image-v6"
 SUPPORTED_PROMPT_VERSIONS = frozenset(
-    {LEGACY_PROMPT_VERSION, PREVIOUS_PROMPT_VERSION, CURRENT_PROMPT_VERSION}
+    {
+        LEGACY_PROMPT_VERSION,
+        VISUAL_PROMPT_VERSION,
+        PREVIOUS_PROMPT_VERSION,
+        REFERENCE_LAYOUT_PROMPT_VERSION,
+        CURRENT_PROMPT_VERSION,
+    }
 )
 VISUAL_PROMPT_VERSIONS = frozenset(
-    {PREVIOUS_PROMPT_VERSION, CURRENT_PROMPT_VERSION}
+    {
+        VISUAL_PROMPT_VERSION,
+        PREVIOUS_PROMPT_VERSION,
+        REFERENCE_LAYOUT_PROMPT_VERSION,
+        CURRENT_PROMPT_VERSION,
+    }
 )
 REQUIRED_OUTPUT_ASPECT_RATIO = (3, 4)
 MAX_SOURCE_PANEL_ASPECT_RATIO_DEVIATION = 0.05
@@ -43,7 +60,78 @@ REFERENCE_MAPPING_TRUE_FLAGS = (
     "reference_composition_followed",
     "locked_subject_preserved",
 )
+V5_REFERENCE_MAPPING_TRUE_FLAGS = (
+    *REFERENCE_MAPPING_TRUE_FLAGS,
+    "reference_layout_followed",
+)
+REFERENCE_LAYOUT_ARCHETYPES = frozenset(
+    {
+        "hero",
+        "lifestyle",
+        "functional_infographic",
+        "annotated_feature",
+        "instructional_steps",
+        "material_closeup",
+        "dimension_fit",
+        "comparison",
+        "set_contents",
+    }
+)
+REFERENCE_PROMPT_VERSIONS = frozenset(
+    {
+        PREVIOUS_PROMPT_VERSION,
+        REFERENCE_LAYOUT_PROMPT_VERSION,
+        CURRENT_PROMPT_VERSION,
+    }
+)
+ADAPTIVE_REFERENCE_PROMPT_VERSIONS = frozenset(
+    {REFERENCE_LAYOUT_PROMPT_VERSION, CURRENT_PROMPT_VERSION}
+)
+INTEGRATED_COPY_PROMPT_VERSIONS = ADAPTIVE_REFERENCE_PROMPT_VERSIONS
+V5_GUIDANCE_MODES = frozenset(
+    {"reference_guided", "ozon_aesthetic_fallback"}
+)
 MINIMUM_OZON_REFERENCE_EDGE = 512
+_RUSSIAN_WORD = re.compile(r"[А-Яа-яЁё]+(?:-[А-Яа-яЁё]+)?")
+_HAN_CHARACTER = re.compile(r"[\u3400-\u9fff]")
+
+
+def _validate_v6_copy_payload(
+    validation: Mapping[str, Any], errors: list[str]
+) -> None:
+    headline = str(validation.get("russian_headline") or "").strip()
+    subtitle = str(validation.get("russian_subtitle") or "").strip()
+    labels = validation.get("russian_functional_labels")
+
+    headline_words = _RUSSIAN_WORD.findall(headline)
+    if not 3 <= len(headline_words) <= 7:
+        errors.append("russian_headline must contain 3 to 7 Russian words")
+    if _HAN_CHARACTER.search(headline):
+        errors.append("russian_headline must not contain Chinese text")
+
+    subtitle_words = _RUSSIAN_WORD.findall(subtitle)
+    if not subtitle_words or len(subtitle_words) > 14:
+        errors.append("russian_subtitle must contain at most 14 Russian words")
+    if _HAN_CHARACTER.search(subtitle):
+        errors.append("russian_subtitle must not contain Chinese text")
+
+    if (
+        not isinstance(labels, (list, tuple))
+        or isinstance(labels, (str, bytes, bytearray))
+        or not 2 <= len(labels) <= 4
+    ):
+        errors.append("russian_functional_labels must contain 2 to 4 labels")
+        return
+    normalized_labels = [str(label or "").strip() for label in labels]
+    if any(
+        not _RUSSIAN_WORD.search(label) or _HAN_CHARACTER.search(label)
+        for label in normalized_labels
+    ):
+        errors.append("each functional label must contain readable Russian text")
+    if len({label.casefold() for label in normalized_labels}) != len(
+        normalized_labels
+    ):
+        errors.append("russian_functional_labels must not repeat")
 
 
 def looks_plain_or_near_white_product_only(path: str | Path) -> bool:
@@ -302,11 +390,19 @@ class SlotResultReceipt:
                     errors.append(f"{key} must be true")
             if not isinstance(self.validation.get("visual_spec"), dict):
                 errors.append("visual_spec is required")
-            if self.validation.get("visual_contract_version") != CURRENT_VISUAL_CONTRACT_VERSION:
+            expected_visual_contract = (
+                CURRENT_VISUAL_CONTRACT_VERSION
+                if self.prompt_version == CURRENT_PROMPT_VERSION
+                else HISTORICAL_VISUAL_CONTRACT_VERSION
+            )
+            if self.validation.get("visual_contract_version") != expected_visual_contract:
                 errors.append(
-                    f"visual_contract_version must be {CURRENT_VISUAL_CONTRACT_VERSION}"
+                    f"visual_contract_version must be {expected_visual_contract}"
                 )
-        if self.prompt_version == CURRENT_PROMPT_VERSION:
+        if (
+            isinstance(self.prompt_version, str)
+            and self.prompt_version in REFERENCE_PROMPT_VERSIONS
+        ):
             if (
                 self.validation.get("reference_mapping_version")
                 != REFERENCE_MAPPING_VERSION
@@ -314,51 +410,125 @@ class SlotResultReceipt:
                 errors.append(
                     f"reference_mapping_version must be {REFERENCE_MAPPING_VERSION}"
                 )
-            reference_sha256 = str(
-                self.validation.get("primary_ozon_reference_sha256") or ""
-            ).lower()
+            guidance_mode = (
+                str(self.validation.get("guidance_mode") or "").strip()
+                if self.prompt_version in ADAPTIVE_REFERENCE_PROMPT_VERSIONS
+                else "reference_guided"
+            )
             if (
-                len(reference_sha256) != 64
-                or any(character not in "0123456789abcdef" for character in reference_sha256)
+                self.prompt_version in ADAPTIVE_REFERENCE_PROMPT_VERSIONS
+                and guidance_mode not in V5_GUIDANCE_MODES
             ):
                 errors.append(
-                    "primary_ozon_reference_sha256 must be a lowercase SHA-256 digest"
+                    "guidance_mode must be reference_guided or "
+                    "ozon_aesthetic_fallback"
                 )
-            reference_path_value = str(
-                self.validation.get("primary_ozon_reference_path") or ""
-            ).strip()
-            if not reference_path_value:
-                errors.append("primary_ozon_reference_path is required")
-            else:
-                reference_path = Path(reference_path_value)
-                if not reference_path.is_file():
-                    errors.append("primary Ozon reference file does not exist")
+            reference_guided = guidance_mode == "reference_guided"
+            if reference_guided:
+                reference_sha256 = str(
+                    self.validation.get("primary_ozon_reference_sha256") or ""
+                ).lower()
+                if (
+                    len(reference_sha256) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in reference_sha256
+                    )
+                ):
+                    errors.append(
+                        "primary_ozon_reference_sha256 must be a lowercase "
+                        "SHA-256 digest"
+                    )
+                reference_path_value = str(
+                    self.validation.get("primary_ozon_reference_path") or ""
+                ).strip()
+                if not reference_path_value:
+                    errors.append("primary_ozon_reference_path is required")
                 else:
-                    if file_sha256(reference_path) != reference_sha256:
-                        errors.append("primary Ozon reference SHA-256 does not match")
-                    try:
-                        with Image.open(reference_path) as reference_image:
-                            if min(reference_image.size) < MINIMUM_OZON_REFERENCE_EDGE:
-                                errors.append(
-                                    "primary Ozon reference edge must be at least 512 pixels"
-                                )
-                    except OSError:
-                        errors.append("primary Ozon reference pixels are unavailable")
-            reference_slot_index = self.validation.get("reference_slot_index")
+                    reference_path = Path(reference_path_value)
+                    if not reference_path.is_file():
+                        errors.append("primary Ozon reference file does not exist")
+                    else:
+                        if file_sha256(reference_path) != reference_sha256:
+                            errors.append(
+                                "primary Ozon reference SHA-256 does not match"
+                            )
+                        try:
+                            with Image.open(reference_path) as reference_image:
+                                if (
+                                    min(reference_image.size)
+                                    < MINIMUM_OZON_REFERENCE_EDGE
+                                ):
+                                    errors.append(
+                                        "primary Ozon reference edge must be at "
+                                        "least 512 pixels"
+                                    )
+                        except OSError:
+                            errors.append(
+                                "primary Ozon reference pixels are unavailable"
+                            )
+                reference_slot_index = self.validation.get(
+                    "reference_slot_index"
+                )
+                if (
+                    not isinstance(reference_slot_index, int)
+                    or isinstance(reference_slot_index, bool)
+                    or reference_slot_index < 1
+                ):
+                    errors.append(
+                        "reference_slot_index must be a positive integer"
+                    )
+                if not isinstance(self.validation.get("reference_reused"), bool):
+                    errors.append("reference_reused must be a boolean")
+            elif self.prompt_version in ADAPTIVE_REFERENCE_PROMPT_VERSIONS:
+                for key in (
+                    "primary_ozon_reference_path",
+                    "primary_ozon_reference_sha256",
+                ):
+                    if self.validation.get(key) not in (None, ""):
+                        errors.append(
+                            f"{key} must be empty for ozon_aesthetic_fallback"
+                        )
+                if self.validation.get("reference_reused") not in (False, None):
+                    errors.append(
+                        "reference_reused must be false for "
+                        "ozon_aesthetic_fallback"
+                    )
+            required_reference_flags = (
+                V5_REFERENCE_MAPPING_TRUE_FLAGS
+                if (
+                    self.prompt_version in ADAPTIVE_REFERENCE_PROMPT_VERSIONS
+                    and reference_guided
+                )
+                else REFERENCE_MAPPING_TRUE_FLAGS
+            )
             if (
-                not isinstance(reference_slot_index, int)
-                or isinstance(reference_slot_index, bool)
-                or reference_slot_index < 1
+                self.prompt_version in ADAPTIVE_REFERENCE_PROMPT_VERSIONS
+                and not reference_guided
             ):
-                errors.append("reference_slot_index must be a positive integer")
-            if not isinstance(self.validation.get("reference_reused"), bool):
-                errors.append("reference_reused must be a boolean")
-            for key in REFERENCE_MAPPING_TRUE_FLAGS:
+                required_reference_flags = ("locked_subject_preserved",)
+            for key in required_reference_flags:
                 if self.validation.get(key) is not True:
                     errors.append(f"{key} must be true")
+            if self.prompt_version in ADAPTIVE_REFERENCE_PROMPT_VERSIONS:
+                reference_layout_archetype = str(
+                    self.validation.get("reference_layout_archetype") or ""
+                ).strip().lower().replace("-", "_").replace(" ", "_")
+                if reference_layout_archetype not in REFERENCE_LAYOUT_ARCHETYPES:
+                    errors.append(
+                        "reference_layout_archetype must be a supported "
+                        "reference-layout archetype"
+                    )
             visual_spec = self.validation.get("visual_spec")
             facts = visual_spec.get("facts", []) if isinstance(visual_spec, dict) else []
-            if self.slot_id != "main_01":
+            slot_requires_integrated_copy = (
+                self.prompt_version == CURRENT_PROMPT_VERSION
+                or (
+                    self.prompt_version == REFERENCE_LAYOUT_PROMPT_VERSION
+                    and self.slot_id != "main_01"
+                )
+            )
+            if slot_requires_integrated_copy:
                 russian_text = " ".join(
                     str(fact.get(key, ""))
                     for fact in facts
@@ -366,21 +536,31 @@ class SlotResultReceipt:
                     for key in ("headline", "detail")
                 )
                 if not re.search(r"[\u0400-\u04ff]", russian_text):
-                    errors.append("supporting slot must contain verified Russian labels")
-                source_digest = str(
-                    self.validation.get("visual_source_sha256") or ""
-                ).lower()
+                    errors.append("finished slot must contain verified Russian labels")
                 output_digest = str(
                     self.validation.get("visual_output_sha256") or ""
                 ).lower()
                 if output_digest != self.output_sha256:
                     errors.append("visual_output_sha256 must match the accepted output")
-                if len(source_digest) != 64 or source_digest == output_digest:
-                    errors.append(
-                        "supporting slot must persist a locally rendered Russian label layer"
-                    )
+                if self.prompt_version in INTEGRATED_COPY_PROMPT_VERSIONS:
+                    if self.validation.get("copy_mode") != "imagegen_integrated":
+                        errors.append("copy_mode must be imagegen_integrated")
+                    if self.validation.get("russian_copy_integrated") is not True:
+                        errors.append("russian_copy_integrated must be true")
+                else:
+                    source_digest = str(
+                        self.validation.get("visual_source_sha256") or ""
+                    ).lower()
+                    if len(source_digest) != 64 or source_digest == output_digest:
+                        errors.append(
+                            "supporting slot must persist a locally rendered "
+                            "Russian label layer"
+                        )
+                if self.prompt_version == CURRENT_PROMPT_VERSION:
+                    _validate_v6_copy_payload(self.validation, errors)
         if (
-            self.prompt_version == CURRENT_PROMPT_VERSION
+            isinstance(self.prompt_version, str)
+            and self.prompt_version in REFERENCE_PROMPT_VERSIONS
             and not is_exact_three_by_four_image(self.output_path)
         ):
             errors.append("output must be exactly 3:4 portrait")
@@ -421,4 +601,49 @@ def validate_output_diversity(
                 errors.append(
                     f"output slots {left.slot_id} and {right.slot_id} are visually near-duplicate"
                 )
+    return errors
+
+
+def validate_reference_layout_diversity(
+    receipts: tuple[SlotResultReceipt, ...],
+    *,
+    minimum_unique_archetypes: int = 6,
+    maximum_reference_reuse: int = 2,
+) -> list[str]:
+    """Reject v5 galleries that only swap backgrounds or over-reuse one reference."""
+    current = tuple(
+        receipt
+        for receipt in receipts
+        if (
+            receipt.prompt_version in ADAPTIVE_REFERENCE_PROMPT_VERSIONS
+            and receipt.accepted
+        )
+    )
+    if not current or len(current) != len(receipts) or len(current) < 8:
+        return []
+    errors: list[str] = []
+    archetypes = [
+        str(receipt.validation.get("reference_layout_archetype") or "")
+        .strip()
+        .lower()
+        .replace("-", "_")
+        .replace(" ", "_")
+        for receipt in current
+    ]
+    if len(set(archetypes)) < minimum_unique_archetypes:
+        errors.append(
+            "v5 eight-slot set must use at least "
+            f"{minimum_unique_archetypes} reference-layout archetypes"
+        )
+    reference_counts = Counter(
+        str(receipt.validation.get("primary_ozon_reference_sha256") or "").lower()
+        for receipt in current
+        if receipt.validation.get("guidance_mode") == "reference_guided"
+        and str(receipt.validation.get("primary_ozon_reference_sha256") or "").strip()
+    )
+    if any(count > maximum_reference_reuse for count in reference_counts.values()):
+        errors.append(
+            "one primary Ozon reference may be bound to at most "
+            f"{maximum_reference_reuse} finished slots"
+        )
     return errors

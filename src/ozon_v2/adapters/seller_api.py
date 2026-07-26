@@ -253,6 +253,76 @@ class SellerApiAdapter:
             raise SellerApiError("Seller API picture import returned an invalid result.")
         return result
 
+    def attach_product_video_assets(
+        self,
+        *,
+        seller_api_item: dict[str, Any],
+        video_url: str,
+        video_cover_url: str,
+        video_template_fields: list[dict[str, Any]],
+        image_urls: list[str],
+    ) -> dict[str, Any]:
+        normalized_video = str(video_url or "").strip()
+        normalized_cover = str(video_cover_url or "").strip()
+        if not normalized_video.startswith("https://"):
+            raise SellerApiError("Product video must use a public HTTPS URL.")
+        if not normalized_cover.startswith("https://"):
+            raise SellerApiError("Product video cover must use a public HTTPS URL.")
+        if not isinstance(seller_api_item, dict) or not seller_api_item.get("offer_id"):
+            raise SellerApiError("The original Seller API item is required for video update.")
+        if not image_urls or any(
+            not str(url or "").strip().startswith("https://") for url in image_urls
+        ):
+            raise SellerApiError("The reviewed public product gallery is required.")
+
+        values_by_kind = {
+            "video_url": normalized_video,
+            "video_cover_url": normalized_video,
+            "video_cover_image_url": normalized_cover,
+            "video_title": "Видео о товаре",
+        }
+        video_attributes: list[dict[str, Any]] = []
+        for field in video_template_fields:
+            if not isinstance(field, dict):
+                continue
+            field_id = str(field.get("attribute_id") or "").strip()
+            value = values_by_kind.get(str(field.get("kind") or ""))
+            if not field_id or not value:
+                continue
+            video_attributes.append(
+                {
+                    "complex_id": 0,
+                    "id": int(field_id),
+                    "values": [{"value": value}],
+                }
+            )
+        if not video_attributes:
+            raise SellerApiError(
+                "This Seller API category template exposes no video URL attribute."
+            )
+
+        item = json.loads(json.dumps(seller_api_item))
+        retained = {
+            int(attribute.get("id")): attribute
+            for attribute in item.get("attributes") or []
+            if isinstance(attribute, dict) and attribute.get("id") is not None
+        }
+        for attribute in video_attributes:
+            retained[int(attribute["id"])] = attribute
+        item["attributes"] = list(retained.values())
+        item["images"] = [str(url).strip() for url in image_urls]
+        item["primary_image"] = item["images"][0]
+        result = self.import_products([item])
+        return {
+            **result,
+            "offer_id": str(item["offer_id"]),
+            "video_url": normalized_video,
+            "video_cover_url": normalized_cover,
+            "video_attribute_ids": [
+                attribute["id"] for attribute in video_attributes
+            ],
+        }
+
     def get_seller_currency_code(self) -> str:
         payload = self._post_json("/v1/seller/info", {})
         result = payload.get("result", payload)

@@ -69,6 +69,27 @@ def test_product_media_skill_directly_replaces_ozon_gallery_without_workbench_ca
     assert "direct Ozon gallery replacement" in worker_agent
 
 
+def test_product_media_requires_r2_preflight_and_uploads_slideshow_media() -> None:
+    skill_root = ROOT / "skills" / "ozon-product-media-generator"
+    worker_skill = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+    worker_agent = (skill_root / "agents" / "openai.yaml").read_text(
+        encoding="utf-8"
+    )
+    inbox_script = (ROOT / "scripts" / "ozon_image_task_inbox.py").read_text(
+        encoding="utf-8"
+    )
+    combined = "\n".join((worker_skill, worker_agent, inbox_script))
+
+    assert "media-preflight" in combined
+    assert "before any image-generation call" in worker_skill
+    assert "public R2 channel" in worker_skill
+    assert "build-slideshow" in combined
+    assert "slideshow.mp4" in combined
+    assert "video_cover.jpg" in combined
+    assert "--video" in inbox_script
+    assert "--video-cover" in inbox_script
+
+
 def test_product_media_contract_keeps_white_anchor_out_of_finished_slots() -> None:
     skill_root = ROOT / "skills" / "ozon-product-media-generator"
     skill = (skill_root / "SKILL.md").read_text(encoding="utf-8")
@@ -106,9 +127,12 @@ def test_product_media_contract_keeps_white_anchor_out_of_finished_slots() -> No
     assert "ozon-image-v3" in combined
 
 
-def test_product_media_skill_uses_visual_contract_v3_storyboard_and_local_copy_repairs() -> None:
+def test_product_media_skill_uses_visual_contract_v6_storyboard_and_first_pass_russian_copy() -> None:
     skill_root = ROOT / "skills" / "ozon-product-media-generator"
     skill = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+    core_prompt = (
+        skill_root / "assets" / "ozon-commercial-infographic-core-prompt.txt"
+    ).read_text(encoding="utf-8")
     prompt_contract = (skill_root / "references" / "prompt-contract.md").read_text(
         encoding="utf-8"
     )
@@ -126,45 +150,64 @@ def test_product_media_skill_uses_visual_contract_v3_storyboard_and_local_copy_r
         (skill, prompt_contract, main_prompt, detail_a_prompt, detail_b_prompt, repair_prompt)
     )
 
-    assert "ozon-image-v3" in combined
+    assert "ozon-image-v6" in combined
     assert "exactly four mandatory image-generation calls" in skill
     assert "one white subject" in skill
     assert "one 1x2 main grid" in skill
     assert "two 1x3 supporting grids" in skill
-    assert "render-visual" in skill
-    assert "do not call imagegen for typography" in skill
+    assert "copy_mode=imagegen_integrated" in skill
+    assert "Russian labels during the first scene-generation call" in skill
+    assert "never make a second image-generation call merely to add Russian labels" in skill
     assert "detail-grid-a-prompt.txt" in skill
     assert "detail-grid-b-prompt.txt" in skill
     assert "detail-grid-prompt.txt" not in skill
-    assert "main_01" in main_prompt and "clean hero" in main_prompt
-    assert "main_02" in main_prompt and "integrated information rail" in main_prompt
+    assert "main_01" in main_prompt and "core selling point" in main_prompt
+    assert "main_02" in main_prompt and "reference B" in main_prompt
     assert all(slot in detail_a_prompt for slot in ("detail_01", "detail_02", "detail_03"))
     assert all(slot in detail_b_prompt for slot in ("detail_04", "detail_05", "detail_06"))
-    assert "copy failure repairs only the local text layer" in prompt_contract
+    assert "first scene-generation call" in prompt_contract
+    assert "never consume a second image-generation call merely to add Russian copy" in prompt_contract
+    assert "ozon-commercial-infographic-core-prompt.txt" in skill
+    assert "prepend it byte-for-byte" in skill
+    assert "all eight finished panels" in skill
+    assert "55%—70%" in core_prompt
+    assert "3—7个俄语单词" in core_prompt
+    assert "不超过14个俄语单词" in core_prompt
+    assert "2—4个功能标签" in core_prompt
+    assert "最多保留四个主要说明区域" in core_prompt
+    assert "伪俄文" in core_prompt
+    assert "虚构参数" in core_prompt
+    assert "每个成品面板只表达一个核心主题" in core_prompt
+    assert "白底主体锚点" in core_prompt
+    assert "Ozon 参考图只提供" in core_prompt
+    assert "2+3+3" in prompt_contract
+    assert "zero copy" not in "\n".join((skill, prompt_contract, main_prompt))
     assert "natural Russian sentence case" in skill
     assert "360-pixel preview" in prompt_contract
     assert "prominent Russian headline" in prompt_contract
-    assert "edge-gradient visual system" in skill
-    assert "side-edge gradient" in prompt_contract
-    assert "bottom gradient" in prompt_contract
-    assert "anchor lines" in prompt_contract
-    assert "detached rounded text cards" in prompt_contract
-    assert "soft side-edge gradient zone" in main_prompt
-    assert "bottom-gradient caption zone" in detail_a_prompt
-    assert "anchor-line callouts" in detail_a_prompt
-    assert "bottom-gradient caption zone" in detail_b_prompt
-    assert "edge-gradient visual system" in repair_prompt
-    assert "detail_01` and `detail_04` keep one fact block" in skill
-    assert "detail_02`, `detail_03`, `detail_05`, and `detail_06` may use two" in prompt_contract
-    assert "two verified labels" in detail_a_prompt
-    assert "up to two verified labels" in detail_b_prompt
+    assert "reference-layout archetype" in skill
+    assert "reference_layout_archetype" in prompt_contract
+    assert "functional infographic" in prompt_contract
+    assert "instructional steps" in prompt_contract
+    assert "dimension or fit" in prompt_contract
+    assert "do not reduce reference learning to a background swap" in prompt_contract.lower()
+    assert "match the mapped reference's layout archetype" in main_prompt
+    assert "exact Russian headline" in main_prompt
+    assert "annotated feature" in detail_a_prompt
+    assert "instructional or result" in detail_b_prompt
+    assert "reference-layout archetype" in repair_prompt
+    assert "uniform edge-gradient template" in repair_prompt
+    assert "2-4 exact verified Russian `functional_labels`" in skill
+    assert "2-4 exact verified Russian functional labels" in prompt_contract
     for prompt in (main_prompt, detail_a_prompt, detail_b_prompt, repair_prompt):
-        assert "icons" in prompt
+        assert "2—4" in prompt
+    for prompt in (main_prompt, detail_a_prompt, detail_b_prompt, repair_prompt):
+        assert "pictograms" in prompt
     assert "invented claims" in main_prompt
-    assert "second structure or verified metric" in detail_a_prompt
-    assert "detail, material" not in detail_a_prompt
+    assert "only when the pixels prove them" in detail_a_prompt
     diversity_contract = (
-        "differ in at least three of environment, lighting, camera, shot scale, and buyer question"
+        "differ in at least three of layout archetype, visible proof, environment, "
+        "lighting, camera, shot scale, and buyer question"
     )
     assert diversity_contract in main_prompt
     assert diversity_contract in detail_a_prompt
@@ -190,7 +233,7 @@ def test_product_media_skill_and_grid_prompts_require_three_by_four_finished_ima
         encoding="utf-8"
     )
 
-    assert "ozon-image-v4" in "\n".join((skill, prompt_contract))
+    assert "ozon-image-v5" in "\n".join((skill, prompt_contract))
     assert "3:4" in skill
     assert "3:4" in prompt_contract
     assert "3:2" in main_prompt
@@ -226,7 +269,7 @@ def test_product_media_skill_maps_one_primary_ozon_reference_to_every_finished_s
     assert "reference_mapping_version=ozon-reference-map-v1" in combined
     assert "primary_ozon_reference" in skill
     assert "one primary Ozon reference per finished slot" in prompt_contract
-    assert "main_01` through `detail_06" in prompt_contract
+    assert "Every accepted slot receipt records" in prompt_contract
     assert "gallery order" in prompt_contract
     assert "same reference may be bound to at most two slots" in prompt_contract
     assert "one white identity anchor, eight slot-specific Ozon references" in skill
@@ -285,6 +328,43 @@ def test_product_media_skill_materializes_references_and_checkpoints_every_gener
     assert "immediately after each image-generation call" in combined
     assert "reuse every hash-verified checkpoint" in combined
     assert "primary_ozon_reference_path" in combined
+
+
+def test_product_media_skill_falls_back_without_ozon_references_and_trusts_locked_1688_sku() -> None:
+    skill_root = ROOT / "skills" / "ozon-product-media-generator"
+    skill = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+    prompt_contract = (skill_root / "references" / "prompt-contract.md").read_text(
+        encoding="utf-8"
+    )
+    worker_prompt = (skill_root / "agents" / "openai.yaml").read_text(
+        encoding="utf-8"
+    )
+    combined = "\n".join((skill, prompt_contract, worker_prompt))
+
+    assert "ozon_aesthetic_fallback" in combined
+    assert "must not stop generation" in combined
+    assert "locked 1688 SKU and subject evidence are authoritative" in combined
+    assert "unselected supplier variants" in combined
+    assert "Russian labels" in combined
+
+
+def test_product_media_grid_prompts_generate_verified_russian_labels_in_first_pass() -> None:
+    skill_root = ROOT / "skills" / "ozon-product-media-generator"
+    prompts = [
+        (skill_root / "assets" / name).read_text(encoding="utf-8")
+        for name in (
+            "main-grid-prompt.txt",
+            "detail-grid-a-prompt.txt",
+            "detail-grid-b-prompt.txt",
+            "repair-slot-prompt.txt",
+        )
+    ]
+    combined = "\n".join(prompts)
+
+    assert "copy_mode=imagegen_integrated" in combined
+    assert "Render the supplied exact Russian labels as part of this first generation" in combined
+    assert "Do not generate an unlabelled scene for later relabelling" in combined
+    assert "Do not render text" not in combined
 
 
 def test_product_media_handoff_shows_only_final_rendered_slots_with_russian_labels() -> None:

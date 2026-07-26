@@ -71,3 +71,25 @@ def test_image_task_inbox_completion_is_owned_and_never_returns_to_workbench(
         "completed": 1,
         "failed": 0,
     }
+
+
+def test_image_task_inbox_can_release_owned_package_for_missing_r2_preflight(
+    tmp_path: Path,
+) -> None:
+    write_package(tmp_path, "ozon-image-001")
+    inbox = ImageTaskInbox(tmp_path)
+    inbox.claim_next("ozon-image-worker-01")
+
+    released = inbox.release(
+        "ozon-image-001",
+        "ozon-image-worker-01",
+        "public_media_channel_required",
+    )
+
+    assert released["status"] == "pending"
+    assert released["last_release"]["reason"] == "public_media_channel_required"
+    assert "assignment" not in released
+    assert (tmp_path / "image_tasks" / "pending" / "ozon-image-001.json").is_file()
+    assert not (
+        tmp_path / "image_tasks" / "in_progress" / "ozon-image-001.json"
+    ).exists()

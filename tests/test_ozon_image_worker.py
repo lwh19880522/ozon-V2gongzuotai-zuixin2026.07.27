@@ -19,9 +19,11 @@ from ozon_v2.images.worker import (
     SlotResultReceipt,
     crop_grid,
     file_sha256,
+    validate_reference_layout_diversity,
 )
 from ozon_v2.images.visual_design import (
     CURRENT_VISUAL_CONTRACT_VERSION,
+    HISTORICAL_VISUAL_CONTRACT_VERSION,
     VisualFact,
     VisualSpec,
 )
@@ -122,9 +124,13 @@ def _v3_validation(
     *,
     repeated_scene: bool = False,
     primary_ozon_reference_path: Path | None = None,
+    visual_contract_version: str = HISTORICAL_VISUAL_CONTRACT_VERSION,
 ) -> dict:
+    is_current_visual_contract = (
+        visual_contract_version == CURRENT_VISUAL_CONTRACT_VERSION
+    )
     recipes = {
-        "main_01": "clean_hero",
+        "main_01": "integrated_rail" if is_current_visual_contract else "clean_hero",
         "main_02": "integrated_rail",
         "detail_01": "context_caption",
         "detail_02": "feature_callout",
@@ -135,16 +141,18 @@ def _v3_validation(
     }
 
     fact = VisualFact(
-        headline="\u041a\u0420\u0415\u041f\u041b\u0415\u041d\u0418\u0415",
+        headline="Надёжная фиксация кабеля",
         detail="\u041a\u0430\u0431\u0435\u043b\u044c \u043f\u0440\u043e\u0445\u043e\u0434\u0438\u0442 \u0441\u0432\u043e\u0431\u043e\u0434\u043d\u043e",
         evidence_sha256=evidence_sha256,
     )
     scene_suffix = "same" if repeated_scene else slot_id
     spec = VisualSpec(
-        contract_version=CURRENT_VISUAL_CONTRACT_VERSION,
+        contract_version=visual_contract_version,
         slot_id=slot_id,
         recipe=recipes[slot_id],
-        facts=() if slot_id == "main_01" else (fact,),
+        facts=()
+        if slot_id == "main_01" and not is_current_visual_contract
+        else (fact,),
         scene_signature={
             "environment": f"environment_{scene_suffix}",
             "lighting": f"lighting_{scene_suffix}",
@@ -156,6 +164,16 @@ def _v3_validation(
         if slot_id in {"detail_02", "detail_03"}
         else (),
     )
+    archetypes = {
+        "main_01": "hero",
+        "main_02": "functional_infographic",
+        "detail_01": "lifestyle",
+        "detail_02": "annotated_feature",
+        "detail_03": "material_closeup",
+        "detail_04": "instructional_steps",
+        "detail_05": "dimension_fit",
+        "detail_06": "set_contents",
+    }
     validation = {
         "product_truth": True,
         "slot_role": slot_id,
@@ -168,14 +186,25 @@ def _v3_validation(
         "russian_copy_passed": True,
         "safe_area_passed": True,
         "mobile_readability_passed": True,
-        "visual_contract_version": CURRENT_VISUAL_CONTRACT_VERSION,
+        "visual_contract_version": visual_contract_version,
         "visual_spec": spec.to_dict(),
         "reference_mapping_version": "ozon-reference-map-v1",
+        "guidance_mode": "reference_guided",
         "primary_ozon_reference_sha256": "e" * 64,
         "reference_slot_index": 1,
         "reference_reused": False,
         "reference_composition_followed": True,
+        "reference_layout_archetype": archetypes[slot_id],
+        "reference_layout_followed": True,
         "locked_subject_preserved": True,
+        "copy_mode": "imagegen_integrated",
+        "russian_copy_integrated": True,
+        "russian_headline": "Надёжная фиксация кабеля",
+        "russian_subtitle": "Кабель проходит свободно и остаётся на месте",
+        "russian_functional_labels": [
+            "Точная фиксация",
+            "Аккуратная укладка",
+        ],
     }
     if primary_ozon_reference_path is not None:
         validation["primary_ozon_reference_path"] = str(
@@ -369,7 +398,11 @@ def test_v4_receipt_requires_slot_specific_ozon_reference_mapping(
     output = tmp_path / "output.png"
     _solid_grid(source, ["red", "green"], panel_size=(90, 120))
     Image.new("RGB", (90, 120), "red").save(output)
-    validation = _v3_validation(slot["slot_id"], "f" * 64)
+    validation = _v3_validation(
+        slot["slot_id"],
+        "f" * 64,
+        visual_contract_version=CURRENT_VISUAL_CONTRACT_VERSION,
+    )
     validation.pop("primary_ozon_reference_sha256")
     result = _slot_receipt(
         job=job,
@@ -406,6 +439,7 @@ def test_v4_receipt_rejects_unverified_or_low_resolution_reference(
         slot["slot_id"],
         "f" * 64,
         primary_ozon_reference_path=reference,
+        visual_contract_version=CURRENT_VISUAL_CONTRACT_VERSION,
     )
     validation["primary_ozon_reference_sha256"] = "0" * 64
     result = _slot_receipt(
@@ -422,6 +456,89 @@ def test_v4_receipt_rejects_unverified_or_low_resolution_reference(
 
     assert any("reference SHA-256 does not match" in error for error in errors)
     assert any("at least 512 pixels" in error for error in errors)
+
+
+def test_v5_fallback_accepts_a_declared_layout_without_an_ozon_reference(
+    tmp_path: Path,
+) -> None:
+    receipt = _receipt()
+    queue = ImageGenerationQueue(tmp_path / "queue.sqlite3")
+    queue.enqueue(receipt=receipt, subject_master=_master(tmp_path, receipt))
+    job = queue.claim_next("ozon-image-worker-01", now_epoch=100, lease_seconds=30)
+    assert job
+    slot = queue.list_slots(job["job_id"])[0]
+    source = tmp_path / "fallback-source.png"
+    output = tmp_path / "fallback-output.png"
+    _solid_grid(source, ["red", "green"], panel_size=(90, 120))
+    Image.new("RGB", (90, 120), "red").save(output)
+    validation = _v3_validation(
+        slot["slot_id"],
+        "f" * 64,
+        visual_contract_version=CURRENT_VISUAL_CONTRACT_VERSION,
+    )
+    validation.update(
+        {
+            "guidance_mode": "ozon_aesthetic_fallback",
+            "reference_reused": False,
+        }
+    )
+    validation.pop("primary_ozon_reference_sha256")
+    result = _slot_receipt(
+        job=job,
+        slot=slot,
+        source_path=source,
+        output_path=output,
+        accepted=True,
+        prompt_version=CURRENT_PROMPT_VERSION,
+        validation=validation,
+    )
+
+    assert result.acceptance_contract_errors() == []
+
+
+def test_v5_gallery_rejects_background_swap_layouts_and_reference_overuse(
+    tmp_path: Path,
+) -> None:
+    receipt = _receipt()
+    queue = ImageGenerationQueue(tmp_path / "queue.sqlite3")
+    queue.enqueue(receipt=receipt, subject_master=_master(tmp_path, receipt))
+    job = queue.claim_next("ozon-image-worker-01", now_epoch=100, lease_seconds=30)
+    assert job
+    slot = queue.list_slots(job["job_id"])[0]
+    source = tmp_path / "layout-source.png"
+    output = tmp_path / "layout-output.png"
+    _solid_grid(source, ["red", "green"], panel_size=(90, 120))
+    Image.new("RGB", (90, 120), "red").save(output)
+    base = _slot_receipt(
+        job=job,
+        slot=slot,
+        source_path=source,
+        output_path=output,
+        accepted=True,
+        prompt_version=CURRENT_PROMPT_VERSION,
+        validation=_v3_validation(
+            slot["slot_id"],
+            "f" * 64,
+            visual_contract_version=CURRENT_VISUAL_CONTRACT_VERSION,
+        ),
+    )
+    repeated = tuple(
+        replace(
+            base,
+            slot_id=f"slot_{index}",
+            validation={
+                **base.validation,
+                "reference_layout_archetype": "lifestyle",
+                "primary_ozon_reference_sha256": "a" * 64,
+            },
+        )
+        for index in range(8)
+    )
+
+    errors = validate_reference_layout_diversity(repeated)
+
+    assert any("at least 6" in error for error in errors)
+    assert any("at most 2" in error for error in errors)
 
 
 def test_accepted_slot_is_frozen_and_receipt_tampering_is_detected(tmp_path: Path) -> None:
@@ -750,6 +867,7 @@ def _record_user_requested_v3_repair(
                 slot_id,
                 master.source_sha256,
                 primary_ozon_reference_path=reference,
+                visual_contract_version=CURRENT_VISUAL_CONTRACT_VERSION,
             ),
         )
     )
@@ -1038,7 +1156,11 @@ def test_rejected_user_requested_repair_preserves_previous_accepted_artifact(
         accepted=False,
         source_kind="repair_single",
         prompt_version=CURRENT_PROMPT_VERSION,
-        validation=_v3_validation("detail_03", master.source_sha256),
+        validation=_v3_validation(
+            "detail_03",
+            master.source_sha256,
+            visual_contract_version=CURRENT_VISUAL_CONTRACT_VERSION,
+        ),
     )
 
     updated = queue.record_slot_result(rejected)

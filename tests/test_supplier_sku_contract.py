@@ -7,6 +7,7 @@ import pytest
 from ozon_v2.domain.supplier_sku import (
     SupplierSkuOption,
     SupplierSkuSelectionReceipt,
+    documented_composition_quantity,
     validate_supplier_sku_option,
 )
 
@@ -61,6 +62,24 @@ def test_set_quantity_must_match_documented_composition() -> None:
     sku = replace(complete_four_piece_sku(), set_composition=["粉色修正笔 x1"])
 
     assert "set_composition quantity must match set_quantity" in validate_supplier_sku_option(sku)
+
+
+@pytest.mark.parametrize(
+    ("composition", "expected"),
+    [
+        (["清洁剂100ml*2+刷子*1"], 3),
+        (["2 флакона и 1 щетка"], 3),
+        (["2 bottles + 1 brush"], 3),
+        (["комплект x4"], 4),
+        (["12-18 месяцев", "Размер 90 x 70 см", "модель 1020"], None),
+        (["黑色均码", "适用年龄 12-18 个月", "型号 1020"], None),
+    ],
+)
+def test_documented_composition_quantity_uses_only_explicit_sales_unit_counts(
+    composition: list[str],
+    expected: int | None,
+) -> None:
+    assert documented_composition_quantity(composition) == expected
 
 
 def test_selection_hash_is_stable_across_mapping_order() -> None:

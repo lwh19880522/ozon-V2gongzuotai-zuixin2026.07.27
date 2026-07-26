@@ -31,8 +31,37 @@ class CloudflareR2MediaPublisher:
         wrangler_command: list[str] | None = None,
     ) -> None:
         self.command_runner = command_runner or _run_command
-        self.public_probe = public_probe or _probe_public_image
+        self.public_probe = public_probe or _probe_public_media
         self.wrangler_command = wrangler_command or _default_wrangler_command()
+
+    def preflight(self, settings: dict[str, Any]) -> dict[str, Any]:
+        base_url = _https_base_url(settings.get("base_url"))
+        bucket = str(settings.get("r2_bucket") or "").strip()
+        prefix = _safe_segment(settings.get("object_prefix") or "ozon-v2")
+        if not bucket:
+            raise PublicMediaError("Cloudflare R2 bucket is not configured.")
+        result = self.command_runner(
+            [*self.wrangler_command, "r2", "bucket", "list", "--json"],
+            int(settings.get("preflight_timeout_seconds") or 120),
+        )
+        if int(result.get("returncode", 1)) != 0:
+            detail = str(result.get("stderr") or result.get("stdout") or "").strip()
+            raise PublicMediaError(
+                "Cloudflare R2 channel preflight failed: "
+                + (detail or "Wrangler could not list accessible buckets.")
+            )
+        output = str(result.get("stdout") or "")
+        if output.strip().startswith("[") and f'"{bucket}"' not in output:
+            raise PublicMediaError(
+                f"Cloudflare R2 bucket is not accessible: {bucket}"
+            )
+        return {
+            "ready": True,
+            "provider": "cloudflare_r2_direct",
+            "base_url": base_url,
+            "bucket": bucket,
+            "object_prefix": prefix,
+        }
 
     def publish_product(
         self,
@@ -42,19 +71,18 @@ class CloudflareR2MediaPublisher:
         source_files: list[dict[str, Any]],
         settings: dict[str, Any],
     ) -> dict[str, Any]:
-        base_url = _https_base_url(settings.get("base_url"))
-        bucket = str(settings.get("r2_bucket") or "yandex-media").strip()
-        prefix = _safe_segment(settings.get("object_prefix") or "ozon-v2")
-        if not bucket:
-            raise PublicMediaError("Cloudflare R2 bucket is not configured.")
+        preflight = self.preflight(settings)
+        base_url = str(preflight["base_url"])
+        bucket = str(preflight["bucket"])
+        prefix = str(preflight["object_prefix"])
         if not source_files:
-            raise PublicMediaError("No reviewed local images are available to publish.")
+            raise PublicMediaError("No reviewed local media files are available to publish.")
 
         uploads: list[dict[str, Any]] = []
         for index, item in enumerate(source_files, start=1):
             source = Path(str(item.get("path") or "")).expanduser()
             if not source.is_file():
-                raise PublicMediaError(f"Reviewed image file is missing: {source}")
+                raise PublicMediaError(f"Reviewed media file is missing: {source}")
             slot_id = _safe_segment(item.get("slot_id") or f"image_{index:02d}")
             digest = hashlib.sha256(source.read_bytes()).hexdigest()[:12]
             suffix = source.suffix.lower() or ".jpg"
@@ -103,6 +131,7 @@ class CloudflareR2MediaPublisher:
                     "bucket": bucket,
                     "object_key": key,
                     "public_url": public_url,
+                    "content_type": content_type,
                 }
             )
         return {
@@ -161,7 +190,7 @@ def _run_command(command: list[str], timeout_seconds: int) -> dict[str, Any]:
     }
 
 
-def _probe_public_image(url: str, timeout_seconds: int) -> None:
+def _probe_public_media(url: str, timeout_seconds: int) -> None:
     deadline = time.monotonic() + max(1, timeout_seconds)
     last_error = ""
     while time.monotonic() < deadline:
@@ -169,7 +198,9 @@ def _probe_public_image(url: str, timeout_seconds: int) -> None:
             request = Request(url, method="GET", headers={"User-Agent": "OzonV2/1.0"})
             with urlopen(request, timeout=min(10, max(1, timeout_seconds))) as response:
                 content_type = str(response.headers.get("Content-Type") or "").casefold()
-                if 200 <= int(response.status) < 300 and content_type.startswith("image/"):
+                if 200 <= int(response.status) < 300 and content_type.startswith(
+                    ("image/", "video/")
+                ):
                     response.read(1)
                     return
                 last_error = f"HTTP {response.status}, content-type={content_type or 'missing'}"
@@ -178,7 +209,7 @@ def _probe_public_image(url: str, timeout_seconds: int) -> None:
         except (URLError, TimeoutError, OSError) as exc:
             last_error = str(exc)
         time.sleep(1)
-    raise PublicMediaError(f"Public image verification failed: {last_error}")
+    raise PublicMediaError(f"Public media verification failed: {last_error}")
 
 
 def _https_base_url(value: Any) -> str:

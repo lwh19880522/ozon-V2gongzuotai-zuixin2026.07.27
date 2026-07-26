@@ -7,6 +7,7 @@ from PIL import Image
 
 from ozon_v2.images.visual_design import (
     CURRENT_VISUAL_CONTRACT_VERSION,
+    HISTORICAL_VISUAL_CONTRACT_VERSION,
     VisualFact,
     VisualSpec,
     render_visual,
@@ -53,9 +54,28 @@ def _spec(slot_id: str, recipe: str, **overrides: object) -> VisualSpec:
     return VisualSpec(**values)
 
 
-def test_main_01_clean_hero_allows_no_copy_but_rejects_facts() -> None:
-    clean = _spec("main_01", "clean_hero")
-    copied = _spec("main_01", "clean_hero", facts=(_fact(),))
+def test_main_01_current_contract_requires_integrated_russian_copy() -> None:
+    missing = _spec("main_01", "integrated_rail")
+    copied = _spec("main_01", "integrated_rail", facts=(_fact(),))
+
+    assert "slot requires verified copy" in validate_visual_spec(
+        missing, {LOCKED_HASH}
+    )
+    assert validate_visual_spec(copied, {LOCKED_HASH}) == []
+
+
+def test_main_01_historical_clean_hero_remains_read_compatible() -> None:
+    clean = _spec(
+        "main_01",
+        "clean_hero",
+        contract_version=HISTORICAL_VISUAL_CONTRACT_VERSION,
+    )
+    copied = _spec(
+        "main_01",
+        "clean_hero",
+        contract_version=HISTORICAL_VISUAL_CONTRACT_VERSION,
+        facts=(_fact(),),
+    )
 
     assert validate_visual_spec(clean, {LOCKED_HASH}) == []
     assert "slot does not allow copy" in validate_visual_spec(copied, {LOCKED_HASH})
@@ -112,7 +132,7 @@ def test_detail_01_reports_unlocked_and_promotional_copy_together() -> None:
 
 
 def test_scene_slots_need_three_dimensions_of_difference() -> None:
-    main_01 = _spec("main_01", "clean_hero")
+    main_01 = _spec("main_01", "integrated_rail", facts=(_fact(),))
     main_02 = _spec(
         "main_02",
         "integrated_rail",
@@ -128,7 +148,7 @@ def test_scene_slots_need_three_dimensions_of_difference() -> None:
 
 def test_scene_diversity_covers_detail_02_and_detail_03_in_a_full_eight_slot_set() -> None:
     recipes = {
-        "main_01": "clean_hero",
+        "main_01": "integrated_rail",
         "main_02": "integrated_rail",
         "detail_01": "context_caption",
         "detail_02": "feature_callout",
@@ -166,7 +186,7 @@ def test_scene_diversity_covers_detail_02_and_detail_03_in_a_full_eight_slot_set
 
 def test_full_eight_slot_set_rejects_one_reused_environment_family() -> None:
     recipes = {
-        "main_01": "clean_hero",
+        "main_01": "integrated_rail",
         "main_02": "integrated_rail",
         "detail_01": "context_caption",
         "detail_02": "feature_callout",
@@ -196,10 +216,17 @@ def test_full_eight_slot_set_rejects_one_reused_environment_family() -> None:
 def test_slot_contract_rejects_version_slot_recipe_copy_limit_and_missing_copy() -> None:
     invalid = _spec("unknown", "clean_hero", contract_version="old")
     wrong_recipe = _spec("detail_01", "clean_hero", facts=(_fact(),))
-    too_many = _spec("main_02", "integrated_rail", facts=(_fact(), _fact(), _fact()))
+    too_many = _spec(
+        "main_02",
+        "integrated_rail",
+        facts=(_fact(), _fact(), _fact(), _fact(), _fact()),
+    )
     missing_copy = _spec("main_02", "integrated_rail")
 
-    assert "contract_version must be ozon-visual-v1" in validate_visual_spec(invalid, {LOCKED_HASH})
+    assert any(
+        "contract_version must be one of" in error
+        for error in validate_visual_spec(invalid, {LOCKED_HASH})
+    )
     assert "unknown visual slot" in validate_visual_spec(invalid, {LOCKED_HASH})
     assert "is not allowed" in " ".join(validate_visual_spec(wrong_recipe, {LOCKED_HASH}))
     assert "too many copy fact blocks" in validate_visual_spec(too_many, {LOCKED_HASH})
@@ -258,7 +285,7 @@ def test_feature_callout_rejects_extra_points_for_one_fact() -> None:
 
 def test_visual_spec_copies_scene_signature_from_caller() -> None:
     scene = _scene()
-    spec = _spec("main_01", "clean_hero", scene_signature=scene)
+    spec = _spec("main_01", "integrated_rail", scene_signature=scene)
 
     scene["environment"] = "kitchen"
 
@@ -266,14 +293,14 @@ def test_visual_spec_copies_scene_signature_from_caller() -> None:
 
 
 def test_visual_spec_scene_signature_is_read_only() -> None:
-    spec = _spec("main_01", "clean_hero")
+    spec = _spec("main_01", "integrated_rail")
 
     with pytest.raises(TypeError):
         spec.scene_signature["environment"] = "kitchen"
 
 
 def test_scene_whitespace_cannot_create_fake_dimension_difference() -> None:
-    first = _spec("main_01", "clean_hero")
+    first = _spec("main_01", "integrated_rail")
     second = _spec(
         "main_02",
         "integrated_rail",
@@ -344,10 +371,10 @@ def test_visual_spec_from_dict_rejects_non_json_object_shapes(
 
 
 def test_visual_set_rejects_duplicate_slots_and_buyer_questions() -> None:
-    first = _spec("main_01", "clean_hero")
+    first = _spec("main_01", "integrated_rail")
     duplicate_slot = _spec(
         "main_01",
-        "clean_hero",
+        "integrated_rail",
         scene_signature=_scene(
             environment="kitchen",
             lighting="cool_day",
@@ -507,7 +534,7 @@ def test_render_visual_renders_verified_russian_integrated_rail(tmp_path: Path) 
     assert receipt["russian_copy_passed"] is True
     assert receipt["safe_area_passed"] is True
     assert receipt["mobile_readability_passed"] is True
-    assert receipt["visual_system"] == "ozon-edge-gradient-b1"
+    assert receipt["visual_system"] == "ozon-reference-layout-v2"
     assert receipt["visual_source_sha256"] == file_sha256(source)
     assert receipt["visual_output_sha256"] == file_sha256(output)
     assert receipt["visual_source_sha256"] != receipt["visual_output_sha256"]
@@ -867,7 +894,11 @@ def test_render_visual_clean_hero_preserves_pixels_and_size(tmp_path: Path) -> N
     source = tmp_path / "source.png"
     output = tmp_path / "output.png"
     Image.new("RGB", (900, 1200), (205, 192, 180)).save(source)
-    spec = _spec("main_01", "clean_hero")
+    spec = _spec(
+        "main_01",
+        "clean_hero",
+        contract_version=HISTORICAL_VISUAL_CONTRACT_VERSION,
+    )
 
     render_visual(source, output, spec, {LOCKED_HASH})
 

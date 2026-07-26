@@ -58,24 +58,46 @@ class SupplierSkuOption:
 def documented_composition_quantity(values: list[str]) -> int | None:
     quantities: list[int] = []
     for value in values:
-        multipliers = [
-            int(match)
-            for match in re.findall(
-                r"(?:x|×|\*)\s*(\d+)\b",
-                value,
-                flags=re.IGNORECASE,
-            )
-        ]
+        multipliers: list[int] = []
+        for match in re.finditer(
+            r"(?:x|×|\*)\s*(\d+)\b",
+            value,
+            flags=re.IGNORECASE,
+        ):
+            prefix = value[: match.start()].rstrip()
+            # "90 x 70 cm" is a dimension, while "set x4" and "100ml*2"
+            # are explicit sales-unit counts.
+            if prefix and prefix[-1].isdigit():
+                continue
+            multipliers.append(int(match.group(1)))
         if multipliers:
             quantities.append(sum(multipliers))
             continue
         documented_counts = [
-            int(match)
-            for match in re.findall(
-                r"(\d+)\s*(?:支|件|个|只|套|枚|片|瓶|包|组)",
+            int(match.group(1))
+            for match in re.finditer(
+                r"(?<!\d)(\d+)\s*(?:"
+                r"支|件|个(?!\s*(?:月|年|岁))|只|双|套|枚|片|瓶|包|组|盒|罐|条|对|刷子"
+                r")",
                 value,
+                flags=re.IGNORECASE,
             )
         ]
+        documented_counts.extend(
+            int(match.group(1))
+            for match in re.finditer(
+                r"(?<!\d)(\d+)\s*(?:"
+                r"шт(?:\.|ук(?:а|и|ов)?)?|пар(?:а|ы)?|"
+                r"флакон(?:а|ов)?|бутыл(?:ка|ки|ок)|"
+                r"комплект(?:а|ов)?|набор(?:а|ов)?|"
+                r"щ[её]тк(?:а|и|ок)|предмет(?:а|ов)?|"
+                r"pc(?:s)?|piece(?:s)?|pair(?:s)?|bottle(?:s)?|"
+                r"set(?:s)?|pack(?:s)?|brush(?:es)?"
+                r")\b",
+                value,
+                flags=re.IGNORECASE,
+            )
+        )
         if documented_counts:
             quantities.append(sum(documented_counts))
     return sum(quantities) if quantities else None

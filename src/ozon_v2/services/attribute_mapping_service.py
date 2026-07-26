@@ -239,6 +239,7 @@ def map_template_attributes(
     supplier_selection: dict[str, Any] | None = None,
     rewritten_content: dict[str, Any] | None = None,
     pricing_evidence: dict[str, Any] | None = None,
+    user_confirmed_required_fields: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     evidence = _collect_evidence(
         ozon_candidate,
@@ -381,6 +382,36 @@ def map_template_attributes(
                     "reason": (
                         "No verified brand was found in the locked supplier or "
                         "Ozon evidence; the user-approved Ozon no-brand value is used."
+                    ),
+                }
+            )
+            continue
+
+        manual_entry = (user_confirmed_required_fields or {}).get(field_key)
+        manual_value = (
+            manual_entry.get("value")
+            if isinstance(manual_entry, dict)
+            else manual_entry
+        )
+        if selected is None and required and _has_value(manual_value):
+            mapped_fields.append(
+                {
+                    **base,
+                    "status": "mapped",
+                    "value": _plain_value(manual_value),
+                    "source": "user_confirmed_required_attribute",
+                    "source_label": label,
+                    "evidence_ref": (
+                        f"required_attribute_evidence.items."
+                        f"{ozon_candidate.get('seed_id')}.{field_key}"
+                    ),
+                    "mapping_method": "user_confirmed_missing_required_field",
+                    "dictionary_resolution_required": bool(
+                        schema_field.get("dictionary_id")
+                    ),
+                    "reason": (
+                        "The user supplied this value specifically for a "
+                        "missing Seller API required field."
                     ),
                 }
             )
@@ -551,7 +582,18 @@ def map_template_attributes(
     required_fields = [field for field in mapped_fields if field["required"]]
     required_mapped = [field for field in required_fields if field["status"] == "mapped"]
     missing_required = [
-        {"field_key": field["field_key"], "label": field["label"], "status": field["status"]}
+        {
+            key: field.get(key)
+            for key in (
+                "field_key",
+                "label",
+                "status",
+                "attribute_type",
+                "dictionary_id",
+                "allowed_values",
+                "reason",
+            )
+        }
         for field in required_fields
         if field["status"] != "mapped"
     ]
@@ -848,6 +890,9 @@ def _generated_field_result(value: Any) -> dict[str, Any] | None:
             if isinstance(evidence_refs, list)
             else [],
             "reason": str(value.get("reason") or "").strip(),
+            "resolution_class": str(
+                value.get("resolution_class") or ""
+            ).strip(),
             "structured": True,
         }
     if _has_value(value):

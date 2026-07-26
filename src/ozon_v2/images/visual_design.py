@@ -16,7 +16,11 @@ import uuid
 from PIL import Image, ImageDraw, ImageFont
 
 
-CURRENT_VISUAL_CONTRACT_VERSION = "ozon-visual-v1"
+HISTORICAL_VISUAL_CONTRACT_VERSION = "ozon-visual-v1"
+CURRENT_VISUAL_CONTRACT_VERSION = "ozon-visual-v2"
+SUPPORTED_VISUAL_CONTRACT_VERSIONS = frozenset(
+    {HISTORICAL_VISUAL_CONTRACT_VERSION, CURRENT_VISUAL_CONTRACT_VERSION}
+)
 MIN_VISUAL_DIMENSION = 320
 MOBILE_PREVIEW_DIMENSION = 360
 MIN_MOBILE_COPY_PX = 13
@@ -58,7 +62,7 @@ class SlotVisualContract:
     copy_required: bool
 
 
-SLOT_VISUAL_CONTRACTS = {
+HISTORICAL_SLOT_VISUAL_CONTRACTS = {
     "main_01": SlotVisualContract(("clean_hero",), 0, False),
     "main_02": SlotVisualContract(("integrated_rail",), 2, True),
     "detail_01": SlotVisualContract(("context_caption",), 1, True),
@@ -67,6 +71,17 @@ SLOT_VISUAL_CONTRACTS = {
     "detail_04": SlotVisualContract(("context_caption",), 1, True),
     "detail_05": SlotVisualContract(("context_caption", "metric_panel"), 2, True),
     "detail_06": SlotVisualContract(("integrated_rail", "context_caption"), 2, True),
+}
+
+SLOT_VISUAL_CONTRACTS = {
+    "main_01": SlotVisualContract(("integrated_rail",), 4, True),
+    "main_02": SlotVisualContract(("integrated_rail", "context_caption"), 4, True),
+    "detail_01": SlotVisualContract(("context_caption",), 4, True),
+    "detail_02": SlotVisualContract(("feature_callout",), 4, True),
+    "detail_03": SlotVisualContract(("feature_callout", "metric_panel"), 4, True),
+    "detail_04": SlotVisualContract(("context_caption",), 4, True),
+    "detail_05": SlotVisualContract(("context_caption", "metric_panel"), 4, True),
+    "detail_06": SlotVisualContract(("integrated_rail", "context_caption"), 4, True),
 }
 
 
@@ -201,10 +216,18 @@ def validate_visual_spec(
     spec: VisualSpec, locked_evidence_sha256s: set[str]
 ) -> list[str]:
     errors: list[str] = []
-    if spec.contract_version != CURRENT_VISUAL_CONTRACT_VERSION:
-        errors.append(f"contract_version must be {CURRENT_VISUAL_CONTRACT_VERSION}")
+    if spec.contract_version not in SUPPORTED_VISUAL_CONTRACT_VERSIONS:
+        errors.append(
+            "contract_version must be one of "
+            + ", ".join(sorted(SUPPORTED_VISUAL_CONTRACT_VERSIONS))
+        )
 
-    contract = SLOT_VISUAL_CONTRACTS.get(spec.slot_id)
+    contracts = (
+        HISTORICAL_SLOT_VISUAL_CONTRACTS
+        if spec.contract_version == HISTORICAL_VISUAL_CONTRACT_VERSION
+        else SLOT_VISUAL_CONTRACTS
+    )
+    contract = contracts.get(spec.slot_id)
     if contract is None:
         errors.append("unknown visual slot")
     else:
@@ -214,7 +237,11 @@ def validate_visual_spec(
             errors.append("too many copy fact blocks")
         if contract.copy_required and not spec.facts:
             errors.append("slot requires verified copy")
-        if spec.slot_id == "main_01" and spec.facts:
+        if (
+            spec.contract_version == HISTORICAL_VISUAL_CONTRACT_VERSION
+            and spec.slot_id == "main_01"
+            and spec.facts
+        ):
             errors.append("slot does not allow copy")
 
     if spec.panel_side not in {"left", "right"}:
@@ -400,13 +427,13 @@ def render_visual(
     output.parent.mkdir(parents=True, exist_ok=True)
     _write_atomically(output, encoded.getvalue())
     return {
-        "visual_contract_version": CURRENT_VISUAL_CONTRACT_VERSION,
+        "visual_contract_version": spec.contract_version,
         "layout_recipe": spec.recipe,
         "copy_block_count": len(spec.facts),
         "copy_evidence_sha256s": [fact.evidence_sha256 for fact in spec.facts],
         "scene_signature": dict(spec.scene_signature),
         "visual_spec": spec.to_dict(),
-        "visual_system": "ozon-edge-gradient-b1",
+        "visual_system": "ozon-reference-layout-v2",
         "visual_source_sha256": _file_sha256(source),
         "visual_output_sha256": _file_sha256(output),
         "visual_design_passed": True,

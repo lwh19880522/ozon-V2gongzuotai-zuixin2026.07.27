@@ -6,7 +6,9 @@ import ipaddress
 import os
 import random
 import re
+import threading
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -48,6 +50,7 @@ from ozon_v2.services.attribute_mapping_service import (
     canonical_attribute_label,
     is_visual_inference_field,
     map_template_attributes,
+    normalize_attribute_label,
 )
 from ozon_v2.services.collection_contract_service import (
     CREATIVE_FIELDS_REQUIRING_REWRITE,
@@ -111,6 +114,7 @@ class WorkbenchService:
         self.public_media_publisher = (
             public_media_publisher or CloudflareR2MediaPublisher()
         )
+        self._upload_state_lock = threading.RLock()
 
     def start_batch(self, target_count: int) -> Result:
         if target_count <= 0:
@@ -559,6 +563,20 @@ class WorkbenchService:
         seed_templates[template_index] = seed_template
         payload["seed_templates"] = seed_templates
         self.repo.save_attribute_template_result(run_id, payload)
+        required_evidence_path = (
+            self.repo.run_dir(run_id) / "required_attribute_evidence.json"
+        )
+        if required_evidence_path.exists():
+            required_evidence = self.repo.load_required_attribute_evidence(
+                run_id
+            )
+            evidence_items = required_evidence.get("items")
+            if isinstance(evidence_items, dict) and seed_id in evidence_items:
+                evidence_items.pop(seed_id, None)
+                self.repo.save_required_attribute_evidence(
+                    run_id,
+                    required_evidence,
+                )
         event = self.repo.append_run_event(
             run_id,
             "attribute_template.refreshed",
@@ -1592,6 +1610,20 @@ class WorkbenchService:
                     for seed_id, item in raw_pricing_items.items()
                     if isinstance(item, dict)
                 }
+        required_attribute_evidence: dict[str, dict[str, Any]] = {}
+        required_evidence_path = (
+            self.repo.run_dir(run_id) / "required_attribute_evidence.json"
+        )
+        if required_evidence_path.exists():
+            raw_required_evidence = self.repo.load_required_attribute_evidence(
+                run_id
+            ).get("items", {})
+            if isinstance(raw_required_evidence, dict):
+                required_attribute_evidence = {
+                    str(seed_id): item
+                    for seed_id, item in raw_required_evidence.items()
+                    if isinstance(item, dict)
+                }
         upload_previews: dict[str, dict[str, Any]] = {}
         preview_path = self.repo.run_dir(run_id) / "upload_previews.json"
         if preview_path.exists():
@@ -1729,6 +1761,26 @@ class WorkbenchService:
                 product_type=str(product_type or ""),
                 category_url=str(category_candidate.get("category_url") or ""),
             )
+            generated_field_results = (
+                (generated_content_items.get(seed_id) or {}).get(
+                    "field_results"
+                )
+                or (generated_content_items.get(seed_id) or {}).get("fields")
+                or {}
+            )
+            incompatible_required_fields = _required_not_applicable_fields(
+                schema,
+                generated_field_results,
+            )
+            if incompatible_required_fields:
+                category_assessment = {
+                    **category_assessment,
+                    "credible": False,
+                    "reason": "required_template_fields_not_applicable",
+                    "incompatible_required_fields": (
+                        incompatible_required_fields
+                    ),
+                }
             template_ready = bool(
                 schema
                 and seller_template
@@ -1747,8 +1799,12 @@ class WorkbenchService:
                         else None
                     ),
                     rewritten_content=(
-                        (generated_content_items.get(seed_id) or {}).get("field_results")
-                        or (generated_content_items.get(seed_id) or {}).get("fields")
+                        generated_field_results
+                    ),
+                    user_confirmed_required_fields=(
+                        (required_attribute_evidence.get(seed_id) or {}).get(
+                            "values"
+                        )
                         or {}
                     ),
                 )
@@ -1831,6 +1887,7 @@ class WorkbenchService:
                     "attribute_schema_count": len(schema),
                     "prefill_plan_count": len(prefill_plan),
                     "prefill_plan": prefill_plan,
+                    "video_template_fields": _video_template_fields(schema),
                     "template_ready": template_ready,
                     "category_template_assessment": category_assessment,
                     "attribute_mapping": mapping["fields"],
@@ -1973,6 +2030,157 @@ class WorkbenchService:
                     "publish_locked": bool(run.get("publish_locked", True)),
                     "ready_to_build": ready_to_build_count > 0,
                 },
+            },
+        )
+
+    def save_required_attribute_evidence(
+        self,
+        run_id: str,
+        seed_id: str,
+        values: dict[str, Any],
+    ) -> Result:
+        workspace = self.upload_workspace(run_id)
+        if not workspace.ok:
+            return workspace
+        item = next(
+            (
+                candidate
+                for candidate in workspace.data.get("items", [])
+                if str(candidate.get("seed_id") or "") == seed_id
+            ),
+            None,
+        )
+        if item is None:
+            return Result.failure(
+                "required_attribute_evidence.product_missing",
+                "The requested product is not part of this batch.",
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+        if item.get("template_ready") is not True:
+            return Result.failure(
+                "required_attribute_evidence.template_not_ready",
+                "Resolve the Seller API category template before filling required fields.",
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+        missing_fields = {
+            str(field.get("field_key") or ""): field
+            for field in item.get("missing_required_fields", [])
+            if str(field.get("field_key") or "")
+        }
+        normalized_values = {
+            str(field_key).strip(): value
+            for field_key, value in (values or {}).items()
+            if str(field_key).strip()
+        }
+        invalid_keys = sorted(set(normalized_values) - set(missing_fields))
+        empty_keys = sorted(
+            field_key
+            for field_key, value in normalized_values.items()
+            if not _has_content_value(value)
+        )
+        if not normalized_values or invalid_keys or empty_keys:
+            return Result.failure(
+                "required_attribute_evidence.invalid_fields",
+                "Only currently missing required fields can be saved, and every value must be non-empty.",
+                errors=[
+                    *(
+                        ["Not currently missing required: " + ", ".join(invalid_keys)]
+                        if invalid_keys
+                        else []
+                    ),
+                    *(
+                        ["Empty required values: " + ", ".join(empty_keys)]
+                        if empty_keys
+                        else []
+                    ),
+                ],
+                data={
+                    "run_id": run_id,
+                    "seed_id": seed_id,
+                    "allowed_field_keys": sorted(missing_fields),
+                },
+            )
+        for field_key, value in normalized_values.items():
+            allowed_values = missing_fields[field_key].get("allowed_values")
+            if (
+                isinstance(allowed_values, list)
+                and allowed_values
+                and str(value) not in {str(candidate) for candidate in allowed_values}
+            ):
+                return Result.failure(
+                    "required_attribute_evidence.dictionary_value_invalid",
+                    "Choose a valid Seller API dictionary value for the required field.",
+                    data={
+                        "run_id": run_id,
+                        "seed_id": seed_id,
+                        "field_key": field_key,
+                        "allowed_values": allowed_values,
+                    },
+                )
+        payload = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "items": {},
+        }
+        path = self.repo.run_dir(run_id) / "required_attribute_evidence.json"
+        if path.exists():
+            saved = self.repo.load_required_attribute_evidence(run_id)
+            if isinstance(saved, dict):
+                payload.update(saved)
+        if not isinstance(payload.get("items"), dict):
+            payload["items"] = {}
+        existing = payload["items"].get(seed_id)
+        existing_values = (
+            dict(existing.get("values") or {})
+            if isinstance(existing, dict)
+            else {}
+        )
+        existing_values.update(
+            {
+                field_key: {
+                    "value": value,
+                    "label": missing_fields[field_key].get("label"),
+                    "source": "user_confirmed_required_attribute",
+                    "confirmed_at": utc_now_iso(),
+                }
+                for field_key, value in normalized_values.items()
+            }
+        )
+        payload["items"][seed_id] = {
+            "description_category_id": item.get("description_category_id"),
+            "type_id": item.get("type_id"),
+            "values": existing_values,
+            "updated_at": utc_now_iso(),
+        }
+        saved_path = self.repo.save_required_attribute_evidence(
+            run_id,
+            payload,
+        )
+        refreshed = self.upload_workspace(run_id)
+        refreshed_item = next(
+            (
+                candidate
+                for candidate in refreshed.data.get("items", [])
+                if str(candidate.get("seed_id") or "") == seed_id
+            ),
+            {},
+        )
+        return Result.success(
+            "required_attribute_evidence.saved",
+            "User-confirmed values were saved for this product's missing required fields.",
+            {
+                "run_id": run_id,
+                "seed_id": seed_id,
+                "saved_field_keys": sorted(normalized_values),
+                "missing_required_fields": refreshed_item.get(
+                    "missing_required_fields",
+                    [],
+                ),
+                "required_attributes_ready": refreshed_item.get(
+                    "required_attributes_ready",
+                    False,
+                ),
+                "evidence_path": str(saved_path),
             },
         )
 
@@ -2574,20 +2782,59 @@ class WorkbenchService:
             },
         )
 
-    def build_upload_draft(self, run_id: str) -> Result:
+    def build_upload_draft(
+        self,
+        run_id: str,
+        *,
+        seed_ids: list[str] | None = None,
+    ) -> Result:
         workspace = self.upload_workspace(run_id)
         if not workspace.ok:
             return workspace
+        requested_seed_ids = {
+            str(seed_id).strip()
+            for seed_id in (seed_ids or [])
+            if str(seed_id).strip()
+        }
         ready_items = [
             item
             for item in workspace.data.get("items", [])
             if item.get("ready_to_build") is True
+            and (
+                not requested_seed_ids
+                or str(item.get("seed_id") or "") in requested_seed_ids
+            )
         ]
         if not ready_items:
+            selected_items = [
+                item
+                for item in workspace.data.get("items", [])
+                if not requested_seed_ids
+                or str(item.get("seed_id") or "") in requested_seed_ids
+            ]
             return Result.failure(
                 "upload_draft.no_ready_products",
                 "No product currently passes its own template, required-attribute, and image gates.",
-                data={"run_id": run_id, "prepared_product_count": 0, "items": []},
+                data={
+                    "run_id": run_id,
+                    "prepared_product_count": 0,
+                    "items": [],
+                    "blocked_items": [
+                        {
+                            "seed_id": item.get("seed_id"),
+                            "blocking_gates": item.get("blocking_gates") or [],
+                            "missing_required_fields": item.get(
+                                "missing_required_fields"
+                            )
+                            or [],
+                            "category_template_assessment": item.get(
+                                "category_template_assessment"
+                            )
+                            or {},
+                        }
+                        for item in selected_items
+                    ],
+                },
             )
         draft_items = []
         blocked_items = []
@@ -2669,6 +2916,7 @@ class WorkbenchService:
                     "upload_core_fields": item.get("upload_core_fields"),
                     "pricing_evidence": item.get("pricing_evidence"),
                     "attributes": draft_attributes,
+                    "video_template_fields": item.get("video_template_fields") or [],
                     "omitted_optional_dictionary_fields": (
                         omitted_optional_dictionary_fields
                     ),
@@ -2810,7 +3058,7 @@ class WorkbenchService:
         )
         return Result.success(
             "public_media.configured",
-            "Cloudflare R2 公网图片通道已保存；准备上传时会先真实发布并逐张验证。",
+            "Cloudflare R2 公网媒体通道已保存；生图前会校验通道，上传时会逐个验证图片、视频和封面。",
             {
                 "base_url": normalized,
                 "r2_bucket": "yandex-media",
@@ -2820,7 +3068,7 @@ class WorkbenchService:
         )
 
     def preview_product_upload(self, run_id: str, seed_id: str) -> Result:
-        draft = self.build_upload_draft(run_id)
+        draft = self.build_upload_draft(run_id, seed_ids=[seed_id])
         draft_item = next(
             (
                 item
@@ -2838,16 +3086,47 @@ class WorkbenchService:
                 ),
                 None,
             )
-            return Result.failure(
-                "product_upload.product_not_ready",
-                "This product does not yet pass its own upload gates.",
-                data={
-                    "run_id": run_id,
-                    "seed_id": seed_id,
-                    "draft_code": draft.code,
-                    "blocked_item": blocked_item,
-                },
+            blocking_gates = (
+                blocked_item.get("blocking_gates") or []
+                if isinstance(blocked_item, dict)
+                else []
             )
+            if "category_template" in blocking_gates:
+                refreshed = self.refresh_attribute_template(run_id, seed_id)
+                if refreshed.ok:
+                    draft = self.build_upload_draft(
+                        run_id,
+                        seed_ids=[seed_id],
+                    )
+                    draft_item = next(
+                        (
+                            item
+                            for item in draft.data.get("items", [])
+                            if str(item.get("seed_id") or "") == seed_id
+                        ),
+                        None,
+                    )
+                    blocked_item = next(
+                        (
+                            item
+                            for item in draft.data.get("blocked_items", [])
+                            if str(item.get("seed_id") or "") == seed_id
+                        ),
+                        None,
+                    )
+            if draft_item is not None:
+                blocked_item = None
+            else:
+                return Result.failure(
+                    "product_upload.product_not_ready",
+                    "This product does not yet pass its own upload gates.",
+                    data={
+                        "run_id": run_id,
+                        "seed_id": seed_id,
+                        "draft_code": draft.code,
+                        "blocked_item": blocked_item,
+                    },
+                )
         bootstrap_image_url = str(
             draft_item.get("bootstrap_image_url") or ""
         ).strip()
@@ -2910,31 +3189,36 @@ class WorkbenchService:
                     "ozon_reference_images"
                 )
                 or [],
+                "video_template_fields": draft_item.get(
+                    "video_template_fields"
+                )
+                or [],
             },
             "status": "awaiting_user_confirmation",
         }
-        previews = {"schema_version": 1, "run_id": run_id, "items": {}}
-        try:
-            saved = self.repo.load_upload_previews(run_id)
-        except FileNotFoundError:
-            saved = None
-        if isinstance(saved, dict):
-            previews.update(saved)
-        if not isinstance(previews.get("items"), dict):
-            previews["items"] = {}
-        previews["items"][seed_id] = preview
-        path = self.repo.save_upload_previews(run_id, previews)
-        event = self.repo.append_run_event(
-            run_id,
-            "product_upload.preview_ready",
-            "A final Seller API payload was prepared for one product and is awaiting user confirmation.",
-            {
-                "seed_id": seed_id,
-                "offer_id": seller_api_item["offer_id"],
-                "image_count": len(image_urls),
-                "preview_path": str(path),
-            },
-        )
+        with self._upload_state_lock:
+            previews = {"schema_version": 1, "run_id": run_id, "items": {}}
+            try:
+                saved = self.repo.load_upload_previews(run_id)
+            except FileNotFoundError:
+                saved = None
+            if isinstance(saved, dict):
+                previews.update(saved)
+            if not isinstance(previews.get("items"), dict):
+                previews["items"] = {}
+            previews["items"][seed_id] = preview
+            path = self.repo.save_upload_previews(run_id, previews)
+            event = self.repo.append_run_event(
+                run_id,
+                "product_upload.preview_ready",
+                "A final Seller API payload was prepared for one product and is awaiting user confirmation.",
+                {
+                    "seed_id": seed_id,
+                    "offer_id": seller_api_item["offer_id"],
+                    "image_count": len(image_urls),
+                    "preview_path": str(path),
+                },
+            )
         return Result.success(
             "product_upload.preview_ready",
             "Final product upload payload is ready for explicit confirmation.",
@@ -2969,6 +3253,11 @@ class WorkbenchService:
                 "seller_import_task_id": seller_import_task_id,
                 "offer_id": seller_api_item.get("offer_id"),
                 "product_id": None,
+                "seller_api_item": seller_api_item,
+                "video_template_fields": image_task_context.get(
+                    "video_template_fields"
+                )
+                or [],
             },
             "bootstrap_image": {
                 "source": "locked_1688_subject_original",
@@ -2983,6 +3272,19 @@ class WorkbenchService:
                 "direct_ozon_upload": True,
                 "replace_complete_gallery": True,
                 "return_to_workbench": False,
+                "r2_preflight_required": True,
+                "video": {
+                    "required": True,
+                    "source": "eight_accepted_images",
+                    "format": "mp4",
+                    "layout": "3:4_vertical_slideshow",
+                },
+                "video_cover": {
+                    "required": True,
+                    "source": "main_01",
+                    "format": "jpg",
+                    "aspect_ratio": "3:4",
+                },
             },
             "evidence": {
                 "subject_master": subject_master,
@@ -3133,6 +3435,295 @@ class WorkbenchService:
             "product_upload.submitted",
             "The confirmed product was submitted to Ozon.",
             {**record, "submission_path": str(path), "last_event": event.to_dict()},
+        )
+
+    def batch_upload_products(
+        self,
+        run_id: str,
+        *,
+        seed_ids: list[str] | None = None,
+        confirmed: bool = False,
+        max_workers: int = 4,
+    ) -> Result:
+        if confirmed is not True:
+            return Result.failure(
+                "batch_product_upload.confirmation_required",
+                "Explicit confirmation is required before uploading multiple products.",
+                data={"run_id": run_id},
+            )
+        requested = {
+            str(seed_id).strip()
+            for seed_id in (seed_ids or [])
+            if str(seed_id).strip()
+        }
+        workspace = self.upload_workspace(run_id)
+        if not workspace.ok:
+            return workspace
+        selected_items = [
+            item
+            for item in workspace.data.get("items", [])
+            if not requested
+            or str(item.get("seed_id") or "") in requested
+        ]
+        refresh_results: list[dict[str, Any]] = []
+        for item in selected_items:
+            if item.get("template_ready") is True:
+                continue
+            refreshed = self.refresh_attribute_template(
+                run_id,
+                str(item.get("seed_id") or ""),
+            )
+            refresh_results.append(
+                {
+                    "seed_id": item.get("seed_id"),
+                    "ok": refreshed.ok,
+                    "code": refreshed.code,
+                    "message": refreshed.message,
+                }
+            )
+        if refresh_results:
+            workspace = self.upload_workspace(run_id)
+            if not workspace.ok:
+                return workspace
+            selected_items = [
+                item
+                for item in workspace.data.get("items", [])
+                if not requested
+                or str(item.get("seed_id") or "") in requested
+            ]
+        selected_seed_ids = [
+            str(item.get("seed_id") or "")
+            for item in selected_items
+            if str(item.get("seed_id") or "")
+        ]
+        if not selected_seed_ids:
+            return Result.failure(
+                "batch_product_upload.no_products",
+                "No batch products were selected for upload.",
+                data={"run_id": run_id, "items": []},
+            )
+
+        worker_count = max(
+            1,
+            min(int(max_workers or 1), 4, len(selected_seed_ids)),
+        )
+        preview_results: dict[str, Result] = {}
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(
+                    self.preview_product_upload,
+                    run_id,
+                    seed_id,
+                ): seed_id
+                for seed_id in selected_seed_ids
+            }
+            for future in as_completed(futures):
+                seed_id = futures[future]
+                try:
+                    preview_results[seed_id] = future.result()
+                except Exception as exc:  # isolate one product from the batch
+                    preview_results[seed_id] = Result.failure(
+                        "batch_product_upload.preview_failed",
+                        str(exc),
+                        data={"run_id": run_id, "seed_id": seed_id},
+                    )
+
+        with self._upload_state_lock:
+            submissions = {
+                "schema_version": 1,
+                "run_id": run_id,
+                "items": {},
+            }
+            try:
+                saved_submissions = self.repo.load_upload_submissions(run_id)
+            except FileNotFoundError:
+                saved_submissions = None
+            if isinstance(saved_submissions, dict):
+                submissions.update(saved_submissions)
+            if not isinstance(submissions.get("items"), dict):
+                submissions["items"] = {}
+
+        result_items: dict[str, dict[str, Any]] = {}
+        pending_imports: dict[str, dict[str, Any]] = {}
+        for seed_id in selected_seed_ids:
+            preview_result = preview_results[seed_id]
+            if not preview_result.ok:
+                result_items[seed_id] = {
+                    "seed_id": seed_id,
+                    "status": "blocked",
+                    "code": preview_result.code,
+                    "message": preview_result.message,
+                    "errors": preview_result.errors,
+                }
+                continue
+            existing = submissions["items"].get(seed_id)
+            existing_status = (
+                str(existing.get("status") or "").casefold()
+                if isinstance(existing, dict)
+                else ""
+            )
+            if (
+                isinstance(existing, dict)
+                and existing.get("task_id") is not None
+                and existing_status not in {"failed", "error", "declined"}
+            ):
+                result_items[seed_id] = {
+                    **existing,
+                    "seed_id": seed_id,
+                    "status": "already_submitted",
+                }
+                continue
+            preview = preview_result.data
+            seller_api_item = preview.get("seller_api_item")
+            if not isinstance(seller_api_item, dict):
+                result_items[seed_id] = {
+                    "seed_id": seed_id,
+                    "status": "failed",
+                    "code": "product_upload.preview_invalid",
+                    "message": "The saved upload preview is invalid.",
+                }
+                continue
+            pending_imports[seed_id] = {
+                "preview": preview,
+                "seller_api_item": seller_api_item,
+                "existing": existing,
+            }
+
+        def import_one(
+            seed_id: str,
+            pending: dict[str, Any],
+        ) -> tuple[str, dict[str, Any]]:
+            submitted = self.seller_api_adapter.import_products(
+                [pending["seller_api_item"]]
+            )
+            return seed_id, submitted
+
+        import_results: dict[str, dict[str, Any]] = {}
+        with ThreadPoolExecutor(
+            max_workers=max(
+                1,
+                min(worker_count, len(pending_imports) or 1),
+            )
+        ) as executor:
+            futures = {
+                executor.submit(import_one, seed_id, pending): seed_id
+                for seed_id, pending in pending_imports.items()
+            }
+            for future in as_completed(futures):
+                seed_id = futures[future]
+                try:
+                    _seed_id, submitted = future.result()
+                except (SellerApiError, TypeError, ValueError) as exc:
+                    result_items[seed_id] = {
+                        "seed_id": seed_id,
+                        "status": "failed",
+                        "code": "product_upload.seller_api_failed",
+                        "message": str(exc),
+                    }
+                else:
+                    import_results[seed_id] = submitted
+
+        for seed_id, submitted in import_results.items():
+            pending = pending_imports[seed_id]
+            seller_api_item = pending["seller_api_item"]
+            preview = pending["preview"]
+            record = {
+                "run_id": run_id,
+                "seed_id": seed_id,
+                "offer_id": seller_api_item.get("offer_id"),
+                "confirmation_token": preview.get("confirmation_token"),
+                "task_id": submitted["task_id"],
+                "status": "submitted",
+                "submitted_at": utc_now_iso(),
+            }
+            record.update(
+                self._emit_image_task_package(
+                    run_id=run_id,
+                    seed_id=seed_id,
+                    seller_import_task_id=int(submitted["task_id"]),
+                    preview=preview,
+                )
+            )
+            existing = pending.get("existing")
+            if isinstance(existing, dict) and existing.get("task_id") is not None:
+                history = [
+                    item
+                    for item in existing.get("attempt_history") or []
+                    if isinstance(item, dict)
+                ]
+                history.append(
+                    {
+                        key: value
+                        for key, value in existing.items()
+                        if key != "attempt_history"
+                    }
+                )
+                record["attempt_history"] = history
+            submissions["items"][seed_id] = record
+            result_items[seed_id] = record
+
+        with self._upload_state_lock:
+            submission_path = self.repo.save_upload_submissions(
+                run_id,
+                submissions,
+            )
+        ordered_results = [
+            result_items[seed_id]
+            for seed_id in selected_seed_ids
+            if seed_id in result_items
+        ]
+        submitted_count = sum(
+            1
+            for item in ordered_results
+            if item.get("status") == "submitted"
+        )
+        already_submitted_count = sum(
+            1
+            for item in ordered_results
+            if item.get("status") == "already_submitted"
+        )
+        event = self.repo.append_run_event(
+            run_id,
+            "batch_product_upload.completed",
+            "Eligible products were validated and submitted independently with bounded concurrency.",
+            {
+                "requested_product_count": len(selected_seed_ids),
+                "submitted_product_count": submitted_count,
+                "already_submitted_product_count": already_submitted_count,
+                "failed_or_blocked_product_count": (
+                    len(ordered_results)
+                    - submitted_count
+                    - already_submitted_count
+                ),
+                "max_workers": worker_count,
+            },
+        )
+        payload = {
+            "run_id": run_id,
+            "requested_product_count": len(selected_seed_ids),
+            "submitted_product_count": submitted_count,
+            "already_submitted_product_count": already_submitted_count,
+            "failed_or_blocked_product_count": (
+                len(ordered_results)
+                - submitted_count
+                - already_submitted_count
+            ),
+            "max_workers": worker_count,
+            "template_refreshes": refresh_results,
+            "items": ordered_results,
+            "submission_path": str(submission_path),
+            "last_event": event.to_dict(),
+        }
+        if submitted_count == 0 and already_submitted_count == 0:
+            return Result.failure(
+                "batch_product_upload.no_eligible_products",
+                "No selected product passed validation and upload.",
+                data=payload,
+            )
+        return Result.success(
+            "batch_product_upload.completed",
+            "Eligible products were validated and uploaded independently.",
+            payload,
         )
 
     def refresh_product_upload_status(self, run_id: str, seed_id: str) -> Result:
@@ -5620,6 +6211,8 @@ class WorkbenchService:
             "reference_slot_index",
             "reference_reused",
             "reference_composition_followed",
+            "reference_layout_archetype",
+            "reference_layout_followed",
             "locked_subject_preserved",
         )
         for raw_slot in snapshot["slots"]:
@@ -6424,7 +7017,11 @@ class WorkbenchService:
             candidate_quantity = int(candidate.get("set_quantity") or 0)
         except (TypeError, ValueError):
             candidate_quantity = 0
-        set_quantity = documented_quantity or candidate_quantity or 1
+        # A single visible page SKU is one sales unit unless its selected label
+        # or composition explicitly documents a multi-item set. Raw numeric
+        # metadata is not trusted here because age, size and model numbers have
+        # repeatedly been misclassified as quantity.
+        set_quantity = documented_quantity or 1
         price = (
             dict(candidate.get("price") or {})
             if isinstance(candidate.get("price"), dict)
@@ -6458,6 +7055,9 @@ class WorkbenchService:
                 "price_independent_sku_selection": True,
             }
         )
+        if candidate_quantity > 0 and candidate_quantity != set_quantity:
+            evidence["ignored_unverified_candidate_quantity"] = True
+            evidence["captured_candidate_quantity"] = candidate_quantity
         option = SupplierSkuOption(
             supplier_sku_id=supplier_sku_id,
             combination_key=combination_key,
@@ -7341,6 +7941,41 @@ def _normalize_ozon_rich_content_value(value: Any) -> str:
     )
 
 
+def _video_template_fields(
+    upload_schema: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    fields: list[dict[str, Any]] = []
+    for field in upload_schema:
+        if not isinstance(field, dict):
+            continue
+        attribute_id = str(field.get("attribute_id") or "").strip()
+        label = str(field.get("attribute_label") or "").strip()
+        normalized = normalize_attribute_label(label)
+        if not attribute_id or "видео" not in normalized:
+            continue
+        if "видеооблож" in normalized and any(
+            token in normalized for token in ("изображ", "постер", "превью")
+        ):
+            kind = "video_cover_image_url"
+        elif "видеооблож" in normalized and "ссыл" in normalized:
+            kind = "video_cover_url"
+        elif "ссыл" in normalized:
+            kind = "video_url"
+        elif "назван" in normalized:
+            kind = "video_title"
+        else:
+            continue
+        fields.append(
+            {
+                "attribute_id": attribute_id,
+                "attribute_label": label,
+                "kind": kind,
+                "is_required": field.get("is_required") is True,
+            }
+        )
+    return fields
+
+
 def _seller_api_import_item(
     draft_item: dict[str, Any],
     image_urls: list[str],
@@ -7450,6 +8085,38 @@ def _product_import_status(payload: dict[str, Any]) -> str:
     ):
         return "accepted_by_ozon"
     return "processing"
+
+
+def _required_not_applicable_fields(
+    upload_schema: list[dict[str, Any]],
+    generated_field_results: Any,
+) -> list[dict[str, str]]:
+    if not isinstance(generated_field_results, dict):
+        return []
+    required_by_key = {
+        str(field.get("attribute_id") or ""): field
+        for field in upload_schema
+        if isinstance(field, dict)
+        and field.get("is_required") is True
+        and str(field.get("attribute_id") or "")
+    }
+    conflicts: list[dict[str, str]] = []
+    for field_key, field in required_by_key.items():
+        result = generated_field_results.get(field_key)
+        if not isinstance(result, dict):
+            continue
+        if (
+            str(result.get("decision") or "").strip() == "unresolved"
+            and str(result.get("resolution_class") or "").strip()
+            == "not_applicable"
+        ):
+            conflicts.append(
+                {
+                    "field_key": field_key,
+                    "label": str(field.get("attribute_label") or field_key),
+                }
+            )
+    return conflicts
 
 
 def _pricing_upload_core_fields(

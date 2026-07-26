@@ -84,6 +84,25 @@ class ImageTaskInbox:
         source.unlink()
         return {**payload, "package_path": str(target.resolve())}
 
+    def release(
+        self,
+        package_id: str,
+        worker_id: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        payload, source = self._owned_package(package_id, worker_id)
+        payload["status"] = "pending"
+        payload["last_release"] = {
+            "worker_id": _worker_id(worker_id),
+            "released_at": _utc_now(),
+            "reason": str(reason or "").strip() or "released",
+        }
+        payload.pop("assignment", None)
+        target = self.directory("pending") / source.name
+        _write_json(target, payload)
+        source.unlink()
+        return {**payload, "package_path": str(target.resolve())}
+
     def load_in_progress(self, package_id: str, worker_id: str) -> dict[str, Any]:
         payload, source = self._owned_package(package_id, worker_id)
         return {**payload, "package_path": str(source.resolve())}

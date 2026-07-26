@@ -24,6 +24,9 @@ def test_image_controller_skill_uses_ten_fixed_visible_tasks() -> None:
     assert "at most ten products concurrently" in text
     assert "Return repair and continuation work to the product's `preferred_slot`" in text
     assert "only when the user explicitly requests a new task" in text
+    assert "one-time pool bootstrap" in text
+    assert "registered pool is empty" in text
+    assert "Do not ask the user to repeat a magic confirmation phrase" in text
     assert "internal subagent" not in text
     assert "five regular worker" not in text
 

@@ -13,9 +13,12 @@ from ozon_v2.images.worker import (
     CURRENT_PROMPT_VERSION,
     LEGACY_PROMPT_VERSION,
     PREVIOUS_PROMPT_VERSION,
+    REFERENCE_LAYOUT_PROMPT_VERSION,
+    VISUAL_PROMPT_VERSION,
     SlotResultReceipt,
     VISUAL_PROMPT_VERSIONS,
     validate_output_diversity,
+    validate_reference_layout_diversity,
 )
 
 
@@ -35,7 +38,13 @@ REPAIR_ISSUE_CODES = frozenset(
 )
 MAX_REVIEW_NOTE_LENGTH = 500
 HISTORICAL_PROMPT_VERSIONS = frozenset(
-    {"ozon-image-v1", LEGACY_PROMPT_VERSION, PREVIOUS_PROMPT_VERSION}
+    {
+        "ozon-image-v1",
+        LEGACY_PROMPT_VERSION,
+        VISUAL_PROMPT_VERSION,
+        PREVIOUS_PROMPT_VERSION,
+        REFERENCE_LAYOUT_PROMPT_VERSION,
+    }
 )
 
 SLOT_DEFINITIONS = (
@@ -1119,11 +1128,15 @@ class ImageGenerationQueue:
                 if not errors:
                     errors.extend(validate_visual_set(tuple(specs)))
                     errors.extend(validate_output_diversity(tuple(receipts)))
+                    errors.extend(
+                        validate_reference_layout_diversity(tuple(receipts))
+                    )
                 if errors:
                     connection.rollback()
                     raise ValueError("visual set validation failed: " + "; ".join(errors))
             elif prompt_versions not in (
                 {LEGACY_PROMPT_VERSION},
+                {VISUAL_PROMPT_VERSION},
                 {PREVIOUS_PROMPT_VERSION},
             ):
                 connection.rollback()

@@ -13,6 +13,7 @@ from urllib.request import Request, urlopen
 from PIL import Image
 
 from ozon_v2.adapters.fs_repo import FsRepo
+from ozon_v2.app.result import Result
 from ozon_v2.domain.models import SeedProduct
 from ozon_v2.domain.models import WorkbenchAction, WorkbenchState
 from ozon_v2.domain.supplier_sku import SupplierSkuOption, SupplierSkuSelectionReceipt
@@ -23,6 +24,7 @@ from ozon_v2.services.attribute_mapping_service import map_template_attributes
 from ozon_v2.services.workbench_service import (
     WorkbenchService,
     _normalize_ozon_rich_content_value,
+    _video_template_fields,
 )
 from ozon_v2.workbench.local_server import create_handler
 
@@ -56,6 +58,36 @@ class FakeRuntimeController:
             "data": {"action": action},
             "errors": [],
         }
+
+
+def test_video_template_fields_classify_video_and_cover_inputs() -> None:
+    fields = _video_template_fields(
+        [
+            {
+                "attribute_id": "10",
+                "attribute_label": "Озон.Видеообложка: ссылка",
+            },
+            {
+                "attribute_id": "11",
+                "attribute_label": "Озон.Видео: ссылка",
+            },
+            {
+                "attribute_id": "12",
+                "attribute_label": "Озон.Видео: название",
+            },
+            {
+                "attribute_id": "13",
+                "attribute_label": "Озон.Видеообложка: изображение-превью",
+            },
+        ]
+    )
+
+    assert {field["attribute_id"]: field["kind"] for field in fields} == {
+        "10": "video_cover_url",
+        "11": "video_url",
+        "12": "video_title",
+        "13": "video_cover_image_url",
+    }
 
 
 class WorkbenchLocalServerTests(RuntimeTestCase):
@@ -1964,6 +1996,60 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual("visible-123456789012-cleaning-kit", option["supplier_sku_id"])
         self.assertEqual(3, option["set_quantity"])
         self.assertTrue(selected["ok"])
+
+    def test_supplier_review_does_not_treat_age_size_or_model_numbers_as_quantity(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        supplier_product = self.supplier_product_payload(seed.seed_id)
+        supplier_product["sku_options"] = []
+        supplier_product["sku_groups"] = [
+            {
+                "name": "颜色",
+                "options": [
+                    {
+                        "label": "黑色均码",
+                        "supplier_sku_id": "",
+                        "image_url": "https://cbu01.alicdn.com/img/ibank/black.jpg",
+                        "disabled": False,
+                        "selected": False,
+                        "option_index": 0,
+                    }
+                ],
+            }
+        ]
+        supplier_product["sku_option_candidates"] = [
+            {
+                "supplier_sku_id": "visible-123456789012-black",
+                "combination_key": "颜色>黑色均码",
+                "raw_label": "黑色均码",
+                "selected_options": {"颜色": "黑色均码"},
+                "set_quantity": 18,
+                "set_composition": ["黑色均码", "适用年龄 12-18 个月", "型号 1020"],
+                "price": {"currency": "CNY", "amount": ""},
+                "stock": {"status": "in_stock", "quantity": None},
+                "image_urls": ["https://cbu01.alicdn.com/img/ibank/black.jpg"],
+                "evidence_source": "single_visible_sku_combination",
+                "complete": False,
+                "evidence": {"user_confirmation_required": True},
+            }
+        ]
+        supplier_product["sku_matrix_status"] = "manual_confirmation_required"
+        self.repo.save_supplier_collection_result(
+            run_id,
+            {
+                "run_id": run_id,
+                "network": {"mode": "direct", "proxy_disabled": True},
+                "supplier_products": [supplier_product],
+            },
+        )
+        run = self.repo.load_run(run_id)
+        run["status"] = WorkbenchState.SUPPLIER_COLLECTED.value
+        self.repo.save_run(run)
+
+        review = self.get_json(f"/api/batches/{run_id}/supplier-review")
+        option = review["data"]["items"][0]["supplier_sku_options"][0]
+
+        self.assertEqual(1, option["set_quantity"])
+        self.assertTrue(option["evidence"]["ignored_unverified_candidate_quantity"])
 
     def test_supplier_selection_capture_recovers_skus_from_specification_matrix(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
@@ -4191,6 +4277,65 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual("cross_domain_category_mismatch", item["category_template_assessment"]["reason"])
         self.assertIn("category_template", item["blocking_gates"])
 
+    def test_required_not_applicable_field_marks_template_for_automatic_refresh(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        template_result = self.repo.load_attribute_template_result(run_id)
+        template_result["seed_templates"][0]["upload_attribute_schema"].append(
+            {
+                "attribute_id": "900",
+                "attribute_label": "Форма выпуска средства",
+                "attribute_type": "string",
+                "is_required": True,
+                "schema_source": (
+                    "ozon_seller_api_description_category_attribute"
+                ),
+            }
+        )
+        self.repo.save_attribute_template_result(run_id, template_result)
+        self.repo.save_generated_content_result(
+            run_id,
+            {
+                "schema_version": 2,
+                "run_id": run_id,
+                "items": {
+                    seed.seed_id: {
+                        "status": "completed_with_gaps",
+                        "field_results": {
+                            "900": {
+                                "decision": "unresolved",
+                                "resolution_class": "not_applicable",
+                                "reason": (
+                                    "The selected product is not a chemical "
+                                    "cleaning agent."
+                                ),
+                                "evidence_refs": [],
+                            }
+                        },
+                    }
+                },
+            },
+        )
+
+        item = WorkbenchService(self.repo).upload_workspace(run_id).data[
+            "items"
+        ][0]
+
+        self.assertFalse(item["template_ready"])
+        self.assertEqual(
+            "required_template_fields_not_applicable",
+            item["category_template_assessment"]["reason"],
+        )
+        self.assertEqual(
+            ["900"],
+            [
+                field["field_key"]
+                for field in item["category_template_assessment"][
+                    "incompatible_required_fields"
+                ]
+            ],
+        )
+        self.assertIn("category_template", item["blocking_gates"])
+
     def test_upload_draft_resolves_required_dictionary_value_ids(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
         ozon_result = self.repo.load_ozon_collection_result(run_id)
@@ -4519,6 +4664,27 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertFalse(
             package["generation_contract"]["return_to_workbench"],
         )
+        self.assertTrue(
+            package["generation_contract"]["r2_preflight_required"],
+        )
+        self.assertEqual(
+            {
+                "required": True,
+                "source": "eight_accepted_images",
+                "format": "mp4",
+                "layout": "3:4_vertical_slideshow",
+            },
+            package["generation_contract"]["video"],
+        )
+        self.assertEqual(
+            {
+                "required": True,
+                "source": "main_01",
+                "format": "jpg",
+                "aspect_ratio": "3:4",
+            },
+            package["generation_contract"]["video_cover"],
+        )
         self.assertEqual(1, len(adapter.imported_items))
         self.assertEqual(
             preview.data["seller_api_item"]["offer_id"],
@@ -4550,6 +4716,206 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             reloaded_item["upload_preview"]["confirmation_token"],
         )
         self.assertEqual(7001, reloaded_item["upload_submission"]["task_id"])
+
+    def test_product_upload_preview_builds_only_the_requested_product_draft(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        ozon_result = self.repo.load_ozon_collection_result(run_id)
+        ozon_result["ozon_candidates"][0]["attributes"]["Цвет"] = "белый"
+        self.repo.save_ozon_collection_result(run_id, ozon_result)
+        self.attach_locked_subject_master(run_id, seed.seed_id)
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+        service = WorkbenchService(
+            self.repo,
+            seller_api_adapter=FakeSellerApiAdapter(),
+        )
+        self.assertTrue(
+            service.confirm_pricing_evidence(
+                run_id,
+                self.pricing_input_payload(seed.seed_id),
+            ).ok
+        )
+
+        with patch.object(
+            service,
+            "build_upload_draft",
+            wraps=service.build_upload_draft,
+        ) as build_draft:
+            preview = service.preview_product_upload(run_id, seed.seed_id)
+
+        self.assertTrue(preview.ok, preview.to_dict())
+        self.assertEqual(
+            [seed.seed_id],
+            build_draft.call_args.kwargs["seed_ids"],
+        )
+
+    def test_required_attribute_evidence_only_fills_missing_required_fields(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        template_result = self.repo.load_attribute_template_result(run_id)
+        template_result["seed_templates"][0]["upload_attribute_schema"].append(
+            {
+                "attribute_id": "900",
+                "attribute_label": "Гарантия",
+                "attribute_type": "string",
+                "is_required": True,
+                "schema_source": "ozon_seller_api_description_category_attribute",
+            }
+        )
+        self.repo.save_attribute_template_result(run_id, template_result)
+        service = WorkbenchService(self.repo)
+
+        before = service.upload_workspace(run_id)
+        self.assertTrue(before.ok, before.to_dict())
+        item_before = before.data["items"][0]
+        self.assertIn(
+            "900",
+            [field["field_key"] for field in item_before["missing_required_fields"]],
+        )
+
+        rejected = service.save_required_attribute_evidence(
+            run_id,
+            seed.seed_id,
+            {"85": "красный", "unknown": "value"},
+        )
+        saved = service.save_required_attribute_evidence(
+            run_id,
+            seed.seed_id,
+            {"85": "белый", "900": "1 год"},
+        )
+        after = service.upload_workspace(run_id)
+
+        self.assertFalse(rejected.ok)
+        self.assertTrue(saved.ok, saved.to_dict())
+        item_after = after.data["items"][0]
+        mapped = {
+            field["field_key"]: field
+            for field in item_after["attribute_mapping"]
+        }
+        self.assertTrue(item_after["required_attributes_ready"])
+        self.assertEqual([], item_after["missing_required_fields"])
+        self.assertEqual("1 год", mapped["900"]["value"])
+        self.assertEqual(
+            "user_confirmed_required_attribute",
+            mapped["900"]["source"],
+        )
+
+    def test_batch_upload_requires_confirmation_and_submits_ready_product(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        ozon_result = self.repo.load_ozon_collection_result(run_id)
+        ozon_result["ozon_candidates"][0]["attributes"]["Цвет"] = "белый"
+        self.repo.save_ozon_collection_result(run_id, ozon_result)
+        self.attach_locked_subject_master(run_id, seed.seed_id)
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+        adapter = FakeSellerApiAdapter()
+        service = WorkbenchService(self.repo, seller_api_adapter=adapter)
+        self.assertTrue(
+            service.confirm_pricing_evidence(
+                run_id,
+                self.pricing_input_payload(seed.seed_id),
+            ).ok
+        )
+
+        rejected = service.batch_upload_products(
+            run_id,
+            seed_ids=[seed.seed_id],
+            confirmed=False,
+        )
+        submitted = service.batch_upload_products(
+            run_id,
+            seed_ids=[seed.seed_id],
+            confirmed=True,
+        )
+
+        self.assertFalse(rejected.ok)
+        self.assertTrue(submitted.ok, submitted.to_dict())
+        self.assertEqual(1, submitted.data["submitted_product_count"])
+        self.assertEqual("submitted", submitted.data["items"][0]["status"])
+        self.assertEqual(1, len(adapter.imported_items))
+
+    def test_batch_upload_validates_and_submits_products_concurrently(self) -> None:
+        run = self.repo.create_workbench_batch_record(target_count=2)
+        run_id = run["run_id"]
+
+        class ConcurrentSellerApiAdapter(FakeSellerApiAdapter):
+            def __init__(self) -> None:
+                super().__init__()
+                self._lock = threading.Lock()
+                self._active = 0
+                self.max_active = 0
+                self._next_task_id = 7100
+
+            def import_products(self, items: list[dict]) -> dict:
+                with self._lock:
+                    self._active += 1
+                    self.max_active = max(self.max_active, self._active)
+                    self._next_task_id += 1
+                    task_id = self._next_task_id
+                time.sleep(0.05)
+                with self._lock:
+                    self.imported_items.extend(items)
+                    self._active -= 1
+                return {"task_id": task_id}
+
+        adapter = ConcurrentSellerApiAdapter()
+        service = WorkbenchService(self.repo, seller_api_adapter=adapter)
+        preview_lock = threading.Lock()
+        preview_active = 0
+        preview_max_active = 0
+
+        def preview(seed_id: str) -> Result:
+            nonlocal preview_active, preview_max_active
+            with preview_lock:
+                preview_active += 1
+                preview_max_active = max(
+                    preview_max_active,
+                    preview_active,
+                )
+            time.sleep(0.05)
+            with preview_lock:
+                preview_active -= 1
+            return Result.success(
+                "product_upload.preview_ready",
+                "ready",
+                {
+                    "seed_id": seed_id,
+                    "confirmation_token": f"token-{seed_id}",
+                    "seller_api_item": {
+                        "offer_id": f"offer-{seed_id}",
+                        "name": f"Product {seed_id}",
+                    },
+                    "image_task_context": {},
+                    "bootstrap_image": {},
+                },
+            )
+
+        workspace = Result.success(
+            "upload_workspace.loaded",
+            "loaded",
+            {
+                "items": [
+                    {"seed_id": "seed-a", "template_ready": True},
+                    {"seed_id": "seed-b", "template_ready": True},
+                ]
+            },
+        )
+        with (
+            patch.object(service, "upload_workspace", return_value=workspace),
+            patch.object(
+                service,
+                "preview_product_upload",
+                side_effect=lambda _run_id, seed_id: preview(seed_id),
+            ),
+        ):
+            result = service.batch_upload_products(
+                run_id,
+                confirmed=True,
+                max_workers=4,
+            )
+
+        self.assertTrue(result.ok, result.to_dict())
+        self.assertEqual(2, result.data["submitted_product_count"])
+        self.assertGreaterEqual(preview_max_active, 2)
+        self.assertGreaterEqual(adapter.max_active, 2)
+        self.assertEqual(2, len(adapter.imported_items))
 
     def test_product_upload_ignores_legacy_generated_image_aspect_ratio(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
@@ -4696,6 +5062,12 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertNotIn(f"/batches/{run_id}/images", page)
         self.assertNotIn('id="buildDraft"', page)
         self.assertIn("pollProductUploadStatus", page)
+        self.assertIn("批量校验并上传可用商品", page)
+        self.assertIn("batchUploadProducts", page)
+        self.assertIn("/product-upload/batch", page)
+        self.assertIn("补充缺失必填字段", page)
+        self.assertIn("保存必填证据", page)
+        self.assertIn("/required-attributes/", page)
 
     def test_public_media_base_url_rejects_localhost_and_persists_public_https(self) -> None:
         service = WorkbenchService(self.repo)
@@ -4732,6 +5104,38 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual("Красота / Зеркала", saved["seller_attribute_template"]["matched_category_path"])
         self.assertEqual(1, adapter.resolve_count)
         self.assertEqual(seed.seed_id, result.data["seed_id"])
+
+    def test_product_preview_self_heals_mismatched_category_template_once(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        template_result = self.repo.load_attribute_template_result(run_id)
+        template_result["seed_templates"][0]["seller_attribute_template"][
+            "matched_category_path"
+        ] = "Продукты питания / Соль, сахар, специи / Мак"
+        self.repo.save_attribute_template_result(run_id, template_result)
+        ozon_result = self.repo.load_ozon_collection_result(run_id)
+        ozon_result["ozon_candidates"][0]["attributes"]["Цвет"] = "белый"
+        self.repo.save_ozon_collection_result(run_id, ozon_result)
+        self.attach_locked_subject_master(run_id, seed.seed_id)
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+        adapter = FakeSellerApiAdapter()
+        service = WorkbenchService(self.repo, seller_api_adapter=adapter)
+        self.assertTrue(
+            service.confirm_pricing_evidence(
+                run_id,
+                self.pricing_input_payload(seed.seed_id),
+            ).ok
+        )
+
+        preview = service.preview_product_upload(run_id, seed.seed_id)
+
+        self.assertTrue(preview.ok, preview.to_dict())
+        self.assertEqual(seed.seed_id, preview.data["seed_id"])
+        self.assertEqual(1, adapter.resolve_count)
+        saved = self.repo.load_attribute_template_result(run_id)["seed_templates"][0]
+        self.assertEqual(
+            "Красота / Зеркала",
+            saved["seller_attribute_template"]["matched_category_path"],
+        )
 
     def test_operations_cockpit_pages_and_read_only_apis_use_runtime_data(self) -> None:
         run_id, _seed = self.prepare_supplier_review_run()

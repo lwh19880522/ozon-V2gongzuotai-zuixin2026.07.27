@@ -66,7 +66,7 @@ def test_materializer_upgrades_filters_and_pixel_deduplicates_references(
     assert Path(result["manifest_path"]).is_file()
 
 
-def test_materializer_stops_before_generation_when_references_are_insufficient(
+def test_materializer_falls_back_without_stopping_when_references_are_insufficient(
     tmp_path: Path,
 ) -> None:
     result = materialize_ozon_references(
@@ -76,8 +76,10 @@ def test_materializer_stops_before_generation_when_references_are_insufficient(
         minimum_valid=4,
     )
 
-    assert result["ready"] is False
-    assert result["stop_reason"] == "insufficient_distinct_legible_ozon_references"
+    assert result["ready"] is True
+    assert result["reference_guidance_ready"] is False
+    assert result["generation_mode"] == "ozon_aesthetic_fallback"
+    assert result["stop_reason"] is None
 
 
 def test_generation_checkpoint_is_cropped_immediately_and_hash_verified(

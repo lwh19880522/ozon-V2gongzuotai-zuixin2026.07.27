@@ -9,6 +9,8 @@
 - Python 3.11 或更高版本，并在安装时勾选加入 `PATH`。
 - Microsoft Edge。
 - Git。
+- Node.js 20+（或已安装并登录的 Cloudflare Wrangler），用于 R2 bucket
+  预检和媒体上传。
 - Codex Desktop。字段和生图流程需要在本仓库工作区中使用。
 
 Ozon Seller API 的 `Client-Id` 和 `Api-Key` 属于店铺私密信息。不要写入 Git、截图、文档或任务包。
@@ -100,6 +102,11 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_ozon_v
 - 生图总控 Skill：`skills/ozon-image-generation-controller/`
 - 单品媒体 Skill：`skills/ozon-product-media-generator/`
 
+单品媒体 Skill 的核心俄文商业信息图提示词位于
+`skills/ozon-product-media-generator/assets/ozon-commercial-infographic-core-prompt.txt`。
+一键安装会把该文件与主图、附图和返修包装提示词作为同一 Skill 完整复制，
+不可只复制 `SKILL.md`。
+
 一键安装器已经将 3 个 Skill 安装到当前用户目录。在 Codex Desktop 中仍需把本仓库作为工作区打开，使仓库内 `.mcp.json` 与工作台服务共同生效。插件刷新后新建一个 Codex 任务。若公司环境通过本地 marketplace 管理插件，安装名为：
 
 ```text
@@ -116,6 +123,29 @@ ozon-v2-ops-controller
 4. 保存后执行授权检查。
 
 凭据只保存在本机运行目录，不进入仓库。浏览器扩展不应包含 Seller API 密钥。
+
+## 6.1 配置图片和视频的 R2 公网通道
+
+生图 Skill 在任何生图调用前都会执行 R2 预检。请先登录 Wrangler：
+
+```powershell
+npx --yes wrangler login
+```
+
+然后把公开 HTTPS 域名保存到工作台：
+
+```powershell
+$body = @{ base_url = "https://你的-R2-公网域名" } | ConvertTo-Json
+Invoke-RestMethod -Method Post `
+  -Uri "http://127.0.0.1:8765/api/settings/public-media" `
+  -ContentType "application/json" `
+  -Body $body
+```
+
+默认 bucket 为 `yandex-media`。使用其他 bucket 时，在启动工作台和 Codex
+前设置 `OZON_V2_R2_BUCKET`。域名必须直接公开读取该 bucket 中的对象，并
+对图片返回 `image/*`、对视频返回 `video/*`。通道没有配置或 bucket
+不可访问时，图片任务保持待处理，不会生成或上传。
 
 ## 7. 启动、停止和重启
 

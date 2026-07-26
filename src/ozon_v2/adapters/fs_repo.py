@@ -522,6 +522,20 @@ class FsRepo:
     def load_generated_content_result(self, run_id: str) -> dict[str, Any]:
         return self._read_json(self.run_dir(run_id) / "generated_content_result.json")
 
+    def save_required_attribute_evidence(
+        self,
+        run_id: str,
+        payload: dict[str, Any],
+    ) -> Path:
+        path = self.run_dir(run_id) / "required_attribute_evidence.json"
+        self._write_json(path, payload)
+        return path
+
+    def load_required_attribute_evidence(self, run_id: str) -> dict[str, Any]:
+        return self._read_json(
+            self.run_dir(run_id) / "required_attribute_evidence.json"
+        )
+
     def save_upload_draft(self, run_id: str, payload: dict[str, Any]) -> Path:
         path = self.run_dir(run_id) / "upload_draft.json"
         self._write_json(path, payload)
