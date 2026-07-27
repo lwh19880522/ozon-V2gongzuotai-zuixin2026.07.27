@@ -1,0 +1,58 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage*
+htmlcov/
+.venv/
+venv/
+
+# Secrets and machine-local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Ozon V2 runtime state, logs, browser profiles, and diagnostics
+/runtime/
+/tmp/
+*.log
+*.pid
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+
+# Local Codex/design scratch state
+/.agents/
+/.codex/
+/.codex_spreadsheet_probe/
+/.superpowers/
+/.worktrees/
+/.artifacts/
+/artifacts/
+/.wrangler/
+/work/
+/.release/
+/.tmp/
+/.tmp-npm-cache/
+/.worker-output/
+
+# Collected marketplace evidence and temporary image experiments
+/ozon-v2-run-*
+/ozon-v2-antibot-*
+/ozon-v2-snapshot-run-*
+/ozon-clear-*
+/seed-*
+
+# Historical plugin copy outside Ozon V2
+/yangzongzhengshi-yangdex-chajian/
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
+Desktop.ini

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ozon Intelligent Field Drafter"
+  short_description: "Build Russian Ozon fields from locked SKU evidence"
+  default_prompt: "Use $ozon-intelligent-field-drafter to complete every pending field for the current Ozon V2 batch. Materialize locked 1688 visual evidence, inspect every local image with view_image, identify the locked SKU primary subject, exclude accessories and packaging from primary-subject facts, and submit field-specific visual_analysis plus subject_analysis receipts before classifying a visual field."
