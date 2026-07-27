@@ -28,7 +28,7 @@ def normalize_identity_text(value: str | None) -> str:
 
 
 def seed_identity_key(seed: SeedProduct) -> str:
-    return normalize_identity_text(seed.product_clue or seed.title_or_keyword)
+    return normalize_identity_text(seed.title_or_keyword or seed.product_clue)
 
 
 def existing_product_keys(products: Iterable[ExistingStoreProduct]) -> dict[str, ExistingStoreProduct]:

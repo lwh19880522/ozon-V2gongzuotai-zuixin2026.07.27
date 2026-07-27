@@ -224,10 +224,14 @@ Every seed must have a stable `seed_id`.
 Bundled initial seed pool asset:
 
 ```text
-assets/seed_pool/Ozon_2000精细子类目种子池.txt
+assets/seed_pool/Ozon_5000精细子类目种子池.txt
 assets/seed_pool/seed_pool.initial.json
 assets/seed_pool/manifest.json
 ```
+
+安装或启动时会比较捆绑种子池与运行时种子池的 `package_version`。版本变化时，
+工作台自动换入新包，同时继续排除 `seed_pool.used.jsonl` 与
+`seed_pool.blacklist.jsonl` 已记录的种子，避免升级后重复采集。
 
 The seed pool source language is Chinese. Chinese seed text remains product
 identity evidence; Ozon search uses the bundled Russian-first query terms.

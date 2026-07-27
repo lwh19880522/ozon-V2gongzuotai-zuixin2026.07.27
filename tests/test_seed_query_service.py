@@ -10,17 +10,25 @@ from ozon_v2.services.seed_query_service import SeedQueryService
 
 
 class SeedQueryServiceTests(TestCase):
-    def test_bundled_seed_pool_is_refined_2000_package(self) -> None:
-        seed_path = Path(__file__).resolve().parents[1] / "assets" / "seed_pool" / "seed_pool.initial.json"
+    def test_bundled_seed_pool_is_refined_5000_package_without_private_source_path(self) -> None:
+        asset_dir = Path(__file__).resolve().parents[1] / "assets" / "seed_pool"
+        seed_path = asset_dir / "seed_pool.initial.json"
+        manifest = json.loads((asset_dir / "manifest.json").read_text(encoding="utf-8"))
         payload = json.loads(seed_path.read_text(encoding="utf-8"))
         seeds = [SeedProduct.from_dict(item) for item in payload["seeds"]]
 
-        self.assertEqual(2000, payload["seed_count"])
-        self.assertEqual(2000, len(seeds))
-        self.assertEqual(2000, len({seed.seed_id for seed in seeds}))
-        self.assertEqual(2000, len({seed.title_or_keyword for seed in seeds}))
-        self.assertEqual(2000, len({seed.ozon_query_terms_ru[0].casefold() for seed in seeds}))
+        self.assertEqual("seed_pool.refined.5000.v1", payload["package_version"])
+        self.assertEqual(5000, payload["seed_count"])
+        self.assertEqual(5000, len(seeds))
+        self.assertEqual(5000, len({seed.seed_id for seed in seeds}))
+        self.assertEqual(5000, len({seed.title_or_keyword for seed in seeds}))
+        self.assertEqual(5000, len({seed.ozon_query_terms_ru[0].casefold() for seed in seeds}))
         self.assertTrue(all(seed.category_hint for seed in seeds))
+        self.assertNotIn("source_path", manifest)
+        self.assertNotRegex(
+            json.dumps(manifest, ensure_ascii=False),
+            r"(?i)(?:[a-z]:\\|/users/|xwechat_files|qq\d{5,})",
+        )
         self.assertTrue(
             all(
                 generated_query_terms_are_safe(seed.title_or_keyword, seed.ozon_query_terms_ru)

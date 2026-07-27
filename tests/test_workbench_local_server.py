@@ -5510,7 +5510,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertNotEqual(rejected_seed.seed_id, replacement.seed_id)
         self.assertIn("browser_candidate.exhausted", event_types)
         self.assertIn("seed_sampling.replaced_after_exhaustion", event_types)
-        self.assertEqual(2000, len(self.repo.load_active_seeds()))
+        self.assertEqual(5000, len(self.repo.load_active_seeds()))
         progress = self.get_json(f"/api/batches/{run_id}")["data"]["progress"]["ozon_collection_progress"]
         self.assertEqual(0, progress["replacement_count"])
         self.assertEqual(0, progress["failure_count"])
@@ -5555,7 +5555,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn("seed_sampling.replaced_after_exhaustion", event_types)
         self.assertEqual(1, event_types.count("browser_candidate.replaced"))
         self.assertNotIn("browser_candidate.failed", event_types)
-        self.assertEqual(2000, len(self.repo.load_active_seeds()))
+        self.assertEqual(5000, len(self.repo.load_active_seeds()))
 
         self.post_json(
             "/api/browser-bridge/heartbeat",

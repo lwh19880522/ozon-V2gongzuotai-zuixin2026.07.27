@@ -98,21 +98,66 @@ class FsRepo:
         self.config_dir.mkdir(parents=True, exist_ok=True)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.runs_dir.mkdir(parents=True, exist_ok=True)
-        if not self.config_initial_seed_path.exists():
-            shutil.copy2(self.context.paths.initial_seed_json, self.config_initial_seed_path)
-        if not self.active_seed_path.exists():
-            package = self._read_json(self.context.paths.initial_seed_json)
-            self._write_json(
-                self.active_seed_path,
-                {
-                    "package_version": package["package_version"],
-                    "initialized_at": utc_now_iso(),
-                    "seeds": package["seeds"],
-                },
-            )
         self.used_seed_path.touch(exist_ok=True)
         self.seed_blacklist_path.touch(exist_ok=True)
         self.existing_store_dedupe_path.touch(exist_ok=True)
+
+        bundled_package = self._read_json(self.context.paths.initial_seed_json)
+        bundled_version = str(bundled_package["package_version"])
+        installed_version = ""
+        if self.config_initial_seed_path.exists():
+            try:
+                installed_version = str(
+                    self._read_json(self.config_initial_seed_path).get("package_version") or ""
+                )
+            except (json.JSONDecodeError, OSError, TypeError):
+                installed_version = ""
+        if installed_version != bundled_version:
+            shutil.copy2(self.context.paths.initial_seed_json, self.config_initial_seed_path)
+
+        if not self.active_seed_path.exists():
+            self._write_json(
+                self.active_seed_path,
+                {
+                    "package_version": bundled_version,
+                    "initialized_at": utc_now_iso(),
+                    "seeds": bundled_package["seeds"],
+                },
+            )
+        else:
+            try:
+                active_package = self._read_json(self.active_seed_path)
+            except (json.JSONDecodeError, OSError, TypeError):
+                active_package = {}
+            active_version = str(active_package.get("package_version") or "")
+            if active_version != bundled_version:
+                used_seed_ids = {
+                    str(item["seed_id"])
+                    for item in self._read_jsonl(self.used_seed_path)
+                    if item.get("seed_id")
+                }
+                blacklisted_seed_ids = {
+                    str(item["seed_id"])
+                    for item in self._read_jsonl(self.seed_blacklist_path)
+                    if item.get("seed_id")
+                }
+                excluded_seed_ids = used_seed_ids | blacklisted_seed_ids
+                migrated_seeds = [
+                    seed
+                    for seed in bundled_package["seeds"]
+                    if str(seed.get("seed_id") or "") not in excluded_seed_ids
+                ]
+                self._write_json(
+                    self.active_seed_path,
+                    {
+                        "package_version": bundled_version,
+                        "initialized_at": utc_now_iso(),
+                        "upgraded_from_package_version": active_version or None,
+                        "excluded_used_seed_count": len(used_seed_ids),
+                        "excluded_blacklisted_seed_count": len(blacklisted_seed_ids),
+                        "seeds": migrated_seeds,
+                    },
+                )
         if not self.credentials_template_path.exists():
             self.write_credentials_template()
 
@@ -163,6 +208,7 @@ class FsRepo:
 
     def save_active_seeds(self, seeds: list[SeedProduct]) -> None:
         payload = self._read_json(self.active_seed_path) if self.active_seed_path.exists() else {}
+        payload.setdefault("package_version", self.context.config.seed_pool_version)
         payload["seeds"] = [seed.to_dict() for seed in seeds]
         payload["updated_at"] = utc_now_iso()
         self._write_json(self.active_seed_path, payload)

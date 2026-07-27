@@ -21,7 +21,7 @@ class Paths:
 
 @dataclass(frozen=True)
 class Config:
-    seed_pool_version: str = "seed_pool.refined.2000.v1"
+    seed_pool_version: str = "seed_pool.refined.5000.v1"
     default_ozon_query_language: str = "ru-RU"
     default_seed_source_language: str = "zh-CN"
 

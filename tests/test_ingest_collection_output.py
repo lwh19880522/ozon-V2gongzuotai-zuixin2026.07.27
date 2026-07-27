@@ -111,7 +111,7 @@ class IngestCollectionOutputTests(RuntimeTestCase):
         self.assertEqual("¥6", row["supplier_domestic_shipping_fee"])
         self.assertEqual("广东阳江 -> 福建泉州", row["supplier_domestic_shipping_destination"])
         self.assertIn("运费 ¥6 起", row["supplier_domestic_shipping_evidence"])
-        self.assertEqual(1999, len(repo.load_active_seeds()))
+        self.assertEqual(4999, len(repo.load_active_seeds()))
         self.assertIn(sampled_seed.seed_id, repo.load_used_seed_ids())
 
     def test_partial_batch_is_rejected_without_finalizing_sampled_seeds(self) -> None:
@@ -132,7 +132,7 @@ class IngestCollectionOutputTests(RuntimeTestCase):
         self.assertEqual("ingest.invalid_collection_output", result.code)
         self.assertIn("must include exactly 2 pairs", " ".join(result.errors))
         self.assertIn(sampled_seeds[1].seed_id, " ".join(result.errors))
-        self.assertEqual(2000, len(repo.load_active_seeds()))
+        self.assertEqual(5000, len(repo.load_active_seeds()))
         self.assertEqual(set(), repo.load_used_seed_ids())
 
     def test_replaced_seed_attempt_is_removed_on_finalization(self) -> None:
@@ -175,7 +175,7 @@ class IngestCollectionOutputTests(RuntimeTestCase):
         result = service.ingest_collection_output(run_id, {"collection_pairs": pairs})
 
         self.assertTrue(result.ok)
-        self.assertEqual(1997, len(repo.load_active_seeds()))
+        self.assertEqual(4997, len(repo.load_active_seeds()))
         used_ids = repo.load_used_seed_ids()
         self.assertIn(rejected_seed_id, used_ids)
         self.assertIn(replacement_seed_id, used_ids)

@@ -64,7 +64,43 @@ class FsRepoTests(RuntimeTestCase):
         self.assertTrue((self.context.runtime_root / "config" / "seed_pool.initial.json").exists())
         self.assertTrue((self.context.runtime_root / "state" / "seed_pool.active.json").exists())
         self.assertTrue((self.context.runtime_root / "state" / "seed_pool.used.jsonl").exists())
-        self.assertEqual(2000, len(repo.load_active_seeds()))
+        self.assertEqual(5000, len(repo.load_active_seeds()))
+
+    def test_initialize_runtime_replaces_old_package_without_rehydrating_used_seed(self) -> None:
+        repo = FsRepo(self.context)
+        bundled = json.loads(self.context.paths.initial_seed_json.read_text(encoding="utf-8"))
+        used_seed_id = bundled["seeds"][0]["seed_id"]
+        repo.config_dir.mkdir(parents=True)
+        repo.state_dir.mkdir(parents=True)
+        repo.runs_dir.mkdir(parents=True)
+        repo.config_initial_seed_path.write_text(
+            json.dumps({"package_version": "seed_pool.refined.2000.v1", "seeds": []}),
+            encoding="utf-8",
+        )
+        repo.active_seed_path.write_text(
+            json.dumps(
+                {
+                    "package_version": "seed_pool.refined.2000.v1",
+                    "seeds": [{"seed_id": "seed-legacy", "title_or_keyword": "legacy", "product_clue": "legacy"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        repo.used_seed_path.write_text(
+            json.dumps({"seed_id": used_seed_id}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+        repo.initialize_runtime()
+
+        active_payload = json.loads(repo.active_seed_path.read_text(encoding="utf-8"))
+        config_payload = json.loads(repo.config_initial_seed_path.read_text(encoding="utf-8"))
+        active_ids = {item["seed_id"] for item in active_payload["seeds"]}
+        self.assertEqual("seed_pool.refined.5000.v1", active_payload["package_version"])
+        self.assertEqual("seed_pool.refined.5000.v1", config_payload["package_version"])
+        self.assertEqual(4999, len(active_ids))
+        self.assertNotIn(used_seed_id, active_ids)
+        self.assertNotIn("seed-legacy", active_ids)
 
     def test_initialize_runtime_does_not_restore_removed_used_seed(self) -> None:
         repo = FsRepo(self.context)

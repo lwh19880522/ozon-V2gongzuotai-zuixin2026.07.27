@@ -328,7 +328,7 @@ class WorkbenchSkeletonTests(RuntimeTestCase):
         self.assertEqual("workbench.seeds_selected", result.code)
         self.assertEqual(WorkbenchState.SEED_SELECTED.value, repo.load_run(run_id)["status"])
         self.assertEqual(2, len(repo.load_sampled_seeds(run_id)))
-        self.assertEqual(2000, len(repo.load_active_seeds()))
+        self.assertEqual(5000, len(repo.load_active_seeds()))
         self.assertEqual("seed_sampling.selected", repo.load_run_events(run_id)[-1].event_type)
 
     def test_exhausted_attribute_template_seed_is_replaced_without_removing_active_pool(self) -> None:
@@ -364,7 +364,7 @@ class WorkbenchSkeletonTests(RuntimeTestCase):
         self.assertEqual([replacement.seed_id], loaded["replacement_pending_seed_ids"])
         self.assertFalse(loaded["attribute_template_contract_ready"])
         self.assertNotIn("attribute_template_contract_path", loaded)
-        self.assertEqual(2000, len(repo.load_active_seeds()))
+        self.assertEqual(5000, len(repo.load_active_seeds()))
         self.assertEqual(rejected_seed.seed_id, repo.load_rejected_seed_attempts(run_id)[0]["seed_id"])
         self.assertEqual("seed_sampling.replaced_after_exhaustion", repo.load_run_events(run_id)[-1].event_type)
 

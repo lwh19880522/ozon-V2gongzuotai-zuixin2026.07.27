@@ -180,7 +180,7 @@ Bundled plugin seed assets:
 ```text
 assets/
   seed_pool/
-    Ozon_2000精细子类目种子池.txt
+    Ozon_5000精细子类目种子池.txt
     seed_pool.initial.json
     manifest.json
 ```

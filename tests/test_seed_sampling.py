@@ -37,7 +37,7 @@ class SeedSamplingTests(RuntimeTestCase):
         self.assertTrue(result.ok)
         self.assertEqual(2, len(result.data["sampled_seeds"]))
         self.assertEqual("create_ozon_collection_contract", result.data["next_action"])
-        self.assertEqual(2000, len(repo.load_active_seeds()))
+        self.assertEqual(5000, len(repo.load_active_seeds()))
 
     def test_existing_store_dedupe_blocks_seed_before_sampling(self) -> None:
         repo = FsRepo(self.context)
@@ -54,11 +54,11 @@ class SeedSamplingTests(RuntimeTestCase):
             ]
         )
 
-        result = RunService(repo).start_run(target_count=2000, random_seed=1)
+        result = RunService(repo).start_run(target_count=5000, random_seed=1)
 
         self.assertFalse(result.ok)
         self.assertEqual("run.insufficient_seeds", result.code)
-        self.assertEqual(1999, result.data["eligible_seed_count"])
+        self.assertEqual(4999, result.data["eligible_seed_count"])
 
     def test_next_action_uses_bundled_queries_for_ozon_contract(self) -> None:
         repo = FsRepo(self.context)

@@ -1,19 +1,18 @@
 {
-  "package_version": "seed_pool.refined.2000.v1",
-  "original_filename": "Ozon_2000精细子类目种子池_记事本版(2).txt",
+  "package_version": "seed_pool.refined.5000.v1",
+  "original_filename": "Ozon_5000精细子类目种子池.txt",
   "normalized_filename": "seed_pool.initial.json",
-  "seed_count": 2000,
-  "unique_seed_count": 2000,
+  "seed_count": 5000,
+  "unique_seed_count": 5000,
   "source_language": "zh-CN",
   "ozon_query_language": "ru-RU",
-  "query_policy": "Use unique Russian-first product queries bundled with each refined seed. Chinese names remain identity evidence only.",
+  "query_policy": "Use reviewed primary Russian query first; alternative query is the bounded fallback.",
   "review_status_counts": {
-    "approved_local_validation": 441,
-    "approved_taxonomy_validation": 1559
+    "approved_expanded_low_risk_market_seed": 5000
   },
-  "source_sha256": "820C8B813123685FB711C640FCC5DAC127AA5CC1F0DD403990529A778C0FA88E",
-  "imported_at": "2026-07-13T06:31:33.186962Z",
-  "source_path": "<redacted-local-source>",
+  "source_sha256": "07B338B8C255304DBF8794A311ED30CFF4E9F9A52885B3409E7E4D7EC93B6413",
+  "imported_at": "2026-07-27T02:52:15.326466Z",
+  "source_provenance": "user_supplied_local_file_path_not_persisted",
   "bundled_asset_path": "assets/seed_pool",
-  "runtime_policy": "Replace runtime active pool explicitly during package upgrade. Never rehydrate seed IDs already present in the used ledger."
+  "runtime_policy": "Replace the runtime active pool when package_version changes while preserving used and blacklist ledgers."
 }
