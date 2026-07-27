@@ -78,6 +78,12 @@ _RUSSIAN_OBJECTIVE_FIELDS = {
     "country",
     "gender",
 }
+_PRE_UPLOAD_COMPLIANCE_DECISION_LABELS = frozenset(
+    {
+        "нужен код маркировки",
+        "требуется код маркировки",
+    }
+)
 _INTERNAL_LIFECYCLE_ACTIONS = frozenset(
     action for action in WorkbenchAction if action.value.startswith("mark_")
 )
@@ -1651,7 +1657,12 @@ class WorkbenchService:
         for candidate in candidates:
             seed_id = str(candidate.get("seed_id") or "")
             template = templates_by_seed.get(seed_id, {})
-            schema = template.get("upload_attribute_schema") if isinstance(template.get("upload_attribute_schema"), list) else []
+            raw_schema = (
+                template.get("upload_attribute_schema")
+                if isinstance(template.get("upload_attribute_schema"), list)
+                else []
+            )
+            schema = _effective_upload_schema(raw_schema)
             prefill_plan = template.get("draft_prefill_plan") if isinstance(template.get("draft_prefill_plan"), list) else []
             seller_template = template.get("seller_attribute_template") or {}
             category_candidates = template.get("category_candidates") if isinstance(template.get("category_candidates"), list) else []
@@ -1883,7 +1894,7 @@ class WorkbenchService:
                     "category_path": seller_template.get("matched_category_path") or (category_candidates[0].get("category_path") if category_candidates else None),
                     "description_category_id": seller_template.get("description_category_id"),
                     "type_id": seller_template.get("type_id"),
-                    "required_attribute_count": sum(1 for field in schema if field.get("is_required") is True),
+                    "required_attribute_count": mapping["required_attribute_count"],
                     "attribute_schema_count": len(schema),
                     "prefill_plan_count": len(prefill_plan),
                     "prefill_plan": prefill_plan,
@@ -3360,17 +3371,6 @@ class WorkbenchService:
             and existing.get("task_id") is not None
             and existing_status not in {"failed", "error", "declined"}
         ):
-            if not existing.get("image_task_package_id"):
-                existing.update(
-                    self._emit_image_task_package(
-                        run_id=run_id,
-                        seed_id=seed_id,
-                        seller_import_task_id=int(existing["task_id"]),
-                        preview=preview,
-                    )
-                )
-                submissions["items"][seed_id] = existing
-                self.repo.save_upload_submissions(run_id, submissions)
             return Result.success(
                 "product_upload.already_submitted",
                 "This product upload is already being processed or was accepted.",
@@ -3400,14 +3400,6 @@ class WorkbenchService:
             "status": "submitted",
             "submitted_at": utc_now_iso(),
         }
-        record.update(
-            self._emit_image_task_package(
-                run_id=run_id,
-                seed_id=seed_id,
-                seller_import_task_id=int(submitted["task_id"]),
-                preview=preview,
-            )
-        )
         if isinstance(existing, dict) and existing.get("task_id") is not None:
             history = [
                 item
@@ -3433,9 +3425,6 @@ class WorkbenchService:
                 "offer_id": record["offer_id"],
                 "task_id": record["task_id"],
                 "submission_path": str(path),
-                "image_task_package_path": record[
-                    "image_task_package_path"
-                ],
             },
         )
         return Result.success(
@@ -3643,14 +3632,6 @@ class WorkbenchService:
                 "status": "submitted",
                 "submitted_at": utc_now_iso(),
             }
-            record.update(
-                self._emit_image_task_package(
-                    run_id=run_id,
-                    seed_id=seed_id,
-                    seller_import_task_id=int(submitted["task_id"]),
-                    preview=preview,
-                )
-            )
             existing = pending.get("existing")
             if isinstance(existing, dict) and existing.get("task_id") is not None:
                 history = [
@@ -3762,6 +3743,52 @@ class WorkbenchService:
         record["seller_api_status"] = seller_status
         record["status"] = _product_import_status(seller_status)
         record["status_checked_at"] = utc_now_iso()
+        if (
+            record["status"] != "accepted_by_ozon"
+            and record.get("image_task_package_id")
+        ):
+            premature_package_id = str(record["image_task_package_id"])
+            quarantined_path = self.repo.quarantine_image_task_package(
+                premature_package_id,
+                reason="ozon_upload_not_accepted",
+                details={
+                    "run_id": run_id,
+                    "seed_id": seed_id,
+                    "seller_import_task_id": record.get("task_id"),
+                    "seller_import_status": record["status"],
+                },
+            )
+            record.pop("image_task_package_id", None)
+            record.pop("image_task_package_path", None)
+            record["quarantined_image_task_package_id"] = (
+                premature_package_id
+            )
+            record["quarantined_image_task_package_path"] = (
+                str(quarantined_path) if quarantined_path else None
+            )
+        if (
+            record["status"] == "accepted_by_ozon"
+            and not record.get("image_task_package_id")
+        ):
+            try:
+                previews = self.repo.load_upload_previews(run_id)
+            except FileNotFoundError:
+                previews = {}
+            preview = (previews.get("items") or {}).get(seed_id)
+            if isinstance(preview, dict):
+                record.update(
+                    self._emit_image_task_package(
+                        run_id=run_id,
+                        seed_id=seed_id,
+                        seller_import_task_id=int(record["task_id"]),
+                        preview=preview,
+                    )
+                )
+            else:
+                record["image_task_package_error"] = (
+                    "The accepted product has no saved upload preview; "
+                    "regenerate the preview before creating its image task."
+                )
         submissions["items"][seed_id] = record
         self.repo.save_upload_submissions(run_id, submissions)
         return Result.success(
@@ -6631,7 +6658,13 @@ class WorkbenchService:
         recommended_sku_id = ""
         if ranked and ranked[0][0] > 0 and (len(ranked) == 1 or ranked[0][0] > ranked[1][0]):
             recommended_sku_id = ranked[0][1]
+        single_option_supplier_sku_id = (
+            ordered_sku_ids[0] if len(ordered_sku_ids) == 1 else ""
+        )
         return {
+            "canonical_option_count": len(ordered_sku_ids),
+            "single_option_confirmable": len(ordered_sku_ids) == 1,
+            "single_option_supplier_sku_id": single_option_supplier_sku_id,
             "target_measurements": target_measurements,
             "matching_sku_ids": matching_sku_ids,
             "other_sku_ids": other_sku_ids,
@@ -8124,6 +8157,22 @@ def _required_not_applicable_fields(
                 }
             )
     return conflicts
+
+
+def _effective_upload_schema(
+    upload_schema: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    effective: list[dict[str, Any]] = []
+    for raw_field in upload_schema:
+        if not isinstance(raw_field, dict):
+            continue
+        field = dict(raw_field)
+        normalized_label = normalize_attribute_label(field.get("attribute_label"))
+        if normalized_label in _PRE_UPLOAD_COMPLIANCE_DECISION_LABELS:
+            field["is_required"] = True
+            field["required_reason"] = "ozon_compliance_decision"
+        effective.append(field)
+    return effective
 
 
 def _pricing_upload_core_fields(

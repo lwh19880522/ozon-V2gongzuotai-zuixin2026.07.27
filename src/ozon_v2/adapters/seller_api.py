@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import ssl
 import urllib.error
 import urllib.request
 from typing import Any
@@ -389,7 +390,12 @@ class SellerApiAdapter:
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")
                 raise SellerApiError(f"Ozon Seller API returned HTTP {exc.code}: {body[:300]}") from exc
-            except (urllib.error.URLError, TimeoutError) as exc:
+            except (
+                urllib.error.URLError,
+                TimeoutError,
+                ssl.SSLError,
+                ConnectionResetError,
+            ) as exc:
                 if attempt == 0:
                     continue
                 reason = exc.reason if isinstance(exc, urllib.error.URLError) else str(exc)

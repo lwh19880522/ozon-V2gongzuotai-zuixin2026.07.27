@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ssl
 from unittest import TestCase
 from unittest.mock import patch
 
@@ -61,6 +62,24 @@ class SellerCategoryTreeTests(TestCase):
         with self.assertRaisesRegex(SellerApiError, "timed out"):
             adapter._post_json("/v3/product/list", {"limit": 1000})
 
+        self.assertEqual(2, urlopen.call_count)
+
+    @patch("ozon_v2.adapters.seller_api.urllib.request.urlopen")
+    def test_post_json_retries_once_after_ssl_unexpected_eof(self, urlopen) -> None:
+        urlopen.side_effect = [
+            FakeHttpResponse(
+                read_error=ssl.SSLEOFError(
+                    8,
+                    "[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol",
+                )
+            ),
+            FakeHttpResponse(payload=b'{"result":{"items":[]}}'),
+        ]
+        adapter = SellerApiAdapter(repo=FakeCredentialsRepo())
+
+        result = adapter._post_json("/v1/product/import/info", {"task_id": 7001})
+
+        self.assertEqual({"result": {"items": []}}, result)
         self.assertEqual(2, urlopen.call_count)
 
     def test_type_node_inherits_description_category_id_from_parent(self) -> None:
