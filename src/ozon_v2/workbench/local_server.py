@@ -1813,23 +1813,22 @@ def build_supplier_review_html(run_id: str) -> str:
     }}
 
     function isPageUniqueSupplierSku(item, options) {{
-      if (!Array.isArray(options) || options.length !== 1) return false;
-      const option = options[0] || {{}};
-      if (option.evidence_source === "single_sku_detail_page") return true;
-      const groups = Array.isArray(item.supplier_sku_groups) ? item.supplier_sku_groups : [];
-      if (!groups.length) return false;
-      return groups.every((group) => {{
-        const visibleOptions = Array.isArray(group && group.options)
-          ? group.options.filter((candidate) => candidate && candidate.disabled !== true)
-          : [];
-        return visibleOptions.length === 1;
-      }});
+      const serverDecision = item && item.supplier_sku_decision
+        ? item.supplier_sku_decision
+        : {{}};
+      const option = Array.isArray(options) && options.length === 1
+        ? options[0]
+        : null;
+      return serverDecision.single_option_confirmable === true
+        && Number(serverDecision.canonical_option_count) === 1
+        && !!option
+        && String(serverDecision.single_option_supplier_sku_id || "")
+          === String(option.supplier_sku_id || "");
     }}
 
     function canRecaptureSupplier(item) {{
       const stageAllowsRecapture = ["supplier_review", "supplier_collected", "image_processing"].includes(state.status);
       return stageAllowsRecapture
-        && !!item.supplier_url
         && !item.supplier_sku_selection
         && !item.subject_master;
     }}
@@ -2228,7 +2227,10 @@ def build_supplier_review_html(run_id: str) -> str:
         rejectButton.type = "button";
         rejectButton.className = "reject-button";
         rejectButton.textContent = "找不到供应商 (No Supplier Found)";
-        rejectButton.disabled = state.status !== "supplier_review" || !!item.supplier_url;
+        // A captured URL is not proof that the supplier is correct. Keep the
+        // rejection/refill escape hatch available so a wrong 1688 match cannot
+        // strand the whole batch.
+        rejectButton.disabled = state.status !== "supplier_review";
         rejectButton.addEventListener("click", () => rejectSupplier(item, rejectButton));
         const recaptureButton = document.createElement("button");
         recaptureButton.type = "button";
@@ -3016,7 +3018,7 @@ def build_upload_workspace_html(run_id: str) -> str:
     .pricing-pager {{ display:flex; align-items:center; justify-content:center; gap:8px; padding:6px 10px; border-top:1px solid var(--line); background:#fff; }} .pricing-pager button {{ width:28px; height:28px; display:grid; place-items:center; border:1px solid #cbd4e1; border-radius:5px; color:var(--blue); background:#fff; cursor:pointer; }} .pricing-pager button:disabled {{ color:#aab3c1; background:#f4f6f9; cursor:not-allowed; }} .pricing-page-label {{ min-width:104px; color:var(--muted); font-size:10px; text-align:center; }}
     .pricing-editor {{ min-width:0; padding:16px; }} .pricing-editor-empty {{ min-height:430px; display:grid; place-items:center; color:var(--muted); }} .pricing-reference {{ display:grid; grid-template-columns:86px minmax(0,1fr); gap:13px; padding-bottom:14px; border-bottom:1px solid var(--line); }} .pricing-reference img {{ width:86px; height:86px; object-fit:contain; border:1px solid var(--line); border-radius:5px; background:#fff; }} .pricing-reference h4 {{ margin:0 0 7px; font-size:15px; }} .pricing-reference-row {{ display:flex; flex-wrap:wrap; gap:7px 14px; color:var(--muted); font-size:11px; }} .supplier-link {{ color:var(--blue); font-weight:650; text-decoration:none; }} .supplier-link:hover {{ text-decoration:underline; }}
     .pricing-policy {{ display:flex; flex-wrap:wrap; gap:6px; margin:12px 0; }} .policy-chip {{ padding:4px 8px; border-radius:4px; color:#38506f; background:#edf3fb; font-size:10px; }}
-    .pricing-form {{ display:grid; grid-template-columns:repeat(4,minmax(130px,1fr)); gap:10px; }} .pricing-field {{ display:grid; gap:5px; }} .pricing-field label {{ color:var(--muted); font-size:10px; }} .pricing-field input {{ width:100%; height:36px; padding:0 9px; border:1px solid #cbd4e1; border-radius:5px; color:var(--text); background:#fff; }} .pricing-field input:focus {{ outline:2px solid rgba(36,87,214,.16); border-color:var(--blue); }}
+    .pricing-form {{ display:grid; grid-template-columns:repeat(4,minmax(130px,1fr)); gap:10px; }} .pricing-field {{ align-content:start; display:grid; gap:5px; }} .pricing-field label {{ color:var(--muted); font-size:10px; }} .pricing-field input {{ width:100%; height:36px; padding:0 9px; border:1px solid #cbd4e1; border-radius:5px; color:var(--text); background:#fff; }} .pricing-field input:focus {{ outline:2px solid rgba(36,87,214,.16); border-color:var(--blue); }} .pricing-prefill-note {{ color:var(--green); font-size:9px; line-height:1.35; }}
     .pricing-actions {{ display:flex; align-items:center; gap:9px; margin-top:14px; }} .pricing-action {{ min-height:38px; padding:0 16px; border:1px solid var(--blue); border-radius:5px; color:var(--blue); background:#fff; cursor:pointer; }} .pricing-action.primary-action {{ color:#fff; background:var(--blue); }} .pricing-action:disabled {{ opacity:.5; cursor:not-allowed; }} .pricing-message {{ min-height:20px; margin-top:8px; color:var(--muted); font-size:11px; }} .pricing-message.error {{ color:var(--red); }} .pricing-message.success {{ color:var(--green); }}
     .pricing-result {{ display:grid; grid-template-columns:repeat(6,minmax(105px,1fr)); margin-top:14px; overflow:hidden; border:1px solid var(--line); border-radius:6px; }} .pricing-result-cell {{ min-height:70px; padding:10px; border-right:1px solid var(--line); background:#fbfcfe; }} .pricing-result-cell:last-child {{ border-right:0; }} .pricing-result-cell span {{ display:block; color:var(--muted); font-size:9px; }} .pricing-result-cell strong {{ display:block; margin-top:5px; font-size:14px; }} .pricing-result-cell.price {{ background:var(--green-soft); }} .pricing-result-cell.price strong {{ color:var(--green); }}
     .publish-lock {{ margin:0 14px 12px; padding:11px 12px; border-left:3px solid var(--amber); color:#74410a; background:#fff8eb; }} .publish-lock strong {{ display:block; font-size:11px; }} .publish-lock span {{ display:block; margin-top:3px; font-size:10px; }}
@@ -3043,7 +3045,7 @@ def build_upload_workspace_html(run_id: str) -> str:
           <div class="pricing-layout"><div class="pricing-product-column"><nav id="pricingProductList" class="pricing-products" aria-label="价格证据商品清单"></nav><div id="pricingPager" class="pricing-pager"><button id="pricingPrevPage" type="button" aria-label="上一页">‹</button><span id="pricingPageLabel" class="pricing-page-label" aria-live="polite">第 1 / 1 页 · 每页 5 件</span><button id="pricingNextPage" type="button" aria-label="下一页">›</button></div></div><section id="pricingEditor" class="pricing-editor"><div class="pricing-editor-empty">正在读取商品价格证据…</div></section></div>
         </section>
         <div class="upload-layout"><section class="panel"><div class="panel-head"><h3>类目模板自动映射结果 · 完整字段与内容完善</h3><div class="draft-head-actions"><div id="draftPager" class="draft-pager"><button id="draftPrevPage" type="button" aria-label="上一页">‹</button><span id="draftPageLabel" class="draft-page-label" aria-live="polite">第 1 / 1 页 · 每页 5 件</span><button id="draftNextPage" type="button" aria-label="下一页">›</button></div><span class="pill">Seller API Template</span></div></div><div id="draftItems" class="draft-items"></div></section>
-          <aside id="uploadGate" class="panel"><div class="panel-head"><h3>逐商品上传门禁 · 逐商品真实上传 (Per-product Upload)</h3></div><div class="content-controller"><strong>智能字段草稿总控（证据约束）</strong><p>Ozon 数据用于模仿结构与写法，1688 与已锁定 SKU 用于约束客观事实；无法证明的字段明确保留为未解决，不会自动上传。</p><div id="contentControllerCommand" class="content-command">{escaped_content_controller_command}</div><button id="copyContentControllerCommand" class="content-copy" type="button">复制整批智能字段草稿命令</button><span id="contentControllerCopyStatus" class="content-copy-status"></span></div><div class="gate-list"><div id="templateGate" class="gate-row"><span class="gate-icon">1</span><div><strong>类目模板 (Category Template)</strong><span>等待检查</span></div></div><div id="attributeGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>必填属性 (Required Attributes)</strong><span>等待自动映射。</span></div></div><div id="originalContentGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>原创内容 (Original Content)</strong><span>等待利用 Ozon 证据完成俄文内容。</span></div></div><div id="bootstrapImageGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>锁定原图 (Locked Original)</strong><span>等待锁定一张真实 1688 主体原图。</span></div></div><div id="pricingGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>价格与包装证据 (Pricing)</strong><span>等待逐件确认成本、包装和建议上架价。</span></div></div><div id="draftGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>可独立推进 (Ready Products)</strong><span>逐件计算，不再等待整批。</span></div></div></div><div class="batch-upload-controller"><strong>批量独立校验与上传</strong><p>最多同时处理 4 件；合格商品直接上传，缺字段或模板异常的商品单独保留，不拖住其他商品。</p><button id="batchUploadProducts" type="button">批量校验并上传可用商品</button><span id="batchUploadStatus" class="batch-upload-status"></span></div><div class="publish-lock"><strong>发布锁已开启 (Publish Lock Active) · 逐商品确认</strong><span>建品时只提交锁定的 1688 原图；Seller API 接受后立即输出图片生成与上传任务包，后续图片流程不再回传工作台。</span></div></aside>
+          <aside id="uploadGate" class="panel"><div class="panel-head"><h3>逐商品上传门禁 · 逐商品真实上传 (Per-product Upload)</h3></div><div class="content-controller"><strong>智能字段草稿总控（证据约束）</strong><p>Ozon 数据用于模仿结构与写法，1688 与已锁定 SKU 用于约束客观事实；无法证明的字段明确保留为未解决，不会自动上传。</p><div id="contentControllerCommand" class="content-command">{escaped_content_controller_command}</div><button id="copyContentControllerCommand" class="content-copy" type="button">复制整批智能字段草稿命令</button><span id="contentControllerCopyStatus" class="content-copy-status"></span></div><div class="gate-list"><div id="templateGate" class="gate-row"><span class="gate-icon">1</span><div><strong>类目模板 (Category Template)</strong><span>等待检查</span></div></div><div id="attributeGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>必填属性 (Required Attributes)</strong><span>等待自动映射。</span></div></div><div id="originalContentGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>原创内容 (Original Content)</strong><span>等待利用 Ozon 证据完成俄文内容。</span></div></div><div id="bootstrapImageGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>锁定原图 (Locked Original)</strong><span>等待锁定一张真实 1688 主体原图。</span></div></div><div id="pricingGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>价格与包装证据 (Pricing)</strong><span>等待逐件确认成本、包装和建议上架价。</span></div></div><div id="draftGate" class="gate-row blocked"><span class="gate-icon">!</span><div><strong>可独立推进 (Ready Products)</strong><span>逐件计算，不再等待整批。</span></div></div></div><div class="batch-upload-controller"><strong>批量独立校验与上传</strong><p>最多同时处理 4 件；合格商品直接上传，缺字段或模板异常的商品单独保留，不拖住其他商品。</p><button id="batchUploadProducts" type="button">批量校验并上传可用商品</button><span id="batchUploadStatus" class="batch-upload-status"></span></div><div class="publish-lock"><strong>发布锁已开启 (Publish Lock Active) · 逐商品确认</strong><span>建品时只提交锁定的 1688 原图；只有 Ozon 确认上传成功后才输出图片生成与上传任务包，失败或未上传商品绝不派发生图。</span></div></aside>
         </div>
       </main>
     </div>
@@ -3070,8 +3072,9 @@ def build_upload_workspace_html(run_id: str) -> str:
     ];
     function pricingDraftFor(item) {{
       if (pricingState.drafts.has(item.seed_id)) return pricingState.drafts.get(item.seed_id);
+      const prefilled = item.pricing_prefill && item.pricing_prefill.values ? item.pricing_prefill.values : {{}};
       const saved = item.pricing_evidence && item.pricing_evidence.inputs ? item.pricing_evidence.inputs : {{}};
-      const draft = {{ target_margin_rate:"0.20", ...saved }};
+      const draft = {{ target_margin_rate:"0.20", ...prefilled, ...saved }};
       pricingState.drafts.set(item.seed_id, draft);
       if (item.pricing_evidence && item.pricing_evidence.calculation) pricingState.previews.set(item.seed_id, item.pricing_evidence);
       return draft;
@@ -3147,10 +3150,12 @@ def build_upload_workspace_html(run_id: str) -> str:
       const policy = item.pricing_policy || {{}}; const policyRow = document.createElement("div"); policyRow.className = "pricing-policy";
       [`佣金 ${{Number(policy.commission_rate || 0) * 100}}%`,`包装/标签费 ${{policy.packaging_fee_cny || "-"}} 元`,`汇率 1 CNY = ${{policy.rub_per_cny || "-"}} RUB`,`GUOO 陆空标快 ${{policy.freight_rule_version || ""}}`,`售价向上取 .90`].forEach((text) => {{ const chip = document.createElement("span"); chip.className = "policy-chip"; chip.textContent = text; policyRow.append(chip); }}); editor.append(policyRow);
       const form = document.createElement("div"); form.className = "pricing-form";
-      pricingFieldDefinitions.forEach(([key,label,unit]) => {{ const field = document.createElement("div"); field.className = "pricing-field"; const name = document.createElement("label"); name.htmlFor = `pricing-${{key}}`; name.textContent = `${{label}}（${{unit}}）`; const input = document.createElement("input"); input.id = `pricing-${{key}}`; input.type = "number"; input.step = "any"; input.min = key === "domestic_shipping_cny" || key === "target_margin_rate" ? "0" : "0.000001"; input.value = draft[key] || ""; input.dataset.pricingField = key; input.addEventListener("input", () => {{ pricingState.previews.delete(item.seed_id); const message = $("pricingMessage"); if (message) {{ message.className = "pricing-message"; message.textContent = "输入已保留，点击“计算建议价格”查看新结果。"; }} }}); field.append(name,input); form.append(field); }}); editor.append(form);
+      const savedInputs = item.pricing_evidence && item.pricing_evidence.inputs ? item.pricing_evidence.inputs : {{}};
+      const prefillFields = item.pricing_prefill && item.pricing_prefill.fields ? item.pricing_prefill.fields : {{}};
+      pricingFieldDefinitions.forEach(([key,label,unit]) => {{ const field = document.createElement("div"); field.className = "pricing-field"; const name = document.createElement("label"); name.htmlFor = `pricing-${{key}}`; name.textContent = `${{label}}（${{unit}}）`; const input = document.createElement("input"); input.id = `pricing-${{key}}`; input.type = "number"; input.step = "any"; input.min = key === "domestic_shipping_cny" || key === "target_margin_rate" ? "0" : "0.000001"; input.value = draft[key] || ""; input.dataset.pricingField = key; input.addEventListener("input", () => {{ pricingState.previews.delete(item.seed_id); const message = $("pricingMessage"); if (message) {{ message.className = "pricing-message"; message.textContent = "输入已保留，点击“计算建议价格”查看新结果。"; }} }}); field.append(name,input); const prefill = prefillFields[key]; if (prefill && !Object.prototype.hasOwnProperty.call(savedInputs,key)) {{ const note = document.createElement("span"); note.className = "pricing-prefill-note"; note.textContent = `该项已按${{prefill.label || "现有证据"}}预填，仍需用户确认。`; field.append(note); }} form.append(field); }}); editor.append(form);
       const actions = document.createElement("div"); actions.className = "pricing-actions"; const previewButton = document.createElement("button"); previewButton.type = "button"; previewButton.className = "pricing-action"; previewButton.textContent = "计算建议价格"; const confirmButton = document.createElement("button"); confirmButton.type = "button"; confirmButton.className = "pricing-action primary-action"; confirmButton.textContent = "确认并写入本件价格与包装证据"; actions.append(previewButton,confirmButton); editor.append(actions);
       const preview = pricingState.previews.get(item.seed_id) || item.pricing_evidence;
-      const message = document.createElement("div"); message.id = "pricingMessage"; message.className = `pricing-message${{item.pricing_ready || preview ? " success" : ""}}`; message.textContent = item.pricing_ready ? "本件价格与包装证据已确认，可独立进入后续门禁。" : item.pricing_status === "stale" ? "固定参数已变化，请重新计算并确认本件。" : preview ? "建议价格已计算；确认无误后写入本件价格与包装证据。" : "填写 7 项数据后先计算，再确认写入。"; editor.append(message);
+      const message = document.createElement("div"); message.id = "pricingMessage"; message.className = `pricing-message${{item.pricing_ready || preview ? " success" : ""}}`; message.textContent = item.pricing_ready ? "本件价格与包装证据已确认，可独立进入后续门禁。" : item.pricing_status === "stale" ? "固定参数已变化，请重新计算并确认本件。" : preview ? "建议价格已计算；确认无误后写入本件价格与包装证据。" : "已按真实证据预填可确认项；请补齐剩余空白，再计算并确认写入。"; editor.append(message);
       const resultView = pricingResultView(preview); if (resultView) editor.append(resultView);
       const submit = async (mode, button) => {{ saveVisiblePricingDraft(); const payload = {{ seed_id:item.seed_id, ...pricingState.drafts.get(item.seed_id) }}; previewButton.disabled = true; confirmButton.disabled = true; message.className = "pricing-message"; message.textContent = mode === "preview" ? "正在计算 GUOO 运费与建议上架价…" : "正在确认本件价格与包装证据…"; try {{ const response = await api(pricingEndpoints[mode], {{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify(payload)}}); pricingState.previews.set(item.seed_id,response.data); if (mode === "confirm") {{ await loadUploadWorkspace(); }} else {{ renderPricingEditor(); }} }} catch (error) {{ message.className = "pricing-message error"; message.textContent = (error.errors && error.errors[0]) || error.message || "价格计算失败"; previewButton.disabled = false; confirmButton.disabled = false; }} }};
       previewButton.addEventListener("click", () => submit("preview",previewButton)); confirmButton.addEventListener("click", () => submit("confirm",confirmButton));
@@ -3259,6 +3264,16 @@ def build_upload_workspace_html(run_id: str) -> str:
       visit(payload);
       return [...new Set(codes)].slice(0,4).join(" · ") || "Ozon 未返回详细失败原因";
     }}
+    function scheduleProductUploadStatusRetry(item, controls, remaining) {{
+      if (remaining <= 0) return false;
+      const attempt = 31 - remaining;
+      const delay = Math.min(8000, 2000 + Math.max(0, attempt) * 500);
+      setTimeout(
+        () => pollProductUploadStatus(item, controls, remaining - 1),
+        delay,
+      );
+      return true;
+    }}
     async function pollProductUploadStatus(item, controls, remaining=30) {{
       const confirmButton = controls.querySelector("[data-action=confirm]");
       const previewButton = controls.querySelector("[data-action=preview]");
@@ -3281,14 +3296,18 @@ def build_upload_workspace_html(run_id: str) -> str:
         }}
         status.className = "product-upload-status";
         status.textContent = `Ozon 正在处理 · task_id ${{submission.task_id}}，工作台正在自动回查…`;
-        if (remaining > 0) setTimeout(() => pollProductUploadStatus(item,controls,remaining-1),2000);
-        else {{
+        if (!scheduleProductUploadStatusRetry(item, controls, remaining)) {{
           status.textContent = `Ozon 仍在处理 · task_id ${{submission.task_id}}。刷新页面会继续回查。`;
           previewButton.disabled = true; confirmButton.disabled = true;
         }}
       }} catch (error) {{
-        status.className = "product-upload-status error";
-        status.textContent = `状态回查失败：${{error.message || error}}。可刷新页面重试回查，不要重复提交。`;
+        if (scheduleProductUploadStatusRetry(item, controls, remaining)) {{
+          status.className = "product-upload-status";
+          status.textContent = `状态回查遇到临时网络异常：${{error.message || error}}。正在自动重试，不会重复提交商品。`;
+        }} else {{
+          status.className = "product-upload-status error";
+          status.textContent = `状态回查暂时不可用：${{error.message || error}}。刷新页面只会重新查询状态，不会重复提交商品。`;
+        }}
       }}
     }}
     async function confirmProductUpload(item, controls) {{
@@ -3303,7 +3322,7 @@ def build_upload_workspace_html(run_id: str) -> str:
         const result = await api(`/api/batches/${{encodeURIComponent(runId)}}/product-upload/${{encodeURIComponent(item.seed_id)}}/confirm`, {{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify({{confirmation_token:preview.confirmation_token}})}});
         productUploadState.submissions.set(item.seed_id,result.data);
         status.className = "product-upload-status";
-        status.textContent = `Ozon 已受理任务 · task_id ${{result.data.task_id}} · 图片任务包 ${{result.data.image_task_package_id || "已写入"}}，正在确认建品结果…`;
+        status.textContent = `Ozon 已受理任务 · task_id ${{result.data.task_id}}，正在确认建品结果；只有 Ozon 确认上传成功后才会创建图片任务包…`;
         confirmButton.textContent = "Ozon 处理中";
         await pollProductUploadStatus(item,controls);
       }} catch (error) {{
@@ -3315,7 +3334,7 @@ def build_upload_workspace_html(run_id: str) -> str:
       const controls = document.createElement("div"); controls.className = "product-upload-actions";
       const previewButton = document.createElement("button"); previewButton.type = "button"; previewButton.dataset.action = "preview"; previewButton.textContent = "预览单原图建品"; previewButton.disabled = !item.ready_to_build;
       const confirmButton = document.createElement("button"); confirmButton.type = "button"; confirmButton.dataset.action = "confirm"; confirmButton.className = "confirm"; confirmButton.textContent = "确认上传到 Ozon"; confirmButton.disabled = true;
-      const status = document.createElement("span"); status.className = "product-upload-status"; status.textContent = item.ready_to_build ? "建品载荷只使用锁定的 1688 原图；确认提交后输出独立图片任务包。" : "本商品尚有门禁未完成，不能提交。";
+      const status = document.createElement("span"); status.className = "product-upload-status"; status.textContent = item.ready_to_build ? "建品载荷只使用锁定的 1688 原图；Ozon 确认上传成功后才输出独立图片任务包。" : "本商品尚有门禁未完成，不能提交。";
       if (item.upload_preview && item.upload_preview.confirmation_token) {{ productUploadState.previews.set(item.seed_id,item.upload_preview); previewButton.textContent = "重新预览载荷"; confirmButton.disabled = false; const payload = item.upload_preview.seller_api_item || {{}}; status.textContent = `已准备：1 张锁定原图 · ${{payload.price || "-"}} ${{payload.currency_code || "-"}}。`; }}
       if (item.upload_submission && item.upload_submission.task_id != null) {{
         productUploadState.submissions.set(item.seed_id,item.upload_submission);
@@ -4580,6 +4599,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-

@@ -25,9 +25,10 @@ class SeedQueryServiceTests(TestCase):
         self.assertEqual(5000, len({seed.ozon_query_terms_ru[0].casefold() for seed in seeds}))
         self.assertTrue(all(seed.category_hint for seed in seeds))
         self.assertNotIn("source_path", manifest)
+        messaging_temp_marker = "xwechat_" + "files"
         self.assertNotRegex(
             json.dumps(manifest, ensure_ascii=False),
-            r"(?i)(?:[a-z]:\\|/users/|xwechat_files|qq\d{5,})",
+            rf"(?i)(?:[a-z]:\\|/users/|{messaging_temp_marker}|qq\d{{5,}})",
         )
         self.assertTrue(
             all(

@@ -93,10 +93,10 @@ Seller API `Client-Id`.
 
 Rules:
 
-- Credentials live only under runtime config:
-  `E:\ozon-V2工作区\OzonOpsV2\config\seller_credentials.local.json`.
+- Credentials live only under the sibling runtime config:
+  `<repository-parent>\OzonOpsV2\config\seller_credentials.local.json`.
 - A template may be generated at:
-  `E:\ozon-V2工作区\OzonOpsV2\config\seller_credentials.template.json`.
+  `<repository-parent>\OzonOpsV2\config\seller_credentials.template.json`.
 - Do not store real credentials in project code, docs, tests, seed assets, or
   Obsidian logs.
 - Tool responses and logs must mask `api_key`.

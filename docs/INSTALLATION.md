@@ -20,15 +20,15 @@ Ozon Seller API 的 `Client-Id` 和 `Api-Key` 属于店铺私密信息。不要�
 HTTPS：
 
 ```powershell
-git clone https://github.com/lwh19880522/OZON-gongjutai-2026.07.18.git
-cd OZON-gongjutai-2026.07.18
+git clone https://github.com/lwh19880522/ozon-V2gongzuotai-zuixin2026.07.27.git
+cd ozon-V2gongzuotai-zuixin2026.07.27
 ```
 
 如果本机的 GitHub HTTPS 路由不可用，可改用已配置的 SSH：
 
 ```powershell
-git clone git@github.com:lwh19880522/OZON-gongjutai-2026.07.18.git
-cd OZON-gongjutai-2026.07.18
+git clone git@github.com:lwh19880522/ozon-V2gongzuotai-zuixin2026.07.27.git
+cd ozon-V2gongzuotai-zuixin2026.07.27
 ```
 
 项目路径可以包含中文和空格。安装脚本只使用仓库相对路径，不依赖某台电脑上的固定盘符。

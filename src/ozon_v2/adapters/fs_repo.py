@@ -611,6 +611,11 @@ class FsRepo:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
+    def image_task_quarantined_dir(self) -> Path:
+        path = self.runtime_root / "image_tasks" / "quarantined"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
     def save_image_task_package(
         self,
         package_id: str,
@@ -626,6 +631,39 @@ class FsRepo:
         path = self.image_task_pending_dir() / f"{safe_package_id}.json"
         self._write_json(path, payload)
         return path
+
+    def quarantine_image_task_package(
+        self,
+        package_id: str,
+        *,
+        reason: str,
+        details: dict[str, Any] | None = None,
+    ) -> Path | None:
+        safe_package_id = re.sub(
+            r"[^A-Za-z0-9_.-]+",
+            "-",
+            str(package_id or "").strip(),
+        ).strip(".-")
+        if not safe_package_id:
+            raise ValueError("Image task package_id must contain a safe filename.")
+        source = self.image_task_pending_dir() / f"{safe_package_id}.json"
+        if not source.is_file():
+            return None
+        destination = (
+            self.image_task_quarantined_dir() / f"{safe_package_id}.json"
+        )
+        payload = self._read_json(source)
+        payload.update(
+            {
+                "status": "quarantined",
+                "quarantine_reason": str(reason),
+                "quarantined_at": utc_now_iso(),
+                "quarantine_details": details or {},
+            }
+        )
+        self._write_json(destination, payload)
+        source.unlink(missing_ok=True)
+        return destination
 
     def save_browser_bridge_status(self, payload: dict[str, Any]) -> dict[str, Any]:
         self._initialize_runtime_once()

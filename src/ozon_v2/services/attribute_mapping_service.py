@@ -261,6 +261,7 @@ def map_template_attributes(
             "field_key": field_key,
             "label": label,
             "required": required,
+            "required_reason": schema_field.get("required_reason"),
             "attribute_type": schema_field.get("attribute_type"),
             "dictionary_id": schema_field.get("dictionary_id"),
             "allowed_values": (
@@ -591,6 +592,7 @@ def map_template_attributes(
                 "attribute_type",
                 "dictionary_id",
                 "allowed_values",
+                "required_reason",
                 "reason",
             )
         }

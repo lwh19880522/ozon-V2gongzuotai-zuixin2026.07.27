@@ -40,10 +40,17 @@ class CloudflareR2MediaPublisher:
         prefix = _safe_segment(settings.get("object_prefix") or "ozon-v2")
         if not bucket:
             raise PublicMediaError("Cloudflare R2 bucket is not configured.")
+        timeout_seconds = int(settings.get("preflight_timeout_seconds") or 120)
         result = self.command_runner(
             [*self.wrangler_command, "r2", "bucket", "list", "--json"],
-            int(settings.get("preflight_timeout_seconds") or 120),
+            timeout_seconds,
         )
+        used_text_fallback = _is_unknown_json_argument(result)
+        if used_text_fallback:
+            result = self.command_runner(
+                [*self.wrangler_command, "r2", "bucket", "list"],
+                timeout_seconds,
+            )
         if int(result.get("returncode", 1)) != 0:
             detail = str(result.get("stderr") or result.get("stdout") or "").strip()
             raise PublicMediaError(
@@ -51,7 +58,7 @@ class CloudflareR2MediaPublisher:
                 + (detail or "Wrangler could not list accessible buckets.")
             )
         output = str(result.get("stdout") or "")
-        if output.strip().startswith("[") and f'"{bucket}"' not in output:
+        if used_text_fallback and bucket not in output:
             raise PublicMediaError(
                 f"Cloudflare R2 bucket is not accessible: {bucket}"
             )
@@ -141,6 +148,15 @@ class CloudflareR2MediaPublisher:
             "urls": [item["public_url"] for item in uploads],
             "items": uploads,
         }
+
+
+def _is_unknown_json_argument(result: dict[str, Any]) -> bool:
+    if int(result.get("returncode", 1)) == 0:
+        return False
+    detail = " ".join(
+        str(result.get(key) or "") for key in ("stderr", "stdout")
+    ).casefold()
+    return "unknown argument" in detail and "json" in detail
 
 
 def _default_wrangler_command() -> list[str]:

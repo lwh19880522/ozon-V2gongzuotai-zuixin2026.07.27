@@ -37,6 +37,10 @@ venv/
 /artifacts/
 /.wrangler/
 /work/
+/.release/
+/.tmp/
+/.tmp-npm-cache/
+/.worker-output/
 
 # Collected marketplace evidence and temporary image experiments
 /ozon-v2-run-*

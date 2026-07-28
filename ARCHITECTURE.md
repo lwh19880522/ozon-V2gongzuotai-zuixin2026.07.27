@@ -3,16 +3,15 @@
 This file is the binding architecture contract for Ozon V2 work in this
 workspace.
 
-Current workspace root:
+The repository root is the implementation root:
 
 ```text
-E:\ozon-V2工作区\ozon-v2自动化运行
+<repository-root>
 ```
 
 The directory name `ozon-v2-ops-controller/` in the original design is the V2
-code-root shape. In this workspace, the current root above is the implementation
-root. Do not treat any parent-level directory with a similar name as the target
-for this work.
+code-root shape. Do not treat a parent-level directory with a similar name as
+the implementation root.
 
 ## Guiding Rule
 
@@ -51,8 +50,8 @@ Adapter Layer
   contracts.
 
 Runtime Data
-  E:\ozon-V2工作区\OzonOpsV2 stores runtime data only. It must not contain
-  business code.
+  The sibling directory <repository-parent>\OzonOpsV2 stores runtime data only.
+  It must not contain business code or be committed to this repository.
 ```
 
 ## Directory Design
@@ -107,8 +106,8 @@ ozon-v2-ops-controller/
    lose state.
 6. The singleton guard belongs in FastMCP `lifespan`. Do not rely on the user to
    restart manually.
-7. Do not import the old plugin. Do not share `D:\OzonOps`. Do not share the old
-   `run_id`.
+7. Do not import or share legacy plugin state, runtime roots, or old `run_id`
+   values.
 
 ## Phase One Scope
 

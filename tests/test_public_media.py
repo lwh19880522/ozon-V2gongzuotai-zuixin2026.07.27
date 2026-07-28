@@ -39,6 +39,43 @@ def test_cloudflare_publisher_preflight_requires_public_r2_channel() -> None:
     assert commands == [["wrangler", "r2", "bucket", "list", "--json"]]
 
 
+def test_cloudflare_publisher_preflight_falls_back_for_wrangler_v4_text_output() -> None:
+    commands: list[list[str]] = []
+
+    def run(command: list[str], timeout_seconds: int) -> dict[str, str | int]:
+        commands.append(command)
+        if command[-1] == "--json":
+            return {
+                "returncode": 1,
+                "stdout": "",
+                "stderr": "Unknown argument: json",
+            }
+        return {
+            "returncode": 0,
+            "stdout": "name: yandex-media\ncreation_date: 2026-07-03",
+            "stderr": "",
+        }
+
+    publisher = CloudflareR2MediaPublisher(
+        command_runner=run,
+        public_probe=lambda url, timeout_seconds: None,
+        wrangler_command=["wrangler"],
+    )
+
+    result = publisher.preflight(
+        {
+            "base_url": "https://media.example.test",
+            "r2_bucket": "yandex-media",
+        }
+    )
+
+    assert result["ready"] is True
+    assert commands == [
+        ["wrangler", "r2", "bucket", "list", "--json"],
+        ["wrangler", "r2", "bucket", "list"],
+    ]
+
+
 def test_cloudflare_publisher_preflight_rejects_missing_public_url() -> None:
     publisher = CloudflareR2MediaPublisher(
         command_runner=lambda command, timeout_seconds: {

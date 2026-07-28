@@ -2,10 +2,32 @@
 
 本仓库包含 Ozon V2 工具台的完整可复现程序本体：本地工具台服务、浏览器扩展、MCP 控制器、采集与生图队列、Codex 技能、Windows 一键启动脚本、测试和设计文档。
 
+仓库地址：<https://github.com/lwh19880522/ozon-V2gongzuotai-zuixin2026.07.27>
+
 完整文档：
 
 - [详细安装说明](docs/INSTALLATION.md)
 - [完整使用流程](docs/USER_GUIDE.md)
+- [干净发布与隐私边界](docs/RELEASE_AND_PRIVACY.md)
+
+## 组件一览
+
+| 组件 | 用途 | 安装结果 |
+| --- | --- | --- |
+| 本地工具台 | 批次、采集审核、SKU 主体、价格、字段草稿与逐商品建品 | `http://127.0.0.1:8765/` |
+| Edge 扩展 | 受管浏览器采集桥接 | 从 `browser_extension/ozon_v2_bridge` 加载 |
+| 字段 Skill | 基于已锁定 1688 SKU、Ozon 证据与模板补全字段 | 安装到 Codex Skills |
+| 生图总控 Skill | 从固定任务目录调度最多 10 个生图任务 | 安装到 Codex Skills |
+| 商品媒体 Skill | 锁定主体、生成俄文图库、视频并通过 R2 更新商品 | 安装到 Codex Skills |
+
+主流程：
+
+```text
+安装并启动 → 店铺授权 → 创建批次 → Ozon/1688 采集
+→ 锁定真实 SKU 与主体 → 填价格和包装证据 → 智能字段草稿
+→ 只补录仍缺失的必填项 → 逐商品预览与建品
+→ 写入独立图片任务包 → 生图 Skill 后台更新商品媒体
+```
 
 ## 新电脑一键安装与启动
 
@@ -52,6 +74,19 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\workbench_cont
 
 运行状态、浏览器配置、日志、采集证据和生成图片只保存在本机，不进入 Git 仓库。
 
+## 隐私与干净发布
+
+仓库只包含可安装程序、静态种子池、3 个配套 Skill、测试和公开文档。下列内容不会进入发布包：Seller API 凭证、R2 配置、浏览器资料、运行数据库、采集证据、生成媒体、日志、临时目录、本机用户名和绝对路径。
+
+维护者生成新发布包时使用显式白名单和隐私扫描：
+
+```powershell
+python .\scripts\build_clean_release.py --destination .\.release\ozon-v2
+python .\scripts\build_clean_release.py --scan-only .\.release\ozon-v2
+```
+
+每个发布包都会生成 `RELEASE_MANIFEST.json`，记录仓库地址、文件数量和逐文件 SHA-256。完整边界与复核方法见[干净发布与隐私边界](docs/RELEASE_AND_PRIVACY.md)。
+
 ## 生图并发契约 (Image worker contract)
 
 - 可用生图身份为 `ozon-image-worker-01` 至 `ozon-image-worker-10`，分别对应全局固定的 10 个用户可见 Codex 生图工作任务。
@@ -81,5 +116,5 @@ python -m pytest -q
 - `skills/`：Ozon V2 总控与商品媒体执行技能。
 - `mcp/`：FastMCP 入口。
 - `tests/`：自动化测试。
-- `docs/`：契约、设计和实施计划。
+- `docs/`：安装、使用、隐私发布和公开架构契约。
 - `assets/`：版本化种子池等静态资产。

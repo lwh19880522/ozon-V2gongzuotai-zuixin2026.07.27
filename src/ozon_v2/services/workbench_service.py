@@ -78,6 +78,12 @@ _RUSSIAN_OBJECTIVE_FIELDS = {
     "country",
     "gender",
 }
+_PRE_UPLOAD_COMPLIANCE_DECISION_LABELS = frozenset(
+    {
+        "нужен код маркировки",
+        "требуется код маркировки",
+    }
+)
 _INTERNAL_LIFECYCLE_ACTIONS = frozenset(
     action for action in WorkbenchAction if action.value.startswith("mark_")
 )
@@ -1651,7 +1657,12 @@ class WorkbenchService:
         for candidate in candidates:
             seed_id = str(candidate.get("seed_id") or "")
             template = templates_by_seed.get(seed_id, {})
-            schema = template.get("upload_attribute_schema") if isinstance(template.get("upload_attribute_schema"), list) else []
+            raw_schema = (
+                template.get("upload_attribute_schema")
+                if isinstance(template.get("upload_attribute_schema"), list)
+                else []
+            )
+            schema = _effective_upload_schema(raw_schema)
             prefill_plan = template.get("draft_prefill_plan") if isinstance(template.get("draft_prefill_plan"), list) else []
             seller_template = template.get("seller_attribute_template") or {}
             category_candidates = template.get("category_candidates") if isinstance(template.get("category_candidates"), list) else []
@@ -1662,6 +1673,11 @@ class WorkbenchService:
             supplier_offer_id = (
                 supplier_selection.get("supplier_offer_id")
                 or supplier_product.get("offer_id")
+            )
+            pricing_prefill = _pricing_prefill_from_evidence(
+                candidate=candidate,
+                supplier_product=supplier_product,
+                supplier_sku=supplier_sku,
             )
             pricing_record = pricing_items.get(seed_id) or {}
             pricing_confirmed = (
@@ -1883,7 +1899,7 @@ class WorkbenchService:
                     "category_path": seller_template.get("matched_category_path") or (category_candidates[0].get("category_path") if category_candidates else None),
                     "description_category_id": seller_template.get("description_category_id"),
                     "type_id": seller_template.get("type_id"),
-                    "required_attribute_count": sum(1 for field in schema if field.get("is_required") is True),
+                    "required_attribute_count": mapping["required_attribute_count"],
                     "attribute_schema_count": len(schema),
                     "prefill_plan_count": len(prefill_plan),
                     "prefill_plan": prefill_plan,
@@ -1909,6 +1925,7 @@ class WorkbenchService:
                     "pricing_evidence": (
                         pricing_record if pricing_record else None
                     ),
+                    "pricing_prefill": pricing_prefill,
                     "upload_core_fields": upload_core_fields,
                     "pricing_policy": pricing_policy,
                     "blocking_gates": blocking_gates,
@@ -3360,17 +3377,6 @@ class WorkbenchService:
             and existing.get("task_id") is not None
             and existing_status not in {"failed", "error", "declined"}
         ):
-            if not existing.get("image_task_package_id"):
-                existing.update(
-                    self._emit_image_task_package(
-                        run_id=run_id,
-                        seed_id=seed_id,
-                        seller_import_task_id=int(existing["task_id"]),
-                        preview=preview,
-                    )
-                )
-                submissions["items"][seed_id] = existing
-                self.repo.save_upload_submissions(run_id, submissions)
             return Result.success(
                 "product_upload.already_submitted",
                 "This product upload is already being processed or was accepted.",
@@ -3400,14 +3406,6 @@ class WorkbenchService:
             "status": "submitted",
             "submitted_at": utc_now_iso(),
         }
-        record.update(
-            self._emit_image_task_package(
-                run_id=run_id,
-                seed_id=seed_id,
-                seller_import_task_id=int(submitted["task_id"]),
-                preview=preview,
-            )
-        )
         if isinstance(existing, dict) and existing.get("task_id") is not None:
             history = [
                 item
@@ -3433,9 +3431,6 @@ class WorkbenchService:
                 "offer_id": record["offer_id"],
                 "task_id": record["task_id"],
                 "submission_path": str(path),
-                "image_task_package_path": record[
-                    "image_task_package_path"
-                ],
             },
         )
         return Result.success(
@@ -3643,14 +3638,6 @@ class WorkbenchService:
                 "status": "submitted",
                 "submitted_at": utc_now_iso(),
             }
-            record.update(
-                self._emit_image_task_package(
-                    run_id=run_id,
-                    seed_id=seed_id,
-                    seller_import_task_id=int(submitted["task_id"]),
-                    preview=preview,
-                )
-            )
             existing = pending.get("existing")
             if isinstance(existing, dict) and existing.get("task_id") is not None:
                 history = [
@@ -3762,6 +3749,52 @@ class WorkbenchService:
         record["seller_api_status"] = seller_status
         record["status"] = _product_import_status(seller_status)
         record["status_checked_at"] = utc_now_iso()
+        if (
+            record["status"] != "accepted_by_ozon"
+            and record.get("image_task_package_id")
+        ):
+            premature_package_id = str(record["image_task_package_id"])
+            quarantined_path = self.repo.quarantine_image_task_package(
+                premature_package_id,
+                reason="ozon_upload_not_accepted",
+                details={
+                    "run_id": run_id,
+                    "seed_id": seed_id,
+                    "seller_import_task_id": record.get("task_id"),
+                    "seller_import_status": record["status"],
+                },
+            )
+            record.pop("image_task_package_id", None)
+            record.pop("image_task_package_path", None)
+            record["quarantined_image_task_package_id"] = (
+                premature_package_id
+            )
+            record["quarantined_image_task_package_path"] = (
+                str(quarantined_path) if quarantined_path else None
+            )
+        if (
+            record["status"] == "accepted_by_ozon"
+            and not record.get("image_task_package_id")
+        ):
+            try:
+                previews = self.repo.load_upload_previews(run_id)
+            except FileNotFoundError:
+                previews = {}
+            preview = (previews.get("items") or {}).get(seed_id)
+            if isinstance(preview, dict):
+                record.update(
+                    self._emit_image_task_package(
+                        run_id=run_id,
+                        seed_id=seed_id,
+                        seller_import_task_id=int(record["task_id"]),
+                        preview=preview,
+                    )
+                )
+            else:
+                record["image_task_package_error"] = (
+                    "The accepted product has no saved upload preview; "
+                    "regenerate the preview before creating its image task."
+                )
         submissions["items"][seed_id] = record
         self.repo.save_upload_submissions(run_id, submissions)
         return Result.success(
@@ -6631,7 +6664,13 @@ class WorkbenchService:
         recommended_sku_id = ""
         if ranked and ranked[0][0] > 0 and (len(ranked) == 1 or ranked[0][0] > ranked[1][0]):
             recommended_sku_id = ranked[0][1]
+        single_option_supplier_sku_id = (
+            ordered_sku_ids[0] if len(ordered_sku_ids) == 1 else ""
+        )
         return {
+            "canonical_option_count": len(ordered_sku_ids),
+            "single_option_confirmable": len(ordered_sku_ids) == 1,
+            "single_option_supplier_sku_id": single_option_supplier_sku_id,
             "target_measurements": target_measurements,
             "matching_sku_ids": matching_sku_ids,
             "other_sku_ids": other_sku_ids,
@@ -8124,6 +8163,273 @@ def _required_not_applicable_fields(
                 }
             )
     return conflicts
+
+
+def _effective_upload_schema(
+    upload_schema: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    effective: list[dict[str, Any]] = []
+    for raw_field in upload_schema:
+        if not isinstance(raw_field, dict):
+            continue
+        field = dict(raw_field)
+        normalized_label = normalize_attribute_label(field.get("attribute_label"))
+        if normalized_label in _PRE_UPLOAD_COMPLIANCE_DECISION_LABELS:
+            field["is_required"] = True
+            field["required_reason"] = "ozon_compliance_decision"
+        effective.append(field)
+    return effective
+
+
+_PACKAGE_DIMENSION_LABELS = frozenset(
+    normalize_attribute_label(label)
+    for label in (
+        "包装尺寸",
+        "包装规格",
+        "外包装尺寸",
+        "外箱尺寸",
+        "包裹尺寸",
+        "размер упаковки",
+        "размеры упаковки",
+        "габариты упаковки",
+        "package dimensions",
+        "package size",
+        "shipping dimensions",
+    )
+)
+
+
+def _is_package_dimension_label(normalized_label: str) -> bool:
+    if normalized_label in _PACKAGE_DIMENSION_LABELS:
+        return True
+    return any(
+        token in normalized_label
+        for token in (
+            "包装尺寸",
+            "包装规格",
+            "外包装尺寸",
+            "外箱尺寸",
+            "包裹尺寸",
+            "размер упаковки",
+            "размеры упаковки",
+            "габариты упаковки",
+            "package dimensions",
+            "package size",
+            "shipping dimensions",
+        )
+    )
+
+
+def _pricing_prefill_from_evidence(
+    *,
+    candidate: dict[str, Any],
+    supplier_product: dict[str, Any],
+    supplier_sku: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    values: dict[str, str] = {}
+    fields: dict[str, dict[str, str]] = {}
+
+    def add(
+        field_key: str,
+        value: str | None,
+        *,
+        source: str,
+        label: str,
+    ) -> None:
+        if value is None or field_key in values:
+            return
+        values[field_key] = value
+        fields[field_key] = {
+            "source": source,
+            "label": label,
+            "confidence": "high",
+        }
+
+    price = supplier_sku.get("price")
+    if isinstance(price, dict):
+        currency = str(price.get("currency") or "CNY").strip().upper()
+        if currency == "CNY":
+            add(
+                "purchase_price_cny",
+                _pricing_decimal_text(price.get("amount"), preserve_scale=True),
+                source="locked_supplier_sku.price",
+                label="已锁定 1688 SKU 价格",
+            )
+
+    shipping = supplier_product.get("domestic_shipping_evidence")
+    if isinstance(shipping, dict):
+        shipping_value = _pricing_decimal_text(shipping.get("fee"))
+        if shipping_value is None and (
+            shipping.get("free_shipping_visible") is True
+            or shipping.get("free_shipping") is True
+        ):
+            shipping_value = "0"
+        add(
+            "domestic_shipping_cny",
+            shipping_value,
+            source="supplier.domestic_shipping_evidence",
+            label="1688 页面国内运费",
+        )
+
+    supplier_attributes = supplier_product.get("attributes")
+    ozon_attributes = candidate.get("attributes")
+    for attributes, source_prefix, source_label in (
+        (
+            supplier_attributes,
+            "supplier.attributes",
+            "已锁定 1688 SKU 商品属性",
+        ),
+        (
+            ozon_attributes,
+            "ozon.attributes",
+            "Ozon 原商品包装属性",
+        ),
+    ):
+        if not isinstance(attributes, dict):
+            continue
+        package_values = _package_measurements(attributes)
+        add(
+            "package_weight_g",
+            package_values.get("package_weight_g"),
+            source=f"{source_prefix}.package_weight",
+            label=source_label,
+        )
+        for key in (
+            "package_length_cm",
+            "package_width_cm",
+            "package_height_cm",
+        ):
+            add(
+                key,
+                package_values.get(key),
+                source=f"{source_prefix}.package_dimensions",
+                label=source_label,
+            )
+
+    return {"values": values, "fields": fields}
+
+
+def _package_measurements(attributes: dict[str, Any]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    separate_dimensions: dict[str, str] = {}
+    for raw_label, raw_value in attributes.items():
+        normalized_label = normalize_attribute_label(raw_label)
+        canonical_label = canonical_attribute_label(raw_label)
+        if canonical_label == "package_weight":
+            weight = _pricing_weight_grams(raw_value, raw_label)
+            if weight is not None:
+                result["package_weight_g"] = weight
+            continue
+        if _is_package_dimension_label(normalized_label):
+            dimensions = _pricing_dimensions_cm(raw_value, raw_label)
+            if dimensions is not None:
+                result.update(
+                    {
+                        "package_length_cm": dimensions[0],
+                        "package_width_cm": dimensions[1],
+                        "package_height_cm": dimensions[2],
+                    }
+                )
+            continue
+        dimension_key = {
+            "package_length": "package_length_cm",
+            "package_width": "package_width_cm",
+            "package_height": "package_height_cm",
+        }.get(canonical_label)
+        if dimension_key:
+            dimension = _pricing_length_cm(raw_value, raw_label)
+            if dimension is not None:
+                separate_dimensions[dimension_key] = dimension
+    for key, value in separate_dimensions.items():
+        result.setdefault(key, value)
+    return result
+
+
+def _pricing_decimal(value: Any) -> Decimal | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float, Decimal)):
+        try:
+            decimal_value = Decimal(str(value))
+        except Exception:
+            return None
+        return decimal_value if decimal_value.is_finite() else None
+    text = str(value).strip().replace("\u00a0", " ")
+    match = re.search(r"[-+]?\d+(?:[.,]\d+)?", text)
+    if not match:
+        return None
+    try:
+        decimal_value = Decimal(match.group(0).replace(",", "."))
+    except Exception:
+        return None
+    return decimal_value if decimal_value.is_finite() else None
+
+
+def _pricing_decimal_text(
+    value: Any,
+    *,
+    preserve_scale: bool = False,
+) -> str | None:
+    decimal_value = _pricing_decimal(value)
+    if decimal_value is None or decimal_value < 0:
+        return None
+    if preserve_scale and isinstance(value, str):
+        stripped = value.strip().replace(",", ".")
+        if re.fullmatch(r"\d+(?:\.\d+)?", stripped):
+            return stripped
+    return format(decimal_value.normalize(), "f")
+
+
+def _pricing_measurement_unit(value: Any, label: Any) -> str | None:
+    text = f"{label} {value}".casefold().replace("ё", "е")
+    if re.search(r"(?:^|[^\w])(кг|kg)(?:$|[^\w])", text) or any(
+        token in text for token in ("千克", "公斤")
+    ):
+        return "kg"
+    if re.search(r"(?:^|[^\w])(мм|mm)(?:$|[^\w])", text) or "毫米" in text:
+        return "mm"
+    if re.search(r"(?:^|[^\w])(см|cm)(?:$|[^\w])", text) or "厘米" in text:
+        return "cm"
+    if re.search(r"(?:^|[^\w])(м|m)(?:$|[^\w])", text) or "米" in text:
+        return "m"
+    if re.search(r"(?:^|[^\w])(гр|г|g)(?:$|[^\w])", text) or "克" in text:
+        return "g"
+    return None
+
+
+def _pricing_weight_grams(value: Any, label: Any) -> str | None:
+    decimal_value = _pricing_decimal(value)
+    unit = _pricing_measurement_unit(value, label)
+    if decimal_value is None or decimal_value <= 0 or unit not in {"g", "kg"}:
+        return None
+    if unit == "kg":
+        decimal_value *= Decimal("1000")
+    return format(decimal_value.normalize(), "f")
+
+
+def _pricing_length_cm(value: Any, label: Any) -> str | None:
+    decimal_value = _pricing_decimal(value)
+    unit = _pricing_measurement_unit(value, label)
+    if decimal_value is None or decimal_value <= 0 or unit not in {"mm", "cm", "m"}:
+        return None
+    factor = {"mm": Decimal("0.1"), "cm": Decimal("1"), "m": Decimal("100")}[unit]
+    return format((decimal_value * factor).normalize(), "f")
+
+
+def _pricing_dimensions_cm(
+    value: Any,
+    label: Any,
+) -> tuple[str, str, str] | None:
+    text = str(value or "").replace(",", ".")
+    numbers = re.findall(r"\d+(?:\.\d+)?", text)
+    unit = _pricing_measurement_unit(value, label)
+    if len(numbers) < 3 or unit not in {"mm", "cm", "m"}:
+        return None
+    factor = {"mm": Decimal("0.1"), "cm": Decimal("1"), "m": Decimal("100")}[unit]
+    dimensions = [Decimal(number) * factor for number in numbers[:3]]
+    if any(dimension <= 0 for dimension in dimensions):
+        return None
+    return tuple(format(dimension.normalize(), "f") for dimension in dimensions)  # type: ignore[return-value]
 
 
 def _pricing_upload_core_fields(

@@ -15,7 +15,7 @@
     "image-generation",
     "supplier-sku"
   ],
-  "repository": "https://github.com/lwh19880522/OZON-gongjutai-2026.07.18",
+  "repository": "https://github.com/lwh19880522/ozon-V2gongzuotai-zuixin2026.07.27",
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {

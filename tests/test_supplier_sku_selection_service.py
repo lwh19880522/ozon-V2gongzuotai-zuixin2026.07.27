@@ -330,6 +330,38 @@ class SupplierSkuSelectionServiceTests(RuntimeTestCase):
             decision["candidates"]["sku-25-50-201"]["matched_measurements"],
         )
 
+    def test_supplier_sku_decision_is_the_single_source_of_truth_for_one_option(self) -> None:
+        single_option = {
+            "supplier_sku_id": "generated-single-option",
+            "raw_label": "only visible sales unit",
+            "selected_options": {"style": "one"},
+            "evidence_source": "embedded_sku_map",
+        }
+
+        single = self.service._supplier_sku_decision({}, [single_option])
+        multiple = self.service._supplier_sku_decision(
+            {},
+            [
+                single_option,
+                {
+                    "supplier_sku_id": "second-option",
+                    "raw_label": "second visible sales unit",
+                    "selected_options": {"style": "two"},
+                    "evidence_source": "dom_option_labels",
+                },
+            ],
+        )
+
+        self.assertEqual(1, single["canonical_option_count"])
+        self.assertTrue(single["single_option_confirmable"])
+        self.assertEqual(
+            "generated-single-option",
+            single["single_option_supplier_sku_id"],
+        )
+        self.assertEqual(2, multiple["canonical_option_count"])
+        self.assertFalse(multiple["single_option_confirmable"])
+        self.assertEqual("", multiple["single_option_supplier_sku_id"])
+
     def test_supplier_sku_measurements_expand_multi_axis_dimensions(self) -> None:
         self.assertEqual(
             ["10mm", "300mm", "5mm"],
