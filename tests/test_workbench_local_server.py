@@ -2965,6 +2965,136 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn("每页 5 件", page)
         self.assertIn(".pricing-product-column { height:470px;", page)
 
+    def test_pricing_prefill_uses_locked_supplier_cost_shipping_and_package_facts(
+        self,
+    ) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+        supplier_result = self.repo.load_supplier_collection_result(run_id)
+        supplier_product = supplier_result["supplier_products"][0]
+        supplier_product["attributes"] = {
+            "包装重量": "380克",
+            "包装尺寸": "28 × 11 × 2.5 厘米",
+        }
+        supplier_product["domestic_shipping_evidence"] = {
+            "visible_text": "运费 ¥7",
+            "fee": "7",
+            "free_shipping_visible": False,
+        }
+        self.repo.save_supplier_collection_result(run_id, supplier_result)
+
+        item = self.get_json(f"/api/batches/{run_id}/upload")["data"]["items"][0]
+        prefill = item["pricing_prefill"]
+
+        self.assertEqual(
+            {
+                "purchase_price_cny": "12.80",
+                "domestic_shipping_cny": "7",
+                "package_weight_g": "380",
+                "package_length_cm": "28",
+                "package_width_cm": "11",
+                "package_height_cm": "2.5",
+            },
+            prefill["values"],
+        )
+        self.assertEqual(
+            "locked_supplier_sku.price",
+            prefill["fields"]["purchase_price_cny"]["source"],
+        )
+        self.assertEqual(
+            "supplier.domestic_shipping_evidence",
+            prefill["fields"]["domestic_shipping_cny"]["source"],
+        )
+        self.assertEqual(
+            "supplier.attributes.package_weight",
+            prefill["fields"]["package_weight_g"]["source"],
+        )
+        self.assertEqual(
+            "supplier.attributes.package_dimensions",
+            prefill["fields"]["package_length_cm"]["source"],
+        )
+
+    def test_pricing_prefill_falls_back_to_ozon_package_attributes(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+        supplier_result = self.repo.load_supplier_collection_result(run_id)
+        supplier_product = supplier_result["supplier_products"][0]
+        supplier_product["attributes"] = {}
+        supplier_product["domestic_shipping_evidence"] = {
+            "visible_text": "包邮",
+            "fee": 0,
+            "free_shipping_visible": True,
+        }
+        self.repo.save_supplier_collection_result(run_id, supplier_result)
+        ozon_result = self.repo.load_ozon_collection_result(run_id)
+        ozon_result["ozon_candidates"][0]["attributes"].update(
+            {
+                "Вес с упаковкой, г": "380",
+                "Размер упаковки (Длина х Ширина х Высота), мм": (
+                    "280 × 110 × 25"
+                ),
+            }
+        )
+        self.repo.save_ozon_collection_result(run_id, ozon_result)
+
+        item = self.get_json(f"/api/batches/{run_id}/upload")["data"]["items"][0]
+        prefill = item["pricing_prefill"]
+
+        self.assertEqual("0", prefill["values"]["domestic_shipping_cny"])
+        self.assertEqual("380", prefill["values"]["package_weight_g"])
+        self.assertEqual("28", prefill["values"]["package_length_cm"])
+        self.assertEqual("11", prefill["values"]["package_width_cm"])
+        self.assertEqual("2.5", prefill["values"]["package_height_cm"])
+        self.assertEqual(
+            "ozon.attributes.package_weight",
+            prefill["fields"]["package_weight_g"]["source"],
+        )
+        self.assertEqual(
+            "ozon.attributes.package_dimensions",
+            prefill["fields"]["package_height_cm"]["source"],
+        )
+
+    def test_pricing_prefill_does_not_treat_net_size_or_unknown_shipping_as_package_fact(
+        self,
+    ) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+        supplier_result = self.repo.load_supplier_collection_result(run_id)
+        supplier_product = supplier_result["supplier_products"][0]
+        supplier_product["attributes"] = {
+            "产品重量": "380克",
+            "产品尺寸": "28 × 11 × 2.5 厘米",
+        }
+        supplier_product["domestic_shipping_evidence"] = {
+            "visible_text": "现付，预计明天达",
+            "fee": None,
+            "free_shipping_visible": False,
+        }
+        self.repo.save_supplier_collection_result(run_id, supplier_result)
+
+        item = self.get_json(f"/api/batches/{run_id}/upload")["data"]["items"][0]
+
+        self.assertEqual(
+            {"purchase_price_cny": "12.80"},
+            item["pricing_prefill"]["values"],
+        )
+
+    def test_pricing_editor_uses_evidence_prefill_without_overriding_saved_values(
+        self,
+    ) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+
+        page = self.get_text(f"/batches/{run_id}/upload")
+
+        self.assertIn("item.pricing_prefill && item.pricing_prefill.values", page)
+        self.assertIn(
+            'const draft = { target_margin_rate:"0.20", ...prefilled, ...saved };',
+            page,
+        )
+        self.assertIn("该项已按", page)
+        self.assertIn("预填，仍需用户确认", page)
+
     def test_upload_mapping_results_use_fixed_five_item_pages(self) -> None:
         run_id, _seed = self.prepare_supplier_review_run()
 

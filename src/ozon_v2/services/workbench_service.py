@@ -1674,6 +1674,11 @@ class WorkbenchService:
                 supplier_selection.get("supplier_offer_id")
                 or supplier_product.get("offer_id")
             )
+            pricing_prefill = _pricing_prefill_from_evidence(
+                candidate=candidate,
+                supplier_product=supplier_product,
+                supplier_sku=supplier_sku,
+            )
             pricing_record = pricing_items.get(seed_id) or {}
             pricing_confirmed = (
                 pricing_record.get("status") == "confirmed"
@@ -1920,6 +1925,7 @@ class WorkbenchService:
                     "pricing_evidence": (
                         pricing_record if pricing_record else None
                     ),
+                    "pricing_prefill": pricing_prefill,
                     "upload_core_fields": upload_core_fields,
                     "pricing_policy": pricing_policy,
                     "blocking_gates": blocking_gates,
@@ -8173,6 +8179,257 @@ def _effective_upload_schema(
             field["required_reason"] = "ozon_compliance_decision"
         effective.append(field)
     return effective
+
+
+_PACKAGE_DIMENSION_LABELS = frozenset(
+    normalize_attribute_label(label)
+    for label in (
+        "包装尺寸",
+        "包装规格",
+        "外包装尺寸",
+        "外箱尺寸",
+        "包裹尺寸",
+        "размер упаковки",
+        "размеры упаковки",
+        "габариты упаковки",
+        "package dimensions",
+        "package size",
+        "shipping dimensions",
+    )
+)
+
+
+def _is_package_dimension_label(normalized_label: str) -> bool:
+    if normalized_label in _PACKAGE_DIMENSION_LABELS:
+        return True
+    return any(
+        token in normalized_label
+        for token in (
+            "包装尺寸",
+            "包装规格",
+            "外包装尺寸",
+            "外箱尺寸",
+            "包裹尺寸",
+            "размер упаковки",
+            "размеры упаковки",
+            "габариты упаковки",
+            "package dimensions",
+            "package size",
+            "shipping dimensions",
+        )
+    )
+
+
+def _pricing_prefill_from_evidence(
+    *,
+    candidate: dict[str, Any],
+    supplier_product: dict[str, Any],
+    supplier_sku: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    values: dict[str, str] = {}
+    fields: dict[str, dict[str, str]] = {}
+
+    def add(
+        field_key: str,
+        value: str | None,
+        *,
+        source: str,
+        label: str,
+    ) -> None:
+        if value is None or field_key in values:
+            return
+        values[field_key] = value
+        fields[field_key] = {
+            "source": source,
+            "label": label,
+            "confidence": "high",
+        }
+
+    price = supplier_sku.get("price")
+    if isinstance(price, dict):
+        currency = str(price.get("currency") or "CNY").strip().upper()
+        if currency == "CNY":
+            add(
+                "purchase_price_cny",
+                _pricing_decimal_text(price.get("amount"), preserve_scale=True),
+                source="locked_supplier_sku.price",
+                label="已锁定 1688 SKU 价格",
+            )
+
+    shipping = supplier_product.get("domestic_shipping_evidence")
+    if isinstance(shipping, dict):
+        shipping_value = _pricing_decimal_text(shipping.get("fee"))
+        if shipping_value is None and (
+            shipping.get("free_shipping_visible") is True
+            or shipping.get("free_shipping") is True
+        ):
+            shipping_value = "0"
+        add(
+            "domestic_shipping_cny",
+            shipping_value,
+            source="supplier.domestic_shipping_evidence",
+            label="1688 页面国内运费",
+        )
+
+    supplier_attributes = supplier_product.get("attributes")
+    ozon_attributes = candidate.get("attributes")
+    for attributes, source_prefix, source_label in (
+        (
+            supplier_attributes,
+            "supplier.attributes",
+            "已锁定 1688 SKU 商品属性",
+        ),
+        (
+            ozon_attributes,
+            "ozon.attributes",
+            "Ozon 原商品包装属性",
+        ),
+    ):
+        if not isinstance(attributes, dict):
+            continue
+        package_values = _package_measurements(attributes)
+        add(
+            "package_weight_g",
+            package_values.get("package_weight_g"),
+            source=f"{source_prefix}.package_weight",
+            label=source_label,
+        )
+        for key in (
+            "package_length_cm",
+            "package_width_cm",
+            "package_height_cm",
+        ):
+            add(
+                key,
+                package_values.get(key),
+                source=f"{source_prefix}.package_dimensions",
+                label=source_label,
+            )
+
+    return {"values": values, "fields": fields}
+
+
+def _package_measurements(attributes: dict[str, Any]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    separate_dimensions: dict[str, str] = {}
+    for raw_label, raw_value in attributes.items():
+        normalized_label = normalize_attribute_label(raw_label)
+        canonical_label = canonical_attribute_label(raw_label)
+        if canonical_label == "package_weight":
+            weight = _pricing_weight_grams(raw_value, raw_label)
+            if weight is not None:
+                result["package_weight_g"] = weight
+            continue
+        if _is_package_dimension_label(normalized_label):
+            dimensions = _pricing_dimensions_cm(raw_value, raw_label)
+            if dimensions is not None:
+                result.update(
+                    {
+                        "package_length_cm": dimensions[0],
+                        "package_width_cm": dimensions[1],
+                        "package_height_cm": dimensions[2],
+                    }
+                )
+            continue
+        dimension_key = {
+            "package_length": "package_length_cm",
+            "package_width": "package_width_cm",
+            "package_height": "package_height_cm",
+        }.get(canonical_label)
+        if dimension_key:
+            dimension = _pricing_length_cm(raw_value, raw_label)
+            if dimension is not None:
+                separate_dimensions[dimension_key] = dimension
+    for key, value in separate_dimensions.items():
+        result.setdefault(key, value)
+    return result
+
+
+def _pricing_decimal(value: Any) -> Decimal | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float, Decimal)):
+        try:
+            decimal_value = Decimal(str(value))
+        except Exception:
+            return None
+        return decimal_value if decimal_value.is_finite() else None
+    text = str(value).strip().replace("\u00a0", " ")
+    match = re.search(r"[-+]?\d+(?:[.,]\d+)?", text)
+    if not match:
+        return None
+    try:
+        decimal_value = Decimal(match.group(0).replace(",", "."))
+    except Exception:
+        return None
+    return decimal_value if decimal_value.is_finite() else None
+
+
+def _pricing_decimal_text(
+    value: Any,
+    *,
+    preserve_scale: bool = False,
+) -> str | None:
+    decimal_value = _pricing_decimal(value)
+    if decimal_value is None or decimal_value < 0:
+        return None
+    if preserve_scale and isinstance(value, str):
+        stripped = value.strip().replace(",", ".")
+        if re.fullmatch(r"\d+(?:\.\d+)?", stripped):
+            return stripped
+    return format(decimal_value.normalize(), "f")
+
+
+def _pricing_measurement_unit(value: Any, label: Any) -> str | None:
+    text = f"{label} {value}".casefold().replace("ё", "е")
+    if re.search(r"(?:^|[^\w])(кг|kg)(?:$|[^\w])", text) or any(
+        token in text for token in ("千克", "公斤")
+    ):
+        return "kg"
+    if re.search(r"(?:^|[^\w])(мм|mm)(?:$|[^\w])", text) or "毫米" in text:
+        return "mm"
+    if re.search(r"(?:^|[^\w])(см|cm)(?:$|[^\w])", text) or "厘米" in text:
+        return "cm"
+    if re.search(r"(?:^|[^\w])(м|m)(?:$|[^\w])", text) or "米" in text:
+        return "m"
+    if re.search(r"(?:^|[^\w])(гр|г|g)(?:$|[^\w])", text) or "克" in text:
+        return "g"
+    return None
+
+
+def _pricing_weight_grams(value: Any, label: Any) -> str | None:
+    decimal_value = _pricing_decimal(value)
+    unit = _pricing_measurement_unit(value, label)
+    if decimal_value is None or decimal_value <= 0 or unit not in {"g", "kg"}:
+        return None
+    if unit == "kg":
+        decimal_value *= Decimal("1000")
+    return format(decimal_value.normalize(), "f")
+
+
+def _pricing_length_cm(value: Any, label: Any) -> str | None:
+    decimal_value = _pricing_decimal(value)
+    unit = _pricing_measurement_unit(value, label)
+    if decimal_value is None or decimal_value <= 0 or unit not in {"mm", "cm", "m"}:
+        return None
+    factor = {"mm": Decimal("0.1"), "cm": Decimal("1"), "m": Decimal("100")}[unit]
+    return format((decimal_value * factor).normalize(), "f")
+
+
+def _pricing_dimensions_cm(
+    value: Any,
+    label: Any,
+) -> tuple[str, str, str] | None:
+    text = str(value or "").replace(",", ".")
+    numbers = re.findall(r"\d+(?:\.\d+)?", text)
+    unit = _pricing_measurement_unit(value, label)
+    if len(numbers) < 3 or unit not in {"mm", "cm", "m"}:
+        return None
+    factor = {"mm": Decimal("0.1"), "cm": Decimal("1"), "m": Decimal("100")}[unit]
+    dimensions = [Decimal(number) * factor for number in numbers[:3]]
+    if any(dimension <= 0 for dimension in dimensions):
+        return None
+    return tuple(format(dimension.normalize(), "f") for dimension in dimensions)  # type: ignore[return-value]
 
 
 def _pricing_upload_core_fields(
