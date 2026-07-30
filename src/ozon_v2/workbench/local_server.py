@@ -16,6 +16,7 @@ from ozon_v2.adapters.fs_repo import FsRepo
 from ozon_v2.app.result import Result
 from ozon_v2.domain.models import utc_now_iso
 from ozon_v2.images.queue import REGULAR_IMAGE_WORKER_IDS
+from ozon_v2.platforms.temu.seller_api import TemuSellerApi
 from ozon_v2.services.credential_service import CredentialService
 from ozon_v2.services.diagnostics_export_service import DiagnosticsExportService
 from ozon_v2.services.workbench_service import WorkbenchService
@@ -3024,6 +3025,7 @@ def build_upload_workspace_html(run_id: str) -> str:
     .publish-lock {{ margin:0 14px 12px; padding:11px 12px; border-left:3px solid var(--amber); color:#74410a; background:#fff8eb; }} .publish-lock strong {{ display:block; font-size:11px; }} .publish-lock span {{ display:block; margin-top:3px; font-size:10px; }}
     .primary {{ width:calc(100% - 28px); height:38px; margin:0 14px 14px; border:1px solid var(--blue); border-radius:5px; color:#fff; background:var(--blue); }} .primary:disabled {{ opacity:.48; cursor:not-allowed; }} .empty {{ padding:26px; color:var(--muted); text-align:center; }}
     .product-upload-actions {{ display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-top:10px; padding:10px; border:1px solid #bfd0f8; border-radius:5px; background:#f5f8ff; }} .product-upload-actions button {{ min-height:34px; padding:0 12px; border:1px solid var(--blue); border-radius:4px; color:var(--blue); background:#fff; cursor:pointer; }} .product-upload-actions button.confirm {{ color:#fff; background:var(--blue); }} .product-upload-actions button:disabled {{ opacity:.48; cursor:not-allowed; }} .product-upload-status {{ flex:1 1 260px; color:var(--muted); font-size:10px; }} .product-upload-status.error {{ color:var(--red); }} .product-upload-status.success {{ color:var(--green); }}
+    .temu-upload-actions {{ display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-top:8px; padding:10px; border:1px solid #e6b96c; border-radius:5px; background:#fffaf0; }} .temu-upload-label {{ flex:0 0 100%; color:#8a4b05; font-size:11px; font-weight:700; }} .temu-upload-actions button {{ min-height:34px; padding:0 12px; border:1px solid #bd690a; border-radius:4px; color:#9a5407; background:#fff; cursor:pointer; }} .temu-upload-actions button.confirm {{ color:#fff; background:#bd690a; }} .temu-upload-actions button:disabled {{ opacity:.48; cursor:not-allowed; }} .temu-upload-status {{ flex:1 1 260px; color:var(--muted); font-size:10px; }} .temu-upload-status.error {{ color:var(--red); }} .temu-upload-status.success {{ color:var(--green); }}
     .batch-upload-controller {{ margin:0 14px 12px; padding:11px; border:1px solid #bfd0f8; border-radius:5px; background:#f5f8ff; }} .batch-upload-controller strong {{ display:block; font-size:11px; }} .batch-upload-controller p {{ margin:4px 0 8px; color:var(--muted); font-size:10px; }} .batch-upload-controller button {{ width:100%; min-height:38px; border:1px solid var(--blue); border-radius:4px; color:#fff; background:var(--blue); cursor:pointer; }} .batch-upload-controller button:disabled {{ opacity:.5; cursor:wait; }} .batch-upload-status {{ display:block; min-height:17px; margin-top:6px; color:var(--muted); font-size:10px; }} .batch-upload-status.error {{ color:var(--red); }} .batch-upload-status.success {{ color:var(--green); }}
     @media(max-width:1100px) {{ .pricing-form {{ grid-template-columns:repeat(2,minmax(130px,1fr)); }} .pricing-result {{ grid-template-columns:repeat(3,1fr); }} .pricing-result-cell:nth-child(3) {{ border-right:0; }} }}
     @media(max-width:1000px) {{ .upload-layout {{ grid-template-columns:1fr; }} .pricing-layout {{ grid-template-columns:250px minmax(0,1fr); }} }}
@@ -3056,6 +3058,7 @@ def build_upload_workspace_html(run_id: str) -> str:
     const pricingState = {{ selectedSeedId:null, items:[], drafts:new Map(), previews:new Map(), page:0, pageSize:5 }};
     const draftState = {{ page:0, pageSize:5, items:[] }};
     const productUploadState = {{ previews:new Map(), submissions:new Map() }};
+    const temuUploadState = {{ previews:new Map(), submissions:new Map() }};
     let latestUploadData = null;
     const pricingEndpoints = {{
       preview:`/api/batches/${{encodeURIComponent(runId)}}/pricing-evidence/preview`,
@@ -3351,6 +3354,128 @@ def build_upload_workspace_html(run_id: str) -> str:
       previewButton.addEventListener("click",() => previewProductUpload(item,controls)); confirmButton.addEventListener("click",() => confirmProductUpload(item,controls));
       controls.append(previewButton,confirmButton,status); container.append(controls);
     }}
+    function temuUploadError(submission) {{
+      const error = (submission && (submission.last_error || submission.status_query_error)) || {{}};
+      return error.message || "Temu 未返回可读的失败原因";
+    }}
+    async function previewTemuProductUpload(item, controls) {{
+      const previewButton = controls.querySelector("[data-temu-action=preview]");
+      const confirmButton = controls.querySelector("[data-temu-action=confirm]");
+      const statusButton = controls.querySelector("[data-temu-action=status]");
+      const status = controls.querySelector(".temu-upload-status");
+      previewButton.disabled = true; confirmButton.disabled = true; statusButton.disabled = true;
+      status.className = "temu-upload-status";
+      status.textContent = "正在用已锁定的商品、SKU、价格和包装证据生成 Temu 官方 API 预览…";
+      try {{
+        const result = await api(`/api/batches/${{encodeURIComponent(runId)}}/temu-product-upload/${{encodeURIComponent(item.seed_id)}}/preview`, {{method:"POST",headers:{{"Content-Type":"application/json"}},body:"{{}}"}});
+        const preview = result.data || {{}};
+        temuUploadState.previews.set(item.seed_id,preview);
+        const request = preview.temu_request || {{}};
+        const goods = request.goodsBasic || {{}};
+        status.className = "temu-upload-status success";
+        status.textContent = `Temu 预览已就绪：${{goods.goodsName || item.source_title}} · 预览哈希 ${{String(preview.preview_hash || "").slice(0,12)}}…；请核对后显式确认。`;
+        previewButton.textContent = "重新生成 Temu 预览";
+        previewButton.disabled = false; confirmButton.disabled = false;
+      }} catch (error) {{
+        status.className = "temu-upload-status error";
+        status.textContent = error.message || "Temu 官方 API 预览生成失败";
+        previewButton.disabled = false;
+      }}
+    }}
+    async function pollTemuProductUploadStatus(item, controls) {{
+      const statusButton = controls.querySelector("[data-temu-action=status]");
+      const status = controls.querySelector(".temu-upload-status");
+      statusButton.disabled = true; status.className = "temu-upload-status";
+      status.textContent = "正在通过 Temu 官方 API 回查商品状态…";
+      try {{
+        const result = await api(`/api/batches/${{encodeURIComponent(runId)}}/temu-product-upload/${{encodeURIComponent(item.seed_id)}}/status`, {{method:"POST",headers:{{"Content-Type":"application/json"}},body:"{{}}"}});
+        const submission = result.data || {{}};
+        temuUploadState.submissions.set(item.seed_id,submission);
+        if (submission.status === "published") {{
+          status.className = "temu-upload-status success";
+          status.textContent = `Temu 已发布 · goodsId ${{submission.goods_id}}。`;
+          statusButton.textContent = "Temu 已发布";
+          return;
+        }}
+        if (submission.status === "failed") {{
+          status.className = "temu-upload-status error";
+          status.textContent = `Temu 审核失败：${{temuUploadError(submission)}}。`;
+        }} else if (submission.status === "draft") {{
+          status.textContent = `Temu 商品仍为草稿 · goodsId ${{submission.goods_id}}；可稍后再次回查。`;
+        }} else {{
+          status.textContent = `Temu 正在处理 · goodsId ${{submission.goods_id}}；可稍后再次回查。`;
+        }}
+        statusButton.disabled = false;
+      }} catch (error) {{
+        const saved = error.data || {{}};
+        status.className = "temu-upload-status error";
+        status.textContent = `Temu 状态回查失败：${{temuUploadError(saved) || error.message || error}}。不会重复提交商品。`;
+        statusButton.disabled = false;
+      }}
+    }}
+    async function confirmTemuProductUpload(item, controls) {{
+      const preview = temuUploadState.previews.get(item.seed_id);
+      const previewButton = controls.querySelector("[data-temu-action=preview]");
+      const confirmButton = controls.querySelector("[data-temu-action=confirm]");
+      const statusButton = controls.querySelector("[data-temu-action=status]");
+      const status = controls.querySelector(".temu-upload-status");
+      if (!preview || !preview.preview_hash) {{
+        status.className = "temu-upload-status error";
+        status.textContent = "请先生成 Temu 预览并核对预览哈希。";
+        return;
+      }}
+      const request = preview.temu_request || {{}};
+      const goods = request.goodsBasic || {{}};
+      if (!window.confirm(`确认把“${{goods.goodsName || item.source_title}}”提交到 Temu 官方 API？\\n预览哈希：${{preview.preview_hash}}`)) return;
+      previewButton.disabled = true; confirmButton.disabled = true; statusButton.disabled = true;
+      status.className = "temu-upload-status"; status.textContent = "正在提交这一件商品到 Temu 官方 API…";
+      try {{
+        const result = await api(`/api/batches/${{encodeURIComponent(runId)}}/temu-product-upload/${{encodeURIComponent(item.seed_id)}}/confirm`, {{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify({{preview_hash:preview.preview_hash,confirmed:true}})}});
+        const submission = result.data || {{}};
+        temuUploadState.submissions.set(item.seed_id,submission);
+        status.className = "temu-upload-status success";
+        status.textContent = `Temu 已受理 · goodsId ${{submission.goods_id}}；按官方建议等待后再回查状态，不会重复提交。`;
+        confirmButton.textContent = "Temu 已提交";
+        statusButton.disabled = false;
+      }} catch (error) {{
+        const failed = error.data || {{}};
+        temuUploadState.submissions.set(item.seed_id,failed);
+        status.className = "temu-upload-status error";
+        status.textContent = `Temu 提交失败：${{temuUploadError(failed) || error.message || error}}。本次尝试已记录，禁止盲目重复提交。`;
+      }}
+    }}
+    function renderTemuUploadActions(container,item) {{
+      const controls = document.createElement("div"); controls.className = "temu-upload-actions";
+      const label = document.createElement("strong"); label.className = "temu-upload-label"; label.textContent = "Temu 官方 API · 独立发布通道";
+      const evidenceReady = !!(item.bootstrap_image_ready && item.pricing_ready && item.supplier_selected_sku);
+      const previewButton = document.createElement("button"); previewButton.type = "button"; previewButton.dataset.temuAction = "preview"; previewButton.textContent = "生成 Temu 预览"; previewButton.disabled = !evidenceReady;
+      const confirmButton = document.createElement("button"); confirmButton.type = "button"; confirmButton.dataset.temuAction = "confirm"; confirmButton.className = "confirm"; confirmButton.textContent = "确认提交到 Temu"; confirmButton.disabled = true;
+      const statusButton = document.createElement("button"); statusButton.type = "button"; statusButton.dataset.temuAction = "status"; statusButton.textContent = "查询 Temu 状态"; statusButton.disabled = true;
+      const status = document.createElement("span"); status.className = "temu-upload-status"; status.textContent = evidenceReady ? "使用同一套已锁定商品证据，Temu 预览和提交记录与 Ozon 完全分开。" : "Temu 通道仍缺少锁定原图、SKU 或已确认价格包装证据。";
+      if (item.temu_upload_preview && item.temu_upload_preview.preview_hash) {{
+        temuUploadState.previews.set(item.seed_id,item.temu_upload_preview);
+        previewButton.textContent = "重新生成 Temu 预览"; confirmButton.disabled = false;
+        status.textContent = `Temu 预览待确认 · 预览哈希 ${{String(item.temu_upload_preview.preview_hash).slice(0,12)}}…`;
+      }}
+      if (item.temu_upload_submission) {{
+        const submission = item.temu_upload_submission;
+        temuUploadState.submissions.set(item.seed_id,submission);
+        previewButton.disabled = true; confirmButton.disabled = true;
+        if (submission.goods_id) statusButton.disabled = false;
+        if (submission.status === "published") {{
+          statusButton.disabled = true; statusButton.textContent = "Temu 已发布";
+          status.className = "temu-upload-status success"; status.textContent = `Temu 已发布 · goodsId ${{submission.goods_id}}。`;
+        }} else if (submission.status === "failed") {{
+          status.className = "temu-upload-status error"; status.textContent = `Temu 提交失败：${{temuUploadError(submission)}}。已阻止相同标识盲目重试。`;
+        }} else {{
+          status.textContent = `Temu 已提交 · goodsId ${{submission.goods_id || "-"}} · 当前状态 ${{submission.status || "processing"}}。`;
+        }}
+      }}
+      previewButton.addEventListener("click",() => previewTemuProductUpload(item,controls));
+      confirmButton.addEventListener("click",() => confirmTemuProductUpload(item,controls));
+      statusButton.addEventListener("click",() => pollTemuProductUploadStatus(item,controls));
+      controls.append(label,previewButton,confirmButton,statusButton,status); container.append(controls);
+    }}
     async function batchUploadProducts() {{
       const button = $("batchUploadProducts"); const status = $("batchUploadStatus");
       const items = (latestUploadData && latestUploadData.items) || [];
@@ -3415,7 +3540,7 @@ def build_upload_workspace_html(run_id: str) -> str:
         (item.blocking_gates || []).forEach((gate) => {{ const chip = document.createElement("span"); chip.className = "item-gate-chip"; chip.textContent = `缺少：${{blockerLabels[gate] || gate}}`; gateSummary.append(chip); }});
         if (item.ready_to_build) {{ const ready = document.createElement("span"); ready.className = "item-gate-chip"; ready.textContent = "不等待其他商品"; gateSummary.append(ready); }}
         const meta = document.createElement("div"); meta.className = "meta-grid"; meta.innerHTML = `<div class="meta"><span>精准类目</span><strong>${{item.category_path || "-"}}</strong></div><div class="meta"><span>属性模板</span><strong>${{item.attribute_schema_count || 0}} 字段</strong></div><div class="meta"><span>建品图片</span><strong>${{item.bootstrap_image_ready ? "锁定原图已就绪" : "缺少锁定原图"}}</strong></div>`;
-        body.append(label,title,notice,gateSummary,meta); renderUploadCoreFields(body,item); renderRequiredAttributeEditor(body,item); renderMapping(body,item); renderProductUploadActions(body,item); card.append(body); $("draftItems").append(card);
+        body.append(label,title,notice,gateSummary,meta); renderUploadCoreFields(body,item); renderRequiredAttributeEditor(body,item); renderMapping(body,item); renderProductUploadActions(body,item); renderTemuUploadActions(body,item); card.append(body); $("draftItems").append(card);
       }});
       if (!items.length) {{ const empty = document.createElement("div"); empty.className = "empty"; empty.textContent = "当前批次没有可用的类目模板与商品证据"; $("draftItems").append(empty); }}
     }}
@@ -3506,9 +3631,17 @@ def create_handler(
     repo: FsRepo | None = None,
     background_runner: WorkbenchBackgroundRunner | None = None,
     runtime_controller: WorkbenchRuntimeController | None = None,
+    temu_seller_api: TemuSellerApi | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     selected_repo = repo or FsRepo()
-    service = background_runner.service if background_runner is not None else WorkbenchService(selected_repo)
+    service = (
+        background_runner.service
+        if background_runner is not None
+        else WorkbenchService(
+            selected_repo,
+            temu_seller_api=temu_seller_api,
+        )
+    )
     credential_service = CredentialService(selected_repo)
     diagnostics_exporter = DiagnosticsExportService(selected_repo)
     runner = background_runner or WorkbenchBackgroundRunner(
@@ -3946,6 +4079,52 @@ def create_handler(
             ):
                 self._send_result(
                     service.refresh_product_upload_status(parts[2], parts[4]),
+                    run_id=parts[2],
+                )
+                return
+            if (
+                len(parts) == 6
+                and parts[:2] == ["api", "batches"]
+                and parts[3] == "temu-product-upload"
+                and parts[5] == "preview"
+            ):
+                self._send_result(
+                    service.preview_temu_product_upload(
+                        parts[2],
+                        parts[4],
+                    ),
+                    run_id=parts[2],
+                )
+                return
+            if (
+                len(parts) == 6
+                and parts[:2] == ["api", "batches"]
+                and parts[3] == "temu-product-upload"
+                and parts[5] == "confirm"
+            ):
+                self._send_result(
+                    service.submit_temu_product_upload(
+                        parts[2],
+                        parts[4],
+                        preview_hash=str(
+                            payload.get("preview_hash") or ""
+                        ),
+                        confirmed=payload.get("confirmed") is True,
+                    ),
+                    run_id=parts[2],
+                )
+                return
+            if (
+                len(parts) == 6
+                and parts[:2] == ["api", "batches"]
+                and parts[3] == "temu-product-upload"
+                and parts[5] == "status"
+            ):
+                self._send_result(
+                    service.refresh_temu_product_upload_status(
+                        parts[2],
+                        parts[4],
+                    ),
                     run_id=parts[2],
                 )
                 return

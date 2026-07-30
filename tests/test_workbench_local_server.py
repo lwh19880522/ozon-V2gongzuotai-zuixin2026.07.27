@@ -19,6 +19,7 @@ from ozon_v2.domain.models import WorkbenchAction, WorkbenchState
 from ozon_v2.domain.supplier_sku import SupplierSkuOption, SupplierSkuSelectionReceipt
 from ozon_v2.images.contracts import SubjectMasterSelection
 from ozon_v2.images.queue import ImageGenerationQueue
+from ozon_v2.platforms.temu.seller_api import TemuSellerApiError
 from ozon_v2.services.collection_contract_service import CollectionContractService
 from ozon_v2.services.attribute_mapping_service import map_template_attributes
 from ozon_v2.services.workbench_service import (
@@ -28,7 +29,12 @@ from ozon_v2.services.workbench_service import (
 )
 from ozon_v2.workbench.local_server import create_handler
 
-from tests.helpers import FakePublicMediaPublisher, FakeSellerApiAdapter, RuntimeTestCase
+from tests.helpers import (
+    FakePublicMediaPublisher,
+    FakeSellerApiAdapter,
+    FakeTemuSellerApi,
+    RuntimeTestCase,
+)
 
 
 class FakeBusyRunner:
@@ -5406,6 +5412,159 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn("补充缺失必填字段", page)
         self.assertIn("保存必填证据", page)
         self.assertIn("/required-attributes/", page)
+
+    def test_temu_lane_requires_preview_hash_and_is_idempotent(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        ozon_result = self.repo.load_ozon_collection_result(run_id)
+        ozon_result["ozon_candidates"][0]["attributes"]["Цвет"] = "белый"
+        self.repo.save_ozon_collection_result(run_id, ozon_result)
+        subject = self.attach_locked_subject_master(run_id, seed.seed_id)
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+        temu_api = FakeTemuSellerApi()
+        service = WorkbenchService(
+            self.repo,
+            seller_api_adapter=FakeSellerApiAdapter(),
+            temu_seller_api=temu_api,
+        )
+        pricing = service.confirm_pricing_evidence(
+            run_id,
+            self.pricing_input_payload(seed.seed_id),
+        )
+        self.assertTrue(pricing.ok, pricing.to_dict())
+
+        preview = service.preview_temu_product_upload(run_id, seed.seed_id)
+
+        self.assertTrue(preview.ok, preview.to_dict())
+        self.assertEqual(64, len(preview.data["preview_hash"]))
+        self.assertTrue(preview.data["requires_explicit_confirmation"])
+        request = preview.data["temu_request"]
+        self.assertEqual(
+            subject["source_image_url"],
+            request["goodsBasic"]["goodsCarouselImage"][0],
+        )
+        self.assertEqual("CNY", request["skuList"][0]["price"]["basePrice"]["currency"])
+        self.assertEqual("380", request["skuList"][0]["packageInfo"]["weight"])
+        self.assertEqual([], temu_api.published_requests)
+
+        missing_confirmation = service.submit_temu_product_upload(
+            run_id,
+            seed.seed_id,
+            preview_hash=preview.data["preview_hash"],
+            confirmed=False,
+        )
+        mismatched = service.submit_temu_product_upload(
+            run_id,
+            seed.seed_id,
+            preview_hash="wrong-hash",
+            confirmed=True,
+        )
+
+        self.assertFalse(missing_confirmation.ok)
+        self.assertFalse(mismatched.ok)
+        self.assertEqual([], temu_api.published_requests)
+
+        submitted = service.submit_temu_product_upload(
+            run_id,
+            seed.seed_id,
+            preview_hash=preview.data["preview_hash"],
+            confirmed=True,
+        )
+        repeated = service.submit_temu_product_upload(
+            run_id,
+            seed.seed_id,
+            preview_hash=preview.data["preview_hash"],
+            confirmed=True,
+        )
+
+        self.assertTrue(submitted.ok, submitted.to_dict())
+        self.assertTrue(repeated.ok, repeated.to_dict())
+        self.assertEqual("temu_product_upload.already_submitted", repeated.code)
+        self.assertEqual(1, len(temu_api.published_requests))
+        self.assertEqual(
+            "608573962731830",
+            str(submitted.data["goods_id"]),
+        )
+
+        refreshed = service.refresh_temu_product_upload_status(
+            run_id,
+            seed.seed_id,
+        )
+
+        self.assertTrue(refreshed.ok, refreshed.to_dict())
+        self.assertEqual("published", refreshed.data["status"])
+        self.assertEqual(["608573962731830"], temu_api.status_queries)
+        reloaded = service.upload_workspace(run_id).data["items"][0]
+        self.assertEqual(
+            preview.data["preview_hash"],
+            reloaded["temu_upload_preview"]["preview_hash"],
+        )
+        self.assertEqual(
+            "published",
+            reloaded["temu_upload_submission"]["status"],
+        )
+        self.assertTrue(
+            (self.repo.run_dir(run_id) / "temu_upload_previews.json").exists()
+        )
+        self.assertTrue(
+            (self.repo.run_dir(run_id) / "temu_upload_submissions.json").exists()
+        )
+
+    def test_temu_lane_persists_readable_publish_failure(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        ozon_result = self.repo.load_ozon_collection_result(run_id)
+        ozon_result["ozon_candidates"][0]["attributes"]["Цвет"] = "белый"
+        self.repo.save_ozon_collection_result(run_id, ozon_result)
+        self.attach_locked_subject_master(run_id, seed.seed_id)
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+        temu_api = FakeTemuSellerApi()
+        temu_api.publish_error = TemuSellerApiError(
+            "Temu Partner API error 300001: invalid package dimensions."
+        )
+        service = WorkbenchService(
+            self.repo,
+            seller_api_adapter=FakeSellerApiAdapter(),
+            temu_seller_api=temu_api,
+        )
+        self.assertTrue(
+            service.confirm_pricing_evidence(
+                run_id,
+                self.pricing_input_payload(seed.seed_id),
+            ).ok
+        )
+        preview = service.preview_temu_product_upload(run_id, seed.seed_id)
+
+        failed = service.submit_temu_product_upload(
+            run_id,
+            seed.seed_id,
+            preview_hash=preview.data["preview_hash"],
+            confirmed=True,
+        )
+
+        self.assertFalse(failed.ok)
+        self.assertEqual("failed", failed.data["status"])
+        self.assertIn(
+            "invalid package dimensions",
+            failed.data["last_error"]["message"],
+        )
+        saved = self.repo.load_temu_upload_submissions(run_id)["items"][
+            seed.seed_id
+        ]
+        self.assertEqual("failed", saved["status"])
+        self.assertNotIn("access_token", json.dumps(saved))
+
+    def test_temu_upload_page_exposes_independent_official_api_controls(self) -> None:
+        run_id, _seed = self.prepare_supplier_review_run()
+
+        page = self.get_text(f"/batches/{run_id}/upload")
+
+        self.assertIn("Temu 官方 API", page)
+        self.assertIn("previewTemuProductUpload", page)
+        self.assertIn("confirmTemuProductUpload", page)
+        self.assertIn("pollTemuProductUploadStatus", page)
+        self.assertIn("/temu-product-upload/", page)
+        self.assertIn("确认提交到 Temu", page)
+        self.assertIn("预览哈希", page)
+        self.assertIn("confirmed:true", page)
 
     def test_public_media_base_url_rejects_localhost_and_persists_public_https(self) -> None:
         service = WorkbenchService(self.repo)

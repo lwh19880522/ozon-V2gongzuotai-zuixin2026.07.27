@@ -606,6 +606,34 @@ class FsRepo:
     def load_upload_submissions(self, run_id: str) -> dict[str, Any]:
         return self._read_json(self.run_dir(run_id) / "upload_submissions.json")
 
+    def save_temu_upload_previews(
+        self,
+        run_id: str,
+        payload: dict[str, Any],
+    ) -> Path:
+        path = self.run_dir(run_id) / "temu_upload_previews.json"
+        self._write_json(path, payload)
+        return path
+
+    def load_temu_upload_previews(self, run_id: str) -> dict[str, Any]:
+        return self._read_json(
+            self.run_dir(run_id) / "temu_upload_previews.json"
+        )
+
+    def save_temu_upload_submissions(
+        self,
+        run_id: str,
+        payload: dict[str, Any],
+    ) -> Path:
+        path = self.run_dir(run_id) / "temu_upload_submissions.json"
+        self._write_json(path, payload)
+        return path
+
+    def load_temu_upload_submissions(self, run_id: str) -> dict[str, Any]:
+        return self._read_json(
+            self.run_dir(run_id) / "temu_upload_submissions.json"
+        )
+
     def image_task_pending_dir(self) -> Path:
         path = self.runtime_root / "image_tasks" / "pending"
         path.mkdir(parents=True, exist_ok=True)

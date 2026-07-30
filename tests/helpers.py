@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import shutil
 import tempfile
@@ -7,6 +8,7 @@ from unittest import TestCase
 
 from ozon_v2.app.context import AppContext, Config, Paths
 from ozon_v2.domain.credentials import SellerCredentials
+from ozon_v2.platforms.temu.seller_api import TemuSellerApiError
 
 
 class FakeSellerApiAdapter:
@@ -71,6 +73,62 @@ class FakeSellerApiAdapter:
 
     def get_seller_currency_code(self) -> str:
         return self.seller_currency_code
+
+
+class FakeTemuSellerApi:
+    def __init__(self) -> None:
+        self.previewed_requests: list[dict] = []
+        self.published_requests: list[dict] = []
+        self.status_queries: list[str] = []
+        self.publish_error: TemuSellerApiError | None = None
+        self.status_error: TemuSellerApiError | None = None
+        self.goods_id = "608573962731830"
+        self.status_payload: dict = {
+            "goodsList": [
+                {
+                    "goodsId": self.goods_id,
+                    "status": "published",
+                }
+            ]
+        }
+
+    def preview_publish(self, request: dict) -> dict:
+        saved = json.loads(json.dumps(request, ensure_ascii=False))
+        self.previewed_requests.append(saved)
+        return {
+            "method": "temu.local.goods.v3.add",
+            "request": saved,
+            "idempotency_key": "fake-preview-operation-key",
+            "requires_explicit_confirmation": True,
+        }
+
+    def publish_product(
+        self,
+        request: dict,
+        *,
+        explicit_confirmation: bool,
+    ) -> dict:
+        if explicit_confirmation is not True:
+            raise TemuSellerApiError(
+                "Temu live publication requires explicit confirmation."
+            )
+        if self.publish_error is not None:
+            raise self.publish_error
+        saved = json.loads(json.dumps(request, ensure_ascii=False))
+        self.published_requests.append(saved)
+        return {
+            "goodsId": self.goods_id,
+            "externalGoodsId": saved["goodsBasic"]["externalGoodsId"],
+            "operation_key": "fake-live-operation-key",
+            "publication_confirmed": False,
+            "status_check_after_seconds": 600,
+        }
+
+    def query_product_status(self, goods_id: int | str) -> dict:
+        self.status_queries.append(str(goods_id))
+        if self.status_error is not None:
+            raise self.status_error
+        return json.loads(json.dumps(self.status_payload, ensure_ascii=False))
 
 
 class FakePublicMediaPublisher:

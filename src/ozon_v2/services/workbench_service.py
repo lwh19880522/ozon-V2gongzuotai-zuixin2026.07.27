@@ -45,6 +45,11 @@ from ozon_v2.domain.validators import validate_attribute_template_result, valida
 from ozon_v2.images.contracts import SubjectMasterSelection
 from ozon_v2.images.queue import ImageGenerationQueue, ImageRepairRequestError
 from ozon_v2.images.worker import is_exact_three_by_four_image
+from ozon_v2.platforms.temu.seller_api import (
+    TemuIdempotencyRegistry,
+    TemuSellerApi,
+    TemuSellerApiError,
+)
 from ozon_v2.services.attribute_mapping_service import (
     attribute_content_score_progress,
     canonical_attribute_label,
@@ -107,6 +112,7 @@ class WorkbenchService:
         seed_query_service: SeedQueryService | None = None,
         collection_contract_service: CollectionContractService | None = None,
         seller_api_adapter: SellerApiAdapter | None = None,
+        temu_seller_api: TemuSellerApi | None = None,
         supplier_image_downloader: Callable[[str, Path], Path] | None = None,
         public_media_publisher: CloudflareR2MediaPublisher | None = None,
     ) -> None:
@@ -116,6 +122,13 @@ class WorkbenchService:
         self.seed_query_service = seed_query_service or SeedQueryService()
         self.collection_contract_service = collection_contract_service or CollectionContractService(self.repo)
         self.seller_api_adapter = seller_api_adapter or SellerApiAdapter(self.repo)
+        self.temu_seller_api = temu_seller_api or TemuSellerApi(
+            credentials_path=self.repo.config_dir / "temu_credentials.json",
+            signature_provider=None,
+            idempotency_registry=TemuIdempotencyRegistry(
+                self.repo.state_dir / "temu_idempotency.json"
+            ),
+        )
         self.supplier_image_downloader = supplier_image_downloader or self._download_supplier_image
         self.public_media_publisher = (
             public_media_publisher or CloudflareR2MediaPublisher()
@@ -1652,6 +1665,14 @@ class WorkbenchService:
                     for seed_id, item in raw_submissions.items()
                     if isinstance(item, dict)
                 }
+        temu_upload_previews = _optional_run_items(
+            self.repo.run_dir(run_id) / "temu_upload_previews.json",
+            lambda: self.repo.load_temu_upload_previews(run_id),
+        )
+        temu_upload_submissions = _optional_run_items(
+            self.repo.run_dir(run_id) / "temu_upload_submissions.json",
+            lambda: self.repo.load_temu_upload_submissions(run_id),
+        )
         candidates = ozon_result.get("ozon_candidates") if isinstance(ozon_result.get("ozon_candidates"), list) else []
         items: list[dict[str, Any]] = []
         for candidate in candidates:
@@ -1953,6 +1974,8 @@ class WorkbenchService:
                     ],
                     "upload_preview": upload_previews.get(seed_id),
                     "upload_submission": upload_submissions.get(seed_id),
+                    "temu_upload_preview": temu_upload_previews.get(seed_id),
+                    "temu_upload_submission": temu_upload_submissions.get(seed_id),
                 }
             )
 
@@ -3800,6 +3823,209 @@ class WorkbenchService:
         return Result.success(
             "product_upload.status_loaded",
             "The latest Ozon import status was loaded.",
+            record,
+        )
+
+    def preview_temu_product_upload(self, run_id: str, seed_id: str) -> Result:
+        workspace = self.upload_workspace(run_id)
+        if not workspace.ok:
+            return workspace
+        item = next(
+            (
+                value
+                for value in workspace.data.get("items", [])
+                if str(value.get("seed_id") or "") == seed_id
+            ),
+            None,
+        )
+        if not isinstance(item, dict):
+            return Result.failure(
+                "temu_product_upload.product_missing",
+                "The requested product is not part of this batch.",
+            )
+        try:
+            request = _temu_request(run_id, item)
+            validated = self.temu_seller_api.preview_publish(request)
+            request = validated["request"]
+        except (TemuSellerApiError, ArithmeticError, TypeError, ValueError) as exc:
+            return Result.failure(
+                "temu_product_upload.preview_failed",
+                str(exc),
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+        preview_hash = _payload_sha256(request)
+        preview = {
+            "platform": "temu",
+            "run_id": run_id,
+            "seed_id": seed_id,
+            "prepared_at": utc_now_iso(),
+            "preview_hash": preview_hash,
+            "requires_explicit_confirmation": True,
+            "method": validated.get("method"),
+            "idempotency_key": validated.get("idempotency_key"),
+            "temu_request": request,
+            "status": "awaiting_user_confirmation",
+        }
+        payload = _temu_state(self.repo, run_id, "previews")
+        payload["items"][seed_id] = preview
+        path = self.repo.save_temu_upload_previews(run_id, payload)
+        self.repo.append_run_event(
+            run_id,
+            "temu_product_upload.preview_ready",
+            "Temu official API preview is awaiting explicit hash confirmation.",
+            {"seed_id": seed_id, "preview_hash": preview_hash},
+        )
+        return Result.success(
+            "temu_product_upload.preview_ready",
+            "Temu official API preview is ready for explicit confirmation.",
+            {**preview, "preview_path": str(path)},
+        )
+
+    def submit_temu_product_upload(
+        self,
+        run_id: str,
+        seed_id: str,
+        *,
+        preview_hash: str,
+        confirmed: bool,
+    ) -> Result:
+        if confirmed is not True:
+            return Result.failure(
+                "temu_product_upload.confirmation_required",
+                "Explicit confirmation is required before submitting to Temu.",
+            )
+        previews = _temu_state(self.repo, run_id, "previews")
+        preview = previews["items"].get(seed_id)
+        if not isinstance(preview, dict):
+            return Result.failure(
+                "temu_product_upload.preview_required",
+                "Prepare and inspect the Temu request before submitting it.",
+            )
+        expected_hash = str(preview.get("preview_hash") or "")
+        if not preview_hash or preview_hash != expected_hash:
+            return Result.failure(
+                "temu_product_upload.preview_hash_mismatch",
+                "The Temu preview changed or its exact hash was not confirmed.",
+            )
+        submissions = _temu_state(self.repo, run_id, "submissions")
+        existing = submissions["items"].get(seed_id)
+        if isinstance(existing, dict) and existing.get("goods_id"):
+            return Result.success(
+                "temu_product_upload.already_submitted",
+                "This exact Temu product was already submitted; no duplicate request was sent.",
+                existing,
+            )
+        if isinstance(existing, dict) and existing.get("submission_attempted"):
+            return Result.failure(
+                "temu_product_upload.retry_blocked",
+                "The previous Temu request requires operator review before any retry.",
+                data=existing,
+            )
+        request = preview.get("temu_request")
+        if not isinstance(request, dict):
+            return Result.failure(
+                "temu_product_upload.preview_invalid",
+                "The saved Temu request is invalid; prepare it again.",
+            )
+        record = {
+            "platform": "temu",
+            "run_id": run_id,
+            "seed_id": seed_id,
+            "preview_hash": expected_hash,
+            "external_goods_id": request["goodsBasic"]["externalGoodsId"],
+            "explicit_confirmation": True,
+            "submission_attempted": True,
+            "status": "submitting",
+            "submitted_at": utc_now_iso(),
+        }
+        submissions["items"][seed_id] = record
+        self.repo.save_temu_upload_submissions(run_id, submissions)
+        try:
+            response = self.temu_seller_api.publish_product(
+                request,
+                explicit_confirmation=True,
+            )
+        except (TemuSellerApiError, ArithmeticError, TypeError, ValueError) as exc:
+            record.update(
+                status="failed",
+                last_error={
+                    "code": "temu_seller_api_failed",
+                    "message": str(exc),
+                },
+            )
+            submissions["items"][seed_id] = record
+            self.repo.save_temu_upload_submissions(run_id, submissions)
+            return Result.failure(
+                "temu_product_upload.seller_api_failed",
+                str(exc),
+                data=record,
+            )
+        record.update(
+            goods_id=response.get("goodsId"),
+            operation_key=response.get("operation_key"),
+            status_check_after_seconds=response.get("status_check_after_seconds"),
+            publication_confirmed=response.get("publication_confirmed") is True,
+            status="submitted",
+        )
+        submissions["items"][seed_id] = record
+        path = self.repo.save_temu_upload_submissions(run_id, submissions)
+        self.repo.append_run_event(
+            run_id,
+            "temu_product_upload.submitted",
+            "One hash-confirmed product was submitted through the Temu official API.",
+            {"seed_id": seed_id, "goods_id": record["goods_id"]},
+        )
+        return Result.success(
+            "temu_product_upload.submitted",
+            "The confirmed product was submitted to Temu.",
+            {**record, "submission_path": str(path)},
+        )
+
+    def refresh_temu_product_upload_status(
+        self,
+        run_id: str,
+        seed_id: str,
+    ) -> Result:
+        submissions = _temu_state(self.repo, run_id, "submissions")
+        record = submissions["items"].get(seed_id)
+        if not isinstance(record, dict) or not record.get("goods_id"):
+            return Result.failure(
+                "temu_product_upload.status_unavailable",
+                "No Temu goodsId is available for status lookup.",
+                data=record or {"run_id": run_id, "seed_id": seed_id},
+            )
+        try:
+            payload = self.temu_seller_api.query_product_status(
+                record["goods_id"]
+            )
+        except (TemuSellerApiError, TypeError, ValueError) as exc:
+            record["status_query_error"] = {
+                "code": "temu_status_query_failed",
+                "message": str(exc),
+            }
+            submissions["items"][seed_id] = record
+            self.repo.save_temu_upload_submissions(run_id, submissions)
+            return Result.failure(
+                "temu_product_upload.status_failed",
+                str(exc),
+                data=record,
+            )
+        record.pop("status_query_error", None)
+        record.update(
+            temu_status=payload,
+            status=_temu_status(payload),
+            status_checked_at=utc_now_iso(),
+        )
+        if record["status"] == "failed":
+            record["last_error"] = {
+                "code": "temu_product_rejected",
+                "message": _temu_error_message(payload),
+            }
+        submissions["items"][seed_id] = record
+        self.repo.save_temu_upload_submissions(run_id, submissions)
+        return Result.success(
+            "temu_product_upload.status_loaded",
+            "The latest Temu product status was loaded.",
             record,
         )
 
@@ -8131,6 +8357,184 @@ def _product_import_status(payload: dict[str, Any]) -> str:
     ):
         return "accepted_by_ozon"
     return "processing"
+
+
+def _optional_run_items(
+    path: Path,
+    loader: Callable[[], dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    if not path.exists():
+        return {}
+    items = loader().get("items")
+    return (
+        {
+            str(key): value
+            for key, value in items.items()
+            if isinstance(value, dict)
+        }
+        if isinstance(items, dict)
+        else {}
+    )
+
+
+def _temu_state(repo: FsRepo, run_id: str, kind: str) -> dict[str, Any]:
+    loader = (
+        repo.load_temu_upload_previews
+        if kind == "previews"
+        else repo.load_temu_upload_submissions
+    )
+    try:
+        payload = loader(run_id)
+    except FileNotFoundError:
+        payload = {}
+    items = payload.get("items")
+    return {
+        "schema_version": 1,
+        "platform": "temu",
+        "run_id": run_id,
+        **payload,
+        "items": items if isinstance(items, dict) else {},
+    }
+
+
+def _payload_sha256(payload: dict[str, Any]) -> str:
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _temu_request(run_id: str, item: dict[str, Any]) -> dict[str, Any]:
+    title = str(item.get("source_title") or "").strip()
+    image = str(item.get("bootstrap_image_url") or "").strip()
+    pricing = item.get("pricing_evidence") or {}
+    inputs = pricing.get("inputs") or {}
+    calculation = pricing.get("calculation") or {}
+    sku = item.get("supplier_selected_sku") or {}
+    stock = sku.get("stock") or {}
+    options = sku.get("selected_options") or {}
+    required = {
+        "title": title,
+        "locked image": image if item.get("bootstrap_image_ready") else "",
+        "price": calculation.get("listing_price_cny"),
+        "weight": inputs.get("package_weight_g"),
+        "length": inputs.get("package_length_cm"),
+        "width": inputs.get("package_width_cm"),
+        "height": inputs.get("package_height_cm"),
+        "stock": stock.get("quantity"),
+    }
+    missing = [name for name, value in required.items() if value in (None, "")]
+    if missing:
+        raise ValueError("Temu evidence is missing: " + ", ".join(missing) + ".")
+
+    def number(value: Any) -> str:
+        parsed = Decimal(str(value))
+        if parsed < 0:
+            raise ValueError("Temu numeric evidence cannot be negative.")
+        return format(parsed.normalize(), "f")
+
+    def external_id(prefix: str, *parts: Any) -> str:
+        value = "-".join(
+            re.sub(r"[^A-Za-z0-9_-]+", "-", str(part)).strip("-")
+            for part in parts
+            if str(part or "").strip()
+        )
+        return f"{prefix}-{value}"[:128]
+
+    variations = [
+        {"name": str(name)[:128], "value": str(value)[:128]}
+        for name, value in options.items()
+        if str(name).strip() and str(value).strip()
+    ][:5]
+    if not variations:
+        variations = [
+            {"name": "Model", "value": str(sku.get("raw_label") or "")[:128]}
+        ]
+    if not variations[0]["value"]:
+        raise ValueError("Temu SKU variation evidence is required.")
+    goods_id = external_id("OZV2", run_id, item.get("seed_id"))
+    price = {
+        "basePrice": {
+            "amount": number(calculation["listing_price_cny"]),
+            "currency": "CNY",
+        }
+    }
+    if calculation.get("old_price_cny") not in (None, ""):
+        price["listPrice"] = {
+            "amount": number(calculation["old_price_cny"]),
+            "currency": "CNY",
+        }
+    goods_basic = {
+        "externalGoodsId": goods_id,
+        "goodsName": title[:500],
+        "goodsCarouselImage": [image],
+        "productType": 1,
+    }
+    if item.get("category_path"):
+        goods_basic["extCatName"] = str(item["category_path"])[:500]
+    return {
+        "goodsBasic": goods_basic,
+        "attributes": [
+            {"name": str(name)[:128], "value": [str(value)[:128]]}
+            for name, value in list(options.items())[:200]
+            if str(name).strip() and str(value).strip()
+        ],
+        "skuList": [
+            {
+                "externalSkuId": external_id(
+                    "OZV2-SKU",
+                    run_id,
+                    item.get("seed_id"),
+                    sku.get("supplier_sku_id"),
+                ),
+                "images": [image],
+                "price": price,
+                "variations": variations,
+                "quantity": max(0, int(Decimal(str(stock["quantity"])))),
+                "packageInfo": {
+                    "weight": number(inputs["package_weight_g"]),
+                    "length": number(inputs["package_length_cm"]),
+                    "width": number(inputs["package_width_cm"]),
+                    "height": number(inputs["package_height_cm"]),
+                },
+            }
+        ],
+    }
+
+
+def _temu_status(payload: dict[str, Any]) -> str:
+    text = json.dumps(payload, ensure_ascii=False).casefold()
+    if any(token in text for token in ("reject", "declin", "fail", "error")):
+        return "failed"
+    if any(token in text for token in ("publish", "on_sale", "onsale", "active")):
+        return "published"
+    return "draft" if "draft" in text else "processing"
+
+
+def _temu_error_message(payload: Any) -> str:
+    messages: list[str] = []
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if (
+                str(key).casefold()
+                in {"errormsg", "message", "reason", "rejectreason"}
+                and isinstance(value, str)
+                and value.strip()
+            ):
+                messages.append(value.strip())
+            elif isinstance(value, (dict, list)):
+                nested = _temu_error_message(value)
+                if nested != "Temu product was rejected.":
+                    messages.append(nested)
+    elif isinstance(payload, list):
+        for value in payload:
+            nested = _temu_error_message(value)
+            if nested != "Temu product was rejected.":
+                messages.append(nested)
+    return " · ".join(dict.fromkeys(messages))[:500] or "Temu product was rejected."
 
 
 def _required_not_applicable_fields(
