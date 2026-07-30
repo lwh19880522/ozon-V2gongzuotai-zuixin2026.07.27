@@ -121,6 +121,60 @@ class WorkbenchService:
             public_media_publisher or CloudflareR2MediaPublisher()
         )
         self._upload_state_lock = threading.RLock()
+        self._run_mutation_locks_guard = threading.Lock()
+        self._run_mutation_locks: dict[str, threading.RLock] = {}
+
+    def _run_mutation_lock(self, run_id: str) -> threading.RLock:
+        with self._run_mutation_locks_guard:
+            return self._run_mutation_locks.setdefault(run_id, threading.RLock())
+
+    @staticmethod
+    def _browser_dispatch_token(run: dict[str, Any]) -> str:
+        return str(run.get("browser_task_resumed_at") or run.get("created_at") or "").strip()
+
+    def _reject_stale_stage_result(
+        self,
+        run_id: str,
+        stage: str,
+        run: dict[str, Any],
+        errors: list[str],
+    ) -> Result:
+        event = self.repo.append_run_event(
+            run_id,
+            f"{stage}.ingest_stale",
+            "Browser result was rejected because its collection contract is no longer current.",
+            {"errors": errors},
+        )
+        return Result.failure(
+            f"workbench.{stage}_stale_result",
+            "The browser result belongs to an outdated collection contract and was not saved.",
+            errors=errors,
+            data=self._response_payload(run, event),
+        )
+
+    def _stage_snapshot_errors(
+        self,
+        *,
+        run: dict[str, Any],
+        expected_state: WorkbenchState,
+        expected_seed_ids: list[str],
+        current_seed_ids: list[str],
+        expected_dispatch_token: str,
+        payload_dispatch_token: str,
+    ) -> list[str]:
+        errors: list[str] = []
+        if WorkbenchState(run["status"]) != expected_state:
+            errors.append(
+                f"batch status changed from {expected_state.value} to {run['status']}"
+            )
+        if current_seed_ids != expected_seed_ids:
+            errors.append("sampled seed ids changed while the browser result was being processed")
+        current_dispatch_token = self._browser_dispatch_token(run)
+        if current_dispatch_token != expected_dispatch_token:
+            errors.append("browser dispatch token changed while the result was being processed")
+        if payload_dispatch_token and payload_dispatch_token != current_dispatch_token:
+            errors.append("browser result dispatch token is stale")
+        return errors
 
     def start_batch(self, target_count: int) -> Result:
         if target_count <= 0:
@@ -213,6 +267,21 @@ class WorkbenchService:
         )
 
     def replace_exhausted_attribute_template_seed(
+        self,
+        run_id: str,
+        rejected_seed_id: str,
+        reason: str,
+        random_seed: int | None = None,
+    ) -> Result:
+        with self._run_mutation_lock(run_id):
+            return self._replace_exhausted_attribute_template_seed(
+                run_id,
+                rejected_seed_id,
+                reason,
+                random_seed=random_seed,
+            )
+
+    def _replace_exhausted_attribute_template_seed(
         self,
         run_id: str,
         rejected_seed_id: str,
@@ -314,6 +383,15 @@ class WorkbenchService:
                 "Attribute template result is only accepted while status is attribute_template_collecting.",
                 data=self._response_payload(run, event),
             )
+        dispatch_token = self._browser_dispatch_token(run)
+        payload_dispatch_token = str(payload.get("dispatch_token") or "").strip()
+        if payload_dispatch_token and payload_dispatch_token != dispatch_token:
+            return self._reject_stale_stage_result(
+                run_id,
+                "attribute_template",
+                run,
+                ["browser result dispatch token is stale"],
+            )
         seeds = self._safe_load_sampled_seeds(run_id)
         all_seed_ids = [seed.seed_id for seed in seeds]
         expected_seed_ids = self._pending_or_all_seed_ids(
@@ -364,49 +442,70 @@ class WorkbenchService:
                 errors=seller_schema_errors,
                 data=self._response_payload(run, event),
             )
-        if run.get("replacement_pending_seed_ids"):
-            try:
-                existing_payload = self.repo.load_attribute_template_result(run_id)
-            except FileNotFoundError:
-                existing_payload = {}
-            pending_ids = set(expected_seed_ids)
-            retained_templates = [
-                item
-                for item in existing_payload.get("seed_templates", [])
-                if isinstance(item, dict) and str(item.get("seed_id") or "") not in pending_ids
+        with self._run_mutation_lock(run_id):
+            current_run = self.repo.load_run(run_id)
+            current_seed_ids = [
+                seed.seed_id for seed in self._safe_load_sampled_seeds(run_id)
             ]
-            payload = {**payload, "seed_templates": retained_templates + list(payload.get("seed_templates", []))}
-            merged_errors = validate_attribute_template_result(payload, all_seed_ids, require_seller_schema=True)
-            if merged_errors:
-                event = self.repo.append_run_event(
+            stale_errors = self._stage_snapshot_errors(
+                run=current_run,
+                expected_state=WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTING,
+                expected_seed_ids=all_seed_ids,
+                current_seed_ids=current_seed_ids,
+                expected_dispatch_token=dispatch_token,
+                payload_dispatch_token=payload_dispatch_token,
+            )
+            if stale_errors:
+                return self._reject_stale_stage_result(
                     run_id,
-                    "attribute_template.merge_invalid",
-                    "Replacement attribute template could not be merged with retained evidence.",
-                    {"errors": merged_errors},
+                    "attribute_template",
+                    current_run,
+                    stale_errors,
                 )
-                return Result.failure(
-                    "workbench.attribute_template_merge_invalid",
-                    "Replacement attribute template could not be merged with retained evidence.",
-                    errors=merged_errors,
-                    data=self._response_payload(run, event),
-                )
-        result_path = self.repo.save_attribute_template_result(run_id, payload)
-        current = WorkbenchState(run["status"])
-        run["status"] = transition_workbench_state(current, WorkbenchAction.MARK_ATTRIBUTE_TEMPLATE_COLLECTED).value
-        run["attribute_template_collected"] = True
-        run["attribute_template_result_path"] = str(result_path)
-        self.repo.save_run(run)
-        event = self.repo.append_run_event(
-            run_id,
-            "attribute_template.ingested",
-            "Attribute template result was ingested and the template gate is complete.",
-            {"result_path": str(result_path), "seed_count": len(expected_seed_ids)},
-        )
-        return Result.success(
-            "workbench.attribute_template_ingested",
-            "Attribute template result was ingested and the template gate is complete.",
-            self._response_payload(run, event),
-        )
+            run = current_run
+            if run.get("replacement_pending_seed_ids"):
+                try:
+                    existing_payload = self.repo.load_attribute_template_result(run_id)
+                except FileNotFoundError:
+                    existing_payload = {}
+                pending_ids = set(expected_seed_ids)
+                retained_templates = [
+                    item
+                    for item in existing_payload.get("seed_templates", [])
+                    if isinstance(item, dict) and str(item.get("seed_id") or "") not in pending_ids
+                ]
+                payload = {**payload, "seed_templates": retained_templates + list(payload.get("seed_templates", []))}
+                merged_errors = validate_attribute_template_result(payload, all_seed_ids, require_seller_schema=True)
+                if merged_errors:
+                    event = self.repo.append_run_event(
+                        run_id,
+                        "attribute_template.merge_invalid",
+                        "Replacement attribute template could not be merged with retained evidence.",
+                        {"errors": merged_errors},
+                    )
+                    return Result.failure(
+                        "workbench.attribute_template_merge_invalid",
+                        "Replacement attribute template could not be merged with retained evidence.",
+                        errors=merged_errors,
+                        data=self._response_payload(run, event),
+                    )
+            result_path = self.repo.save_attribute_template_result(run_id, payload)
+            current = WorkbenchState(run["status"])
+            run["status"] = transition_workbench_state(current, WorkbenchAction.MARK_ATTRIBUTE_TEMPLATE_COLLECTED).value
+            run["attribute_template_collected"] = True
+            run["attribute_template_result_path"] = str(result_path)
+            self.repo.save_run(run)
+            event = self.repo.append_run_event(
+                run_id,
+                "attribute_template.ingested",
+                "Attribute template result was ingested and the template gate is complete.",
+                {"result_path": str(result_path), "seed_count": len(expected_seed_ids)},
+            )
+            return Result.success(
+                "workbench.attribute_template_ingested",
+                "Attribute template result was ingested and the template gate is complete.",
+                self._response_payload(run, event),
+            )
 
     def _attach_seller_attribute_templates(self, payload: dict[str, Any]) -> dict[str, Any]:
         enriched = dict(payload)
@@ -984,6 +1083,15 @@ class WorkbenchService:
                 "Ozon collection result is only accepted while status is ozon_collecting.",
                 data=self._response_payload(run, event),
             )
+        dispatch_token = self._browser_dispatch_token(run)
+        payload_dispatch_token = str(payload.get("dispatch_token") or "").strip()
+        if payload_dispatch_token and payload_dispatch_token != dispatch_token:
+            return self._reject_stale_stage_result(
+                run_id,
+                "ozon_collection",
+                run,
+                ["browser result dispatch token is stale"],
+            )
         seeds = self._safe_load_sampled_seeds(run_id)
         all_seed_ids = [seed.seed_id for seed in seeds]
         expected_seed_ids = self._pending_or_all_seed_ids(
@@ -1029,56 +1137,77 @@ class WorkbenchService:
                 errors=errors,
                 data=self._response_payload(run, event),
             )
-        if run.get("replacement_pending_seed_ids"):
-            try:
-                existing_payload = self.repo.load_ozon_collection_result(run_id)
-            except FileNotFoundError:
-                existing_payload = {}
-            pending_ids = set(expected_seed_ids)
-            retained_candidates = [
-                item
-                for item in existing_payload.get("ozon_candidates", [])
-                if isinstance(item, dict) and str(item.get("seed_id") or "") not in pending_ids
+        with self._run_mutation_lock(run_id):
+            current_run = self.repo.load_run(run_id)
+            current_seed_ids = [
+                seed.seed_id for seed in self._safe_load_sampled_seeds(run_id)
             ]
-            payload = {**payload, "ozon_candidates": retained_candidates + list(payload.get("ozon_candidates", []))}
-            merged_errors = validate_ozon_collection_result(payload, all_seed_ids)
-            if merged_errors:
-                event = self.repo.append_run_event(
+            stale_errors = self._stage_snapshot_errors(
+                run=current_run,
+                expected_state=WorkbenchState.OZON_COLLECTING,
+                expected_seed_ids=all_seed_ids,
+                current_seed_ids=current_seed_ids,
+                expected_dispatch_token=dispatch_token,
+                payload_dispatch_token=payload_dispatch_token,
+            )
+            if stale_errors:
+                return self._reject_stale_stage_result(
                     run_id,
-                    "ozon_collection.merge_invalid",
-                    "Replacement Ozon result could not be merged with retained evidence.",
-                    {"errors": merged_errors},
+                    "ozon_collection",
+                    current_run,
+                    stale_errors,
                 )
-                return Result.failure(
-                    "workbench.ozon_collection_merge_invalid",
-                    "Replacement Ozon result could not be merged with retained evidence.",
-                    errors=merged_errors,
-                    data=self._response_payload(run, event),
-                )
-        result_path = self.repo.save_ozon_collection_result(run_id, payload)
-        current = WorkbenchState(run["status"])
-        run["status"] = transition_workbench_state(current, WorkbenchAction.MARK_OZON_COLLECTED).value
-        run["ozon_collected"] = True
-        run["ozon_collection_result_path"] = str(result_path)
-        run.pop("replacement_pending_seed_ids", None)
-        review = self._build_supplier_review(run_id, payload)
-        review_path = self.repo.save_supplier_review(run_id, review)
-        run["supplier_review_path"] = str(review_path)
-        run["status"] = transition_workbench_state(
-            WorkbenchState(run["status"]), WorkbenchAction.OPEN_SUPPLIER_REVIEW
-        ).value
-        self.repo.save_run(run)
-        event = self.repo.append_run_event(
-            run_id,
-            "ozon_collection.ingested",
-            "Ozon collection result was ingested and the Ozon gate is complete.",
-            {"result_path": str(result_path), "candidate_count": len(payload.get("ozon_candidates", []))},
-        )
-        return Result.success(
-            "workbench.ozon_collection_ingested",
-            "Ozon collection result was ingested and the Ozon gate is complete.",
-            self._response_payload(run, event),
-        )
+            run = current_run
+            if run.get("replacement_pending_seed_ids"):
+                try:
+                    existing_payload = self.repo.load_ozon_collection_result(run_id)
+                except FileNotFoundError:
+                    existing_payload = {}
+                pending_ids = set(expected_seed_ids)
+                retained_candidates = [
+                    item
+                    for item in existing_payload.get("ozon_candidates", [])
+                    if isinstance(item, dict) and str(item.get("seed_id") or "") not in pending_ids
+                ]
+                payload = {**payload, "ozon_candidates": retained_candidates + list(payload.get("ozon_candidates", []))}
+                merged_errors = validate_ozon_collection_result(payload, all_seed_ids)
+                if merged_errors:
+                    event = self.repo.append_run_event(
+                        run_id,
+                        "ozon_collection.merge_invalid",
+                        "Replacement Ozon result could not be merged with retained evidence.",
+                        {"errors": merged_errors},
+                    )
+                    return Result.failure(
+                        "workbench.ozon_collection_merge_invalid",
+                        "Replacement Ozon result could not be merged with retained evidence.",
+                        errors=merged_errors,
+                        data=self._response_payload(run, event),
+                    )
+            result_path = self.repo.save_ozon_collection_result(run_id, payload)
+            current = WorkbenchState(run["status"])
+            run["status"] = transition_workbench_state(current, WorkbenchAction.MARK_OZON_COLLECTED).value
+            run["ozon_collected"] = True
+            run["ozon_collection_result_path"] = str(result_path)
+            run.pop("replacement_pending_seed_ids", None)
+            review = self._build_supplier_review(run_id, payload)
+            review_path = self.repo.save_supplier_review(run_id, review)
+            run["supplier_review_path"] = str(review_path)
+            run["status"] = transition_workbench_state(
+                WorkbenchState(run["status"]), WorkbenchAction.OPEN_SUPPLIER_REVIEW
+            ).value
+            self.repo.save_run(run)
+            event = self.repo.append_run_event(
+                run_id,
+                "ozon_collection.ingested",
+                "Ozon collection result was ingested and the Ozon gate is complete.",
+                {"result_path": str(result_path), "candidate_count": len(payload.get("ozon_candidates", []))},
+            )
+            return Result.success(
+                "workbench.ozon_collection_ingested",
+                "Ozon collection result was ingested and the Ozon gate is complete.",
+                self._response_payload(run, event),
+            )
 
     def supplier_review(self, run_id: str) -> Result:
         run = self.repo.load_run(run_id)

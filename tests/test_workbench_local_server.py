@@ -2209,7 +2209,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
     def test_extension_manifest_registers_1688_supplier_content_script(self) -> None:
         manifest_path = self.project_root / "browser_extension" / "ozon_v2_bridge" / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self.assertEqual("0.1.63", manifest["version"])
+        self.assertEqual("0.1.64", manifest["version"])
 
         supplier_scripts = [
             item
@@ -2227,6 +2227,8 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn("seed_id: seedId", content)
         self.assertIn("state.dispatchToken === dispatchToken", content)
         self.assertIn("dispatchToken: task.data.dispatch_token", content)
+        self.assertIn("dispatch_token: dispatchToken", content)
+        self.assertIn("dispatch_token: state.dispatchToken", content)
 
     def test_runner_stop_cancels_current_browser_task(self) -> None:
         seed = SeedProduct(
