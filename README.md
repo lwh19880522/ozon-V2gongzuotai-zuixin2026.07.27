@@ -9,6 +9,13 @@
 - [详细安装说明](docs/INSTALLATION.md)
 - [完整使用流程](docs/USER_GUIDE.md)
 - [干净发布与隐私边界](docs/RELEASE_AND_PRIVACY.md)
+- [Temu 官方 API 操作说明](docs/temu/README.md)
+
+## Temu 常规店铺通道
+
+工作台现在包含一条与 Ozon 上传隔离的 Temu 官方 API 通道，当前边界按常规店铺设计，不依赖海外仓，也不包含半托管流程。操作员先生成无密钥预览，核对后必须同时提交 `confirmed=true` 和该预览的精确 SHA-256 哈希，工作台才会尝试调用 `temu.local.goods.v3.add`；返回 `goodsId` 只代表商品已创建，不代表已经发布，后续还要通过 `temu.local.goods.list.retrieve` 查询官方状态。
+
+真实请求默认保持关闭。只有本机已配置真实 Temu 授权凭据，并注入经过批准的签名提供器时，提交才可能发出；不要在仓库、预览、日志或诊断信息中填写或保存密钥。完整配置、授权、确认、状态查询和错误恢复流程见 [Temu 官方 API 操作说明](docs/temu/README.md)。
 
 ## 组件一览
 

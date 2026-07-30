@@ -33,6 +33,7 @@ venv/
 /.codex_spreadsheet_probe/
 /.superpowers/
 /.worktrees/
+/.inception/
 /.artifacts/
 /artifacts/
 /.wrangler/
