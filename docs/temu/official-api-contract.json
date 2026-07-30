@@ -1,0 +1,196 @@
+{
+  "contract_version": 1,
+  "captured_at": "2026-07-30",
+  "source": {
+    "kind": "official_temu_partner_documentation",
+    "platform": "Temu Partner Platform for GLOBAL",
+    "documents": [
+      {
+        "title": "Partner Platform",
+        "url": "https://partner.temu.com/login",
+        "evidence": [
+          "Developers create and publish an app on the Partner Platform.",
+          "Sellers authorize the app before it manages products and orders."
+        ]
+      },
+      {
+        "title": "Product Publishing API V3 Integration Guide",
+        "url": "https://partner.temu.com/documentation?menu_code=fb16b05f7a904765aac4af3a24b87d4a&sub_menu_code=d2be183c4ebe4f06b232792f0ee53310",
+        "last_update_time": "2026-07-21 19:26:04"
+      },
+      {
+        "title": "temu.local.goods.v3.add",
+        "url": "https://partner.temu.com/documentation?menu_code=fb16b05f7a904765aac4af3a24b87d4a&sub_menu_code=419748d505a3483f8d210d978cb813f8",
+        "last_update_time": "2026-07-07 22:35:08"
+      }
+    ]
+  },
+  "authentication": {
+    "authorization_model": "partner_app_authorized_by_seller",
+    "permission_package": "Local Product Management",
+    "app_types": [
+      "private",
+      "public"
+    ],
+    "request": {
+      "method": "POST",
+      "url": "https://openapi-b-global.temu.com/openapi/router",
+      "content_type": "application/json",
+      "required_common_parameters": {
+        "type": "API method name",
+        "app_key": "Partner Platform application key",
+        "access_token": "Secure token issued for access control after seller authorization",
+        "sign": "Request signature",
+        "timestamp": "Ten-digit Unix time in seconds, accepted from 300 seconds before to 300 seconds after the current time"
+      },
+      "optional_common_parameters": {
+        "data_type": "JSON response format",
+        "version": "API version; the official method page states that V1 is the default when a version is not required"
+      }
+    },
+    "signature_boundary": {
+      "official_public_method_page_confirms": [
+        "The sign parameter is required."
+      ],
+      "implementation_rule": "A live request is rejected locally unless an approved signature provider for the authorized Partner app is configured.",
+      "secret_rule": "Application secrets and access tokens are read only from local runtime configuration and are excluded from payload previews, logs, diagnostics, and source control."
+    }
+  },
+  "category_and_attributes": {
+    "category_input": {
+      "field": "goodsBasic.extCatName",
+      "required": false,
+      "maximum_length": 500,
+      "behavior": "The V3 service recommends a Temu category from the external category name, so the V3 guide says bg.local.goods.cats.get is not required for this flow."
+    },
+    "attributes": {
+      "field": "attributes",
+      "required": false,
+      "maximum_items": 200,
+      "item": {
+        "name_maximum_length": 128,
+        "value_shape": "string array",
+        "value_maximum_length": 128,
+        "maximum_values_per_attribute": 1000
+      },
+      "behavior": "The V3 service maps external attribute names and values; the guide says the older attribute-template endpoints are not required for this flow."
+    },
+    "variations": {
+      "field": "skuList[].variations",
+      "required": true,
+      "maximum_items_per_sku": 5,
+      "name_maximum_length": 128,
+      "value_maximum_length": 128
+    }
+  },
+  "product_publish": {
+    "method": "temu.local.goods.v3.add",
+    "request_root": {
+      "language": "Optional source-language hint",
+      "goodsBasic": "Required basic product object on the method page",
+      "attributes": "Optional external attribute array",
+      "skuList": "Required SKU array with at least one item and at most 500 items"
+    },
+    "required_fields": [
+      "goodsBasic.externalGoodsId",
+      "goodsBasic.goodsName",
+      "skuList[].externalSkuId",
+      "skuList[].images",
+      "skuList[].price.basePrice.amount",
+      "skuList[].price.basePrice.currency",
+      "skuList[].quantity",
+      "skuList[].packageInfo.weight",
+      "skuList[].packageInfo.length",
+      "skuList[].packageInfo.width",
+      "skuList[].packageInfo.height",
+      "skuList[].variations"
+    ],
+    "field_constraints": {
+      "goodsBasic.externalGoodsId": {
+        "maximum_length": 128,
+        "unique_within_store": true
+      },
+      "goodsBasic.goodsName": {
+        "maximum_length": 500
+      },
+      "goodsBasic.goodsDesc": {
+        "required": false,
+        "maximum_length": 10000,
+        "rich_text_supported": true
+      },
+      "goodsBasic.goodsCarouselImage": {
+        "required": false,
+        "maximum_items": 10,
+        "transport": "Public image URLs are downloaded and stored by Temu."
+      },
+      "goodsBasic.detailImage": {
+        "required": false,
+        "maximum_items": 50,
+        "transport": "Public image URLs are downloaded and stored by Temu."
+      },
+      "goodsBasic.productType": {
+        "required": false,
+        "values": {
+          "1": "Normal",
+          "2": "Custom",
+          "3": "MTO",
+          "4": "Second-hand"
+        },
+        "normal_store_default": 1
+      },
+      "skuList": {
+        "maximum_items": 500
+      },
+      "skuList[].externalSkuId": {
+        "maximum_length": 128,
+        "unique_within_store": true
+      },
+      "skuList[].images": {
+        "maximum_items": 10,
+        "transport": "Public image URLs are downloaded and stored by Temu."
+      },
+      "skuList[].price": {
+        "amount_type": "string",
+        "site_specific_rule": "Currency, precision, and minimum or maximum amount must meet the destination site's requirements."
+      },
+      "skuList[].packageInfo": {
+        "value_type": "numeric string without a unit",
+        "weight_unit": "g",
+        "dimension_unit": "cm"
+      }
+    },
+    "response": {
+      "success": "boolean",
+      "errorCode": "integer",
+      "errorMsg": "string",
+      "result.goodsId": "Temu product identifier",
+      "result.externalGoodsId": "Merchant external product identifier"
+    },
+    "creation_semantics": "A returned goodsId confirms product creation only; it does not confirm that publication requirements are satisfied.",
+    "idempotency": {
+      "product_key": "goodsBasic.externalGoodsId",
+      "sku_key": "skuList[].externalSkuId",
+      "rule": "The workbench must persist both external identifiers before submission and must block reuse within the same store."
+    }
+  },
+  "status_query": {
+    "recommended_delay_seconds": 600,
+    "official_methods": [
+      "bg.local.goods.list.query",
+      "temu.local.goods.list.retrieve"
+    ],
+    "selected_method": "temu.local.goods.list.retrieve",
+    "lookup_key": "goodsId returned by temu.local.goods.v3.add",
+    "known_processing_statuses": {
+      "Draft": "Product information is incomplete and cannot be submitted for publication.",
+      "Incomplete": "Product information is complete, has been automatically submitted for review, and is waiting for the platform review result."
+    },
+    "operator_rule": "Keep the submission pending until an official status-query response is recorded; do not equate request success with publication."
+  },
+  "safety": {
+    "live_publish_requires_explicit_confirmation": true,
+    "previews_must_be_secret_free": true,
+    "ozon_credentials_are_not_reused": true,
+    "ozon_adapter_is_not_modified": true
+  }
+}
