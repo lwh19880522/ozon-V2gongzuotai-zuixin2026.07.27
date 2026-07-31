@@ -19,6 +19,9 @@
   let managedDragListenersInstalled = false;
   let referencePreparationPromise = null;
   let referencePreparationKey = "";
+  let referenceRejectionHandling = false;
+  let lastRecognitionFailureText = "";
+  const managedImageSearchReplayTargets = new WeakSet();
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -963,6 +966,45 @@
     return detailUrlFromEvent(event);
   }
 
+  function imageSearchSubmitFromEvent(event) {
+    if (!event || event.defaultPrevented || event.button !== 0) return null;
+    const target = event.target && typeof event.target.closest === "function"
+      ? event.target.closest("button, [role='button'], a")
+      : null;
+    if (!target) return null;
+    const label = textOf(target, 80).replace(/\s+/g, "");
+    return /^(?:搜索图片|鎼滅储鍥剧墖)$/i.test(label) ? target : null;
+  }
+
+  async function acquireSupplierNavigationLease() {
+    const status = document.getElementById("ozon-v2-supplier-status");
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      const lease = await chrome.runtime.sendMessage({
+        type: "ozon_v2_supplier_navigation_intent",
+      }).catch((error) => ({
+        ok: false,
+        code: "supplier_selection.navigation_message_failed",
+        error: error && error.message ? error.message : String(error),
+      }));
+      if (lease && lease.ok === true && lease.granted !== false) return true;
+      if (!lease || lease.code !== "supplier_selection.navigation_busy") return false;
+      if (status) status.textContent = "正在等待上一通道完成图片搜索 (Waiting for Previous Lane)";
+      await sleep(500);
+    }
+    return false;
+  }
+
+  async function submitManagedImageSearch(target) {
+    if (!target || !await acquireSupplierNavigationLease()) {
+      const status = document.getElementById("ozon-v2-supplier-status");
+      if (status) status.textContent = "图片搜索通道暂不可用，请重试 (Search Lane Unavailable)";
+      return false;
+    }
+    managedImageSearchReplayTargets.add(target);
+    target.click();
+    return true;
+  }
+
   function installManagedSameTabNavigation() {
     if (managedNavigationInstalled) return;
     managedNavigationInstalled = true;
@@ -977,6 +1019,17 @@
       }).catch(() => null);
     }, true);
     document.addEventListener("click", (event) => {
+      const imageSearchSubmit = imageSearchSubmitFromEvent(event);
+      if (imageSearchSubmit) {
+        if (managedImageSearchReplayTargets.has(imageSearchSubmit)) {
+          managedImageSearchReplayTargets.delete(imageSearchSubmit);
+          return;
+        }
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        submitManagedImageSearch(imageSearchSubmit).catch(() => null);
+        return;
+      }
       const detailUrl = managedDetailUrl(event);
       if (!detailUrl) return;
       event.preventDefault();
@@ -987,6 +1040,29 @@
 
   function referencePreparedStateKey(binding) {
     return `ozon_v2_reference_prepared_${binding.run_id}_${binding.seed_id}`;
+  }
+
+  function referenceImageIndexStateKey(binding) {
+    return `ozon_v2_reference_index_${binding.run_id}_${binding.seed_id}`;
+  }
+
+  function referenceImageCandidates(binding) {
+    const values = [
+      ...(Array.isArray(binding && binding.reference_image_urls) ? binding.reference_image_urls : []),
+      binding && binding.reference_image_url,
+    ];
+    return values.reduce((urls, value) => {
+      const url = String(value || "").trim();
+      if (/^https:\/\//i.test(url) && !urls.includes(url)) urls.push(url);
+      return urls;
+    }, []);
+  }
+
+  function referenceImageIndex(binding, candidateCount) {
+    const stored = globalThis.sessionStorage
+      ? Number.parseInt(globalThis.sessionStorage.getItem(referenceImageIndexStateKey(binding)) || "0", 10)
+      : 0;
+    return Number.isInteger(stored) && stored >= 0 && stored < candidateCount ? stored : 0;
   }
 
   function clampManagedPanelPosition(panel, position) {
@@ -1258,6 +1334,13 @@
         if (!document.getElementById("ozon-v2-supplier-panel")) {
           scheduleManagedPanelReconcile(100);
         }
+        const rejectionText = imageRecognitionFailureText();
+        if (!rejectionText) {
+          lastRecognitionFailureText = "";
+        } else if (rejectionText !== lastRecognitionFailureText) {
+          lastRecognitionFailureText = rejectionText;
+          handleReferenceImageRejection(activeManagedBinding).catch(() => null);
+        }
       });
       managedPanelObserver.observe(document.documentElement, { childList: true, subtree: true });
     }
@@ -1267,6 +1350,19 @@
     return document.querySelector(
       "input[type='file'][accept*='image'], input[type='file'][accept*='jpg'], .image-search-upload input[type='file']"
     );
+  }
+
+  function imageRecognitionFailureText() {
+    const pattern = /(?:无法识别|识别失败|换一张图片|unable to recognize|image recognition failed)/i;
+    const nodes = document.querySelectorAll(
+      "[role='alert'], [class*='toast'], [class*='message'], [class*='notice'], [class*='error']"
+    );
+    for (const node of nodes) {
+      if (!visibleEvidenceNode(node)) continue;
+      const text = textOf(node, 300);
+      if (pattern.test(text)) return text;
+    }
+    return "";
   }
 
   function findImageSearchLauncher() {
@@ -1292,8 +1388,8 @@
     return input;
   }
 
-  async function uploadReferenceImage(binding) {
-    if (!is1688HomePage() || !binding.reference_image_url) {
+  async function uploadReferenceImage(binding, referenceImageUrl = binding && binding.reference_image_url) {
+    if (!is1688HomePage() || !referenceImageUrl) {
       return { ok: false, reason: "not_home_or_missing_reference" };
     }
     let input = findUploadInput();
@@ -1307,7 +1403,7 @@
     }
     const response = await chrome.runtime.sendMessage({
       type: "ozon_v2_fetch_reference_image",
-      url: binding.reference_image_url,
+      url: referenceImageUrl,
     });
     if (!response || !response.ok || !Array.isArray(response.bytes)) {
       return { ok: false, reason: "reference_fetch_failed" };
@@ -1318,21 +1414,6 @@
       `ozon-${binding.ozon_product_id || binding.seed_id}.jpg`,
       { type: response.contentType || "image/jpeg" },
     ));
-    const navigationLease = await chrome.runtime.sendMessage({
-      type: "ozon_v2_supplier_navigation_intent",
-    }).catch((error) => ({
-      ok: false,
-      code: "supplier_selection.navigation_message_failed",
-      error: error && error.message ? error.message : String(error),
-    }));
-    if (!navigationLease || navigationLease.ok !== true || navigationLease.granted === false) {
-      return {
-        ok: false,
-        reason: navigationLease && (navigationLease.code || navigationLease.error)
-          ? [navigationLease.code, navigationLease.error].filter(Boolean).join(": ")
-          : "supplier_selection.navigation_lease_failed",
-      };
-    }
     input.files = transfer.files;
     input.dispatchEvent(new Event("input", { bubbles: true }));
     input.dispatchEvent(new Event("change", { bubbles: true }));
@@ -1340,11 +1421,13 @@
   }
 
   async function prepareReferenceImage(binding) {
-    if (!is1688HomePage() || !binding.reference_image_url) return false;
+    const candidates = referenceImageCandidates(binding);
+    if (!is1688HomePage() || !candidates.length) return false;
     const status = document.getElementById("ozon-v2-supplier-status");
     const preparedKey = `ozon_v2_reference_prepared_${binding.run_id}_${binding.seed_id}`;
+    const selectedIndex = referenceImageIndex(binding, candidates.length);
     if (globalThis.sessionStorage && globalThis.sessionStorage.getItem(preparedKey) === "true") {
-      if (status) status.textContent = "参考图已输入，请点击 1688 搜索图片 (Image Ready)";
+      if (status) status.textContent = `参考图 ${selectedIndex + 1}/${candidates.length} 已输入，等待 1688 识图 (Image Ready)`;
       return true;
     }
     let lastReason = "";
@@ -1352,18 +1435,13 @@
     while (attempt <= REFERENCE_UPLOAD_ATTEMPTS && is1688HomePage()) {
       if (status) status.textContent = `正在输入参考图 ${attempt}/${REFERENCE_UPLOAD_ATTEMPTS} (Preparing Image)`;
       try {
-        const result = await uploadReferenceImage(binding);
+        const result = await uploadReferenceImage(binding, candidates[selectedIndex]);
         if (result.ok) {
           if (globalThis.sessionStorage) globalThis.sessionStorage.setItem(preparedKey, "true");
-          if (status) status.textContent = "参考图已输入，请点击 1688 搜索图片 (Image Ready)";
+          if (status) status.textContent = `参考图 ${selectedIndex + 1}/${candidates.length} 已输入，等待 1688 识图 (Image Ready)`;
           return true;
         }
         lastReason = result.reason || "upload_failed";
-        if (lastReason === "supplier_selection.navigation_busy") {
-          if (status) status.textContent = "正在等待上一通道完成图片搜索 (Waiting for Previous Lane)";
-          await sleep(500);
-          continue;
-        }
       } catch (error) {
         lastReason = error && error.message ? error.message : String(error);
       }
@@ -1381,6 +1459,40 @@
       details: { channel_index: binding.channel_index, seed_id: binding.seed_id, reason: lastReason },
     });
     return false;
+  }
+
+  async function handleReferenceImageRejection(binding = activeManagedBinding) {
+    if (referenceRejectionHandling || !binding) return false;
+    referenceRejectionHandling = true;
+    try {
+      await chrome.runtime.sendMessage({
+        type: "ozon_v2_supplier_navigation_release",
+      }).catch(() => null);
+      const candidates = referenceImageCandidates(binding);
+      const currentIndex = referenceImageIndex(binding, candidates.length);
+      const preparedKey = referencePreparedStateKey(binding);
+      if (globalThis.sessionStorage) globalThis.sessionStorage.removeItem(preparedKey);
+      const nextIndex = currentIndex + 1;
+      const status = document.getElementById("ozon-v2-supplier-status");
+      if (nextIndex >= candidates.length) {
+        if (status) status.textContent = "1688 未接受所有参考图，请手动更换图片 (Recognition Failed)";
+        await heartbeat({
+          run_id: binding.run_id,
+          stage: "supplier_reference_recognition_failed",
+          code: "browser_bridge.reference_recognition_failed",
+          message: "1688 rejected every available Ozon reference image.",
+          details: { channel_index: binding.channel_index, seed_id: binding.seed_id, candidate_count: candidates.length },
+        });
+        return false;
+      }
+      if (globalThis.sessionStorage) {
+        globalThis.sessionStorage.setItem(referenceImageIndexStateKey(binding), String(nextIndex));
+      }
+      if (status) status.textContent = `第 ${currentIndex + 1} 张未被接受，正在尝试第 ${nextIndex + 1} 张`;
+      return await prepareReferenceImage(binding);
+    } finally {
+      referenceRejectionHandling = false;
+    }
   }
 
   async function initializeManagedChannel() {

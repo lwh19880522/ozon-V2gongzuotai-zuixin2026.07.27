@@ -228,7 +228,7 @@ class WorkbenchService:
 
     def allowed_actions(self, run_id: str) -> Result:
         try:
-            run = self.repo.load_run(run_id)
+            run = self.recover_browser_task_state(run_id)
         except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
             return Result.failure(
                 "workbench.batch_not_found",
@@ -940,7 +940,7 @@ class WorkbenchService:
         )
 
     def restart_browser_task(self, run_id: str) -> Result:
-        run = self.repo.load_run(run_id)
+        run = self.recover_browser_task_state(run_id)
         run = self._recover_pending_supplier_replacement(run)
         status = WorkbenchState(run["status"])
         recapture_seed_ids = {
@@ -1215,7 +1215,7 @@ class WorkbenchService:
             )
 
     def supplier_review(self, run_id: str) -> Result:
-        run = self.repo.load_run(run_id)
+        run = self.recover_browser_task_state(run_id)
         try:
             review = self.repo.load_supplier_review(run_id)
         except FileNotFoundError:
@@ -4190,7 +4190,9 @@ class WorkbenchService:
         run_id: str,
         payload: dict[str, Any],
     ) -> Result:
-        run = self.repo.load_run(run_id)
+        run = self._restore_completed_ozon_collection_if_valid(
+            self.repo.load_run(run_id)
+        )
         status = WorkbenchState(run["status"])
         recapture_seed_ids = {
             str(value).strip()
@@ -5492,7 +5494,7 @@ class WorkbenchService:
                     "Autopilot stopped before the next state transition.",
                     history,
                 )
-            run = self.repo.load_run(run_id)
+            run = self.recover_browser_task_state(run_id)
             run = self._recover_pending_supplier_replacement(run)
             state = WorkbenchState(run["status"])
             if state == WorkbenchState.CREATED:
@@ -6657,7 +6659,13 @@ class WorkbenchService:
             return all_seed_ids
         return pending_ids
 
-    def _build_supplier_review(self, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _build_supplier_review(
+        self,
+        run_id: str,
+        payload: dict[str, Any],
+        *,
+        preserve_created_at: bool = False,
+    ) -> dict[str, Any]:
         try:
             existing_review = self.repo.load_supplier_review(run_id)
         except FileNotFoundError:
@@ -6671,7 +6679,23 @@ class WorkbenchService:
         for candidate in payload.get("ozon_candidates", []):
             media = candidate.get("selected_sku_media") or {}
             selected_options = (candidate.get("target_sku") or {}).get("selected_options") or {}
-            images = media.get("selected_sku_images") or media.get("main_gallery_images") or []
+            raw_images = [
+                *(media.get("selected_sku_images") or []),
+                *(media.get("main_gallery_images") or []),
+            ]
+            images: list[str] = []
+            seen_image_keys: set[str] = set()
+            for raw_image in raw_images:
+                image_url = re.sub(r"/wc\d+/", "/", str(raw_image or "").strip())
+                if not image_url.startswith("https://"):
+                    continue
+                image_key = image_url.rsplit("/", 1)[-1].lower()
+                if not image_key or image_key in seen_image_keys:
+                    continue
+                seen_image_keys.add(image_key)
+                images.append(image_url)
+                if len(images) >= 5:
+                    break
             existing = existing_by_seed.get(str(candidate.get("seed_id") or ""), {})
             items.append(
                 {
@@ -6680,6 +6704,7 @@ class WorkbenchService:
                     "ozon_title": candidate.get("title"),
                     "ozon_url": candidate.get("ozon_url"),
                     "ozon_main_image": images[0] if images else None,
+                    "ozon_reference_images": images,
                     "selected_options": selected_options,
                     "dimension_evidence": self._dimension_evidence(selected_options, candidate.get("attributes") or {}),
                     "key_attributes": candidate.get("attributes") or {},
@@ -6688,7 +6713,75 @@ class WorkbenchService:
                     "verified_at": existing.get("verified_at"),
                 }
             )
-        return {"run_id": run_id, "items": items, "created_at": utc_now_iso(), "updated_at": utc_now_iso()}
+        now = utc_now_iso()
+        return {
+            "run_id": run_id,
+            "items": items,
+            "created_at": (
+                existing_review.get("created_at")
+                if preserve_created_at and existing_review.get("created_at")
+                else now
+            ),
+            "updated_at": now,
+        }
+
+    def recover_browser_task_state(self, run_id: str) -> dict[str, Any]:
+        with self._run_mutation_lock(run_id):
+            run = self.repo.load_run(run_id)
+            return self._restore_completed_ozon_collection_if_valid(run)
+
+    def _restore_completed_ozon_collection_if_valid(self, run: dict[str, Any]) -> dict[str, Any]:
+        current = WorkbenchState(run["status"])
+        recoverable_states = {
+            WorkbenchState.SEED_SELECTED,
+            WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTING,
+            WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTED,
+            WorkbenchState.OZON_COLLECTING,
+            WorkbenchState.OZON_COLLECTED,
+            WorkbenchState.SUPPLIER_REVIEW,
+            WorkbenchState.NEEDS_MANUAL_REVIEW,
+            WorkbenchState.FAILED_RETRYABLE,
+            WorkbenchState.FAILED_BLOCKED,
+        }
+        if current not in recoverable_states:
+            return run
+        try:
+            payload = self.repo.load_ozon_collection_result(run["run_id"])
+            expected_seed_ids = [seed.seed_id for seed in self._safe_load_sampled_seeds(run["run_id"])]
+        except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+            return run
+        if not expected_seed_ids or validate_ozon_collection_result(payload, expected_seed_ids):
+            return run
+
+        changed = (
+            current != WorkbenchState.SUPPLIER_REVIEW
+            or run.get("ozon_collected") is not True
+            or bool(run.get("replacement_pending_seed_ids"))
+        )
+        if not changed:
+            return run
+        review = self._build_supplier_review(
+            run["run_id"],
+            payload,
+            preserve_created_at=True,
+        )
+        review_path = self.repo.save_supplier_review(run["run_id"], review)
+        run["ozon_collected"] = True
+        run["ozon_collection_result_path"] = str(
+            self.repo.run_dir(run["run_id"]) / "ozon_collection_result.json"
+        )
+        run["supplier_review_path"] = str(review_path)
+        run["status"] = WorkbenchState.SUPPLIER_REVIEW.value
+        run.pop("replacement_pending_seed_ids", None)
+        self.repo.save_run(run)
+        if changed:
+            self.repo.append_run_event(
+                run["run_id"],
+                "ozon_collection.completed_result_restored",
+                "A complete verified Ozon result was restored before browser-task recovery.",
+                {"candidate_count": len(payload.get("ozon_candidates", []))},
+            )
+        return run
 
     def _dimension_evidence(self, selected_options: dict[str, Any], attributes: dict[str, Any]) -> dict[str, Any]:
         markers = ("size", "dimension", "length", "width", "height", "размер", "длина", "ширина", "высота", "尺寸", "长", "宽", "高")

@@ -7,7 +7,7 @@ const MAX_SUPPLIER_LANES = 5;
 const MANAGED_TAB_QUERY_ATTEMPTS = 30;
 const MANAGED_TAB_QUERY_DELAY_MS = 100;
 const NATIVE_NEW_TAB_INTENT_MS = 2500;
-const SUPPLIER_NAVIGATION_INTENT_MS = 300000;
+const SUPPLIER_NAVIGATION_INTENT_MS = 30000;
 const SUPPLIER_TERMINAL_STATES = new Set(["collected", "user_skipped"]);
 const supplierNativeNewTabIntents = new Map();
 let openTaskQueue = Promise.resolve();
@@ -168,6 +168,11 @@ async function handleTaskTabRemoved(tabId) {
       ? entry.channels.find((channel) => channel.tabId === tabId)
       : null;
     if (closedChannel) {
+      if (entry.pendingNavigation && entry.pendingNavigation.sourceTabId === tabId) {
+        entry.pendingNavigation = null;
+      }
+      entry.pendingNavigations = (Array.isArray(entry.pendingNavigations) ? entry.pendingNavigations : [])
+        .filter((intent) => intent.sourceTabId !== tabId);
       closedChannel.tabId = null;
       closedChannel.closedAt = closedAt;
       if (!SUPPLIER_TERMINAL_STATES.has(closedChannel.state)) closedChannel.state = "waiting_user";
@@ -187,6 +192,8 @@ async function handleTaskTabRemoved(tabId) {
       // Local suppression still prevents a reopen while the workbench restarts.
     }
     entry.tabId = null;
+    entry.pendingNavigation = null;
+    entry.pendingNavigations = [];
     entry.channels = Array.isArray(entry.channels)
       ? entry.channels.map((channel) => ({ ...channel, tabId: null }))
       : entry.channels;
@@ -347,6 +354,21 @@ async function recordSupplierNavigationIntent(tabId) {
   return { ok: true, granted: true };
 }
 
+async function releaseSupplierNavigationIntent(tabId) {
+  const match = await managedSupplierEntryForTab(tabId);
+  if (!match) return { ok: false, code: "supplier_selection.channel_missing" };
+  const intent = match.entry.pendingNavigation;
+  if (!intent) return { ok: true, released: false };
+  if (intent.sourceTabId !== tabId) {
+    return { ok: false, released: false, code: "supplier_selection.navigation_not_owner" };
+  }
+  match.entry.pendingNavigation = null;
+  match.entry.pendingNavigations = [];
+  match.entry.lastUpdatedAt = new Date().toISOString();
+  await saveOpenedTasks(match.openedTasks);
+  return { ok: true, released: true };
+}
+
 async function managedSupplierEntryForNavigation(tab) {
   if (!tab || !Number.isInteger(tab.windowId)) return null;
   const openedTasks = await loadOpenedTasks();
@@ -435,9 +457,12 @@ async function handleSupplierTabCreated(tab) {
 }
 
 async function handleSupplierTabUpdated(tabId, changeInfo, tab) {
-  if (!changeInfo || (!changeInfo.url && changeInfo.status !== "complete")) return { injected: false };
+  if (!changeInfo || (!changeInfo.url && !["loading", "complete"].includes(changeInfo.status))) {
+    return { injected: false };
+  }
   const match = await managedSupplierEntryForTab(tabId);
   if (!match || !tab || tab.windowId !== match.entry.windowId) return { injected: false };
+  if (changeInfo.url || changeInfo.status === "loading") await releaseSupplierNavigationIntent(tabId);
   const task = managedSupplierTaskForChannel(match.channel);
   return { injected: await ensureContentScript(tab, task) };
 }
@@ -568,6 +593,8 @@ async function handleManagedSupplierWindowRemoved(windowId) {
   if (!matches.length) return { stopped: false };
   let stopped = false;
   for (const [key, entry] of matches) {
+    entry.pendingNavigation = null;
+    entry.pendingNavigations = [];
     if (entry.closingByExtension) {
       entry.windowId = null;
       entry.closedByUser = false;
@@ -1321,6 +1348,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const tabId = sender && sender.tab ? sender.tab.id : null;
     markSupplierChannelTerminal(tabId, String(message.state || ""))
       .then((result) => sendResponse({ ok: result.ok === true, result }))
+      .catch((error) => sendResponse({ ok: false, error: String(error) }));
+    return true;
+  }
+  if (message.type === "ozon_v2_supplier_navigation_release") {
+    const tabId = sender && sender.tab ? sender.tab.id : null;
+    const operation = supplierNavigationQueue.then(() => releaseSupplierNavigationIntent(tabId));
+    supplierNavigationQueue = operation.catch(() => null);
+    operation
+      .then((result) => sendResponse(result))
       .catch((error) => sendResponse({ ok: false, error: String(error) }));
     return true;
   }

@@ -607,6 +607,37 @@ function sendMessage(message, tab) {
   stored.openedTasks = {};
   tabs.clear();
   windows.clear();
+  const sameTabLeaseTask = supplierTask(2, "same-tab-lease-token");
+  await context.performOpenTask(sameTabLeaseTask, "managed_round_test", { allowCreate: true });
+  const sameTabEntry = stored.openedTasks["wb-managed-round:supplier_selection"];
+  const sameTabFirst = tabs.get(sameTabEntry.channels[0].tabId);
+  const sameTabSecond = tabs.get(sameTabEntry.channels[1].tabId);
+  assert.equal((await sendMessage({ type: "ozon_v2_supplier_navigation_intent" }, sameTabFirst)).ok, true);
+  assert.equal((await sendMessage({ type: "ozon_v2_supplier_navigation_intent" }, sameTabSecond)).code, "supplier_selection.navigation_busy");
+  await context.handleSupplierTabUpdated(sameTabFirst.id, { status: "loading" }, sameTabFirst);
+  assert.equal(
+    (await sendMessage({ type: "ozon_v2_supplier_navigation_intent" }, sameTabSecond)).ok,
+    true,
+    "a successful same-tab image search must release the previous lane immediately",
+  );
+  const released = await sendMessage({ type: "ozon_v2_supplier_navigation_release" }, sameTabSecond);
+  assert.equal(released.ok, true, "an image-recognition failure must be able to release its lane explicitly");
+  assert.equal(
+    (await sendMessage({ type: "ozon_v2_supplier_navigation_intent" }, sameTabFirst)).ok,
+    true,
+    "another lane must continue immediately after an explicit recognition-failure release",
+  );
+  tabs.delete(sameTabFirst.id);
+  await context.handleTaskTabRemoved(sameTabFirst.id);
+  assert.equal(
+    (await sendMessage({ type: "ozon_v2_supplier_navigation_intent" }, sameTabSecond)).ok,
+    true,
+    "closing the lease-owning lane must never block the remaining channels",
+  );
+
+  stored.openedTasks = {};
+  tabs.clear();
+  windows.clear();
   removedWindows.length = 0;
   const userCloseTask = supplierTask(1, "user-close-token");
   await context.performOpenTask(userCloseTask, "managed_round_test", { allowCreate: true });

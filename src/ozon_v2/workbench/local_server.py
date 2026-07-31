@@ -4190,7 +4190,7 @@ def create_handler(
             return json.loads(raw.decode("utf-8"))
 
         def _browser_task(self, run_id: str) -> dict[str, Any]:
-            run = selected_repo.load_run(run_id)
+            run = service.recover_browser_task_state(run_id)
             if run.get("browser_task_cancelled"):
                 return {
                     "ok": True,
@@ -4310,6 +4310,11 @@ def create_handler(
                         continue
                     if str(item.get("seed_id") or "") in captured_seed_ids:
                         continue
+                    reference_image_urls = []
+                    for value in item.get("ozon_reference_images") or [item.get("ozon_main_image")]:
+                        image_url = str(value or "").strip()
+                        if image_url.startswith("https://") and image_url not in reference_image_urls:
+                            reference_image_urls.append(image_url)
                     channels.append(
                         {
                             "channel_index": channel_index,
@@ -4318,6 +4323,7 @@ def create_handler(
                             "ozon_title": item.get("ozon_title"),
                             "ozon_url": item.get("ozon_url"),
                             "reference_image_url": item.get("ozon_main_image"),
+                            "reference_image_urls": reference_image_urls,
                             "selected_options": item.get("selected_options") or {},
                             "dimension_evidence": item.get("dimension_evidence") or {},
                         }

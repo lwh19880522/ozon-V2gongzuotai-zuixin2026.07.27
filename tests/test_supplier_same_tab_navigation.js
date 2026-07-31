@@ -9,6 +9,7 @@ const elements = new Map();
 let clickCapture = null;
 let pointerDownCapture = null;
 let assignedUrl = "";
+let imageSearchClicks = 0;
 const runtimeMessages = [];
 
 function node(text = "") {
@@ -75,6 +76,7 @@ const chrome = {
         return { ok: true, task: { code: "browser_task.supplier_selection_ready" } };
       }
       if (message.type === "ozon_v2_get_supplier_channel") return { ok: true, binding };
+      if (message.type === "ozon_v2_supplier_navigation_intent") return { ok: true, granted: true };
       return { ok: true };
     },
     onMessage: { addListener() {} },
@@ -182,6 +184,35 @@ vm.runInContext(fs.readFileSync(scriptPath, "utf8"), context, { filename: script
   );
   dispatch(pointerDownCapture, { href: "https://www.1688.com/", ctrlKey: true });
   assert.equal(runtimeMessages.length, beforeNonDetail, "non-detail links must remain untouched");
+
+  let imagePrevented = false;
+  let imageStopped = false;
+  const imageSearchButton = {
+    innerText: "搜索图片",
+    textContent: "搜索图片",
+    closest(selector) {
+      return selector.includes("button") ? this : null;
+    },
+    click() { imageSearchClicks += 1; },
+  };
+  clickCapture({
+    target: imageSearchButton,
+    button: 0,
+    defaultPrevented: false,
+    preventDefault() { imagePrevented = true; },
+    stopImmediatePropagation() { imageStopped = true; },
+  });
+  const imageDeadline = Date.now() + 1000;
+  while (!imageSearchClicks && Date.now() < imageDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(imagePrevented, true, "the real image-search submit must wait for an exact lane lease");
+  assert.equal(imageStopped, true);
+  assert.equal(imageSearchClicks, 1, "the original image-search submit must replay after the lease is granted");
+  assert.ok(
+    runtimeMessages.some((message) => message.type === "ozon_v2_supplier_navigation_intent"),
+    "the navigation lease must be acquired at search-submit time instead of image-preload time",
+  );
   process.stdout.write("supplier same-tab detail navigation: OK\n");
 })().catch((error) => {
   console.error(error);

@@ -12,6 +12,9 @@ let uploadedFile = null;
 let inputVisible = false;
 let navigationIntents = 0;
 let navigationResponse = { ok: true, granted: true };
+let navigationReleases = 0;
+const requestedImageUrls = [];
+const sessionValues = new Map();
 
 function node(text = "") {
   return {
@@ -94,6 +97,10 @@ const binding = {
   ozon_product_id: "ozon-1",
   ozon_title: "Ozon test product",
   reference_image_url: "https://ir.ozone.ru/reference.jpg",
+  reference_image_urls: [
+    "https://ir.ozone.ru/reference.jpg",
+    "https://ir.ozone.ru/fallback.jpg",
+  ],
   capture_url: "/api/batches/wb-managed/supplier-selection/capture",
   reject_url: "/api/batches/wb-managed/supplier-review/reject",
 };
@@ -109,7 +116,12 @@ const chrome = {
         navigationIntents += 1;
         return navigationResponse;
       }
+      if (message.type === "ozon_v2_supplier_navigation_release") {
+        navigationReleases += 1;
+        return { ok: true, released: true };
+      }
       if (message.type === "ozon_v2_fetch_reference_image") {
+        requestedImageUrls.push(message.url);
         return { ok: true, bytes: [1, 2, 3], contentType: "image/jpeg" };
       }
       return { ok: true };
@@ -140,26 +152,36 @@ const context = vm.createContext({
   File: FakeFile,
   DataTransfer: FakeDataTransfer,
   Event: class { constructor(type) { this.type = type; } },
+  sessionStorage: {
+    getItem(key) { return sessionValues.has(key) ? sessionValues.get(key) : null; },
+    setItem(key, value) { sessionValues.set(key, String(value)); },
+    removeItem(key) { sessionValues.delete(key); },
+  },
 });
 
 const scriptPath = path.join(__dirname, "..", "browser_extension", "ozon_v2_bridge", "supplier_content.js");
 const source = fs.readFileSync(scriptPath, "utf8").replace(
   "  initializeManagedChannel()",
-  "  globalThis.__testUploadReferenceImage = uploadReferenceImage;\n  initializeManagedChannel()",
+  "  globalThis.__testUploadReferenceImage = uploadReferenceImage;\n  globalThis.__testHandleReferenceImageRejection = handleReferenceImageRejection;\n  initializeManagedChannel()",
 );
 vm.runInContext(source, context, { filename: scriptPath });
 
 setTimeout(async () => {
   assert.equal(triggerClicks, 1, "the visible 1688 image-search control must be activated");
   assert.equal(uploadChanges, 1, "the Ozon reference image must be submitted to the 1688 file input");
-  assert.equal(navigationIntents, 1, "the image upload must reserve this lane before 1688 creates a result tab");
+  assert.equal(navigationIntents, 0, "all managed lanes must be able to preload their reference image without taking the navigation lease");
   assert.ok(uploadedFile, "a browser File must be created for the reference image");
   assert.equal(uploadedFile.name, "ozon-ozon-1.jpg");
   navigationResponse = { ok: false, granted: false, code: "supplier_selection.navigation_busy" };
   uploadChanges = 0;
   const blocked = await context.__testUploadReferenceImage(binding);
-  assert.equal(blocked.ok, false);
-  assert.equal(blocked.reason, "supplier_selection.navigation_busy");
-  assert.equal(uploadChanges, 0, "a lane without the navigation lease must never submit its image");
+  assert.equal(blocked.ok, true);
+  assert.equal(uploadChanges, 1, "a busy search-navigation lease must not prevent another lane from preloading its image");
+  assert.equal(navigationIntents, 0, "preloading a reference image must never acquire a search-navigation lease");
+  uploadChanges = 0;
+  await context.__testHandleReferenceImageRejection(binding);
+  assert.equal(navigationReleases, 1, "1688 recognition rejection must release the search-navigation lease immediately");
+  assert.equal(uploadChanges, 1, "the next distinct Ozon SKU image must be preloaded after recognition rejection");
+  assert.equal(requestedImageUrls.at(-1), "https://ir.ozone.ru/fallback.jpg");
   process.stdout.write("supplier managed reference upload: OK\n");
 }, 700);

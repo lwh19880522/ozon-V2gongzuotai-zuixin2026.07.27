@@ -1278,6 +1278,31 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             (self.repo.run_dir(run_id) / "ozon_collection_draft.json").exists()
         )
 
+    def test_autopilot_restores_complete_result_before_pending_replacement_recovery(self) -> None:
+        run_id, seeds = self.prepare_ozon_collecting_run(count=1)
+        candidate = self.ozon_candidate_for_seed(seeds[0], "ozon-complete-autopilot")
+        payload = {
+            "run_id": run_id,
+            "worker": "workbench_browser_bridge",
+            "ozon_candidates": [candidate],
+        }
+        self.repo.save_ozon_collection_result(run_id, payload)
+        service = WorkbenchService(self.repo)
+        self.repo.save_supplier_review(run_id, service._build_supplier_review(run_id, payload))
+        run = self.repo.load_run(run_id)
+        run["status"] = WorkbenchState.FAILED_BLOCKED.value
+        run["replacement_pending_seed_ids"] = [seeds[0].seed_id]
+        run["ozon_collected"] = False
+        self.repo.save_run(run)
+
+        result = service.run_until_blocked(run_id)
+        loaded = self.repo.load_run(run_id)
+
+        self.assertTrue(result.ok)
+        self.assertEqual("supplier_review_required", result.data["blocked_reason"])
+        self.assertEqual(WorkbenchState.SUPPLIER_REVIEW.value, loaded["status"])
+        self.assertNotIn("replacement_pending_seed_ids", loaded)
+
     def test_restart_browser_task_recovers_failed_replacement_and_discards_stale_draft(self) -> None:
         run_id, seeds = self.prepare_ozon_collecting_run(count=2)
         stale_candidate = self.ozon_candidate_for_seed(seeds[0], "ozon-stale")
@@ -1513,6 +1538,12 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
 
     def test_browser_task_endpoint_returns_managed_supplier_selection_channels(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
+        review = self.repo.load_supplier_review(run_id)
+        review["items"][0]["ozon_reference_images"] = [
+            "https://img.example/main.jpg",
+            "https://img.example/alternate.jpg",
+        ]
+        self.repo.save_supplier_review(run_id, review)
 
         task = self.get_json(f"/api/batches/{run_id}/browser-task")
 
@@ -1532,6 +1563,83 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual(seed.seed_id, channel["seed_id"])
         self.assertEqual("ozon-1", channel["ozon_product_id"])
         self.assertEqual("https://img.example/main.jpg", channel["reference_image_url"])
+        self.assertEqual(
+            ["https://img.example/main.jpg", "https://img.example/alternate.jpg"],
+            channel["reference_image_urls"],
+        )
+
+    def test_supplier_review_combines_sku_and_gallery_reference_images(self) -> None:
+        run_id, seeds = self.prepare_ozon_collecting_run(count=1)
+        candidate = self.ozon_candidate_for_seed(seeds[0], "ozon-image-fallbacks")
+        candidate["selected_sku_media"] = {
+            "selected_sku_images": ["https://img.example/wc100/main.jpg"],
+            "main_gallery_images": [
+                "https://img.example/wc300/main.jpg",
+                "https://img.example/wc200/alternate.jpg",
+            ],
+        }
+
+        review = WorkbenchService(self.repo)._build_supplier_review(
+            run_id,
+            {"run_id": run_id, "ozon_candidates": [candidate]},
+        )
+
+        self.assertEqual(
+            ["https://img.example/main.jpg", "https://img.example/alternate.jpg"],
+            review["items"][0]["ozon_reference_images"],
+        )
+
+    def test_restart_restores_complete_ozon_result_before_replacement_recovery(self) -> None:
+        run_id, seeds = self.prepare_ozon_collecting_run(count=2)
+        candidates = [
+            self.ozon_candidate_for_seed(seed, f"ozon-complete-{index}")
+            for index, seed in enumerate(seeds)
+        ]
+        payload = {
+            "run_id": run_id,
+            "worker": "workbench_browser_bridge",
+            "ozon_candidates": candidates,
+        }
+        self.repo.save_ozon_collection_result(run_id, payload)
+        service = WorkbenchService(self.repo)
+        self.repo.save_supplier_review(run_id, service._build_supplier_review(run_id, payload))
+        self.repo.save_ozon_collection_draft(
+            run_id,
+            {
+                "schema_version": 1,
+                "run_id": run_id,
+                "worker": "workbench_browser_bridge",
+                "source": "completed_before_late_retry",
+                "ozon_candidates": candidates,
+                "created_at": "2026-07-31T00:00:00+00:00",
+                "updated_at": "2026-07-31T00:00:00+00:00",
+            },
+        )
+        contract = self.repo.load_ozon_collection_contract(run_id)
+        contract["payload"]["seeds"] = [
+            seed for seed in contract["payload"]["seeds"]
+            if seed["seed_id"] == seeds[1].seed_id
+        ]
+        self.repo.save_ozon_collection_contract(run_id, contract)
+        run = self.repo.load_run(run_id)
+        run["status"] = WorkbenchState.OZON_COLLECTING.value
+        run["replacement_pending_seed_ids"] = [seeds[1].seed_id]
+        run["ozon_collected"] = False
+        run["browser_task_cancelled"] = True
+        run["browser_task_cancel_reason"] = "user_stopped"
+        self.repo.save_run(run)
+
+        restarted = service.restart_browser_task(run_id)
+        loaded = self.repo.load_run(run_id)
+        draft = self.repo.load_ozon_collection_draft(run_id)
+
+        self.assertTrue(restarted.ok)
+        self.assertEqual("supplier_selection", restarted.data["task_type"])
+        self.assertEqual(WorkbenchState.SUPPLIER_REVIEW.value, loaded["status"])
+        self.assertTrue(loaded["ozon_collected"])
+        self.assertNotIn("replacement_pending_seed_ids", loaded)
+        self.assertFalse(loaded["browser_task_cancelled"])
+        self.assertEqual([seed.seed_id for seed in seeds], [item["seed_id"] for item in draft["ozon_candidates"]])
 
     def test_managed_supplier_task_returns_only_five_pending_channels(self) -> None:
         run_id, _seed = self.prepare_supplier_review_run()
@@ -1612,6 +1720,37 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertFalse(result["ok"])
         self.assertEqual("supplier_selection.channel_mismatch", result["code"])
         self.assertEqual(WorkbenchState.SUPPLIER_REVIEW.value, self.repo.load_run(run_id)["status"])
+
+    def test_supplier_selection_capture_recovers_completed_ozon_state_without_invalidating_lane(self) -> None:
+        run_id, seeds = self.prepare_ozon_collecting_run(count=1)
+        candidate = self.ozon_candidate_for_seed(seeds[0], "ozon-recovered-capture")
+        payload = {
+            "run_id": run_id,
+            "worker": "workbench_browser_bridge",
+            "ozon_candidates": [candidate],
+        }
+        service = WorkbenchService(self.repo)
+        self.repo.save_ozon_collection_result(run_id, payload)
+        review = service._build_supplier_review(run_id, payload)
+        self.repo.save_supplier_review(run_id, review)
+        run = self.repo.load_run(run_id)
+        run["status"] = WorkbenchState.OZON_COLLECTING.value
+        run["ozon_collected"] = False
+        self.repo.save_run(run)
+
+        result = service.capture_supplier_selection_product(
+            run_id,
+            {
+                "channel_index": 0,
+                "seed_id": seeds[0].seed_id,
+                "ozon_product_id": "ozon-recovered-capture",
+                "dispatch_token": review["created_at"],
+                "supplier_product": self.supplier_product_payload(seeds[0].seed_id),
+            },
+        )
+
+        self.assertTrue(result.ok, result.to_dict())
+        self.assertNotEqual("supplier_selection.not_expected", result.code)
 
     def test_supplier_selection_capture_rejects_stale_dispatch_generation(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
@@ -2382,7 +2521,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
     def test_extension_manifest_registers_1688_supplier_content_script(self) -> None:
         manifest_path = self.project_root / "browser_extension" / "ozon_v2_bridge" / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self.assertEqual("0.1.65", manifest["version"])
+        self.assertEqual("0.1.66", manifest["version"])
 
         supplier_scripts = [
             item
