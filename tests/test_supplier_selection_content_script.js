@@ -80,6 +80,12 @@ const document = {
   addEventListener() {},
   getElementById(id) { return elements.get(id) || null; },
   querySelector(selector) {
+    if (selector === "[class*='title-text']") {
+      const staleTitle = textNode("过期推荐商品标题");
+      staleTitle.hidden = true;
+      staleTitle.getClientRects = () => [];
+      return staleTitle;
+    }
     if (selector.includes("og:title")) return { getAttribute: () => "测试收纳盒" };
     if (selector === "h1") return textNode("广东测试供应商有限公司");
     if (selector.includes("price") || selector.includes("Price")) return textNode("¥12.80");
@@ -99,6 +105,7 @@ const binding = {
   channel_index: 0,
   seed_id: "seed-1",
   ozon_product_id: "ozon-1",
+  dispatch_token: "supplier-dispatch-current",
   ozon_title: "Ozon test product",
   reference_image_url: "https://ir.ozone.ru/reference.jpg",
   capture_url: "/api/batches/wb-managed/supplier-selection/capture",
@@ -114,6 +121,17 @@ const chrome = {
       if (message.type === "ozon_v2_get_supplier_channel") {
         channelLookupCount += 1;
         return channelLookupCount === 1 ? { ok: false } : { ok: true, binding };
+      }
+      if (message.type === "ozon_v2_capture_supplier_channel") {
+        capturedPayload = message;
+        return {
+          ok: true,
+          result: {
+            ok: true,
+            code: "supplier_selection.batch_complete",
+            message: "saved",
+          },
+        };
       }
       if (message.type === "ozon_v2_reject_supplier_channel") {
         rejectedChannel = true;
@@ -139,10 +157,7 @@ const context = vm.createContext({
   console,
   document,
   location: { href: supplierUrl, hostname: "detail.1688.com" },
-  fetch: async (url, options = {}) => {
-    if (String(url).includes("supplier-selection/capture")) capturedPayload = JSON.parse(options.body);
-    return { json: async () => ({ ok: true, code: "supplier_selection.batch_complete", message: "saved" }) };
-  },
+  fetch: async () => ({ json: async () => ({ ok: true }) }),
   addEventListener() {},
   history: { pushState() {}, replaceState() {} },
   innerWidth: 1280,
@@ -173,10 +188,12 @@ vm.runInContext(fs.readFileSync(scriptPath, "utf8"), context, { filename: script
   assert.ok(collectButton, "the current-product collection button must remain visible");
   assert.ok(rejectButton, "the no-supplier button must remain visible");
   await collectButton.onclick();
-  assert.ok(capturedPayload, "a user click must submit current public supplier evidence");
-  assert.equal(capturedPayload.channel_index, 0);
-  assert.equal(capturedPayload.seed_id, "seed-1");
-  assert.equal(capturedPayload.ozon_product_id, "ozon-1");
+  assert.ok(capturedPayload, "a user click must proxy current public supplier evidence through the background");
+  assert.equal(
+    capturedPayload.type,
+    "ozon_v2_capture_supplier_channel",
+    "the content page must not post channel identity directly to the workbench",
+  );
   const product = capturedPayload.supplier_product;
   assert.equal(product.supplier_url, supplierUrl);
   assert.equal(product.final_url, supplierUrl);
@@ -194,8 +211,8 @@ vm.runInContext(fs.readFileSync(scriptPath, "utf8"), context, { filename: script
   assert.equal(product.sku_options[0].supplier_sku_id, "sku-black-1");
   assert.deepEqual(
     terminalStates,
-    ["collected"],
-    "a persisted supplier capture must mark its managed lane terminal exactly once",
+    [],
+    "the background must persist the capture and mark the lane terminal atomically",
   );
   await rejectButton.onclick();
   assert.equal(rejectedChannel, true, "the no-supplier action must reject the product through its bound channel");

@@ -1,6 +1,6 @@
 {
   "name": "ozon-v2-ops-controller",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Ozon V2 controller for verified collection, intelligent field drafting, and evidence-locked image generation.",
   "author": {
     "name": "Ozon V2"

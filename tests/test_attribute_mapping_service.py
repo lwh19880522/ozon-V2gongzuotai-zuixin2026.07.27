@@ -9,6 +9,70 @@ from ozon_v2.services.attribute_mapping_service import (
 
 
 class AttributeMappingServiceTests(unittest.TestCase):
+    def test_only_intelligence_confirmed_required_gaps_are_manual_fields(self) -> None:
+        schema = [
+            {
+                "attribute_id": "color",
+                "attribute_label": "Название цвета",
+                "is_required": True,
+            },
+            {
+                "attribute_id": "warranty",
+                "attribute_label": "Гарантия",
+                "is_required": True,
+            },
+        ]
+
+        pending = map_template_attributes(schema, {"attributes": {}})
+
+        self.assertEqual(
+            ["color", "warranty"],
+            [field["field_key"] for field in pending["missing_required_fields"]],
+        )
+        self.assertEqual(
+            ["color", "warranty"],
+            [
+                field["field_key"]
+                for field in pending["skill_pending_required_fields"]
+            ],
+        )
+        self.assertEqual([], pending["manual_required_fields"])
+
+        completed = map_template_attributes(
+            schema,
+            {"attributes": {}},
+            rewritten_content={
+                "color": {
+                    "decision": "filled",
+                    "value": "Черный",
+                    "evidence_refs": [
+                        "supplier_selection.supplier_sku.selected_options.颜色"
+                    ],
+                    "reason": "Цвет подтвержден выбранным SKU.",
+                },
+                "warranty": {
+                    "decision": "unresolved",
+                    "resolution_class": "source_fact_missing",
+                    "evidence_refs": [],
+                    "reason": "Гарантия отсутствует в собранных данных.",
+                },
+            },
+        )
+
+        self.assertEqual(
+            ["warranty"],
+            [field["field_key"] for field in completed["missing_required_fields"]],
+        )
+        self.assertEqual(
+            ["warranty"],
+            [field["field_key"] for field in completed["manual_required_fields"]],
+        )
+        self.assertEqual([], completed["skill_pending_required_fields"])
+        self.assertEqual(
+            "unresolved",
+            completed["manual_required_fields"][0]["intelligence_decision"],
+        )
+
     def test_store_fixed_grouping_flags_are_mapped_before_field_skill(self) -> None:
         result = map_template_attributes(
             [

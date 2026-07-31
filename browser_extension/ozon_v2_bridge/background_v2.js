@@ -501,6 +501,64 @@ async function markSupplierChannelTerminal(tabId, state, options = {}) {
   return { ok: true, state, allTerminal };
 }
 
+function supplierOfferId(value) {
+  const match = String(value || "").match(/\/offer\/(\d+)\.html/i);
+  return match ? match[1] : "";
+}
+
+async function captureSupplierSelectionFromTab(tab, supplierProduct) {
+  if (!tab || !Number.isInteger(tab.id)) {
+    return { ok: false, code: "supplier_selection.channel_missing" };
+  }
+  const match = await managedSupplierEntryForTab(tab.id);
+  if (!match || match.entry.windowId !== tab.windowId) {
+    return { ok: false, code: "supplier_selection.channel_missing" };
+  }
+  if (SUPPLIER_TERMINAL_STATES.has(match.channel.state)) {
+    return { ok: false, code: "supplier_selection.channel_terminal" };
+  }
+  const currentUrl = String(tab.url || "");
+  const currentOfferId = supplierOfferId(currentUrl);
+  if (!currentOfferId || !isSupplierTab(tab)) {
+    return { ok: false, code: "supplier_selection.detail_page_required" };
+  }
+  const product = supplierProduct && typeof supplierProduct === "object"
+    ? { ...supplierProduct }
+    : {};
+  const reportedOfferIds = [
+    supplierOfferId(product.supplier_url),
+    supplierOfferId(product.final_url),
+    String(product.offer_id || product.supplier_product_id || "").trim(),
+  ].filter(Boolean);
+  if (
+    !reportedOfferIds.length
+    || reportedOfferIds.some((offerId) => offerId !== currentOfferId)
+  ) {
+    return { ok: false, code: "supplier_selection.offer_identity_mismatch" };
+  }
+  product.supplier_url = currentUrl;
+  product.final_url = currentUrl;
+  product.offer_id = currentOfferId;
+  const result = await postJson(match.channel.capture_url, {
+    channel_index: match.channel.channel_index,
+    seed_id: match.channel.seed_id,
+    ozon_product_id: match.channel.ozon_product_id,
+    dispatch_token: match.channel.dispatch_token,
+    supplier_product: product,
+  });
+  if (!result || result.ok === false) {
+    return {
+      ok: false,
+      result,
+      code: result && result.code
+        ? result.code
+        : "supplier_selection.capture_failed",
+    };
+  }
+  await markSupplierChannelTerminal(tab.id, "collected");
+  return { ok: true, result };
+}
+
 async function handleManagedSupplierWindowRemoved(windowId) {
   if (!Number.isInteger(windowId)) return { stopped: false };
   const openedTasks = await loadOpenedTasks();
@@ -1263,6 +1321,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const tabId = sender && sender.tab ? sender.tab.id : null;
     markSupplierChannelTerminal(tabId, String(message.state || ""))
       .then((result) => sendResponse({ ok: result.ok === true, result }))
+      .catch((error) => sendResponse({ ok: false, error: String(error) }));
+    return true;
+  }
+  if (message.type === "ozon_v2_capture_supplier_channel") {
+    const senderTab = sender && sender.tab ? sender.tab : null;
+    captureSupplierSelectionFromTab(senderTab, message.supplier_product)
+      .then((result) => sendResponse(result))
       .catch((error) => sendResponse({ ok: false, error: String(error) }));
     return true;
   }

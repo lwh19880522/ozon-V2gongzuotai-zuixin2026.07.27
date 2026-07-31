@@ -206,7 +206,7 @@ class InstallationContractTests(unittest.TestCase):
             (ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
         )
 
-        self.assertEqual("0.4.1", plugin["version"])
+        self.assertEqual("0.4.2", plugin["version"])
         self.assertEqual("./skills/", plugin["skills"])
         self.assertLessEqual(len(plugin["interface"]["defaultPrompt"]), 3)
         prompts = "\n".join(plugin["interface"]["defaultPrompt"])

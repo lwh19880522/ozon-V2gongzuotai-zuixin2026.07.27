@@ -52,6 +52,8 @@ def test_field_drafter_skill_owns_intelligent_field_workflow() -> None:
     assert "现货当天发" in text
     assert "supplier fulfillment" in text
     assert "workflow.defaults.disable_product_grouping" in text
+    assert "compliance decisions are not Skill inference" in text
+    assert "boolean confirmation" in text
     assert "ozon.category_path.leaf" in text
     assert "supplier truth" in text
     assert "Do not upload" in text
@@ -89,6 +91,8 @@ def test_field_drafter_skill_has_detailed_source_and_validation_policy() -> None
     assert "complete_set" in policy
     assert "Visible accessories do not create a product-color conflict" in policy
     assert "Do not infer dimensions, weight, warranty, certification" in policy
+    assert "compliance decisions are not Skill inference" in policy
+    assert "boolean confirmation" in policy
 
 
 def test_field_drafter_materializes_locked_images_for_actual_visual_inspection(
@@ -148,7 +152,7 @@ def test_plugin_versions_workbench_and_both_skill_phases_as_one_product() -> Non
         (ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
     )
 
-    assert plugin["version"] == "0.4.1"
+    assert plugin["version"] == "0.4.2"
     assert "field-drafting" in plugin["keywords"]
     description = plugin["interface"]["longDescription"]
     prompts = "\n".join(plugin["interface"]["defaultPrompt"])

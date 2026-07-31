@@ -1743,20 +1743,21 @@ def build_supplier_review_html(run_id: str) -> str:
     function renderSupplierSkuCandidate(candidate, context) {{
       const option = candidate.option;
       const label = document.createElement("label"); label.className = "sku-option";
+      if (context.readOnly) label.classList.add("blocked");
       if (context.analysis.recommendedSkuId === option.supplier_sku_id) label.classList.add("recommended");
       const radio = document.createElement("input"); radio.type = "radio"; radio.name = "supplierSku"; radio.value = option.supplier_sku_id || "";
-      radio.checked = (!!context.lockedSku && context.lockedSku.supplier_sku_id === option.supplier_sku_id)
+      radio.checked = !context.readOnly && ((!!context.lockedSku && context.lockedSku.supplier_sku_id === option.supplier_sku_id)
         || (!context.receipt && (context.selectedSupplierSkuId
           ? context.selectedSupplierSkuId === option.supplier_sku_id
-          : context.singlePageSku || context.analysis.recommendedSkuId === option.supplier_sku_id));
-      radio.disabled = !!context.receipt;
+          : context.singlePageSku || context.analysis.recommendedSkuId === option.supplier_sku_id)));
+      radio.disabled = !!context.receipt || context.readOnly === true;
       radio.addEventListener("change", updateSkuLockButton);
       const main = document.createElement("div"); main.className = "sku-option-main";
       const imageUrl = Array.isArray(option.image_urls) ? String(option.image_urls[0] || "") : "";
-      if (imageUrl) {{
-        const fallbackUrls = [imageUrl, ...(context.supplierFallbackImages || [])]
-          .map((value) => String(value || "").trim())
-          .filter((value, index, values) => value && values.indexOf(value) === index);
+      const fallbackUrls = [imageUrl, ...(context.supplierFallbackImages || [])]
+        .map((value) => String(value || "").trim())
+        .filter((value, index, values) => value && values.indexOf(value) === index);
+      if (fallbackUrls.length) {{
         let fallbackIndex = 0;
         const image = document.createElement("img"); image.className = "sku-option-image"; image.src = fallbackUrls[0]; image.alt = option.raw_label || "1688 SKU"; image.loading = "lazy"; image.referrerPolicy = "no-referrer";
         image.addEventListener("error", () => {{
@@ -1773,6 +1774,13 @@ def build_supplier_review_html(run_id: str) -> str:
         main.classList.add("no-image");
       }}
       const copy = document.createElement("div");
+      if (context.readOnly) {{
+        const badge = document.createElement("span"); badge.className = "sku-badge"; badge.textContent = "已识别但不可锁定"; copy.append(badge);
+        const mediaNote = document.createElement("span"); mediaNote.className = "sku-comparison"; mediaNote.textContent = imageUrl
+          ? "SKU 证据仍不完整"
+          : "无 SKU 专属图；下方仅显示公共商品图";
+        copy.append(mediaNote);
+      }}
       if (context.analysis.recommendedSkuId === option.supplier_sku_id) {{
         const badge = document.createElement("span"); badge.className = "sku-badge"; badge.textContent = "建议选择 (Recommended)"; copy.append(badge);
       }}
@@ -1831,6 +1839,19 @@ def build_supplier_review_html(run_id: str) -> str:
       return stageAllowsRecapture
         && !item.supplier_sku_selection
         && !item.subject_master;
+    }}
+
+    function candidateOnlyMissingSkuImage(candidate) {{
+      const allowed = new Set([
+        "SKU-bound image_urls are required",
+        "complete supplier SKU evidence is required",
+      ]);
+      const errors = Array.isArray(candidate && candidate.validation_errors)
+        ? candidate.validation_errors
+        : [];
+      return !!String(candidate && candidate.supplier_sku_id || "").trim()
+        && errors.length > 0
+        && errors.every((error) => allowed.has(String(error)));
     }}
 
     function updateSkuLockButton() {{
@@ -1914,6 +1935,7 @@ def build_supplier_review_html(run_id: str) -> str:
       optionsRoot.dataset.seedId = String(item.seed_id || "");
       subjectRoot.dataset.seedId = String(item.seed_id || "");
       const options = item.supplier_sku_options || [];
+      const blockedOptions = item.supplier_sku_candidates || [];
       const skuGroups = item.supplier_sku_groups || [];
       const receipt = item.supplier_sku_selection || null;
       const lockedSku = receipt && receipt.supplier_sku ? receipt.supplier_sku : null;
@@ -1923,6 +1945,9 @@ def build_supplier_review_html(run_id: str) -> str:
       const skuNeedsConfirmation = !!item.supplier_product && !options.length && !receipt;
       const singlePageSku = isPageUniqueSupplierSku(item, options);
       const analysis = analyzeSupplierSkuOptions(item, options);
+      const blockedAnalysis = analyzeSupplierSkuOptions(item, blockedOptions);
+      const candidatesOnlyMissingImages = blockedOptions.length > 0
+        && blockedOptions.every(candidateOnlyMissingSkuImage);
       $("skuDecisionContext").textContent = `${{state.evidenceIndex + 1}} / ${{state.items.length}} · ${{item.ozon_title || item.seed_id}}`;
       $("skuDecisionStatus").textContent = subjectMaster
         ? "主体已锁定 (Subject Locked)"
@@ -1943,7 +1968,9 @@ def build_supplier_review_html(run_id: str) -> str:
       const matchingCandidates = analysis.candidates.filter((candidate) => strongestScore > 0 && candidate.score === strongestScore);
       const otherCandidates = analysis.candidates.filter((candidate) => !matchingCandidates.includes(candidate));
       const modeNote = document.createElement("div"); modeNote.className = "sku-mode-note";
-      modeNote.textContent = singlePageSku
+      modeNote.textContent = !options.length && blockedOptions.length
+        ? `已识别 ${{blockedOptions.length}} 个真实 SKU，但证据不完整，当前不可锁定。公共商品图仅供核对。`
+        : singlePageSku
         ? "页面只有一个真实 SKU，无需选择规格；请核对商品和数量后确认。"
         : matchingCandidates.length > 1
           ? `已根据 Ozon 标题和属性收窄为 ${{matchingCandidates.length}} 项；只需判断剩余差异，其他 ${{otherCandidates.length}} 项已折叠。`
@@ -1990,6 +2017,19 @@ def build_supplier_review_html(run_id: str) -> str:
         renderSupplierSkuGroup(otherRoot, matchingCandidates.length ? "其他未匹配规格" : "全部真实规格", hiddenCandidates, candidateContext);
         otherDetails.append(summary, otherRoot); candidatesRoot.append(otherDetails);
       }}
+      if (blockedOptions.length) {{
+        const blockedContext = {{
+          ...candidateContext,
+          analysis: blockedAnalysis,
+          readOnly: true,
+        }};
+        renderSupplierSkuGroup(
+          candidatesRoot,
+          `已识别但不可锁定（${{blockedOptions.length}}）`,
+          blockedAnalysis.candidates,
+          blockedContext,
+        );
+      }}
       optionsRoot.append(candidatesRoot);
       if (!options.length) {{
         const visibleGroups = skuGroups
@@ -2001,7 +2041,7 @@ def build_supplier_review_html(run_id: str) -> str:
           .filter(Boolean)
           .join("\\n");
         candidatesRoot.append(field("可见规格组 (Visible SKU Groups)", visibleGroups || null));
-        if (canRecaptureSupplier(item)) {{
+        if (!candidatesOnlyMissingImages && canRecaptureSupplier(item)) {{
           const recaptureSkuButton = document.createElement("button");
           recaptureSkuButton.type = "button";
           recaptureSkuButton.className = "secondary-button";
@@ -2014,6 +2054,8 @@ def build_supplier_review_html(run_id: str) -> str:
       $("skuDecisionMessage").className = receipt ? "success" : "muted";
       $("skuDecisionMessage").textContent = receipt
         ? "真实供应商 SKU 已锁定，后续采购、标题、属性和图片均以此为准。"
+        : candidatesOnlyMissingImages
+          ? "已识别真实 SKU，但 1688 未提供 SKU 专属图；公共商品图已展示供核对，系统不会放宽锁定门禁，也无需反复重新采集。"
         : skuNeedsConfirmation
           ? "商品公开证据已采集；完整 SKU 矩阵未解析，已转入用户确认门禁，不会伪造 SKU。"
           : singlePageSku
@@ -3008,7 +3050,7 @@ def build_upload_workspace_html(run_id: str) -> str:
     .upload-core {{ margin-top:10px; padding:9px; border:1px solid #b9ddcf; border-radius:5px; background:#f2fbf8; }} .upload-core-head {{ display:flex; align-items:center; justify-content:space-between; gap:10px; }} .upload-core-head strong {{ color:var(--green); font-size:11px; }} .upload-core-head span {{ color:var(--muted); font-size:9px; }} .upload-core-grid {{ display:grid; grid-template-columns:repeat(4,minmax(110px,1fr)); gap:6px; margin-top:8px; }} .upload-core-field {{ padding:7px 8px; border:1px solid #d8ebe4; border-radius:4px; background:#fff; }} .upload-core-field span {{ display:block; color:var(--muted); font-size:9px; }} .upload-core-field strong {{ display:block; margin-top:2px; color:var(--text); font-size:10px; }}
     .mapping-summary {{ display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }} .mapping-chip {{ padding:3px 7px; border-radius:4px; color:var(--green); background:var(--green-soft); font-size:10px; }} .mapping-chip.warn {{ color:var(--red); background:var(--red-soft); }}
     .score-progress {{ margin-top:8px; padding:8px 9px; border-left:3px solid var(--blue); color:#29456f; background:#f1f5ff; font-size:10px; }}
-    .required-field-editor {{ margin-top:10px; padding:10px; border:1px solid #efbd68; border-radius:5px; background:#fffaf0; }} .required-field-editor h4 {{ margin:0; color:#74410a; font-size:12px; }} .required-field-editor p {{ margin:3px 0 9px; color:var(--muted); font-size:10px; }} .required-field-grid {{ display:grid; grid-template-columns:repeat(2,minmax(180px,1fr)); gap:8px; }} .required-field-input {{ display:grid; gap:4px; }} .required-field-input label {{ color:#74410a; font-size:10px; font-weight:650; }} .required-field-input input,.required-field-input select {{ width:100%; height:34px; padding:0 8px; border:1px solid #d7b574; border-radius:4px; color:var(--text); background:#fff; }} .required-field-actions {{ display:flex; align-items:center; gap:9px; margin-top:9px; }} .required-field-actions button {{ min-height:34px; padding:0 13px; border:1px solid var(--blue); border-radius:4px; color:#fff; background:var(--blue); cursor:pointer; }} .required-field-actions button:disabled {{ opacity:.5; cursor:wait; }} .required-field-status {{ color:var(--muted); font-size:10px; }} .required-field-status.error {{ color:var(--red); }} .required-field-status.success {{ color:var(--green); }}
+    .required-field-skill-pending {{ margin-top:10px; padding:9px 10px; border-left:3px solid var(--blue); color:#29456f; background:#f1f5ff; font-size:10px; }} .required-field-editor {{ margin-top:10px; padding:10px; border:1px solid #efbd68; border-radius:5px; background:#fffaf0; }} .required-field-editor h4 {{ margin:0; color:#74410a; font-size:12px; }} .required-field-editor p {{ margin:3px 0 9px; color:var(--muted); font-size:10px; }} .required-field-grid {{ display:grid; grid-template-columns:repeat(2,minmax(180px,1fr)); gap:8px; }} .required-field-input {{ display:grid; gap:4px; }} .required-field-input label {{ color:#74410a; font-size:10px; font-weight:650; }} .required-field-input input,.required-field-input select {{ width:100%; height:34px; padding:0 8px; border:1px solid #d7b574; border-radius:4px; color:var(--text); background:#fff; }} .required-field-actions {{ display:flex; align-items:center; gap:9px; margin-top:9px; }} .required-field-actions button {{ min-height:34px; padding:0 13px; border:1px solid var(--blue); border-radius:4px; color:#fff; background:var(--blue); cursor:pointer; }} .required-field-actions button:disabled {{ opacity:.5; cursor:wait; }} .required-field-status {{ color:var(--muted); font-size:10px; }} .required-field-status.error {{ color:var(--red); }} .required-field-status.success {{ color:var(--green); }}
     .attribute-grid {{ display:grid; grid-template-columns:1fr 1fr; margin-top:8px; border:1px solid var(--line); border-radius:4px; overflow:hidden; }} .attribute {{ display:grid; grid-template-columns:minmax(110px,.8fr) minmax(0,1.2fr); gap:10px; padding:8px 9px; border-right:1px solid var(--line); border-bottom:1px solid #edf0f4; font-size:10px; }} .attribute:nth-child(2n) {{ border-right:0; }} .attribute span {{ color:var(--muted); }} .attribute strong {{ overflow-wrap:anywhere; }} .attribute.missing_fact strong {{ color:var(--red); }} .attribute.rewrite_required strong {{ color:var(--amber); }} .attribute.not_applicable strong {{ color:var(--muted); font-weight:500; }} .all-mappings {{ margin-top:8px; color:var(--muted); font-size:10px; }} .all-mappings summary {{ cursor:pointer; color:var(--blue); font-weight:650; }}
     .gate-list {{ padding:6px 14px 12px; }} .gate-row {{ display:grid; grid-template-columns:22px minmax(0,1fr); gap:9px; padding:10px 0; border-bottom:1px solid #edf0f4; }} .gate-row:last-child {{ border-bottom:0; }} .gate-icon {{ width:22px; height:22px; display:grid; place-items:center; border-radius:50%; color:var(--green); background:var(--green-soft); font-size:11px; font-weight:700; }} .gate-row.blocked .gate-icon {{ color:var(--amber); background:var(--amber-soft); }} .gate-row strong {{ display:block; font-size:11px; }} .gate-row span {{ display:block; margin-top:2px; color:var(--muted); font-size:10px; }}
     .content-controller {{ margin:12px 14px; padding:11px; border:1px solid #bfd0f8; border-radius:5px; background:var(--blue-soft); }} .content-controller strong {{ display:block; font-size:11px; }} .content-controller p {{ margin:4px 0 8px; color:var(--muted); font-size:10px; }} .content-command {{ max-height:190px; overflow:auto; padding:9px; border:1px solid #c9d5ec; border-radius:4px; white-space:pre-wrap; color:#263756; background:#fff; font:10px/1.5 Consolas,"Courier New",monospace; }} .content-copy {{ width:100%; min-height:34px; margin-top:8px; border:1px solid var(--blue); border-radius:4px; color:#fff; background:var(--blue); cursor:pointer; }} .content-copy-status {{ display:block; min-height:16px; margin-top:4px; color:var(--green); font-size:10px; text-align:center; }}
@@ -3188,12 +3230,20 @@ def build_upload_workspace_html(run_id: str) -> str:
     function mappingGrid(fields) {{ const statusText = {{ rewrite_required:"待原创（依据采集事实，不复制 Ozon 原文）", missing_fact:"缺少事实，需补充", not_applicable:"未提供可选素材", excluded:"不参与本阶段" }}; const grid = document.createElement("div"); grid.className = "attribute-grid"; (fields || []).forEach((field) => {{ const row = document.createElement("div"); row.className = `attribute ${{field.status || "missing_fact"}}`; const label = document.createElement("span"); label.textContent = `${{field.label || field.field_key}}${{field.required ? " *" : ""}}`; const fact = document.createElement("strong"); const pendingVisual = field.status === "missing_fact" && field.visual_inference_supported; fact.textContent = field.status === "mapped" ? String(field.value) : (pendingVisual ? "可从锁定 1688 原图判定，等待智能字段 Skill 重判" : (field.intelligence_decision === "unresolved" ? `证据不足：${{field.reason || "无法确认"}}` : (statusText[field.status] || "缺少事实，需补充"))); row.append(label,fact); grid.append(row); }}); return grid; }}
     function requiredOptionValue(option) {{ if (option && typeof option === "object") return String(option.id ?? option.value ?? option.name ?? option.label ?? ""); return String(option ?? ""); }}
     function requiredOptionLabel(option) {{ if (option && typeof option === "object") return String(option.name ?? option.label ?? option.value ?? option.id ?? ""); return String(option ?? ""); }}
+    function requiredBooleanOptionLabel(field,value) {{ const positive = value === "true"; const label = String(field.label || "").toLowerCase(); if (label.includes("18+")) return positive ? "商品需要 18+ 标识" : "商品不需要 18+ 标识"; return positive ? "需要标记代码" : "不需要标记代码"; }}
     function renderRequiredAttributeEditor(container,item) {{
-      const fields = (item.missing_required_fields || []).filter((field) => field && field.field_key);
-      if (!item.template_ready || !fields.length) return;
+      const pendingFields = (item.skill_pending_required_fields || []).filter((field) => field && field.field_key);
+      const fields = (item.manual_required_fields || []).filter((field) => field && field.field_key);
+      if (!item.template_ready) return;
+      if (pendingFields.length) {{
+        const pending = document.createElement("div"); pending.className = "required-field-skill-pending";
+        pending.textContent = `${{pendingFields.length}} 项必填字段正在等待智能字段 Skill 补足，当前无需用户填写。`;
+        container.append(pending);
+      }}
+      if (!fields.length) return;
       const editor = document.createElement("section"); editor.className = "required-field-editor";
-      const title = document.createElement("h4"); title.textContent = "补充缺失必填字段";
-      const note = document.createElement("p"); note.textContent = "这里只显示 Seller API 当前仍缺失的必填项；填写值会作为用户确认的字段证据，不会覆盖已映射字段。";
+      const title = document.createElement("h4"); title.textContent = "补充技能无法确认的必填字段";
+      const note = document.createElement("p"); note.textContent = "这里只显示智能字段 Skill 已穷尽采集证据后仍无法确认的必填项；不会显示待技能处理或已经映射的字段。";
       const grid = document.createElement("div"); grid.className = "required-field-grid";
       fields.forEach((field) => {{
         const wrapper = document.createElement("div"); wrapper.className = "required-field-input";
@@ -3203,7 +3253,7 @@ def build_upload_workspace_html(run_id: str) -> str:
         input.id = label.htmlFor; input.dataset.fieldKey = field.field_key;
         if (options.length) {{
           const placeholder = document.createElement("option"); placeholder.value = ""; placeholder.textContent = "请选择"; input.append(placeholder);
-          options.forEach((option) => {{ const choice = document.createElement("option"); choice.value = requiredOptionValue(option); choice.textContent = requiredOptionLabel(option); input.append(choice); }});
+          options.forEach((option) => {{ const choice = document.createElement("option"); choice.value = requiredOptionValue(option); const rawLabel = requiredOptionLabel(option); choice.textContent = String(field.attribute_type || "").toLowerCase() === "boolean" ? requiredBooleanOptionLabel(field,choice.value) : rawLabel; input.append(choice); }});
         }} else {{
           input.type = field.attribute_type === "integer" || field.attribute_type === "decimal" ? "number" : "text";
           input.placeholder = field.reason ? `缺失：${{field.reason}}` : "请输入真实值";
@@ -3229,7 +3279,7 @@ def build_upload_workspace_html(run_id: str) -> str:
       }});
       actions.append(save,status); editor.append(title,note,grid,actions); container.append(editor);
     }}
-    function renderMapping(container, item) {{ if (!item.template_ready) {{ const summary = document.createElement("div"); summary.className = "mapping-summary"; const blocked = document.createElement("span"); blocked.className = "mapping-chip warn"; blocked.textContent = "模板错配，未执行字段映射"; summary.append(blocked); container.append(summary); return; }} const fields = item.attribute_mapping || []; const summary = document.createElement("div"); summary.className = "mapping-summary"; const ready = document.createElement("span"); ready.className = `mapping-chip${{item.required_attributes_ready ? "" : " warn"}}`; ready.textContent = `必填 ${{item.required_mapped_count || 0}} / ${{item.required_attribute_count || 0}}`; const mapped = document.createElement("span"); mapped.className = "mapping-chip"; mapped.textContent = `模板已填 ${{item.mapped_attribute_count || 0}}`; const rewrite = document.createElement("span"); rewrite.className = `mapping-chip${{(item.rewrite_required_count || 0) ? " warn" : ""}}`; rewrite.textContent = `待智能生成/规范 ${{item.rewrite_required_count || 0}}`; const missing = document.createElement("span"); missing.className = `mapping-chip${{(item.missing_fact_count || 0) ? " warn" : ""}}`; missing.textContent = `缺少事实 ${{item.missing_fact_count || 0}}`; const assets = document.createElement("span"); assets.className = "mapping-chip"; assets.textContent = `未提供可选素材 ${{item.not_applicable_count || 0}}`; summary.append(ready,mapped,rewrite,missing,assets); container.append(summary); const score = item.attribute_score_progress || {{}}; if (score.scorable_attribute_count) {{ const progress = document.createElement("div"); progress.className = "score-progress"; const paths = []; if (score.fields_to_50_percent > 0) paths.push(`再补 ${{score.fields_to_50_percent}} 项进入 15 分档`); if (score.fields_to_70_percent > 0) paths.push(`再补 ${{score.fields_to_70_percent}} 项进入 30 分档`); if (!paths.length) paths.push("已达到属性完整度 30 分档"); progress.textContent = `Ozon 属性分预估 ${{score.estimated_attribute_points}} / 30 · 计分属性 ${{score.filled_attribute_count}} / ${{score.scorable_attribute_count}} (${{score.completion_percent}}%) · ${{paths.join("；")}}`; container.append(progress); }} const details = document.createElement("details"); details.className = "all-mappings"; details.open = true; const label = document.createElement("summary"); label.textContent = `全部模板字段 (${{fields.length}})`; details.append(label,mappingGrid(fields)); container.append(details); }}
+    function renderMapping(container, item) {{ if (!item.template_ready) {{ const summary = document.createElement("div"); summary.className = "mapping-summary"; const blocked = document.createElement("span"); blocked.className = "mapping-chip warn"; blocked.textContent = "模板错配，未执行字段映射"; summary.append(blocked); container.append(summary); return; }} const fields = item.attribute_mapping || []; const summary = document.createElement("div"); summary.className = "mapping-summary"; const ready = document.createElement("span"); ready.className = `mapping-chip${{item.required_attributes_ready ? "" : " warn"}}`; ready.textContent = `必填 ${{item.required_mapped_count || 0}} / ${{item.required_attribute_count || 0}}`; const mapped = document.createElement("span"); mapped.className = "mapping-chip"; mapped.textContent = `模板已填 ${{item.mapped_attribute_count || 0}}`; const rewrite = document.createElement("span"); rewrite.className = `mapping-chip${{(item.rewrite_required_count || 0) ? " warn" : ""}}`; rewrite.textContent = `待智能生成/规范 ${{item.rewrite_required_count || 0}}`; const missing = document.createElement("span"); missing.className = `mapping-chip${{(item.missing_fact_count || 0) ? " warn" : ""}}`; missing.textContent = `缺少事实 ${{item.missing_fact_count || 0}}`; const assets = document.createElement("span"); assets.className = "mapping-chip"; assets.textContent = `未提供可选素材 ${{item.not_applicable_count || 0}}`; summary.append(ready,mapped,rewrite,missing,assets); container.append(summary); const score = item.attribute_score_progress || {{}}; if (score.scorable_attribute_count) {{ const progress = document.createElement("div"); progress.className = "score-progress"; const paths = []; if (score.fields_to_50_percent > 0) paths.push(`再补 ${{score.fields_to_50_percent}} 项进入 15 分档`); if (score.fields_to_70_percent > 0) paths.push(`再补 ${{score.fields_to_70_percent}} 项进入 30 分档`); if (!paths.length) paths.push("已达到属性完整度 30 分档"); progress.textContent = `Ozon 属性分预估 ${{score.estimated_attribute_points}} / 30 · 计分属性 ${{score.filled_attribute_count}} / ${{score.scorable_attribute_count}} (${{score.completion_percent}}%) · ${{paths.join("；")}}`; container.append(progress); }} const details = document.createElement("details"); details.className = "all-mappings"; details.open = false; const label = document.createElement("summary"); label.textContent = `查看全部模板字段（只读） (${{fields.length}})`; details.append(label,mappingGrid(fields)); container.append(details); }}
     async function previewProductUpload(item, controls) {{
       const previewButton = controls.querySelector("[data-action=preview]");
       const confirmButton = controls.querySelector("[data-action=confirm]");

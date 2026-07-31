@@ -87,6 +87,27 @@
     return "";
   }
 
+  function visibleEvidenceNode(node) {
+    if (!node || node.hidden === true) return false;
+    if (node.getAttribute && node.getAttribute("aria-hidden") === "true") return false;
+    if (typeof node.getClientRects === "function" && node.getClientRects().length === 0) return false;
+    if (typeof globalThis.getComputedStyle === "function") {
+      const style = globalThis.getComputedStyle(node);
+      if (style && (style.display === "none" || style.visibility === "hidden")) return false;
+    }
+    return true;
+  }
+
+  function firstVisibleText(selectors, limit = 300) {
+    for (const selector of selectors) {
+      const node = document.querySelector(selector);
+      if (!visibleEvidenceNode(node)) continue;
+      const value = textOf(node, limit);
+      if (value) return value;
+    }
+    return "";
+  }
+
   function metaContent(selectors) {
     for (const selector of selectors) {
       const node = document.querySelector(selector);
@@ -704,20 +725,19 @@
   }
 
   function collectTitle() {
-    return firstText([
+    return firstVisibleText([
       "[data-testid='offer-title']",
       "[class*='offer-title']",
       "[class*='offerTitle']",
-      "[class*='title-text']",
-      "[class*='titleText']",
     ], 500)
       || metaContent(["meta[property='og:title']", "meta[name='title']"])
+      || firstVisibleText(["main h1", "h1"], 500)
+      || normalizedText(document.title, 500)
       || scriptEvidence([
         /"offerTitle"\s*:\s*"([^"]+)"/i,
         /"subject"\s*:\s*"([^"]+)"/i,
       ])
-      || firstText(["main h1", "h1"], 500)
-      || normalizedText(document.title, 500);
+      || "";
   }
 
   function collectSeller() {
@@ -1121,28 +1141,18 @@
         status.textContent = `采集不完整，请等待页面加载：${missing.join(", ")} (Incomplete)`;
         return;
       }
-      const result = await api(current.capture_url, {
-        method: "POST",
-        body: JSON.stringify({
-          channel_index: current.channel_index,
-          seed_id: current.seed_id,
-          ozon_product_id: current.ozon_product_id,
-          supplier_product: product,
-        }),
+      const response = await chrome.runtime.sendMessage({
+        type: "ozon_v2_capture_supplier_channel",
+        supplier_product: product,
       });
+      const result = response && response.result ? response.result : response || {};
       const skuMatrixDeferred = !(product.sku_options || []).length;
-      status.textContent = result.ok
+      status.textContent = response && response.ok === true && result.ok !== false
         ? skuMatrixDeferred
           ? "公开数据已采集；完整 SKU 待工具台确认 (Collected)"
           : "采集成功，已回传工具台 (Collected)"
         : `采集失败：${result.message || result.code || "unknown"} (Failed)`;
-      collect.disabled = result.ok === true;
-      if (result.ok === true) {
-        await chrome.runtime.sendMessage({
-          type: "ozon_v2_supplier_channel_terminal",
-          state: "collected",
-        });
-      }
+      collect.disabled = !!(response && response.ok === true && result.ok !== false);
     };
     reject.onclick = async () => {
       reject.disabled = true;
@@ -1179,13 +1189,32 @@
     }
   }
 
-  async function reconcileManagedPanel(binding = activeManagedBinding) {
+  function invalidateManagedPanel() {
+    activeManagedBinding = null;
+    const panel = document.getElementById("ozon-v2-supplier-panel");
+    if (!panel) return null;
+    panel.dataset.channelInvalid = "true";
+    for (const selector of [
+      "#ozon-v2-supplier-back",
+      "#ozon-v2-collect-current-product",
+      "#ozon-v2-no-supplier",
+    ]) {
+      const button = panel.querySelector(selector);
+      if (button) button.disabled = true;
+    }
+    const status = panel.querySelector("#ozon-v2-supplier-status");
+    if (status) status.textContent = "当前标签页通道已失效，请使用工作台重新打开 (Stale Channel)";
+    return panel;
+  }
+
+  async function reconcileManagedPanel(binding = null) {
     const resolved = binding || await currentSupplierChannel();
-    if (!resolved) return null;
+    if (!resolved) return invalidateManagedPanel();
     activeManagedBinding = resolved;
     let panel = document.getElementById("ozon-v2-supplier-panel");
     const created = !panel;
     if (!panel) panel = createManagedPanel(resolved);
+    delete panel.dataset.channelInvalid;
     panel.dataset.channelIndex = String(resolved.channel_index);
     const title = panel.querySelector("[data-role='channel-title']");
     if (title) title.textContent = `通道 ${Number(resolved.channel_index) + 1} · ${resolved.ozon_title || resolved.seed_id}`;

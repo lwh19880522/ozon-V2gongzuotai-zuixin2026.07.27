@@ -50,6 +50,12 @@ country, warranty, certification, and marking only from explicit evidence.
 Never infer safety certification, warranty, EAC/marking codes, partner identity,
 factory-pack count, customs values, or weight from category norms.
 
+Marking-code and similar compliance decisions are not Skill inference. When the
+Seller API declares one as a Boolean field, the workbench must request one
+explicit boolean confirmation and carry that typed value into the upload draft.
+The Skill must not derive true or false from category norms, missing evidence,
+images, or unrelated attributes.
+
 ## Visual evidence
 
 Use only original locked supplier images exposed through `visual_evidence_refs`.
@@ -135,8 +141,21 @@ title, description, hashtags, or Rich Content blocks verbatim.
 
 ## Required fields
 
-Required fields receive no permission to guess. Classify the missing fact and
-leave the product blocked while other products continue independently.
+Process required fields before optional and creative fields. Exhaust exact
+locked-SKU evidence, supplier attributes, structured Ozon attributes, allowed
+dictionary values, permitted visual evidence, translation, and normalization
+before declaring a required fact missing.
+
+Required fields receive no permission to guess. If the fact remains
+unavailable, classify it as `unresolved`. The workbench may expose it to the
+user only after that decision appears in `manual_required_fields`; a merely
+pending entry in `missing_required_fields` is still Skill work and must not
+become a user input.
+
+After the user confirms an exact manual required value, save only that field,
+reload the field tasks, and continue until the product is upload-ready or a new
+specific blocker is returned. Never leave a product at a generic required-field
+blocker without either an evidence-backed value or an exact manual handoff.
 
 ## Conflict handling
 

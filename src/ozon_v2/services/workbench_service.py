@@ -82,6 +82,11 @@ _PRE_UPLOAD_COMPLIANCE_DECISION_LABELS = frozenset(
     {
         "нужен код маркировки",
         "требуется код маркировки",
+        "подпись 18",
+        "признак 18",
+        "знак 18",
+        "маркировка 18",
+        "нужна подпись 18",
     }
 )
 _INTERNAL_LIFECYCLE_ACTIONS = frozenset(
@@ -1964,6 +1969,8 @@ class WorkbenchService:
                     "required_attribute_count": 0,
                     "required_mapped_count": 0,
                     "missing_required_fields": [],
+                    "skill_pending_required_fields": [],
+                    "manual_required_fields": [],
                     "required_attributes_ready": False,
                     "attribute_score_progress": attribute_content_score_progress([]),
                 }
@@ -2043,6 +2050,10 @@ class WorkbenchService:
                     "excluded_attribute_count": mapping["excluded_attribute_count"],
                     "required_mapped_count": mapping["required_mapped_count"],
                     "missing_required_fields": mapping["missing_required_fields"],
+                    "skill_pending_required_fields": mapping[
+                        "skill_pending_required_fields"
+                    ],
+                    "manual_required_fields": mapping["manual_required_fields"],
                     "attribute_score_progress": mapping[
                         "attribute_score_progress"
                     ],
@@ -2210,13 +2221,20 @@ class WorkbenchService:
             )
         missing_fields = {
             str(field.get("field_key") or ""): field
-            for field in item.get("missing_required_fields", [])
+            for field in item.get("manual_required_fields", [])
             if str(field.get("field_key") or "")
         }
         normalized_values = {
             str(field_key).strip(): value
             for field_key, value in (values or {}).items()
             if str(field_key).strip()
+        }
+        normalized_values = {
+            field_key: _normalized_required_attribute_value(
+                missing_fields.get(field_key),
+                value,
+            )
+            for field_key, value in normalized_values.items()
         }
         invalid_keys = sorted(set(normalized_values) - set(missing_fields))
         empty_keys = sorted(
@@ -2227,7 +2245,7 @@ class WorkbenchService:
         if not normalized_values or invalid_keys or empty_keys:
             return Result.failure(
                 "required_attribute_evidence.invalid_fields",
-                "Only currently missing required fields can be saved, and every value must be non-empty.",
+                "Only required fields confirmed unresolved by the field Skill can be saved, and every value must be non-empty.",
                 errors=[
                     *(
                         ["Not currently missing required: " + ", ".join(invalid_keys)]
@@ -2251,6 +2269,7 @@ class WorkbenchService:
             if (
                 isinstance(allowed_values, list)
                 and allowed_values
+                and value not in allowed_values
                 and str(value) not in {str(candidate) for candidate in allowed_values}
             ):
                 return Result.failure(
@@ -2352,10 +2371,16 @@ class WorkbenchService:
             intelligent_fields = [
                 field
                 for field in item.get("attribute_mapping", [])
-                if field.get("status") in {"rewrite_required", "missing_fact"}
-                or field.get("source")
-                in {"generated_original_content", "generated_evidence_completion"}
-                or field.get("intelligence_decision") == "unresolved"
+                if field.get("required_reason") != "ozon_compliance_decision"
+                and (
+                    field.get("status") in {"rewrite_required", "missing_fact"}
+                    or field.get("source")
+                    in {
+                        "generated_original_content",
+                        "generated_evidence_completion",
+                    }
+                    or field.get("intelligence_decision") == "unresolved"
+                )
             ]
             if not intelligent_fields:
                 continue
@@ -2511,6 +2536,8 @@ class WorkbenchService:
                         "supplier_truth_overrides_ozon": True,
                         "unsupported_claims_forbidden": True,
                         "complete_all_pending_fields": True,
+                        "required_fields_must_be_completed_first": True,
+                        "manual_entry_only_after_intelligence_unresolved": True,
                         "objective_values_require_evidence_refs": True,
                         "unverifiable_fields_must_be_unresolved": True,
                         "visual_supported_fields_must_inspect_supplier_images": True,
@@ -2708,6 +2735,21 @@ class WorkbenchService:
                     if not evidence_refs:
                         errors.append(
                             f"{label}: evidence_refs are required for objective fields."
+                        )
+                    field_specific_refs = {
+                        str(reference)
+                        for reference in (
+                            field.get("candidate_evidence_refs") or []
+                        )
+                        if str(reference or "").strip()
+                    }
+                    field_specific_refs.update(visual_evidence_refs)
+                    if evidence_refs and not field_specific_refs.intersection(
+                        evidence_refs
+                    ):
+                        errors.append(
+                            f"{label}: a filled objective field must cite a "
+                            "field-specific evidence_ref."
                         )
                     allowed_values = field.get("allowed_values") or []
                     if (
@@ -2998,6 +3040,7 @@ class WorkbenchService:
                     "attribute_id": field["field_key"],
                     "label": field["label"],
                     "value": upload_value,
+                    "attribute_type": field.get("attribute_type"),
                     "dictionary_id": field.get("dictionary_id"),
                     "dictionary_value_id": None,
                     "dictionary_resolution_required": field.get(
@@ -4134,7 +4177,19 @@ class WorkbenchService:
             ),
         )
 
-    def capture_supplier_selection_product(self, run_id: str, payload: dict[str, Any]) -> Result:
+    def capture_supplier_selection_product(
+        self,
+        run_id: str,
+        payload: dict[str, Any],
+    ) -> Result:
+        with self._run_mutation_lock(run_id):
+            return self._capture_supplier_selection_product_locked(run_id, payload)
+
+    def _capture_supplier_selection_product_locked(
+        self,
+        run_id: str,
+        payload: dict[str, Any],
+    ) -> Result:
         run = self.repo.load_run(run_id)
         status = WorkbenchState(run["status"])
         recapture_seed_ids = {
@@ -4154,6 +4209,23 @@ class WorkbenchService:
                 data={"run_id": run_id, "status": run["status"]},
             )
         review = self.repo.load_supplier_review(run_id)
+        expected_dispatch_token = str(
+            run.get("browser_task_resumed_at")
+            or review.get("created_at")
+            or run.get("created_at")
+            or ""
+        ).strip()
+        payload_dispatch_token = str(payload.get("dispatch_token") or "").strip()
+        if not payload_dispatch_token or payload_dispatch_token != expected_dispatch_token:
+            return Result.failure(
+                "supplier_selection.dispatch_stale",
+                "This 1688 tab belongs to an outdated supplier-selection dispatch.",
+                data={
+                    "run_id": run_id,
+                    "status": run["status"],
+                    "received_dispatch_token": payload_dispatch_token or None,
+                },
+            )
         items = [item for item in review.get("items", []) if isinstance(item, dict)]
         seed_id = requested_seed_id
         ozon_product_id = str(payload.get("ozon_product_id") or "").strip()
@@ -4192,8 +4264,41 @@ class WorkbenchService:
                 "Open an exact 1688 product detail page before collecting.",
                 data={"run_id": run_id, "seed_id": seed_id, "supplier_url": supplier_url},
             )
+        supplier_offer_match = re.search(r"/offer/(\d+)\.html", supplier_url)
+        supplier_offer_id = supplier_offer_match.group(1) if supplier_offer_match else ""
+        final_url = str(product.get("final_url") or "").strip()
+        final_offer_match = re.search(r"/offer/(\d+)\.html", final_url) if final_url else None
+        final_offer_id = final_offer_match.group(1) if final_offer_match else ""
+        reported_offer_id = str(
+            product.get("offer_id")
+            or product.get("supplier_product_id")
+            or ""
+        ).strip()
+        offer_ids = {
+            value
+            for value in (supplier_offer_id, final_offer_id, reported_offer_id)
+            if value
+        }
+        if (
+            not supplier_offer_id
+            or not reported_offer_id
+            or (final_url and not final_offer_id)
+            or len(offer_ids) != 1
+        ):
+            return Result.failure(
+                "supplier_selection.offer_identity_mismatch",
+                "The 1688 URL, final page and captured Offer ID do not identify one product.",
+                data={
+                    "run_id": run_id,
+                    "seed_id": seed_id,
+                    "supplier_url": supplier_url,
+                    "final_url": final_url or None,
+                    "reported_offer_id": reported_offer_id or None,
+                },
+            )
         product["seed_id"] = seed_id
         product["supplier_url"] = supplier_url
+        product["offer_id"] = supplier_offer_id
         if is_late_recapture:
             missing = self._supplier_product_missing_fields(product)
             if missing:
@@ -4215,6 +4320,58 @@ class WorkbenchService:
             "supplier_products": [],
             "created_at": utc_now_iso(),
         }
+        persisted_products = [
+            item
+            for item in draft.get("supplier_products", [])
+            if isinstance(item, dict)
+        ]
+        if is_late_recapture:
+            persisted_products.extend(
+                item
+                for item in self.repo.load_supplier_collection_result(run_id).get(
+                    "supplier_products",
+                    [],
+                )
+                if isinstance(item, dict)
+            )
+        review_by_seed = {
+            str(item.get("seed_id") or ""): item
+            for item in items
+            if isinstance(item, dict)
+        }
+        for existing in persisted_products:
+            existing_seed_id = str(existing.get("seed_id") or "").strip()
+            if not existing_seed_id or existing_seed_id == seed_id:
+                continue
+            existing_offer_id = str(
+                existing.get("offer_id")
+                or existing.get("supplier_product_id")
+                or ""
+            ).strip()
+            if not existing_offer_id:
+                existing_match = re.search(
+                    r"/offer/(\d+)\.html",
+                    str(existing.get("supplier_url") or ""),
+                )
+                existing_offer_id = (
+                    existing_match.group(1) if existing_match else ""
+                )
+            if existing_offer_id != supplier_offer_id:
+                continue
+            conflicting_review = review_by_seed.get(existing_seed_id) or {}
+            return Result.failure(
+                "supplier_selection.offer_already_assigned",
+                "This 1688 Offer is already assigned to another Ozon product in the batch.",
+                data={
+                    "run_id": run_id,
+                    "seed_id": seed_id,
+                    "offer_id": supplier_offer_id,
+                    "conflicting_seed_id": existing_seed_id,
+                    "conflicting_ozon_product_id": conflicting_review.get(
+                        "ozon_product_id"
+                    ),
+                },
+            )
         captured = {
             str(item.get("seed_id") or ""): item
             for item in draft.get("supplier_products", [])
@@ -6598,10 +6755,17 @@ class WorkbenchService:
             if supplier_product is not None:
                 supplier_product["images"] = self._supplier_product_images(supplier_product)
             supplier_sku_options = self._supplier_sku_options(supplier_product) if supplier_product else []
+            supplier_sku_candidates = [
+                dict(candidate)
+                for candidate in (supplier_product or {}).get("sku_option_candidates") or []
+                if isinstance(candidate, dict)
+                and str(candidate.get("supplier_sku_id") or "").strip()
+            ]
             merged = dict(stored_item)
             merged["ozon_product"] = ozon_product
             merged["supplier_product"] = supplier_product
             merged["supplier_sku_options"] = supplier_sku_options
+            merged["supplier_sku_candidates"] = supplier_sku_candidates
             merged["supplier_sku_decision"] = self._supplier_sku_decision(
                 ozon_product,
                 supplier_sku_options,
@@ -7524,9 +7688,20 @@ def _field_candidate_evidence_refs(
     special_suffixes = {
         "quantity": (".set_quantity",),
         "package_contents": (".set_composition.0", ".raw_label"),
+        "set_item_count": (".set_quantity", ".set_composition.0", ".raw_label"),
         "model": (".raw_label", ".combination_key"),
         "article": (".supplier_sku_id",),
     }
+    related_canonical_labels = {
+        "set_item_count": {"package_contents", "quantity"},
+        "factory_package_count": {"quantity"},
+    }
+    candidates.extend(
+        reference
+        for reference in evidence_index
+        if canonical_attribute_label(reference.rsplit(".", 1)[-1])
+        in related_canonical_labels.get(canonical_label, set())
+    )
     for suffix in special_suffixes.get(canonical_label, ()):
         candidates.extend(
             reference
@@ -7938,6 +8113,28 @@ def _has_content_value(value: Any) -> bool:
     return True
 
 
+def _coerce_boolean_value(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value or "").strip().casefold()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    return None
+
+
+def _normalized_required_attribute_value(
+    field: dict[str, Any] | None,
+    value: Any,
+) -> Any:
+    attribute_type = str((field or {}).get("attribute_type") or "").strip().casefold()
+    if attribute_type not in {"bool", "boolean"}:
+        return value
+    normalized = _coerce_boolean_value(value)
+    return normalized if normalized is not None else value
+
+
 def _normalize_content_text(value: Any) -> str:
     return " ".join(
         part
@@ -8201,7 +8398,16 @@ def _seller_api_attribute(attribute: dict[str, Any]) -> dict[str, Any] | None:
     if not attribute_id or not _has_content_value(value):
         return None
     dictionary_value_id = attribute.get("dictionary_value_id")
-    seller_value = {"value": str(value)}
+    attribute_type = str(attribute.get("attribute_type") or "").strip().casefold()
+    if attribute_type in {"bool", "boolean"}:
+        boolean_value = _coerce_boolean_value(value)
+        if boolean_value is None:
+            raise ValueError(
+                f"Boolean Seller API attribute {attribute_id} requires true or false."
+            )
+        seller_value = {"value": "true" if boolean_value else "false"}
+    else:
+        seller_value = {"value": str(value)}
     if dictionary_value_id is not None:
         seller_value["dictionary_value_id"] = int(dictionary_value_id)
     return {
@@ -8306,6 +8512,13 @@ def _effective_upload_schema(
         if normalized_label in _PRE_UPLOAD_COMPLIANCE_DECISION_LABELS:
             field["is_required"] = True
             field["required_reason"] = "ozon_compliance_decision"
+            if str(field.get("attribute_type") or "").strip().casefold() in {
+                "bool",
+                "boolean",
+            }:
+                field["attribute_type"] = "Boolean"
+                field["allowed_values"] = [False, True]
+                field["dictionary_id"] = None
         effective.append(field)
     return effective
 

@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -24,9 +25,10 @@ from ozon_v2.services.attribute_mapping_service import map_template_attributes
 from ozon_v2.services.workbench_service import (
     WorkbenchService,
     _normalize_ozon_rich_content_value,
+    _seller_api_attribute,
     _video_template_fields,
 )
-from ozon_v2.workbench.local_server import create_handler
+from ozon_v2.workbench.local_server import build_upload_workspace_html, create_handler
 
 from tests.helpers import FakePublicMediaPublisher, FakeSellerApiAdapter, RuntimeTestCase
 
@@ -1611,6 +1613,105 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual("supplier_selection.channel_mismatch", result["code"])
         self.assertEqual(WorkbenchState.SUPPLIER_REVIEW.value, self.repo.load_run(run_id)["status"])
 
+    def test_supplier_selection_capture_rejects_stale_dispatch_generation(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        current_task = self.get_json(f"/api/batches/{run_id}/browser-task")
+        current_token = current_task["data"]["dispatch_token"]
+
+        result = self.post_json(
+            f"/api/batches/{run_id}/supplier-selection/capture",
+            {
+                "channel_index": 0,
+                "seed_id": seed.seed_id,
+                "ozon_product_id": "ozon-1",
+                "dispatch_token": f"{current_token}-stale",
+                "supplier_product": self.supplier_product_payload(seed.seed_id),
+            },
+            ok=False,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("supplier_selection.dispatch_stale", result["code"])
+        self.assertFalse((self.repo.run_dir(run_id) / "supplier_selection_draft.json").exists())
+        self.assertEqual(WorkbenchState.SUPPLIER_REVIEW.value, self.repo.load_run(run_id)["status"])
+
+    def test_supplier_selection_capture_rejects_mixed_offer_identity(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        task = self.get_json(f"/api/batches/{run_id}/browser-task")
+        supplier_product = self.supplier_product_payload(seed.seed_id)
+        supplier_product["final_url"] = supplier_product["supplier_url"]
+        supplier_product["offer_id"] = "999999999999"
+
+        result = self.post_json(
+            f"/api/batches/{run_id}/supplier-selection/capture",
+            {
+                "channel_index": 0,
+                "seed_id": seed.seed_id,
+                "ozon_product_id": "ozon-1",
+                "dispatch_token": task["data"]["dispatch_token"],
+                "supplier_product": supplier_product,
+            },
+            ok=False,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("supplier_selection.offer_identity_mismatch", result["code"])
+        self.assertFalse((self.repo.run_dir(run_id) / "supplier_selection_draft.json").exists())
+
+    def test_supplier_selection_capture_rejects_offer_already_assigned_to_another_product(
+        self,
+    ) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        review = self.repo.load_supplier_review(run_id)
+        second_item = dict(review["items"][0])
+        second_item.update(
+            {
+                "channel_index": 1,
+                "seed_id": "seed-second",
+                "ozon_product_id": "ozon-2",
+                "ozon_title": "Second Ozon product",
+                "supplier_url": None,
+                "user_verified_exact_match": False,
+            }
+        )
+        review["items"].append(second_item)
+        self.repo.save_supplier_review(run_id, review)
+        task = self.get_json(f"/api/batches/{run_id}/browser-task")
+        dispatch_token = task["data"]["dispatch_token"]
+
+        first = self.post_json(
+            f"/api/batches/{run_id}/supplier-selection/capture",
+            {
+                "channel_index": 0,
+                "seed_id": seed.seed_id,
+                "ozon_product_id": "ozon-1",
+                "dispatch_token": dispatch_token,
+                "supplier_product": self.supplier_product_payload(seed.seed_id),
+            },
+        )
+        second_product = self.supplier_product_payload("seed-second")
+        second = self.post_json(
+            f"/api/batches/{run_id}/supplier-selection/capture",
+            {
+                "channel_index": 1,
+                "seed_id": "seed-second",
+                "ozon_product_id": "ozon-2",
+                "dispatch_token": dispatch_token,
+                "supplier_product": second_product,
+            },
+            ok=False,
+        )
+
+        self.assertTrue(first["ok"])
+        self.assertFalse(second["ok"])
+        self.assertEqual("supplier_selection.offer_already_assigned", second["code"])
+        self.assertEqual(seed.seed_id, second["data"]["conflicting_seed_id"])
+        draft = self.repo.load_supplier_selection_draft(run_id)
+        self.assertEqual(
+            [seed.seed_id],
+            [item["seed_id"] for item in draft["supplier_products"]],
+        )
+
     def test_supplier_selection_reset_removes_wrong_capture_and_reopens_lane(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
         review = self.repo.load_supplier_review(run_id)
@@ -1676,6 +1777,11 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         collection = self.repo.load_supplier_collection_result(run_id)
         retained_product = self.supplier_product_payload("seed-retained")
         retained_product["title"] = "Already completed supplier product"
+        retained_product["supplier_url"] = (
+            "https://detail.1688.com/offer/987654321098.html"
+        )
+        retained_product["final_url"] = retained_product["supplier_url"]
+        retained_product["offer_id"] = "987654321098"
         collection["supplier_products"].append(retained_product)
         self.repo.save_supplier_collection_result(run_id, collection)
         run = self.repo.load_run(run_id)
@@ -1824,6 +1930,73 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         )
         self.assertTrue(item["supplier_sku_options"][0]["complete"])
         self.assertEqual(WorkbenchState.SUPPLIER_COLLECTED.value, self.repo.load_run(run_id)["status"])
+
+    def test_supplier_review_exposes_multi_sku_candidates_without_variant_images_read_only(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        task = self.get_json(f"/api/batches/{run_id}/browser-task")
+        supplier_product = self.supplier_product_payload(seed.seed_id)
+        supplier_product["sku_groups"] = [
+            {
+                "name": "颜色",
+                "options": [
+                    {"label": "银色一个", "supplier_sku_id": "", "image_url": ""},
+                    {"label": "蓝色一个", "supplier_sku_id": "", "image_url": ""},
+                ],
+            }
+        ]
+        supplier_product["sku_options"] = [
+            {
+                "supplier_sku_id": "sku-silver",
+                "combination_key": "银色一个",
+                "raw_label": "银色一个",
+                "selected_options": {"颜色": "银色一个"},
+                "set_quantity": 1,
+                "set_composition": ["银色一个"],
+                "price": {"currency": "CNY", "amount": "110.00"},
+                "stock": {"status": "in_stock", "quantity": 4753},
+                "image_urls": [],
+                "evidence_source": "embedded_sku_map",
+                "complete": False,
+            },
+            {
+                "supplier_sku_id": "sku-blue",
+                "combination_key": "蓝色一个",
+                "raw_label": "蓝色一个",
+                "selected_options": {"颜色": "蓝色一个"},
+                "set_quantity": 1,
+                "set_composition": ["蓝色一个"],
+                "price": {"currency": "CNY", "amount": "110.00"},
+                "stock": {"status": "in_stock", "quantity": 4946},
+                "image_urls": [],
+                "evidence_source": "embedded_sku_map",
+                "complete": False,
+            },
+        ]
+
+        captured = self.post_json(
+            f"/api/batches/{run_id}/supplier-selection/capture",
+            {
+                "channel_index": 0,
+                "seed_id": seed.seed_id,
+                "ozon_product_id": "ozon-1",
+                "dispatch_token": task["data"]["dispatch_token"],
+                "supplier_product": supplier_product,
+            },
+        )
+        review = self.get_json(f"/api/batches/{run_id}/supplier-review")
+        item = review["data"]["items"][0]
+        page = self.get_text(f"/batches/{run_id}/supplier-review")
+
+        self.assertTrue(captured["ok"])
+        self.assertEqual([], item["supplier_sku_options"])
+        self.assertEqual(
+            ["sku-silver", "sku-blue"],
+            [candidate["supplier_sku_id"] for candidate in item["supplier_sku_candidates"]],
+        )
+        self.assertTrue(all(not candidate["image_urls"] for candidate in item["supplier_sku_candidates"]))
+        self.assertIn("supplier_sku_candidates", page)
+        self.assertIn("已识别但不可锁定", page)
+        self.assertIn("公共商品图", page)
 
     def test_supplier_selection_capture_exposes_page_unique_sku_for_confirmation(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
@@ -2209,7 +2382,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
     def test_extension_manifest_registers_1688_supplier_content_script(self) -> None:
         manifest_path = self.project_root / "browser_extension" / "ozon_v2_bridge" / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self.assertEqual("0.1.64", manifest["version"])
+        self.assertEqual("0.1.65", manifest["version"])
 
         supplier_scripts = [
             item
@@ -2928,7 +3101,15 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             "已由用户确认；构建草稿时自动写入。包装字段不会冒充商品净尺寸字段",
             page,
         )
-        self.assertIn("全部模板字段", page)
+        self.assertIn("查看全部模板字段（只读）", page)
+        self.assertIn("item.manual_required_fields", page)
+        self.assertIn("item.skill_pending_required_fields", page)
+        self.assertIn("无需用户填写", page)
+        self.assertNotIn(
+            "const fields = (item.missing_required_fields || [])",
+            page,
+        )
+        self.assertIn("details.open = false", page)
         self.assertIn("待原创", page)
         self.assertIn("缺少事实", page)
         self.assertIn("未提供可选素材", page)
@@ -3604,6 +3785,10 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual("evidence_inference", field_tasks["tools-count"]["mode"])
         self.assertEqual("evidence_inference", field_tasks["warranty"]["mode"])
         self.assertEqual("creative_rewrite", field_tasks["title"]["mode"])
+        self.assertTrue(task["rules"]["required_fields_must_be_completed_first"])
+        self.assertTrue(
+            task["rules"]["manual_entry_only_after_intelligence_unresolved"]
+        )
         self.assertEqual(
             "1 инструмент",
             task["evidence_index"]["ozon.attributes.Комплектация"],
@@ -3634,6 +3819,35 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual("content_task.validation_failed", invalid["code"])
         self.assertTrue(
             any("evidence_refs" in error for error in invalid.get("errors", []))
+        )
+
+        unrelated = self.post_json(
+            f"/api/batches/{run_id}/content-tasks/complete",
+            {
+                "seed_id": seed.seed_id,
+                "fields": {
+                    "tools-count": {
+                        "decision": "filled",
+                        "value": "1",
+                        "evidence_refs": ["ozon.attributes.Комплектация"],
+                        "reason": "Количество извлечено из собранной комплектации.",
+                    },
+                    "warranty": {
+                        "decision": "filled",
+                        "value": "1 год",
+                        "evidence_refs": ["ozon.attributes.Комплектация"],
+                        "reason": "Гарантия якобы выведена из комплектации.",
+                    },
+                    "title": (
+                        "Комплект ручных инструментов для точной работы, 1 предмет"
+                    ),
+                },
+            },
+            ok=False,
+        )
+        self.assertEqual("content_task.validation_failed", unrelated["code"])
+        self.assertTrue(
+            any("field-specific evidence_ref" in error for error in unrelated["errors"])
         )
 
         completed = self.post_json(
@@ -5041,6 +5255,49 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             "900",
             [field["field_key"] for field in item_before["missing_required_fields"]],
         )
+        self.assertEqual([], item_before["manual_required_fields"])
+
+        pending_save = service.save_required_attribute_evidence(
+            run_id,
+            seed.seed_id,
+            {"900": "1 год"},
+        )
+        self.assertFalse(pending_save.ok)
+
+        self.repo.save_generated_content_result(
+            run_id,
+            {
+                "schema_version": 2,
+                "run_id": run_id,
+                "items": {
+                    seed.seed_id: {
+                        "status": "blocked",
+                        "field_results": {
+                            "85": {
+                                "decision": "filled",
+                                "value": "белый",
+                                "evidence_refs": ["ozon.attributes.Цвет"],
+                                "reason": "Цвет подтвержден собранными данными.",
+                            },
+                            "900": {
+                                "decision": "unresolved",
+                                "resolution_class": "source_fact_missing",
+                                "evidence_refs": [],
+                                "reason": "Гарантия отсутствует в собранных данных.",
+                            },
+                        },
+                    }
+                },
+            },
+        )
+        after_skill = service.upload_workspace(run_id)
+        self.assertEqual(
+            ["900"],
+            [
+                field["field_key"]
+                for field in after_skill.data["items"][0]["manual_required_fields"]
+            ],
+        )
 
         rejected = service.save_required_attribute_evidence(
             run_id,
@@ -5050,7 +5307,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         saved = service.save_required_attribute_evidence(
             run_id,
             seed.seed_id,
-            {"85": "белый", "900": "1 год"},
+            {"900": "1 год"},
         )
         after = service.upload_workspace(run_id)
 
@@ -5078,8 +5335,18 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             {
                 "attribute_id": "901",
                 "attribute_label": "Нужен код маркировки",
-                "attribute_type": "dictionary",
-                "dictionary_id": 9010,
+                "attribute_type": "Boolean",
+                "is_required": False,
+                "schema_source": (
+                    "ozon_seller_api_description_category_attribute"
+                ),
+            }
+        )
+        template_result["seed_templates"][0]["upload_attribute_schema"].append(
+            {
+                "attribute_id": "902",
+                "attribute_label": "Подпись 18+",
+                "attribute_type": "Boolean",
                 "is_required": False,
                 "schema_source": (
                     "ozon_seller_api_description_category_attribute"
@@ -5088,6 +5355,9 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         )
         self.repo.save_attribute_template_result(run_id, template_result)
         service = WorkbenchService(self.repo)
+        upload_html = build_upload_workspace_html(run_id)
+        self.assertIn("需要标记代码", upload_html)
+        self.assertIn("商品需要 18+ 标识", upload_html)
 
         before = service.upload_workspace(run_id)
 
@@ -5102,13 +5372,46 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             "ozon_compliance_decision",
             missing["901"]["required_reason"],
         )
+        self.assertEqual(
+            "ozon_compliance_decision",
+            missing["902"]["required_reason"],
+        )
         self.assertIn("required_attributes", item_before["blocking_gates"])
-        self.assertEqual(2, item_before["required_attribute_count"])
+        self.assertEqual(3, item_before["required_attribute_count"])
+        self.assertEqual(
+            ["901", "902"],
+            [
+                field["field_key"]
+                for field in item_before["manual_required_fields"]
+            ],
+        )
+        self.assertEqual(
+            [False, True],
+            item_before["manual_required_fields"][0]["allowed_values"],
+        )
+        self.assertEqual(
+            [False, True],
+            item_before["manual_required_fields"][1]["allowed_values"],
+        )
+        tasks = service.content_tasks(run_id)
+        self.assertTrue(tasks.ok, tasks.to_dict())
+        task_field_keys = {
+            field["field_key"]
+            for item in tasks.data["items"]
+            for field in item["field_tasks"]
+        }
+        self.assertTrue(
+            {"901", "902"}.isdisjoint(task_field_keys),
+            (
+                "compliance decisions must remain user-owned instead of being "
+                "sent to the field drafting Skill"
+            ),
+        )
 
         saved = service.save_required_attribute_evidence(
             run_id,
             seed.seed_id,
-            {"901": "Нет"},
+            {"901": "false", "902": "true"},
         )
         after = service.upload_workspace(run_id)
 
@@ -5119,7 +5422,8 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             field["field_key"]: field
             for field in item_after["attribute_mapping"]
         }
-        self.assertEqual("Нет", mapped["901"]["value"])
+        self.assertIs(False, mapped["901"]["value"])
+        self.assertIs(True, mapped["902"]["value"])
         self.assertEqual(
             "user_confirmed_required_attribute",
             mapped["901"]["source"],
@@ -5128,6 +5432,43 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             "901",
             [field["field_key"] for field in item_after["missing_required_fields"]],
         )
+        self.assertNotIn(
+            "902",
+            [field["field_key"] for field in item_after["missing_required_fields"]],
+        )
+
+    def test_seller_api_attribute_serializes_boolean_values_for_ozon(self) -> None:
+        for stored_value, seller_value in (
+            (False, "false"),
+            (True, "true"),
+            ("false", "false"),
+            ("true", "true"),
+        ):
+            with self.subTest(stored_value=stored_value):
+                attribute = _seller_api_attribute(
+                    {
+                        "attribute_id": "901",
+                        "attribute_type": "Boolean",
+                        "value": stored_value,
+                    }
+                )
+
+                self.assertEqual(
+                    {
+                        "complex_id": 0,
+                        "id": 901,
+                        "values": [{"value": seller_value}],
+                    },
+                    attribute,
+                )
+        with self.assertRaisesRegex(ValueError, "requires true or false"):
+            _seller_api_attribute(
+                {
+                    "attribute_id": "901",
+                    "attribute_type": "Boolean",
+                    "value": "Нет",
+                }
+            )
 
     def test_batch_upload_requires_confirmation_and_submits_ready_product(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
@@ -5405,7 +5746,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn("批量校验并上传可用商品", page)
         self.assertIn("batchUploadProducts", page)
         self.assertIn("/product-upload/batch", page)
-        self.assertIn("补充缺失必填字段", page)
+        self.assertIn("补充技能无法确认的必填字段", page)
         self.assertIn("保存必填证据", page)
         self.assertIn("/required-attributes/", page)
 
@@ -6139,6 +6480,18 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         return result
 
     def post_json(self, path: str, payload: dict, ok: bool = True) -> dict:
+        supplier_capture_match = re.fullmatch(
+            r"/api/batches/([^/]+)/supplier-selection/capture",
+            path,
+        )
+        if supplier_capture_match and "dispatch_token" not in payload:
+            task = self.get_json(
+                f"/api/batches/{supplier_capture_match.group(1)}/browser-task"
+            )
+            payload = {
+                **payload,
+                "dispatch_token": task["data"]["dispatch_token"],
+            }
         request = Request(
             self.base_url + path,
             data=json.dumps(payload).encode("utf-8"),

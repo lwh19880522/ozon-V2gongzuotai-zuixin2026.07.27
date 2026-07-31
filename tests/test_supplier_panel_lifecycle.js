@@ -156,11 +156,13 @@ const binding = {
   channel_index: 2,
   seed_id: "seed-3",
   ozon_product_id: "ozon-3",
+  dispatch_token: "supplier-dispatch-current",
   ozon_title: "Ozon managed product",
   reference_image_url: "https://ir.ozone.ru/reference.jpg",
   capture_url: "/api/batches/wb-managed/supplier-selection/capture",
   reject_url: "/api/batches/wb-managed/supplier-review/reject",
 };
+let channelBinding = binding;
 
 const chrome = {
   runtime: {
@@ -171,7 +173,7 @@ const chrome = {
         return { ok: true, task: { code: "browser_task.supplier_selection_ready" } };
       }
       if (message.type === "ozon_v2_get_supplier_channel") {
-        return { ok: true, binding, diagnostics: null };
+        return { ok: true, binding: channelBinding, diagnostics: null };
       }
       if (message.type === "ozon_v2_fetch_reference_image") {
         referenceFetches += 1;
@@ -314,6 +316,14 @@ vm.runInContext(fs.readFileSync(scriptPath, "utf8"), context, { filename: script
   const ping = await sendRuntimeMessage({ type: "ozon_v2_content_ping" });
   assert.equal(ping.binding_present, true);
   assert.equal(ping.panel_present, true);
+
+  channelBinding = null;
+  await sendRuntimeMessage({ type: "ozon_v2_supplier_channel_refresh" });
+  await wait(40);
+  const staleCollectButton = document.getElementById("ozon-v2-collect-current-product");
+  assert.equal(staleCollectButton.disabled, true, "an unbound stale tab must not keep a usable capture button");
+  const stalePing = await sendRuntimeMessage({ type: "ozon_v2_content_ping" });
+  assert.equal(stalePing.binding_present, false, "a removed channel binding must invalidate page-local state");
   process.stdout.write("supplier managed panel lifecycle: OK\n");
 })().catch((error) => {
   console.error(error);
