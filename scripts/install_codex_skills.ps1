@@ -19,7 +19,7 @@ if ([string]::IsNullOrWhiteSpace($SkillTargetRoot)) {
 $skillNames = @(
     'ozon-product-media-generator',
     'ozon-intelligent-field-drafter',
-    'ozon-image-generation-controller'
+    'ozon-store-content-risk-optimizer'
 )
 
 function Get-RelativeFileMap {
