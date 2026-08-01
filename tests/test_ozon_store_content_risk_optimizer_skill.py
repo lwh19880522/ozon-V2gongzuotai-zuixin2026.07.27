@@ -1,4 +1,6 @@
 from pathlib import Path
+import subprocess
+import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +27,22 @@ def test_skill_entrypoint_exposes_the_fixed_commands() -> None:
     )
     for command in ("scan", "next", "apply", "status"):
         assert f'add_parser("{command}")' in script
+
+
+def test_skill_entrypoint_runs_directly_from_repository_root() -> None:
+    script = SKILL_ROOT / "scripts" / "store_content_optimizer.py"
+    completed = subprocess.run(
+        [sys.executable, str(script), "--help"],
+        cwd=ROOT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        timeout=20,
+    )
+    assert completed.returncode == 0, completed.stderr
+    for command in ("scan", "next", "apply", "status"):
+        assert command in completed.stdout
 
 
 def test_skill_is_automatic_incremental_non_media_and_risk_first() -> None:

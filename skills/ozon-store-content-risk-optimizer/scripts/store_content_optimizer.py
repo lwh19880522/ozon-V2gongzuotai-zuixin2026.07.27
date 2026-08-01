@@ -16,8 +16,9 @@ import unicodedata
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+SOURCE_ROOT = REPO_ROOT / "src"
+if str(SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(SOURCE_ROOT))
 
 from ozon_v2.adapters.fs_repo import FsRepo
 from ozon_v2.adapters.seller_api import SellerApiAdapter, SellerApiError
