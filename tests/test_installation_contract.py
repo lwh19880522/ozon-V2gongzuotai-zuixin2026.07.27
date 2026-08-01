@@ -107,7 +107,7 @@ class InstallationContractTests(unittest.TestCase):
             for skill_name in (
                 "ozon-product-media-generator",
                 "ozon-intelligent-field-drafter",
-                "ozon-image-generation-controller",
+                "ozon-store-content-risk-optimizer",
             ):
                 source = ROOT / "skills" / skill_name
                 installed = target_root / skill_name
@@ -137,7 +137,7 @@ class InstallationContractTests(unittest.TestCase):
         self.assertIn("api/health", text)
         self.assertIn("ozon-product-media-generator", text)
         self.assertIn("ozon-intelligent-field-drafter", text)
-        self.assertIn("ozon-image-generation-controller", text)
+        self.assertIn("ozon-store-content-risk-optimizer", text)
         self.assertIn("Get-FileHash", text)
         self.assertIn("DOCTOR_PASSED", text)
         self.assertIn("DOCTOR_FAILED", text)
@@ -150,7 +150,7 @@ class InstallationContractTests(unittest.TestCase):
             for skill_name in (
                 "ozon-product-media-generator",
                 "ozon-intelligent-field-drafter",
-                "ozon-image-generation-controller",
+                "ozon-store-content-risk-optimizer",
             ):
                 source = ROOT / "skills" / skill_name
                 target = skill_root / skill_name

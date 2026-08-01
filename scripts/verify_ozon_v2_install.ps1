@@ -104,7 +104,7 @@ if ($pythonReady) {
 $skillNames = @(
     'ozon-product-media-generator',
     'ozon-intelligent-field-drafter',
-    'ozon-image-generation-controller'
+    'ozon-store-content-risk-optimizer'
 )
 if (-not $SkipSkills) {
     foreach ($skillName in $skillNames) {
