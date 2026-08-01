@@ -15,8 +15,17 @@ from typing import Any
 import unicodedata
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-SOURCE_ROOT = REPO_ROOT / "src"
+_OWN_REPO_CANDIDATE = Path(__file__).resolve().parents[3]
+_REPO_CANDIDATES = (Path.cwd(), *Path.cwd().parents, _OWN_REPO_CANDIDATE)
+SOURCE_ROOT = next(
+    (
+        candidate / "src"
+        for candidate in _REPO_CANDIDATES
+        if (candidate / "src" / "ozon_v2").is_dir()
+    ),
+    _OWN_REPO_CANDIDATE / "src",
+)
+REPO_ROOT = SOURCE_ROOT.parent
 if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 

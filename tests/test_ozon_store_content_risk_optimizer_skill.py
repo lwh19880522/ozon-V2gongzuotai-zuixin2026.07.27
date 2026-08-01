@@ -1,4 +1,5 @@
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -43,6 +44,34 @@ def test_skill_entrypoint_runs_directly_from_repository_root() -> None:
     assert completed.returncode == 0, completed.stderr
     for command in ("scan", "next", "apply", "status"):
         assert command in completed.stdout
+
+
+def test_installed_skill_script_discovers_repository_from_working_directory(
+    tmp_path: Path,
+) -> None:
+    installed = (
+        tmp_path
+        / ".codex"
+        / "skills"
+        / "ozon-store-content-risk-optimizer"
+        / "scripts"
+    )
+    installed.mkdir(parents=True)
+    script = installed / "store_content_optimizer.py"
+    shutil.copy2(
+        SKILL_ROOT / "scripts" / "store_content_optimizer.py",
+        script,
+    )
+    completed = subprocess.run(
+        [sys.executable, str(script), "--help"],
+        cwd=ROOT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        timeout=20,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_skill_is_automatic_incremental_non_media_and_risk_first() -> None:
