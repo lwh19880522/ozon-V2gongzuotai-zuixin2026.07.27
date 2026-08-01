@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -238,13 +239,23 @@ def task(
     objective_value: str = "1",
 ) -> dict[str, Any]:
     original = product("11", "sale-11")
+    seller_api_item = deepcopy(original["seller_api_item"])
+    for runtime_key in (
+        "product_id",
+        "sku",
+        "visibility",
+        "archived",
+        "stocks",
+        "content_score_groups",
+    ):
+        seller_api_item.pop(runtime_key, None)
     return {
         "product_id": "11",
         "sku": "sku-11",
         "offer_id": "sale-11",
         "source_fingerprint": "base-fingerprint",
         "visibility": "IN_SALE",
-        "seller_api_item": original["seller_api_item"],
+        "seller_api_item": seller_api_item,
         "current": {
             "name": original["name"],
             "description": original["description"],
@@ -436,3 +447,273 @@ def test_known_price_loss_is_classified_as_severe(optimizer) -> None:
     result = optimizer.validate_proposal(current_task, valid_proposal())
     assert "price_loss" in result["risk_codes"]
     assert result["risk_level"] == "severe"
+
+
+class FakeActionGateway:
+    def __init__(
+        self,
+        current: dict[str, Any] | None = None,
+        *,
+        active_orders: set[str] | None = None,
+        warehouses: list[dict[str, Any]] | None = None,
+        readback_is_bad: bool = False,
+        rollback_fails: bool = False,
+        import_status: str = "imported",
+    ) -> None:
+        self.current = deepcopy(current or product("11", "sale-11"))
+        self.active_orders = active_orders or set()
+        self.warehouses = warehouses if warehouses is not None else [
+            {
+                "warehouse_id": 501,
+                "status": "created",
+                "is_rfbs": True,
+                "warehouse_type": "rfbs",
+            }
+        ]
+        self.readback_is_bad = readback_is_bad
+        self.rollback_fails = rollback_fails
+        self.import_status_value = import_status
+        self.import_requests: list[list[dict[str, Any]]] = []
+        self.stock_requests: list[dict[str, Any]] = []
+        self.archive_requests: list[dict[str, Any]] = []
+
+    def fetch_product(self, product_id: str) -> dict[str, Any]:
+        assert str(self.current["product_id"]) == str(product_id)
+        return deepcopy(self.current)
+
+    def import_product(self, item: dict[str, Any]) -> int:
+        self.import_requests.append([deepcopy(item)])
+        if self.rollback_fails and len(self.import_requests) >= 2:
+            raise RuntimeError("rollback failed")
+        self.current.update(deepcopy(item))
+        self.current["seller_api_item"] = deepcopy(item)
+        if self.readback_is_bad and len(self.import_requests) == 1:
+            self.current["name"] = "Неверное название"
+        return len(self.import_requests)
+
+    def import_status(self, task_id: int) -> dict[str, Any]:
+        return {"items": [{"status": self.import_status_value}]}
+
+    def list_rfbs_warehouses(self) -> list[dict[str, Any]]:
+        return deepcopy(self.warehouses)
+
+    def active_order_offer_ids(self) -> set[str]:
+        return set(self.active_orders)
+
+    def set_stock(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
+        self.stock_requests.extend(deepcopy(rows))
+        stock = int(rows[0]["stock"])
+        self.current["stocks"] = [{"present": stock, "reserved": 0}]
+        return {"result": [{"updated": True}]}
+
+
+def seeded_ledger(optimizer, tmp_path: Path, current_task: dict[str, Any]):
+    ledger = optimizer.Ledger(tmp_path / "optimizer.sqlite3")
+    ledger.upsert_task(current_task, rule_hashes())
+    return ledger
+
+
+def test_in_sale_product_is_optimized_without_stock_overwrite(
+    optimizer, tmp_path: Path
+) -> None:
+    current_task = task()
+    gateway = FakeActionGateway(product("11", "sale-11", visibility="IN_SALE", stock=7))
+    result = optimizer.apply_one(
+        gateway,
+        seeded_ledger(optimizer, tmp_path, current_task),
+        current_task,
+        valid_proposal(),
+        sleep_fn=lambda _seconds: None,
+    )
+    assert result["status"] == "completed"
+    assert gateway.stock_requests == []
+
+
+def test_safe_ready_to_supply_product_gets_stock_ten_after_verified_import(
+    optimizer, tmp_path: Path
+) -> None:
+    current_task = task()
+    current_task["visibility"] = "READY_TO_SUPPLY"
+    gateway = FakeActionGateway(
+        product("11", "sale-11", visibility="READY_TO_SUPPLY", stock=0)
+    )
+    result = optimizer.apply_one(
+        gateway,
+        seeded_ledger(optimizer, tmp_path, current_task),
+        current_task,
+        valid_proposal(),
+        sleep_fn=lambda _seconds: None,
+    )
+    assert result["status"] == "completed"
+    assert gateway.stock_requests == [
+        {
+            "offer_id": "sale-11",
+            "product_id": 11,
+            "stock": 10,
+            "warehouse_id": 501,
+        }
+    ]
+
+
+def test_archived_product_is_never_imported_or_restocked(
+    optimizer, tmp_path: Path
+) -> None:
+    current_task = task()
+    gateway = FakeActionGateway(
+        product("11", "sale-11", visibility="ARCHIVED", stock=0)
+    )
+    result = optimizer.apply_one(
+        gateway,
+        seeded_ledger(optimizer, tmp_path, current_task),
+        current_task,
+        valid_proposal(),
+        sleep_fn=lambda _seconds: None,
+    )
+    assert result["status"] == "skipped_archived"
+    assert gateway.import_requests == []
+    assert gateway.stock_requests == []
+
+
+def test_unresolved_severe_risk_sets_stock_zero_without_archiving(
+    optimizer, tmp_path: Path
+) -> None:
+    current_task = task()
+    proposal = valid_proposal()
+    proposal["risk_findings"] = [
+        {
+            "code": "quantity_conflict",
+            "level": "severe",
+            "resolution": "unresolved",
+            "evidence_refs": ["seller.attributes.6318"],
+        }
+    ]
+    gateway = FakeActionGateway(product("11", "sale-11", stock=7))
+    result = optimizer.apply_one(
+        gateway,
+        seeded_ledger(optimizer, tmp_path, current_task),
+        current_task,
+        proposal,
+        sleep_fn=lambda _seconds: None,
+    )
+    assert result["status"] == "paused"
+    assert gateway.stock_requests[0]["stock"] == 0
+    assert gateway.archive_requests == []
+    assert gateway.import_requests == []
+
+
+def test_order_race_blocks_every_stock_mutation(
+    optimizer, tmp_path: Path
+) -> None:
+    current_task = task()
+    current_task["visibility"] = "READY_TO_SUPPLY"
+    gateway = FakeActionGateway(
+        product("11", "sale-11", visibility="READY_TO_SUPPLY", stock=0),
+        active_orders={"sale-11"},
+    )
+    result = optimizer.apply_one(
+        gateway,
+        seeded_ledger(optimizer, tmp_path, current_task),
+        current_task,
+        valid_proposal(),
+        sleep_fn=lambda _seconds: None,
+    )
+    assert result["status"] == "pending_risk"
+    assert gateway.stock_requests == []
+
+
+def test_failed_readback_rolls_back_original_payload(
+    optimizer, tmp_path: Path
+) -> None:
+    current_task = task()
+    original = deepcopy(current_task["seller_api_item"])
+    gateway = FakeActionGateway(readback_is_bad=True)
+    result = optimizer.apply_one(
+        gateway,
+        seeded_ledger(optimizer, tmp_path, current_task),
+        current_task,
+        valid_proposal(),
+        sleep_fn=lambda _seconds: None,
+    )
+    assert result["status"] == "rolled_back"
+    assert gateway.import_requests[-1] == [original]
+
+
+def test_rollback_failure_pauses_with_stock_zero(
+    optimizer, tmp_path: Path
+) -> None:
+    current_task = task()
+    gateway = FakeActionGateway(readback_is_bad=True, rollback_fails=True)
+    result = optimizer.apply_one(
+        gateway,
+        seeded_ledger(optimizer, tmp_path, current_task),
+        current_task,
+        valid_proposal(),
+        sleep_fn=lambda _seconds: None,
+    )
+    assert result["status"] == "paused"
+    assert gateway.stock_requests[-1]["stock"] == 0
+
+
+def test_ambiguous_rfbs_warehouse_blocks_inventory_mutation(
+    optimizer, tmp_path: Path
+) -> None:
+    current_task = task()
+    current_task["visibility"] = "READY_TO_SUPPLY"
+    gateway = FakeActionGateway(
+        product("11", "sale-11", visibility="READY_TO_SUPPLY", stock=0),
+        warehouses=[],
+    )
+    result = optimizer.apply_one(
+        gateway,
+        seeded_ledger(optimizer, tmp_path, current_task),
+        current_task,
+        valid_proposal(),
+        sleep_fn=lambda _seconds: None,
+    )
+    assert result["status"] == "pending_risk"
+    assert gateway.stock_requests == []
+
+
+def test_evidence_insufficient_product_is_never_restocked(
+    optimizer, tmp_path: Path
+) -> None:
+    current_task = task(evidence_insufficient=True)
+    current_task["visibility"] = "READY_TO_SUPPLY"
+    gateway = FakeActionGateway(
+        product("11", "sale-11", visibility="READY_TO_SUPPLY", stock=0)
+    )
+    result = optimizer.apply_one(
+        gateway,
+        seeded_ledger(optimizer, tmp_path, current_task),
+        current_task,
+        valid_proposal(attribute_decisions=[]),
+        sleep_fn=lambda _seconds: None,
+    )
+    assert result["status"] == "evidence_insufficient"
+    assert gateway.stock_requests == []
+
+
+def test_duplicate_successful_import_is_not_submitted_again_or_left_applying(
+    optimizer, tmp_path: Path
+) -> None:
+    current_task = task()
+    gateway = FakeActionGateway(product("11", "sale-11", visibility="IN_SALE"))
+    ledger = seeded_ledger(optimizer, tmp_path, current_task)
+    first = optimizer.apply_one(
+        gateway,
+        ledger,
+        current_task,
+        valid_proposal(),
+        sleep_fn=lambda _seconds: None,
+    )
+    second = optimizer.apply_one(
+        gateway,
+        ledger,
+        current_task,
+        valid_proposal(),
+        sleep_fn=lambda _seconds: None,
+    )
+    assert first["status"] == "completed"
+    assert second["status"] == "duplicate_skipped"
+    assert len(gateway.import_requests) == 1
+    assert ledger.get_state("11")["status"] == "completed"

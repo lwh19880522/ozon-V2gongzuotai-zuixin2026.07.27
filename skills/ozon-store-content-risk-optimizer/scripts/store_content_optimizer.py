@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import sqlite3
 import sys
+import time
 from typing import Any
 import unicodedata
 
@@ -19,7 +20,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from ozon_v2.adapters.fs_repo import FsRepo
-from ozon_v2.adapters.seller_api import SellerApiAdapter
+from ozon_v2.adapters.seller_api import SellerApiAdapter, SellerApiError
 
 
 RULE_VERSION = "1.0.0"
@@ -81,6 +82,10 @@ MOJIBAKE_MARKERS = (
 
 
 class ValidationError(ValueError):
+    pass
+
+
+class ApplyError(RuntimeError):
     pass
 
 
@@ -683,6 +688,21 @@ class Ledger:
         self.connection.commit()
         return cursor.rowcount == 1
 
+    def action_succeeded(
+        self,
+        product_id: str,
+        action: str,
+        request_payload: Any,
+    ) -> bool:
+        row = self.connection.execute(
+            """
+            SELECT result FROM action_log
+            WHERE product_id = ? AND action = ? AND payload_hash = ?
+            """,
+            (str(product_id), action, payload_hash(request_payload)),
+        ).fetchone()
+        return row is not None and str(row["result"]) == "success"
+
     def status_summary(self) -> dict[str, int]:
         rows = self.connection.execute(
             "SELECT status, COUNT(*) AS count FROM product_state GROUP BY status"
@@ -949,6 +969,378 @@ class SellerGateway:
                 }
             )
         return products
+
+    def fetch_product(self, product_id: str) -> dict[str, Any]:
+        target = str(product_id)
+        for item in self.fetch_catalog():
+            if str(item.get("product_id") or "") == target:
+                return item
+        raise ApplyError(f"Seller product {target} was not found")
+
+    def _retry_call(self, operation: Any) -> Any:
+        delays = (1, 2, 4)
+        for attempt in range(len(delays) + 1):
+            try:
+                return operation()
+            except SellerApiError as exc:
+                text = str(exc).casefold()
+                transient = "http 429" in text or "request failed" in text
+                if not transient or attempt >= len(delays):
+                    raise
+                time.sleep(delays[attempt])
+        raise ApplyError("Seller API retry loop ended unexpectedly")
+
+    def import_product(self, item: dict[str, Any]) -> int:
+        result = self._retry_call(lambda: self.adapter.import_products([item]))
+        return int(result["task_id"])
+
+    def import_status(self, task_id: int) -> dict[str, Any]:
+        return self._retry_call(
+            lambda: self.adapter.get_product_import_info(task_id)
+        )
+
+    def list_rfbs_warehouses(self) -> list[dict[str, Any]]:
+        payload = self._retry_call(
+            lambda: self.adapter._post_json("/v2/warehouse/list", {})
+        )
+        return [
+            item
+            for item in payload.get("warehouses", [])
+            if isinstance(item, dict)
+            and item.get("status") == "created"
+            and item.get("is_rfbs") is True
+            and item.get("warehouse_type") == "rfbs"
+        ]
+
+    def set_stock(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
+        return self._retry_call(
+            lambda: self.adapter._post_json(
+                "/v2/products/stocks", {"stocks": rows}
+            )
+        )
+
+    def active_order_offer_ids(self) -> set[str]:
+        now = datetime.now(timezone.utc)
+        date_from = (now - timedelta(days=30)).isoformat().replace("+00:00", "Z")
+        date_to = (now + timedelta(days=2)).isoformat().replace("+00:00", "Z")
+        requests = (
+            (
+                "/v3/posting/fbs/list",
+                {
+                    "dir": "ASC",
+                    "filter": {"since": date_from, "to": date_to},
+                    "limit": 1000,
+                    "offset": 0,
+                    "with": {"analytics_data": False, "financial_data": False},
+                },
+            ),
+            (
+                "/v2/posting/fbo/list",
+                {
+                    "dir": "ASC",
+                    "filter": {"since": date_from, "to": date_to},
+                    "limit": 1000,
+                    "offset": 0,
+                    "translit": True,
+                    "with": {"analytics_data": False, "financial_data": False},
+                },
+            ),
+        )
+        active: set[str] = set()
+        terminal = {
+            "cancelled",
+            "canceled",
+            "delivered",
+            "disposed",
+            "returned",
+        }
+        for path, request_payload in requests:
+            response = self._retry_call(
+                lambda path=path, request_payload=request_payload: self.adapter._post_json(
+                    path, request_payload
+                )
+            )
+            result = response.get("result", response)
+            postings = result.get("postings", []) if isinstance(result, dict) else []
+            for posting in postings:
+                if not isinstance(posting, dict):
+                    continue
+                status = str(posting.get("status") or "").casefold()
+                if status in terminal:
+                    continue
+                for item in posting.get("products") or []:
+                    if isinstance(item, dict) and item.get("offer_id"):
+                        active.add(str(item["offer_id"]))
+        return active
+
+
+def _product_import_status(payload: dict[str, Any]) -> str:
+    items = payload.get("items")
+    if not isinstance(items, list) or not items:
+        return "processing"
+    statuses = {
+        str(item.get("status") or item.get("state") or "").casefold()
+        for item in items
+        if isinstance(item, dict)
+    }
+    if any(value in {"failed", "error", "declined"} for value in statuses):
+        return "failed"
+    if statuses and all(
+        value in {"imported", "success", "processed", "moderating"}
+        for value in statuses
+    ):
+        return "accepted"
+    return "processing"
+
+
+def _poll_import(
+    gateway: Any,
+    task_id: int,
+    *,
+    sleep_fn: Any,
+) -> dict[str, Any]:
+    delays = (1, 2, 4, 8, 15, 15)
+    latest: dict[str, Any] = {}
+    for index, delay in enumerate(delays):
+        latest = gateway.import_status(task_id)
+        status = _product_import_status(latest)
+        if status == "accepted":
+            return latest
+        if status == "failed":
+            raise ApplyError(f"Seller import task {task_id} was rejected")
+        if index < len(delays) - 1:
+            sleep_fn(delay)
+    raise ApplyError(f"Seller import task {task_id} did not reach a terminal status")
+
+
+def _attribute_values_by_id(product: dict[str, Any]) -> dict[int, Any]:
+    result: dict[int, Any] = {}
+    for item in product.get("attributes") or []:
+        if not isinstance(item, dict) or item.get("id") is None:
+            continue
+        result[int(item["id"])] = item.get("values") or []
+    return result
+
+
+def _verify_readback(
+    task: dict[str, Any],
+    proposal: dict[str, Any],
+    expected: dict[str, Any],
+    actual: dict[str, Any],
+) -> None:
+    for key in ("name", "description", "rich_content"):
+        if canonical_json(actual.get(key)) != canonical_json(expected.get(key)):
+            raise ApplyError(f"Seller read-back mismatch for {key}")
+    actual_attributes = _attribute_values_by_id(actual)
+    expected_attributes = _attribute_values_by_id(expected)
+    for decision in proposal.get("attribute_decisions") or []:
+        if str(decision.get("decision")) != "set":
+            continue
+        attribute_id = int(decision["id"])
+        if canonical_json(actual_attributes.get(attribute_id)) != canonical_json(
+            expected_attributes.get(attribute_id)
+        ):
+            raise ApplyError(
+                f"Seller read-back mismatch for attribute {attribute_id}"
+            )
+    for key in MEDIA_KEYS:
+        original_value = (task.get("seller_api_item") or {}).get(key)
+        if canonical_json(actual.get(key)) != canonical_json(original_value):
+            raise ApplyError(f"Seller read-back changed media field {key}")
+    before_score = task.get("non_media_score")
+    after_score = non_media_score(actual.get("content_score_groups") or {})
+    if (
+        before_score is not None
+        and after_score is not None
+        and int(after_score) < int(before_score)
+    ):
+        raise ApplyError("Seller non-media score decreased after write")
+
+
+def _snapshot_matches(expected: dict[str, Any], actual: dict[str, Any]) -> bool:
+    keys = {
+        "name",
+        "description",
+        "rich_content",
+        "attributes",
+        *MEDIA_KEYS,
+    }
+    return all(
+        canonical_json(actual.get(key)) == canonical_json(expected.get(key))
+        for key in keys
+    )
+
+
+def _stock_count(product: dict[str, Any]) -> int:
+    count = 0
+    for row in product.get("stocks") or []:
+        if not isinstance(row, dict):
+            continue
+        count += int(row.get("present") or row.get("stock") or 0)
+    return count
+
+
+def _guarded_stock_action(
+    gateway: Any,
+    ledger: Ledger,
+    task: dict[str, Any],
+    stock: int,
+) -> tuple[bool, str]:
+    offer_id = str(task.get("offer_id") or "")
+    if offer_id in gateway.active_order_offer_ids():
+        return False, "active_order"
+    warehouses = gateway.list_rfbs_warehouses()
+    if len(warehouses) != 1:
+        return False, "rfbs_warehouse_ambiguous"
+    try:
+        product_id = int(task["product_id"])
+        warehouse_id = int(warehouses[0]["warehouse_id"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ApplyError("Product or RFBS warehouse ID is invalid") from exc
+    row = {
+        "offer_id": offer_id,
+        "product_id": product_id,
+        "stock": int(stock),
+        "warehouse_id": warehouse_id,
+    }
+    action = f"stock_{stock}"
+    if ledger.action_succeeded(str(product_id), action, row):
+        return True, "duplicate_skipped"
+    gateway.set_stock([row])
+    ledger.log_action(str(product_id), action, row, "success")
+    return True, "updated"
+
+
+def _rollback_product(
+    gateway: Any,
+    ledger: Ledger,
+    task: dict[str, Any],
+    original: dict[str, Any],
+    *,
+    sleep_fn: Any,
+) -> bool:
+    product_id = str(task["product_id"])
+    try:
+        rollback_task_id = gateway.import_product(original)
+        _poll_import(
+            gateway,
+            rollback_task_id,
+            sleep_fn=sleep_fn,
+        )
+        readback = gateway.fetch_product(product_id)
+        if not _snapshot_matches(original, readback):
+            raise ApplyError("Rollback read-back does not match original payload")
+    except Exception:
+        ledger.log_action(product_id, "rollback", original, "failed")
+        return False
+    ledger.log_action(product_id, "rollback", original, "success")
+    return True
+
+
+def apply_one(
+    gateway: Any,
+    ledger: Ledger,
+    task: dict[str, Any],
+    proposal: dict[str, Any],
+    *,
+    sleep_fn: Any = time.sleep,
+) -> dict[str, Any]:
+    product_id = str(task["product_id"])
+    live_before = gateway.fetch_product(product_id)
+    if _is_archived(live_before):
+        ledger.mark_status(product_id, "pending_risk", risk_codes=["archived"])
+        return {"status": "skipped_archived", "product_id": product_id}
+
+    validation = validate_proposal(task, proposal)
+    if validation["unresolved_blocking_risk"]:
+        updated, reason = _guarded_stock_action(
+            gateway, ledger, task, 0
+        )
+        status = "paused" if updated else "pending_risk"
+        ledger.mark_status(
+            product_id,
+            status,
+            risk_level=validation["risk_level"],
+            risk_codes=validation["risk_codes"] + ([reason] if not updated else []),
+        )
+        return {
+            "status": status,
+            "product_id": product_id,
+            "reason": reason,
+        }
+
+    original = deepcopy(
+        task.get("seller_api_item") or live_before.get("seller_api_item") or {}
+    )
+    merged = merge_proposal(task, proposal)
+    if ledger.action_succeeded(product_id, "content_import", merged):
+        return {"status": "duplicate_skipped", "product_id": product_id}
+    ledger.save_original(product_id, original)
+
+    try:
+        import_task_id = gateway.import_product(merged)
+        _poll_import(gateway, import_task_id, sleep_fn=sleep_fn)
+        readback = gateway.fetch_product(product_id)
+        _verify_readback(task, proposal, merged, readback)
+        ledger.log_action(product_id, "content_import", merged, "success")
+    except Exception as exc:
+        ledger.log_action(product_id, "content_import", merged, "failed")
+        if _rollback_product(
+            gateway,
+            ledger,
+            task,
+            original,
+            sleep_fn=sleep_fn,
+        ):
+            ledger.mark_status(
+                product_id,
+                "pending_risk",
+                risk_level="high",
+                risk_codes=["write_rolled_back"],
+                error=str(exc),
+            )
+            return {"status": "rolled_back", "product_id": product_id}
+        updated, reason = _guarded_stock_action(gateway, ledger, task, 0)
+        status = "paused" if updated else "failed"
+        ledger.mark_status(
+            product_id,
+            status,
+            risk_level="severe",
+            risk_codes=["rollback_failed", reason],
+            error=str(exc),
+        )
+        return {"status": status, "product_id": product_id, "reason": reason}
+
+    live_after = gateway.fetch_product(product_id)
+    if validation["evidence_insufficient"]:
+        ledger.mark_status(product_id, "evidence_insufficient")
+        return {"status": "evidence_insufficient", "product_id": product_id}
+    if str(live_after.get("visibility") or "").upper() == "IN_SALE":
+        ledger.mark_completed(
+            product_id,
+            source_fingerprint(live_after),
+            payload_hash(proposal),
+        )
+        return {"status": "completed", "product_id": product_id}
+    if _stock_count(live_after) == 0:
+        updated, reason = _guarded_stock_action(gateway, ledger, task, 10)
+        if not updated:
+            ledger.mark_status(
+                product_id,
+                "pending_risk",
+                risk_codes=[reason],
+            )
+            return {
+                "status": "pending_risk",
+                "product_id": product_id,
+                "reason": reason,
+            }
+    ledger.mark_completed(
+        product_id,
+        source_fingerprint(gateway.fetch_product(product_id)),
+        payload_hash(proposal),
+    )
+    return {"status": "completed", "product_id": product_id}
 
 
 def build_parser() -> argparse.ArgumentParser:
