@@ -4,22 +4,27 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 
 from ozon_v2.adapters.fs_repo import FsRepo
+from ozon_v2.domain.models import SeedProduct
 
 from tests.helpers import RuntimeTestCase
 
 
 class FsRepoTests(RuntimeTestCase):
-    def test_clear_workbench_batches_only_removes_verified_workbench_runs(self) -> None:
+    def test_clear_workbench_batches_removes_all_recognized_batch_directories(self) -> None:
         repo = FsRepo(self.context)
         repo.initialize_runtime()
         first = repo.create_workbench_batch_record(target_count=1)
         second = repo.create_workbench_batch_record(target_count=2)
-        legacy_dir = repo.run_dir("run-legacy-keep")
+        legacy_dir = repo.run_dir("run-legacy-clear")
         legacy_dir.mkdir(parents=True)
         (legacy_dir / "run.json").write_text(
-            json.dumps({"run_id": "run-legacy-keep", "status": "finalized"}),
+            json.dumps({"run_id": "run-legacy-clear", "status": "finalized"}),
             encoding="utf-8",
         )
+        malformed_workbench_dir = repo.run_dir("wb-malformed-clear")
+        malformed_workbench_dir.mkdir(parents=True)
+        malformed_legacy_dir = repo.run_dir("run-malformed-clear")
+        malformed_legacy_dir.mkdir(parents=True)
         unrelated_dir = repo.runs_dir / "manual-notes"
         unrelated_dir.mkdir()
 
@@ -29,14 +34,61 @@ class FsRepoTests(RuntimeTestCase):
 
         result = repo.clear_workbench_batches()
 
-        self.assertEqual({first["run_id"], second["run_id"]}, set(result["deleted_run_ids"]))
+        self.assertEqual(
+            {
+                first["run_id"],
+                second["run_id"],
+                "run-legacy-clear",
+                "wb-malformed-clear",
+                "run-malformed-clear",
+            },
+            set(result["deleted_run_ids"]),
+        )
         self.assertFalse(repo.run_dir(first["run_id"]).exists())
         self.assertFalse(repo.run_dir(second["run_id"]).exists())
-        self.assertTrue(legacy_dir.exists())
+        self.assertFalse(legacy_dir.exists())
+        self.assertFalse(malformed_workbench_dir.exists())
+        self.assertFalse(malformed_legacy_dir.exists())
         self.assertTrue(unrelated_dir.exists())
         self.assertEqual(credentials_before, repo.credentials_template_path.read_bytes())
         self.assertEqual(seeds_before, repo.active_seed_path.read_bytes())
         self.assertEqual(dedupe_before, repo.existing_store_dedupe_path.read_bytes())
+
+    def test_seed_identity_is_stable_across_legacy_and_current_pool_ids(self) -> None:
+        repo = FsRepo(self.context)
+        legacy = SeedProduct(
+            seed_id="seed-1440",
+            title_or_keyword="legacy title",
+            product_clue="legacy clue",
+        )
+        current = SeedProduct(
+            seed_id="seed-5000-1440",
+            title_or_keyword="current title",
+            product_clue="current clue",
+        )
+
+        self.assertEqual(repo.seed_identity_key(legacy), repo.seed_identity_key(current))
+
+    def test_used_seed_ledger_is_idempotent_by_stable_identity(self) -> None:
+        repo = FsRepo(self.context)
+        legacy = SeedProduct(
+            seed_id="seed-1440",
+            title_or_keyword="legacy title",
+            product_clue="legacy clue",
+        )
+        current = SeedProduct(
+            seed_id="seed-5000-1440",
+            title_or_keyword="current title",
+            product_clue="current clue",
+        )
+
+        repo.append_used_seeds("wb-first", [legacy], "workbench_sampled")
+        repo.append_used_seeds("wb-second", [current], "workbench_sampled")
+
+        rows = [json.loads(line) for line in repo.used_seed_path.read_text(encoding="utf-8").splitlines() if line]
+        self.assertEqual(1, len(rows))
+        self.assertEqual(repo.seed_identity_key(current), rows[0]["seed_identity_key"])
+        self.assertEqual({repo.seed_identity_key(current)}, repo.load_used_seed_identity_keys())
 
     def test_concurrent_browser_bridge_status_writes_remain_valid_json(self) -> None:
         repo = FsRepo(self.context)

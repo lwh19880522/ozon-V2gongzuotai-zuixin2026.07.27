@@ -12,6 +12,7 @@ const windows = new Map();
 const removedTabs = [];
 const removedWindows = [];
 const postedPaths = [];
+const postedRequests = [];
 const sentMessages = [];
 const backCalls = [];
 const updatedTabs = [];
@@ -115,7 +116,13 @@ const context = vm.createContext({
   chrome,
   console,
   fetch: async (url, options = {}) => {
-    if (options.method === "POST") postedPaths.push(String(url));
+    if (options.method === "POST") {
+      postedPaths.push(String(url));
+      postedRequests.push({
+        url: String(url),
+        body: options.body ? JSON.parse(options.body) : null,
+      });
+    }
     const response = !options.method && String(url).includes("/browser-task") && browserTaskResponse
       ? browserTaskResponse
       : { ok: true, code: "ok", data: {} };
@@ -523,6 +530,110 @@ function sendMessage(message, tab) {
   assert.equal(activationRecovery.recovered, true, "activating an existing orphan after extension reload must restore its lane");
   assert.equal(activationEntry.channels[0].tabId, activatedOrphan.id);
   assert.ok(removedTabs.includes(activationSource.id));
+
+  stored.openedTasks = {};
+  tabs.clear();
+  windows.clear();
+  removedWindows.length = 0;
+  const captureTask = supplierTask(1, "capture-proxy-token");
+  await context.performOpenTask(captureTask, "managed_round_test", { allowCreate: true });
+  const captureEntry = stored.openedTasks["wb-managed-round:supplier_selection"];
+  const captureTab = tabs.get(captureEntry.channels[0].tabId);
+  captureTab.url = "https://detail.1688.com/offer/919191919191.html";
+  const capturePostCount = postedRequests.length;
+  const mismatchedCapture = await sendMessage(
+    {
+      type: "ozon_v2_capture_supplier_channel",
+      supplier_product: {
+        supplier_url: "https://detail.1688.com/offer/929292929292.html",
+        final_url: "https://detail.1688.com/offer/929292929292.html",
+        offer_id: "929292929292",
+      },
+    },
+    captureTab,
+  );
+  assert.equal(mismatchedCapture.ok, false);
+  assert.equal(mismatchedCapture.code, "supplier_selection.offer_identity_mismatch");
+  assert.equal(postedRequests.length, capturePostCount, "a mismatched page offer must never be persisted");
+
+  const captured = await sendMessage(
+    {
+      type: "ozon_v2_capture_supplier_channel",
+      channel_index: 999,
+      seed_id: "forged-seed",
+      ozon_product_id: "forged-ozon",
+      dispatch_token: "forged-token",
+      supplier_product: {
+        supplier_url: captureTab.url,
+        final_url: captureTab.url,
+        offer_id: "919191919191",
+        title: "Exact current supplier product",
+      },
+    },
+    captureTab,
+  );
+  assert.equal(captured.ok, true, "an exactly bound detail tab must capture through the background");
+  assert.equal(postedRequests.length, capturePostCount + 1);
+  const trustedCapture = postedRequests.at(-1);
+  assert.ok(trustedCapture.url.endsWith("/api/batches/wb-managed-round/supplier-selection/capture"));
+  assert.equal(trustedCapture.body.channel_index, 0, "page-supplied channel indexes must be ignored");
+  assert.equal(trustedCapture.body.seed_id, "seed-1", "page-supplied seed ids must be ignored");
+  assert.equal(trustedCapture.body.ozon_product_id, "ozon-1", "page-supplied Ozon ids must be ignored");
+  assert.equal(trustedCapture.body.dispatch_token, "capture-proxy-token", "the stored dispatch generation must be authoritative");
+  assert.equal(captureEntry.channels[0].state, "collected", "capture persistence and terminal state must be one background operation");
+
+  const orphanCaptureTab = {
+    id: 405,
+    windowId: captureEntry.windowId,
+    url: "https://detail.1688.com/offer/929292929292.html",
+    active: true,
+  };
+  tabs.set(orphanCaptureTab.id, orphanCaptureTab);
+  const orphanCapture = await sendMessage(
+    {
+      type: "ozon_v2_capture_supplier_channel",
+      supplier_product: {
+        supplier_url: orphanCaptureTab.url,
+        final_url: orphanCaptureTab.url,
+        offer_id: "929292929292",
+      },
+    },
+    orphanCaptureTab,
+  );
+  assert.equal(orphanCapture.ok, false);
+  assert.equal(orphanCapture.code, "supplier_selection.channel_missing");
+  assert.equal(postedRequests.length, capturePostCount + 1, "an unbound tab must never reach the workbench capture API");
+
+  stored.openedTasks = {};
+  tabs.clear();
+  windows.clear();
+  const sameTabLeaseTask = supplierTask(2, "same-tab-lease-token");
+  await context.performOpenTask(sameTabLeaseTask, "managed_round_test", { allowCreate: true });
+  const sameTabEntry = stored.openedTasks["wb-managed-round:supplier_selection"];
+  const sameTabFirst = tabs.get(sameTabEntry.channels[0].tabId);
+  const sameTabSecond = tabs.get(sameTabEntry.channels[1].tabId);
+  assert.equal((await sendMessage({ type: "ozon_v2_supplier_navigation_intent" }, sameTabFirst)).ok, true);
+  assert.equal((await sendMessage({ type: "ozon_v2_supplier_navigation_intent" }, sameTabSecond)).code, "supplier_selection.navigation_busy");
+  await context.handleSupplierTabUpdated(sameTabFirst.id, { status: "loading" }, sameTabFirst);
+  assert.equal(
+    (await sendMessage({ type: "ozon_v2_supplier_navigation_intent" }, sameTabSecond)).ok,
+    true,
+    "a successful same-tab image search must release the previous lane immediately",
+  );
+  const released = await sendMessage({ type: "ozon_v2_supplier_navigation_release" }, sameTabSecond);
+  assert.equal(released.ok, true, "an image-recognition failure must be able to release its lane explicitly");
+  assert.equal(
+    (await sendMessage({ type: "ozon_v2_supplier_navigation_intent" }, sameTabFirst)).ok,
+    true,
+    "another lane must continue immediately after an explicit recognition-failure release",
+  );
+  tabs.delete(sameTabFirst.id);
+  await context.handleTaskTabRemoved(sameTabFirst.id);
+  assert.equal(
+    (await sendMessage({ type: "ozon_v2_supplier_navigation_intent" }, sameTabSecond)).ok,
+    true,
+    "closing the lease-owning lane must never block the remaining channels",
+  );
 
   stored.openedTasks = {};
   tabs.clear();

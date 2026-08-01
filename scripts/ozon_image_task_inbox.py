@@ -12,8 +12,9 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from ozon_v2.adapters.fs_repo import FsRepo  # noqa: E402
 from ozon_v2.adapters.public_media import (  # noqa: E402
-    CloudflareR2MediaPublisher,
+    CloudflareQuickTunnelMediaPublisher,
     PublicMediaError,
+    stop_quick_tunnel_gateway,
 )
 from ozon_v2.adapters.seller_api import SellerApiAdapter, SellerApiError  # noqa: E402
 from ozon_v2.app.context import build_default_context  # noqa: E402
@@ -23,24 +24,27 @@ from ozon_v2.images.worker import is_exact_three_by_four_image  # noqa: E402
 
 
 def _print(payload: Any) -> None:
-    print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    rendered = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+    try:
+        print(rendered)
+    except UnicodeEncodeError:
+        print(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Fixed inbox for post-product Ozon image generation and upload tasks"
+        description="Single-thread inbox for post-product Ozon image generation and upload tasks"
     )
     parser.add_argument("--runtime-root", required=True)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("status")
-    commands.add_parser("media-preflight")
+    commands.add_parser("media-start")
+    commands.add_parser("media-stop")
 
-    claim = commands.add_parser("claim-next")
-    claim.add_argument("--worker", required=True)
+    commands.add_parser("claim-next")
 
     slideshow = commands.add_parser("build-slideshow")
     slideshow.add_argument("--package", required=True)
-    slideshow.add_argument("--worker", required=True)
     slideshow.add_argument("--output-dir", required=True)
     slideshow.add_argument(
         "--image",
@@ -51,7 +55,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     upload = commands.add_parser("upload-gallery")
     upload.add_argument("--package", required=True)
-    upload.add_argument("--worker", required=True)
     upload.add_argument("--product-id", type=int)
     upload.add_argument(
         "--image",
@@ -64,12 +67,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     fail = commands.add_parser("fail")
     fail.add_argument("--package", required=True)
-    fail.add_argument("--worker", required=True)
     fail.add_argument("--reason", required=True)
 
     release = commands.add_parser("release")
     release.add_argument("--package", required=True)
-    release.add_argument("--worker", required=True)
     release.add_argument("--reason", required=True)
     return parser
 
@@ -80,27 +81,29 @@ def main() -> int:
     inbox = ImageTaskInbox(runtime_root)
     context = build_default_context(runtime_root=runtime_root)
     repo = FsRepo(context)
-    publisher = CloudflareR2MediaPublisher()
+    publisher = CloudflareQuickTunnelMediaPublisher(runtime_root)
     if args.command == "status":
         _print(inbox.status())
         return 0
-    if args.command == "media-preflight":
-        _print(publisher.preflight(repo.load_public_media_settings()))
+    if args.command == "media-start":
+        _print(publisher.preflight())
+        return 0
+    if args.command == "media-stop":
+        _print(stop_quick_tunnel_gateway(runtime_root))
         return 0
     if args.command == "claim-next":
-        _print(inbox.claim_next(args.worker) or {"status": "idle"})
+        _print(inbox.claim_next() or {"status": "idle"})
         return 0
     if args.command == "fail":
-        _print(inbox.fail(args.package, args.worker, args.reason))
+        _print(inbox.fail(args.package, args.reason))
         return 0
     if args.command == "release":
-        _print(inbox.release(args.package, args.worker, args.reason))
+        _print(inbox.release(args.package, args.reason))
         return 0
 
-    package = inbox.load_in_progress(args.package, args.worker)
+    package = inbox.load_in_progress(args.package)
     source_files = _ordered_source_files(args.image)
     if args.command == "build-slideshow":
-        publisher.preflight(repo.load_public_media_settings())
         result = build_product_slideshow(
             [item["path"] for item in source_files],
             output_dir=Path(args.output_dir).resolve(),
@@ -128,7 +131,6 @@ def main() -> int:
             {"slot_id": "slideshow_video", "path": str(video_path)},
             {"slot_id": "video_cover", "path": str(cover_path)},
         ],
-        settings=repo.load_public_media_settings(),
     )
     public_by_slot = {
         str(item["slot_id"]): str(item["public_url"])
@@ -152,7 +154,6 @@ def main() -> int:
     )
     completed = inbox.complete(
         args.package,
-        args.worker,
         {
             "product_id": product_id,
             "public_media": publication,

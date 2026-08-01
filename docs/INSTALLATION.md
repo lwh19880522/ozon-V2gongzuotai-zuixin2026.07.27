@@ -9,8 +9,8 @@
 - Python 3.11 或更高版本，并在安装时勾选加入 `PATH`。
 - Microsoft Edge。
 - Git。
-- Node.js 20+（或已安装并登录的 Cloudflare Wrangler），用于 R2 bucket
-  预检和媒体上传。
+- 可访问 GitHub 和 Cloudflare。专用生图 Skill 会自动下载轻量
+  `cloudflared` 并创建临时公网通道，无需 Cloudflare 账号。
 - Codex Desktop。字段和生图流程需要在本仓库工作区中使用。
 
 Ozon Seller API 的 `Client-Id` 和 `Api-Key` 属于店铺私密信息。不要写入 Git、截图、文档或任务包。
@@ -54,12 +54,12 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_ozon_v
 1. 检查 Python 3.11+。
 2. 创建或复用仓库内的 `.venv`。
 3. 安装工作台、Pillow、FastMCP 和项目代码。
-4. 将仓库同版本的字段 Skill、生图总控 Skill 和单品媒体 Skill 安装到当前 Windows 用户的 `.codex\skills`。
+4. 将仓库同版本的字段 Skill 和 Ozon 专用生图 Skill 安装到当前 Windows 用户的 `.codex\skills`。
 5. 创建桌面“`Ozon V2 工具台`”快捷方式。
 6. 启动并打开本地服务 `http://127.0.0.1:8765/`。
-7. 严格验证虚拟环境、运行依赖、3 个 Skill 的文件版本、桌面快捷方式和 `/api/health`。
+7. 严格验证虚拟环境、运行依赖、2 个 Skill 的文件版本、桌面快捷方式和 `/api/health`。
 
-只有第 7 步输出 `DOCTOR_PASSED` 后，才算完整安装成功。只复制 3 个 Skill 不算安装完成，也不能用 Ozon 官方卖家后台网址代替本地工具台。
+只有第 7 步输出 `DOCTOR_PASSED` 后，才算完整安装成功。只复制 Skill 不算安装完成，也不能用 Ozon 官方卖家后台网址代替本地工具台。
 
 安装器可重复执行；更新代码后再次执行即可刷新依赖。常用选项：
 
@@ -99,15 +99,14 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_ozon_v
 - 清单：`.codex-plugin/plugin.json`
 - MCP：`.mcp.json`
 - 字段 Skill：`skills/ozon-intelligent-field-drafter/`
-- 生图总控 Skill：`skills/ozon-image-generation-controller/`
-- 单品媒体 Skill：`skills/ozon-product-media-generator/`
+- Ozon 专用生图 Skill：`skills/ozon-product-media-generator/`
 
 单品媒体 Skill 的核心俄文商业信息图提示词位于
 `skills/ozon-product-media-generator/assets/ozon-commercial-infographic-core-prompt.txt`。
 一键安装会把该文件与主图、附图和返修包装提示词作为同一 Skill 完整复制，
 不可只复制 `SKILL.md`。
 
-一键安装器已经将 3 个 Skill 安装到当前用户目录。在 Codex Desktop 中仍需把本仓库作为工作区打开，使仓库内 `.mcp.json` 与工作台服务共同生效。插件刷新后新建一个 Codex 任务。若公司环境通过本地 marketplace 管理插件，安装名为：
+一键安装器已经将 2 个 Skill 安装到当前用户目录。在 Codex Desktop 中仍需把本仓库作为工作区打开，使仓库内 `.mcp.json` 与工作台服务共同生效。插件刷新后新建一个 Codex 任务。若公司环境通过本地 marketplace 管理插件，安装名为：
 
 ```text
 ozon-v2-ops-controller
@@ -124,28 +123,12 @@ ozon-v2-ops-controller
 
 凭据只保存在本机运行目录，不进入仓库。浏览器扩展不应包含 Seller API 密钥。
 
-## 6.1 配置图片和视频的 R2 公网通道
+## 6.1 图片和视频公网通道
 
-生图 Skill 在任何生图调用前都会执行 R2 预检。请先登录 Wrangler：
-
-```powershell
-npx --yes wrangler login
-```
-
-然后把公开 HTTPS 域名保存到工作台：
-
-```powershell
-$body = @{ base_url = "https://你的-R2-公网域名" } | ConvertTo-Json
-Invoke-RestMethod -Method Post `
-  -Uri "http://127.0.0.1:8765/api/settings/public-media" `
-  -ContentType "application/json" `
-  -Body $body
-```
-
-默认 bucket 为 `yandex-media`。使用其他 bucket 时，在启动工作台和 Codex
-前设置 `OZON_V2_R2_BUCKET`。域名必须直接公开读取该 bucket 中的对象，并
-对图片返回 `image/*`、对视频返回 `video/*`。通道没有配置或 bucket
-不可访问时，图片任务保持待处理，不会生成或上传。
+无需人工配置。专用生图 Skill 在领取任务前运行 `media-start`，自动启动
+本地只读媒体服务并创建免费的匿名 Cloudflare Quick Tunnel。通道仅在当前
+批次使用；所有 Ozon 媒体提交完成后运行 `media-stop`。若自动下载或公网
+连通失败，Skill 不领取商品，也不消耗生图调用，并直接报告本机错误日志。
 
 ## 7. 启动、停止和重启
 
@@ -184,7 +167,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify_ozon_v2
 
 - 仓库本体和工作台服务入口存在。
 - `.venv` 与 Python 运行依赖可用。
-- 当前用户安装的 3 个 Skill 与仓库版本一致。
+- 当前用户安装的 2 个 Skill 与仓库版本一致。
 - 桌面“`Ozon V2 工具台`”快捷方式指向当前仓库。
 - `http://127.0.0.1:8765/api/health` 返回真实健康状态。
 

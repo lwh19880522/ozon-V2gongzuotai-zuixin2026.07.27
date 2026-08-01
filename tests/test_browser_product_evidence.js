@@ -211,6 +211,18 @@ assert.deepEqual(
 );
 assert.deepEqual(
   evidence.blockingCandidateFields(
+    ["rating", "review_count", "delivery_origin", "delivery_time", "fulfillment_label"],
+    {
+      is_chinese_domestic_seller: true,
+      confidence: "high",
+      signals: [{ kind: "product_origin_china", raw_text: "Страна-изготовитель: Китай" }],
+    },
+  ),
+  [],
+  "product origin China must not be rejected only because optional rating, review, or delivery fields are unavailable",
+);
+assert.deepEqual(
+  evidence.blockingCandidateFields(
     ["attributes", "delivery_origin", "delivery_time", "fulfillment_label"],
     {
       is_chinese_domestic_seller: true,

@@ -1,0 +1,22 @@
+Append this gallery wrapper after `ozon-commercial-infographic-core-prompt.txt`.
+
+Create one ecommerce gallery grid containing exactly eight independent finished panels in four columns and two rows, with a complete canvas aspect ratio of exactly 3:2. Every equal cell is exactly 3:4 portrait after deterministic splitting. Keep all subjects, text, annotations, backgrounds, lighting and effects fully inside their own cell. Do not allow any content to cross a cell boundary. Do not render visible panel borders, gutters, panel numbers, slot IDs or collage labels.
+
+Reference Image 1 is the verified, frozen white-background identity anchor and the only product-identity source. Preserve the exact same product in every panel: silhouette, proportions, geometry, quantity, sales unit, set composition, structure, parts, openings, seams, sole, heel, toe, controls, interfaces, print, visible markings, material appearance, color and selected variant must not change. Do not reinterpret or redesign the subject from text. If a scene cannot be made without changing Reference Image 1, simplify the scene. Product identity has higher priority than scene richness.
+
+The complete image input list must contain exactly one item: Reference Image 1. Do not attach Reference Image 2, an Ozon image, a supplier evidence image, an unselected supplier variant, a previous generated scene, or a conversation image. Use `referenced_image_paths=[<same frozen white anchor path>]` and never use `num_last_images_to_include`.
+
+Map the equal cells in row-major order exactly as follows:
+
+1. `main_01`: high-impact core selling point. Show the complete locked product as the dominant subject and integrate the supplied exact Russian headline, subtitle and 2-4 verified functional labels.
+2. `main_02`: materially different real-use value overview. Make the use context or buyer value visually obvious and integrate its supplied exact Russian copy.
+3. `detail_01`: real-use demonstration or visible result supported by locked evidence. Do not invent a use case or result.
+4. `detail_02`: annotated feature, mechanism, operation or safety view. Leader lines and insets may point only to real visible parts.
+5. `detail_03`: material, construction, detail or reliable parameter close-up. Use a number only when locked evidence proves it exactly.
+6. `detail_04`: instructional, operation, maintenance or result scene supported by locked evidence. Do not invent a step or before/after effect.
+7. `detail_05`: dimension, fit, scale, compatibility, target-user or second use-scene infographic. If no reliable metric exists, use another evidence-safe theme.
+8. `detail_06`: exact set contents, packaging, accessories, storage, care or another proved buyer question. Preserve the exact sales unit and never create a bundle.
+
+Apply the shared core prompt independently to all eight panels. Use the supplied prompt-only blueprint and exact verified Russian copy for each slot. Across the grid use at least six layout archetypes, five environment families, four lighting treatments, four camera/composition families and three shot scales. Any two panels must differ in at least three of layout archetype, visible proof, environment, lighting, camera, shot scale and buyer question. A background or angle change alone is invalid.
+
+Render each slot's supplied exact Russian headline, subtitle and 2-4 functional labels during this single generation call. Render no unsupported text, number, logo, badge, price, discount, URL or watermark. Every panel must be a polished commercial scene or infographic, never a plain or near-white product-only catalog image. Use `ozon-image-v9`, `ozon-visual-v2`, `copy_mode=imagegen_integrated`, `reference_mapping_version=none` and `guidance_mode=fixed_prompt_white_anchor`.

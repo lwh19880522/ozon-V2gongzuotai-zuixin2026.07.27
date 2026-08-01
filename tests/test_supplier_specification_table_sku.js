@@ -107,6 +107,10 @@ const chrome = {
     async sendMessage(message) {
       if (message.type === "ozon_v2_get_current_task") return { ok: true, task: { code: "browser_task.supplier_selection_ready" } };
       if (message.type === "ozon_v2_get_supplier_channel") return { ok: true, binding };
+      if (message.type === "ozon_v2_capture_supplier_channel") {
+        capturedPayload = message;
+        return { ok: true, result: { ok: true, code: "supplier_selection.batch_complete", message: "saved" } };
+      }
       return { ok: true };
     },
     onMessage: { addListener() {} },
@@ -118,10 +122,7 @@ const context = vm.createContext({
   console,
   document,
   location: { href: supplierUrl, hostname: "detail.1688.com" },
-  fetch: async (url, options = {}) => {
-    if (String(url).includes("supplier-selection/capture")) capturedPayload = JSON.parse(options.body);
-    return { json: async () => ({ ok: true, code: "supplier_selection.batch_complete", message: "saved" }) };
-  },
+  fetch: async () => ({ json: async () => ({ ok: true }) }),
   addEventListener() {},
   history: { pushState() {}, replaceState() {} },
   innerWidth: 1280,

@@ -1,52 +1,47 @@
 from pathlib import Path
 
 
-SKILL_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "skills"
-    / "ozon-image-generation-controller"
-    / "SKILL.md"
-)
+ROOT = Path(__file__).resolve().parents[1]
+SKILL_PATH = ROOT / "skills" / "ozon-product-media-generator" / "SKILL.md"
 
 
-def test_image_controller_skill_uses_ten_fixed_visible_tasks() -> None:
+def test_old_controller_skill_is_removed_and_media_skill_owns_the_full_flow() -> None:
     text = SKILL_PATH.read_text(encoding="utf-8")
 
-    assert "name: ozon-image-generation-controller" in text
-    assert "skills/ozon-product-media-generator/SKILL.md" in text
-    for index in range(1, 11):
-        assert f"ozon-image-worker-{index:02d}" in text
-    assert "ten fixed user-visible Codex work tasks" in text
-    assert "global across every Ozon V2 batch" in text
-    assert "persisted opaque `thread_id`" in text
-    assert "Reuse the same ten tasks in slot order" in text
-    assert "one product at a time" in text
-    assert "at most ten products concurrently" in text
-    assert "Return repair and continuation work to the product's `preferred_slot`" in text
-    assert "only when the user explicitly requests a new task" in text
-    assert "one-time pool bootstrap" in text
-    assert "registered pool is empty" in text
-    assert "Do not ask the user to repeat a magic confirmation phrase" in text
-    assert "internal subagent" not in text
-    assert "five regular worker" not in text
+    assert not (ROOT / "skills" / "ozon-image-generation-controller").exists()
+    assert "name: ozon-product-media-generator" in text
+    assert "single-thread" in text
+    assert "one package at a time" in text
+    assert "claim-next" in text
+    assert "RUN package_id=" in text
+    assert "worker-01" not in text
+    assert "thread_id" not in text
+    assert "pool" not in text.casefold()
+    assert "concurrent" not in text.casefold()
 
 
-def test_image_controller_skill_has_bounded_stop_gates() -> None:
+def test_dedicated_media_skill_starts_and_stops_automatic_public_gateway() -> None:
     text = SKILL_PATH.read_text(encoding="utf-8")
 
-    assert "Continue dispatching other eligible `pending` packages" in text
+    assert "media-start" in text
+    assert "media-stop" in text
+    assert "free anonymous Cloudflare Quick Tunnel" in text
+    assert "ask the user" not in text.casefold()
+    assert "R2" not in text
+
+
+def test_dedicated_media_skill_has_bounded_per_product_stop_gates() -> None:
+    text = SKILL_PATH.read_text(encoding="utf-8")
+
     assert "A missing SKU or subject gate blocks only that product" in text
-    assert "A `stopped` product does not stop other eligible products" in text
     assert "Never auto-resume a stopped product" in text
-    assert "no eligible `pending` packages remain" in text
-    assert "manual review" not in text.casefold()
-    assert "user stops" in text
+    assert "`pending` = 0" in text
+    assert "`in_progress` = 0" in text
     assert "directly replaces the product gallery in Ozon" in text
     assert "never returns generated files to the workbench" in text
-    assert "Never modify business source code" in text
 
 
-def test_image_controller_dispatches_user_selected_repairs_without_reopening_frozen_slots() -> None:
+def test_dedicated_media_skill_preserves_selected_repairs_and_frozen_slots() -> None:
     text = SKILL_PATH.read_text(encoding="utf-8")
 
     assert "repair_pending" in text
@@ -56,22 +51,10 @@ def test_image_controller_dispatches_user_selected_repairs_without_reopening_fro
     assert "Never reopen or regenerate an unselected `accepted` slot" in text
 
 
-def test_image_controller_claims_fixed_task_packages_outside_the_workbench() -> None:
+def test_dedicated_media_skill_claims_workbench_task_packages() -> None:
     text = SKILL_PATH.read_text(encoding="utf-8")
 
     assert "image_tasks/pending" in text
     assert "image_tasks/in_progress" in text
     assert "seller_import_task_id" in text
     assert "product_id" in text
-    assert "fixed task-package inbox" in text
-
-
-def test_image_controller_uses_the_lightweight_dispatcher_until_every_job_is_drained() -> None:
-    text = SKILL_PATH.read_text(encoding="utf-8")
-
-    assert "scripts/ozon_image_task_inbox.py" in text
-    assert "claim-next" in text
-    assert "RUN package_id=" in text
-    assert "Do not stop after the first ten products" in text
-    assert "`pending` = 0" in text
-    assert "`in_progress` = 0" in text

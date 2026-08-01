@@ -7,7 +7,7 @@
 - 本地工具台源代码与 MCP 入口。
 - Windows 一键安装、启动、停止、重启和 Doctor 脚本。
 - Edge 采集桥接扩展。
-- `ozon-intelligent-field-drafter`、`ozon-image-generation-controller`、`ozon-product-media-generator` 三个完整 Skill。
+- `ozon-intelligent-field-drafter` 与 `ozon-product-media-generator` 两个完整 Skill；生图仅由后者负责。
 - 版本化 5000 条种子池静态资产。
 - 安装说明、完整使用流程、公开架构契约和自动化测试。
 - `RELEASE_MANIFEST.json`：仓库地址、文件数量和所有发布文件的 SHA-256。
@@ -15,7 +15,7 @@
 ## 永远不进入仓库的内容
 
 - Seller API 的 `Client-Id`、`Api-Key`、访问令牌或任何店铺凭证。
-- Cloudflare R2 的账户 ID、访问密钥、Secret、bucket 私有配置和用户公网域名。
+- 自动临时公网通道的进程状态、随机地址、访问令牌与运行日志。
 - 浏览器用户目录、Cookies、会话、下载、缓存和扩展本地状态。
 - 运行数据库、批次状态、采集证据、商品草稿、生成图片、视频、日志和诊断包。
 - `.env`、私钥、证书、SQLite/DB 文件。
@@ -61,8 +61,8 @@ python .\scripts\build_clean_release.py --scan-only .
 1. 从仓库默认分支下载或克隆项目。
 2. 确认根目录存在 `安装并启动 Ozon V2.cmd`、`启动 Ozon V2.cmd`、`skills`、`browser_extension` 和 `scripts`。
 3. 双击 `安装并启动 Ozon V2.cmd`。
-4. 运行 `scripts\verify_ozon_v2_install.ps1`，确认本地健康接口、虚拟环境、三个 Skill 和桌面入口全部通过。
-5. 店铺凭证和 R2 配置只能在新电脑本地录入，不要提交回 Git。
+4. 运行 `scripts\verify_ozon_v2_install.ps1`，确认本地健康接口、虚拟环境、两个 Skill 和桌面入口全部通过。
+5. 店铺凭证只能在新电脑本地录入；生图 Skill 会自动启动临时公网通道，不要求用户提供公网配置。
 
 ## 发现隐私泄漏时
 

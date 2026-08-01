@@ -138,7 +138,22 @@ def test_inputs_reject_invalid_cost_or_package_values(field: str, value: str) ->
 def test_product_outside_guoo_standard_limits_is_rejected() -> None:
     with pytest.raises(ValueError, match="GUOO land-air standard"):
         calculate_listing_price(
-            _first_product_input(package_weight_g="31000"),
+            _first_product_input(
+                package_weight_g="31000",
+                package_length_cm="100",
+                package_width_cm="50",
+                package_height_cm="50",
+            ),
             PricingPolicy.default(),
             initial_sale_rub="1000",
+        )
+
+
+def test_package_density_outside_ozon_range_is_rejected_before_upload() -> None:
+    with pytest.raises(ValueError, match="package density"):
+        _first_product_input(
+            package_weight_g="300",
+            package_length_cm="2.02",
+            package_width_cm="2.01",
+            package_height_cm="1.5",
         )

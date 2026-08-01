@@ -228,6 +228,55 @@ class SellerApiAdapter:
             raise SellerApiError("Seller API product import status has invalid shape.")
         return result
 
+    def get_product_state_by_offer_id(self, offer_id: str) -> dict[str, Any]:
+        normalized_offer_id = str(offer_id or "").strip()
+        if not normalized_offer_id:
+            raise SellerApiError("Seller product state lookup requires an offer_id.")
+        payload = self._post_json(
+            "/v3/product/list",
+            {
+                "filter": {
+                    "offer_id": [normalized_offer_id],
+                    "visibility": "ALL",
+                },
+                "last_id": "",
+                "limit": 1000,
+            },
+        )
+        result = payload.get("result", {})
+        refs = result.get("items", []) if isinstance(result, dict) else []
+        exact_ref = next(
+            (
+                item
+                for item in refs
+                if isinstance(item, dict)
+                and str(item.get("offer_id") or "").strip()
+                == normalized_offer_id
+            ),
+            None,
+        )
+        if not isinstance(exact_ref, dict):
+            return {}
+        product_id = exact_ref.get("product_id") or exact_ref.get("id")
+        if product_id in (None, ""):
+            return {}
+        info_by_id = self._fetch_product_info([int(product_id)])
+        info = info_by_id.get(str(product_id), {})
+        statuses = info.get("statuses") if isinstance(info.get("statuses"), dict) else {}
+        errors = info.get("errors") if isinstance(info.get("errors"), list) else []
+        is_created = info.get("is_created")
+        if is_created is None:
+            is_created = statuses.get("is_created", exact_ref.get("is_created"))
+        return {
+            "offer_id": normalized_offer_id,
+            "product_id": int(product_id),
+            "sku": info.get("sku", exact_ref.get("sku")),
+            "is_created": is_created,
+            "validation_status": statuses.get("validation_status"),
+            "statuses": statuses,
+            "errors": errors,
+        }
+
     def replace_product_pictures(
         self,
         *,

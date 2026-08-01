@@ -26,7 +26,7 @@ def test_skill_entrypoint_exposes_the_fixed_commands() -> None:
     script = (SKILL_ROOT / "scripts" / "store_content_optimizer.py").read_text(
         encoding="utf-8"
     )
-    for command in ("scan", "next", "apply", "status"):
+    for command in ("audit", "scan", "next", "apply", "status"):
         assert f'add_parser("{command}")' in script
 
 
@@ -42,7 +42,7 @@ def test_skill_entrypoint_runs_directly_from_repository_root() -> None:
         timeout=20,
     )
     assert completed.returncode == 0, completed.stderr
-    for command in ("scan", "next", "apply", "status"):
+    for command in ("audit", "scan", "next", "apply", "status"):
         assert command in completed.stdout
 
 

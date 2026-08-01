@@ -1,6 +1,6 @@
 ---
 name: ozon-intelligent-field-drafter
-description: Build auditable Russian Ozon V2 Seller API field drafts from collected Ozon evidence, confirmed 1688 product facts, and the complete user-locked supplier SKU. Use for batch field drafting, objective attribute completion, Russian title/description/Rich Content creation, classified evidence gaps, and retrying rejected field decisions before upload.
+description: Build auditable Russian Ozon V2 Seller API field drafts from collected Ozon evidence, confirmed 1688 product facts, and the complete user-locked supplier SKU. Use for required-field-first completion, batch field drafting, objective attribute completion, Russian title/description/Rich Content creation, classified evidence gaps, and retrying rejected field decisions before upload; manual required-field handoff is allowed only after evidence-exhausted unresolved decisions.
 ---
 
 # Ozon Intelligent Field Drafter
@@ -20,7 +20,10 @@ fields.
 
 1. Require an Ozon V2 `run_id`.
 2. GET `http://127.0.0.1:8765/api/batches/{run_id}/content-tasks`.
-3. Process every item with `status=pending`. Do not spawn subagents.
+3. Process every item with `status=pending`. Do not spawn subagents. Within each
+   product, process every pending `required=true` field before optional or
+   creative fields. A required field is an upload blocker, not a reporting-only
+   gap.
    The workbench has already applied pre-resolved store defaults and direct
    deterministic mappings. Do not spend model decisions recreating fixed
    country, approved no-brand, seller-code, pricing/package, or locked-SKU
@@ -28,6 +31,9 @@ fields.
    `workflow.defaults.disable_product_grouping=Нет` and may use
    `ozon.category_path.leaf` as a low-priority type fallback when no more
    specific verified type exists.
+   Ozon marking-code and similar compliance decisions are not Skill inference.
+   The workbench exposes them as a dedicated boolean confirmation and omits
+   them from `field_tasks`; never invent or submit a compliance value.
 4. For every pending entry in `field_tasks`, inspect its
    `candidate_evidence_refs`, then
    verify the referenced values in `evidence_index`. Read the full evidence when
@@ -73,17 +79,37 @@ fields.
      remove only unrelated supplier fulfillment or promotion text. Terms such
      as `现货当天发`, `包邮`, `一件代发`, warehouse promises, or wholesale
      advertising must never enter the Ozon customer-facing value.
+   - Before returning `unresolved` for a required field, exhaust this checklist:
+     inspect all `candidate_evidence_refs`; search the full `evidence_index`;
+     inspect `confirmed_supplier_sku`, supplier attributes, structured Ozon
+     attributes, allowed dictionary values, and every permitted locked visual
+     reference. Translate and normalize verified facts instead of treating them
+     as absent. Do not infer prohibited regulatory, certification, warranty,
+     customs, or measurement facts.
 9. POST one product at a time to
    `http://127.0.0.1:8765/api/batches/{run_id}/content-tasks/complete`. Cover
    every pending field for that product.
 10. Correct only rejected fields and resubmit the same product. Preserve accepted
    decisions.
 11. Repeat GET until `summary.pending=0` and `summary.pending_fields=0`. This is
-   not proof of readiness: inspect `summary.ready`,
-   `summary.completed_with_gaps`, and `summary.blocked`.
-12. GET `http://127.0.0.1:8765/api/batches/{run_id}/upload` and report, per
-    product, total mapped fields, newly filled fields, classified optional gaps,
-    required blockers, image blockers, and draft readiness.
+    not proof of readiness: inspect `summary.ready`,
+    `summary.completed_with_gaps`, and `summary.blocked`. Do not stop merely
+    because all decisions were submitted.
+12. GET `http://127.0.0.1:8765/api/batches/{run_id}/upload`. For each product:
+    - If `manual_required_fields` is empty, never ask the user to fill a
+      required field. Pending entries in `missing_required_fields` still belong
+      to this Skill.
+    - If `manual_required_fields` contains entries, ask the user only for those
+      exact fields. They are required fields that this Skill already classified
+      as evidence-exhausted `unresolved`.
+    - After the user provides a value, POST only those keys to
+      `http://127.0.0.1:8765/api/batches/{run_id}/required-attributes/{seed_id}`,
+      then reload content tasks and upload state until the product is ready or
+      a new exact blocker is returned.
+13. Report, per product, total mapped fields, newly filled fields, classified
+    optional gaps, exact manual required fields, image blockers, and draft
+    readiness. Never leave a required blocker as a vague “cannot upload”
+    outcome.
 
 ## Submission shapes
 
@@ -161,6 +187,13 @@ Use exactly one for every unresolved field:
 ## Validation rules
 
 - Submit exact `field_key` values from the current task.
+- Complete required pending fields before optional and creative fields.
+- Never convert a merely pending required field into a user input request.
+  Manual handoff is valid only when the refreshed upload item exposes it in
+  `manual_required_fields`.
+- A workbench-supplied compliance boolean confirmation is the narrow exception:
+  it is intentionally user-owned from the start and must not be inferred from
+  product category, images, or unrelated attributes.
 - Cite only exact `evidence_index` keys.
 - For a visual-supported field, inspect the original locked 1688 images and
   cite every exact `visual_evidence_refs` entry in `visual_analysis`. A generic
@@ -186,14 +219,18 @@ Use exactly one for every unresolved field:
   exact locked-SKU evidence reference.
 - Preserve codes, quantities, measurements, colors, materials, composition, and
   variant identity during translation.
+- For Ozon hashtags: no whitespace inside a hashtag. Emit one space-delimited
+  token per hashtag. Every token starts with `#`; replace multi-word hashtag spaces with underscores,
+  for example `#садовый_декор`. Do not return `#садовый декор`, because Ozon
+  reads `декор` as an unmarked token.
 - Do not translate an identifier into a different identifier and do not invent
   absent certification, customs, warranty, weight, or regulatory facts.
 - `completed_with_gaps` is not `ready`; a required unresolved field is
-  `blocked`.
+  `blocked` and requires an exact `manual_required_fields` handoff.
 
 ## Phase relationship
 
-This Skill and `$ozon-image-generation-controller` are peer executors of the same
+This Skill and `$ozon-product-media-generator` are peer executors of the same
 Ozon V2 batch. Field drafting must not wait for unrelated image work. Each
 product passes its own field and image gates independently.
 

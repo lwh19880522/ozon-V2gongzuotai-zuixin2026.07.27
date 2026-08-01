@@ -33,12 +33,28 @@ from ozon_v2.adapters.fs_repo import FsRepo
 from ozon_v2.adapters.seller_api import SellerApiAdapter, SellerApiError
 
 
-RULE_VERSION = "1.0.0"
+RULE_VERSION = "1.1.0"
 MEDIA_KEYS = frozenset(
     {"images", "primary_image", "images360", "video", "video_cover"}
 )
+TITLE_ATTRIBUTE_ID = 4180
+DESCRIPTION_ATTRIBUTE_ID = 4191
+RICH_CONTENT_ATTRIBUTE_ID = 11254
+MIN_NON_MEDIA_SCORE = 80
+CONTENT_ATTRIBUTE_IDS = {
+    "name": TITLE_ATTRIBUTE_ID,
+    "description": DESCRIPTION_ATTRIBUTE_ID,
+    "rich_content": RICH_CONTENT_ATTRIBUTE_ID,
+}
 TERMINAL_UNCHANGED_STATUSES = frozenset(
-    {"completed", "pending_risk", "evidence_insufficient", "paused"}
+    {
+        "completed",
+        "pending_risk",
+        "score_below_target",
+        "score_unverified",
+        "evidence_insufficient",
+        "paused",
+    }
 )
 PROPOSAL_KEYS = frozenset(
     {
@@ -120,6 +136,190 @@ def payload_hash(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def _attribute_map(attributes: Any) -> dict[int, dict[str, Any]]:
+    result: dict[int, dict[str, Any]] = {}
+    for item in attributes or []:
+        if not isinstance(item, dict) or item.get("id") is None:
+            continue
+        try:
+            result[int(item["id"])] = item
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def _first_attribute_text(attributes: Any, attribute_id: int) -> str:
+    item = _attribute_map(attributes).get(int(attribute_id)) or {}
+    for value in item.get("values") or []:
+        if isinstance(value, dict) and value.get("value") is not None:
+            return str(value["value"]).strip()
+    return ""
+
+
+def _product_content(product: dict[str, Any]) -> dict[str, Any]:
+    seller_item = product.get("seller_api_item") or {}
+    attributes = product.get("attributes") or seller_item.get("attributes") or []
+    name = _first_attribute_text(attributes, TITLE_ATTRIBUTE_ID) or str(
+        product.get("name") or seller_item.get("name") or ""
+    ).strip()
+    description = _first_attribute_text(attributes, DESCRIPTION_ATTRIBUTE_ID) or str(
+        product.get("description") or seller_item.get("description") or ""
+    ).strip()
+    rich_text = _first_attribute_text(attributes, RICH_CONTENT_ATTRIBUTE_ID)
+    rich_content = product.get("rich_content") or seller_item.get("rich_content") or {}
+    if rich_text:
+        try:
+            decoded = json.loads(rich_text)
+        except json.JSONDecodeError:
+            decoded = {}
+        if isinstance(decoded, dict):
+            rich_content = decoded
+    return {
+        "name": name,
+        "description": description,
+        "rich_content": rich_content if isinstance(rich_content, dict) else {},
+        "attributes": attributes,
+    }
+
+
+def _seller_status(product: dict[str, Any]) -> dict[str, Any]:
+    status = product.get("seller_status") or product.get("statuses")
+    if not isinstance(status, dict):
+        status = (product.get("seller_api_item") or {}).get("statuses")
+    return deepcopy(status) if isinstance(status, dict) else {}
+
+
+def _normalized_seller_errors(product: dict[str, Any]) -> list[dict[str, Any]]:
+    source = (
+        product.get("seller_errors")
+        or product.get("errors")
+        or product.get("item_errors")
+    )
+    if not source:
+        seller_item = product.get("seller_api_item") or {}
+        source = seller_item.get("errors") or seller_item.get("item_errors") or []
+    result: list[dict[str, Any]] = []
+    for item in source or []:
+        if not isinstance(item, dict):
+            continue
+        texts = item.get("texts") or {}
+        result.append(
+            {
+                "code": str(item.get("code") or "UNKNOWN_SELLER_ERROR"),
+                "level": str(item.get("level") or ""),
+                "attribute_id": item.get("attribute_id"),
+                "message": str(
+                    texts.get("message")
+                    or texts.get("description")
+                    or item.get("message")
+                    or ""
+                ),
+            }
+        )
+    return result
+
+
+def _missing_required_attribute_ids(
+    product: dict[str, Any], schema: list[dict[str, Any]] | None = None
+) -> list[int]:
+    current = _attribute_map(_product_content(product).get("attributes") or [])
+    missing: list[int] = []
+    for field in (
+        schema if schema is not None else product.get("attribute_schema") or []
+    ):
+        if not isinstance(field, dict) or not field.get("required"):
+            continue
+        try:
+            attribute_id = int(field["id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        values = (current.get(attribute_id) or {}).get("values") or []
+        populated = any(
+            isinstance(value, dict)
+            and (
+                value.get("dictionary_value_id") not in (None, 0, "", "0")
+                or str(value.get("value") or "").strip()
+            )
+            for value in values
+        )
+        if not populated:
+            missing.append(attribute_id)
+    return sorted(set(missing))
+
+
+def _seller_error_severity(level: str) -> str:
+    folded = str(level or "").casefold()
+    if any(token in folded for token in ("error", "fatal", "critical")):
+        return "severe"
+    if "warn" in folded:
+        return "medium"
+    return "high"
+
+
+def _deterministic_findings(
+    product: dict[str, Any], schema: list[dict[str, Any]] | None = None
+) -> list[dict[str, str]]:
+    findings = [
+        {
+            "code": f"seller_error:{item['code']}",
+            "level": _seller_error_severity(str(item.get("level") or "")),
+            "resolution": "unresolved",
+        }
+        for item in _normalized_seller_errors(product)
+    ]
+    status = _seller_status(product)
+    validation_status = str(status.get("validation_status") or "").casefold()
+    if validation_status and validation_status not in {
+        "success",
+        "valid",
+        "validated",
+    }:
+        findings.append(
+            {
+                "code": f"seller_validation_status:{validation_status}",
+                "level": "high",
+                "resolution": "unresolved",
+            }
+        )
+    if status.get("is_created") is False:
+        findings.append(
+            {
+                "code": "seller_not_created",
+                "level": "high",
+                "resolution": "unresolved",
+            }
+        )
+    if status.get("status_failed"):
+        findings.append(
+            {
+                "code": "seller_status_failed",
+                "level": "high",
+                "resolution": "unresolved",
+            }
+        )
+    for attribute_id in _missing_required_attribute_ids(product, schema):
+        findings.append(
+            {
+                "code": f"missing_required_attribute:{attribute_id}",
+                "level": "high",
+                "resolution": "unresolved",
+            }
+        )
+    for field_name, value in _customer_text_values(product).items():
+        if _has_ambiguous_numeric_separator(value):
+            findings.append(
+                {
+                    "code": f"ambiguous_numeric_separator:{field_name}",
+                    "level": "severe",
+                    "resolution": "unresolved",
+                }
+            )
+    unique: dict[str, dict[str, str]] = {}
+    for finding in findings:
+        unique[finding["code"]] = finding
+    return list(unique.values())
+
+
 def source_fingerprint(product: dict[str, Any]) -> str:
     tracked = {
         key: product.get(key)
@@ -138,6 +338,12 @@ def source_fingerprint(product: dict[str, Any]) -> str:
             "stocks",
             "description_category_id",
             "type_id",
+            "statuses",
+            "errors",
+            "item_errors",
+            "attribute_schema",
+            "content_score_groups",
+            "content_rating",
         )
     }
     return payload_hash(tracked)
@@ -158,6 +364,86 @@ def non_media_score(groups: dict[str, dict[str, float]]) -> int | None:
 
 def _normalized_text(value: Any) -> str:
     return unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
+
+
+def _has_ambiguous_numeric_separator(value: Any) -> bool:
+    folded = _normalized_text(value)
+    return bool(
+        re.search(
+            r"\b\d+(?:[.,]\d+)?\s+\d+(?:[.,]\d+)?\s*"
+            r"(?:мм|см|м|мл|л|г|кг|вт|ватт|в|вольт|шт|штук|игрок)",
+            folded,
+        )
+        or re.search(r"\bот\s+\d+(?:[.,]\d+)?\s+до\s+\+\d", folded)
+    )
+
+
+def _customer_text_values(product: dict[str, Any]) -> dict[str, str]:
+    content = _product_content(product)
+    rich_fragments: list[str] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+        elif isinstance(value, str):
+            rich_fragments.append(value)
+
+    visit(content.get("rich_content") or {})
+    return {
+        "name": str(content.get("name") or ""),
+        "description": str(content.get("description") or ""),
+        "rich_content": " ".join(rich_fragments),
+    }
+
+
+def _numeric_atoms(value: Any) -> set[str]:
+    return set(re.findall(r"\d+", unicodedata.normalize("NFKC", str(value or ""))))
+
+
+def _evidence_value_texts(value: Any) -> list[str]:
+    result: list[str] = []
+    if isinstance(value, dict):
+        if "value" in value and not isinstance(value.get("value"), (dict, list)):
+            result.append(str(value.get("value") or ""))
+        for child in value.values():
+            if isinstance(child, (dict, list)):
+                result.extend(_evidence_value_texts(child))
+    elif isinstance(value, list):
+        for child in value:
+            result.extend(_evidence_value_texts(child))
+    return result
+
+
+def _validate_supported_numeric_facts(
+    task: dict[str, Any], proposal: dict[str, Any]
+) -> None:
+    current_text = " ".join(_customer_text_values(task).values())
+    evidence_text = " ".join(
+        _evidence_value_texts(task.get("objective_evidence") or {})
+    )
+    allowed = _numeric_atoms(f"{current_text} {evidence_text}")
+    proposed_product = {
+        "name": proposal.get("name"),
+        "description": proposal.get("description"),
+        "rich_content": proposal.get("rich_content"),
+    }
+    proposed_text = " ".join(_customer_text_values(proposed_product).values())
+    attribute_text = " ".join(
+        value
+        for item in proposal.get("attribute_decisions") or []
+        if isinstance(item, dict) and str(item.get("decision") or "") == "set"
+        for value in _decision_value_strings(item)
+    )
+    proposed_numbers = _numeric_atoms(f"{proposed_text} {attribute_text}")
+    unsupported = sorted(proposed_numbers - allowed)
+    if unsupported:
+        raise ValidationError(
+            f"proposal contains unsupported numeric facts: {', '.join(unsupported)}"
+        )
 
 
 def _has_cjk(text: str) -> bool:
@@ -206,6 +492,10 @@ def _validate_customer_text(
         raise ValidationError(f"{field_name} contains external contact information")
     if re.search(r"(?:\+?\d[\s()-]*){10,}", text):
         raise ValidationError(f"{field_name} contains a phone number")
+    if _has_ambiguous_numeric_separator(text):
+        raise ValidationError(
+            f"{field_name} contains an ambiguous numeric separator"
+        )
     if any(
         phrase in folded
         for phrase in (
@@ -317,7 +607,7 @@ def _validate_attribute_decisions(
         if not isinstance(values, list) or not values:
             raise ValidationError(f"attribute {attribute_id} needs values")
         dictionary_values = field.get("dictionary_values") or []
-        if field.get("dictionary") or dictionary_values:
+        if dictionary_values:
             allowed_ids = {
                 str(item.get("id") or item.get("dictionary_value_id"))
                 for item in dictionary_values
@@ -332,6 +622,16 @@ def _validate_attribute_decisions(
             if not proposed_ids or not proposed_ids.issubset(allowed_ids):
                 raise ValidationError(
                     f"attribute {attribute_id} dictionary value is not allowed"
+                )
+        elif field.get("dictionary"):
+            proposed_ids = [
+                int(item.get("dictionary_value_id") or item.get("id") or 0)
+                for item in values
+                if isinstance(item, dict)
+            ]
+            if not proposed_ids or any(value_id <= 0 for value_id in proposed_ids):
+                raise ValidationError(
+                    f"attribute {attribute_id} dictionary value was not resolved"
                 )
         evidence = _evidence_for_attribute(task, attribute_id)
         objective = bool(field.get("objective")) or bool(evidence)
@@ -379,20 +679,57 @@ def _price_loss(task: dict[str, Any]) -> bool:
 def _risk_summary(
     task: dict[str, Any], proposal: dict[str, Any]
 ) -> tuple[str | None, list[str], bool]:
-    findings: list[dict[str, str]] = []
+    findings_by_code: dict[str, dict[str, str]] = {}
     for item in proposal.get("risk_findings") or []:
         if not isinstance(item, dict):
             raise ValidationError("risk finding must be an object")
         level = str(item.get("level") or "").casefold()
         if level not in SEVERITY:
             raise ValidationError("risk finding level is invalid")
-        findings.append(
-            {
-                "code": str(item.get("code") or "unspecified"),
-                "level": level,
-                "resolution": str(item.get("resolution") or "unresolved").casefold(),
-            }
+        code = str(item.get("code") or "unspecified")
+        findings_by_code[code] = {
+            "code": code,
+            "level": level,
+            "resolution": str(item.get("resolution") or "unresolved").casefold(),
+        }
+
+    deterministic = task.get("deterministic_findings")
+    if not isinstance(deterministic, list):
+        deterministic = _deterministic_findings(
+            task, list(task.get("attribute_schema") or [])
         )
+    set_attribute_ids = {
+        int(item["id"])
+        for item in proposal.get("attribute_decisions") or []
+        if isinstance(item, dict)
+        and str(item.get("decision") or "") == "set"
+        and item.get("id") is not None
+    }
+    for item in deterministic:
+        if not isinstance(item, dict):
+            continue
+        code = str(item.get("code") or "unspecified")
+        proposed = findings_by_code.get(code) or {}
+        resolution = str(proposed.get("resolution") or "unresolved").casefold()
+        if code.startswith("missing_required_attribute:"):
+            try:
+                missing_id = int(code.rsplit(":", 1)[1])
+            except (TypeError, ValueError):
+                missing_id = -1
+            if missing_id in set_attribute_ids:
+                resolution = "fixed"
+        if code.startswith("ambiguous_numeric_separator:"):
+            field_name = code.rsplit(":", 1)[1]
+            proposed_value: Any = proposal.get(field_name)
+            if field_name == "rich_content":
+                proposed_value = canonical_json(proposal.get("rich_content") or {})
+            if not _has_ambiguous_numeric_separator(proposed_value):
+                resolution = "fixed"
+        findings_by_code[code] = {
+            "code": code,
+            "level": str(item.get("level") or "high").casefold(),
+            "resolution": resolution,
+        }
 
     product_url = str(task.get("product_url") or "")
     objective = task.get("objective_evidence") or {}
@@ -408,18 +745,20 @@ def _risk_summary(
         )
         observed = _normalized_text(observation.get("value"))
         if expected and observed and expected != observed:
-            findings.append(
-                {
-                    "code": f"storefront_divergence:{field_key}",
-                    "level": "high",
-                    "resolution": "unresolved",
-                }
-            )
+            code = f"storefront_divergence:{field_key}"
+            findings_by_code[code] = {
+                "code": code,
+                "level": "high",
+                "resolution": "unresolved",
+            }
 
     if _price_loss(task):
-        findings.append(
-            {"code": "price_loss", "level": "severe", "resolution": "unresolved"}
-        )
+        findings_by_code["price_loss"] = {
+            "code": "price_loss",
+            "level": "severe",
+            "resolution": "unresolved",
+        }
+    findings = list(findings_by_code.values())
     if not findings:
         return None, [], False
     highest = max(findings, key=lambda item: SEVERITY[item["level"]])["level"]
@@ -469,6 +808,7 @@ def validate_proposal(
         proposal,
         compliance_supported=compliance_supported,
     )
+    _validate_supported_numeric_facts(task, proposal)
     risk_level, risk_codes, unresolved_blocking = _risk_summary(task, proposal)
     evidence_insufficient = bool(task.get("evidence_insufficient"))
     return {
@@ -509,6 +849,256 @@ def merge_proposal(
         else:
             merged.pop(key, None)
     return merged
+
+
+def resolve_proposal_dictionary_values(
+    gateway: Any,
+    task: dict[str, Any],
+    proposal: dict[str, Any],
+) -> dict[str, Any]:
+    resolved_proposal = deepcopy(proposal)
+    schema = _schema_by_id(task)
+    for decision in resolved_proposal.get("attribute_decisions") or []:
+        if not isinstance(decision, dict) or decision.get("id") is None:
+            continue
+        attribute_id = int(decision["id"])
+        field = schema.get(attribute_id) or {}
+        if str(decision.get("decision") or "") != "set" or not field.get(
+            "dictionary"
+        ):
+            continue
+        resolved_values = []
+        for value in decision.get("values") or []:
+            visible = str((value or {}).get("value") or "").strip()
+            if not visible:
+                raise ValidationError(
+                    f"attribute {attribute_id} dictionary value is empty"
+                )
+            resolved_values.append(
+                gateway.resolve_dictionary_value(task, attribute_id, visible)
+            )
+        decision["values"] = resolved_values
+        if field.get("dictionary_values"):
+            field["dictionary_values"] = deepcopy(resolved_values)
+    return resolved_proposal
+
+
+def _attribute_update(
+    attribute_id: int,
+    values: list[dict[str, Any]],
+    *,
+    complex_id: int = 0,
+) -> dict[str, Any]:
+    normalized_values = []
+    for value in values:
+        normalized_values.append(
+            {
+                "dictionary_value_id": int(value.get("dictionary_value_id") or 0),
+                "value": str(value.get("value") or ""),
+            }
+        )
+    return {
+        "id": int(attribute_id),
+        "complex_id": int(complex_id),
+        "values": normalized_values,
+    }
+
+
+def _updated_attributes(
+    task: dict[str, Any], proposal: dict[str, Any]
+) -> list[dict[str, Any]]:
+    attributes = _attribute_map(
+        (task.get("current") or {}).get("attributes")
+        or (task.get("seller_api_item") or {}).get("attributes")
+        or []
+    )
+    changed = [
+        _attribute_update(
+            TITLE_ATTRIBUTE_ID,
+            [{"value": str(proposal["name"]).strip()}],
+        ),
+        _attribute_update(
+            DESCRIPTION_ATTRIBUTE_ID,
+            [{"value": str(proposal["description"]).strip()}],
+        ),
+        _attribute_update(
+            RICH_CONTENT_ATTRIBUTE_ID,
+            [{"value": canonical_json(proposal["rich_content"])}],
+        ),
+    ]
+    for decision in proposal.get("attribute_decisions") or []:
+        if str(decision.get("decision") or "") != "set":
+            continue
+        changed.append(
+            _attribute_update(
+                int(decision["id"]),
+                list(decision.get("values") or []),
+                complex_id=int(decision.get("complex_id") or 0),
+            )
+        )
+    for item in changed:
+        attributes[int(item["id"])] = item
+    return list(attributes.values())
+
+
+def build_attribute_update(
+    task: dict[str, Any], proposal: dict[str, Any]
+) -> dict[str, Any]:
+    updated = _attribute_map(_updated_attributes(task, proposal))
+    changed_ids = {
+        TITLE_ATTRIBUTE_ID,
+        DESCRIPTION_ATTRIBUTE_ID,
+        RICH_CONTENT_ATTRIBUTE_ID,
+    }
+    changed_ids.update(
+        int(decision["id"])
+        for decision in proposal.get("attribute_decisions") or []
+        if str(decision.get("decision") or "") == "set"
+    )
+    return {
+        "offer_id": str(task.get("offer_id") or ""),
+        "attributes": [updated[attribute_id] for attribute_id in changed_ids],
+    }
+
+
+def build_original_attribute_update(
+    task: dict[str, Any], proposal: dict[str, Any]
+) -> dict[str, Any]:
+    current = task.get("current") or {}
+    original_attributes = _attribute_map(current.get("attributes") or [])
+    values = {
+        TITLE_ATTRIBUTE_ID: _attribute_update(
+            TITLE_ATTRIBUTE_ID, [{"value": str(current.get("name") or "")}]
+        ),
+        DESCRIPTION_ATTRIBUTE_ID: _attribute_update(
+            DESCRIPTION_ATTRIBUTE_ID,
+            [{"value": str(current.get("description") or "")}],
+        ),
+        RICH_CONTENT_ATTRIBUTE_ID: _attribute_update(
+            RICH_CONTENT_ATTRIBUTE_ID,
+            [{"value": canonical_json(current.get("rich_content") or {})}],
+        ),
+    }
+    for decision in proposal.get("attribute_decisions") or []:
+        if str(decision.get("decision") or "") != "set":
+            continue
+        attribute_id = int(decision["id"])
+        prior = original_attributes.get(attribute_id) or {
+            "id": attribute_id,
+            "complex_id": int(decision.get("complex_id") or 0),
+            "values": [],
+        }
+        values[attribute_id] = deepcopy(prior)
+    return {
+        "offer_id": str(task.get("offer_id") or ""),
+        "attributes": list(values.values()),
+    }
+
+
+def _first_media_value(value: Any) -> str:
+    if isinstance(value, list):
+        return str(next((item for item in value if item), ""))
+    return str(value or "")
+
+
+def _sanitized_import_item(
+    source: dict[str, Any],
+    *,
+    name: str,
+    attributes: list[dict[str, Any]],
+) -> dict[str, Any]:
+    item = {
+        "attributes": deepcopy(attributes),
+        "barcode": str(source.get("barcode") or ""),
+        "complex_attributes": deepcopy(source.get("complex_attributes") or []),
+        "currency_code": str(source.get("currency_code") or ""),
+        "depth": source.get("depth"),
+        "description_category_id": source.get("description_category_id"),
+        "dimension_unit": str(source.get("dimension_unit") or ""),
+        "height": source.get("height"),
+        "images": deepcopy(source.get("images") or []),
+        "name": str(name).strip(),
+        "offer_id": str(source.get("offer_id") or ""),
+        "old_price": str(source.get("old_price") or ""),
+        "pdf_list": deepcopy(source.get("pdf_list") or []),
+        "premium_price": str(source.get("premium_price") or ""),
+        "price": str(source.get("price") or ""),
+        "primary_image": _first_media_value(source.get("primary_image")),
+        "type_id": source.get("type_id"),
+        "vat": str(source.get("vat") or "0"),
+        "weight": source.get("weight"),
+        "weight_unit": str(source.get("weight_unit") or ""),
+        "width": source.get("width"),
+    }
+    required = (
+        "currency_code",
+        "depth",
+        "description_category_id",
+        "dimension_unit",
+        "height",
+        "images",
+        "name",
+        "offer_id",
+        "price",
+        "primary_image",
+        "type_id",
+        "weight",
+        "weight_unit",
+        "width",
+    )
+    missing = [key for key in required if item.get(key) in (None, "", [])]
+    if missing:
+        raise ApplyError(
+            f"Seller import preflight is missing required fields: {', '.join(missing)}"
+        )
+    return item
+
+
+def build_content_import(
+    task: dict[str, Any], proposal: dict[str, Any]
+) -> dict[str, Any]:
+    source = task.get("seller_api_item") or {}
+    return _sanitized_import_item(
+        source,
+        name=str(proposal["name"]),
+        attributes=_updated_attributes(task, proposal),
+    )
+
+
+def build_original_content_import(task: dict[str, Any]) -> dict[str, Any]:
+    source = task.get("seller_api_item") or {}
+    current = task.get("current") or {}
+    return _sanitized_import_item(
+        source,
+        name=str(current.get("name") or source.get("name") or ""),
+        attributes=deepcopy(current.get("attributes") or source.get("attributes") or []),
+    )
+
+
+def proposal_changes_product(
+    task: dict[str, Any], proposal: dict[str, Any]
+) -> bool:
+    current = task.get("current") or {}
+    for key in ("name", "description", "rich_content"):
+        if canonical_json(proposal.get(key)) != canonical_json(current.get(key)):
+            return True
+    current_attributes = _attribute_values_by_id(
+        {"attributes": current.get("attributes") or []}
+    )
+    for decision in proposal.get("attribute_decisions") or []:
+        if str(decision.get("decision") or "") != "set":
+            continue
+        attribute_id = int(decision["id"])
+        normalized = _attribute_update(
+            attribute_id,
+            list(decision.get("values") or []),
+            complex_id=int(decision.get("complex_id") or 0),
+        )["values"]
+        if canonical_json(current_attributes.get(attribute_id) or []) != canonical_json(
+            normalized
+        ):
+            return True
+    return False
 
 
 class Ledger:
@@ -625,14 +1215,34 @@ class Ledger:
         fingerprint: str,
         proposal_fingerprint: str,
     ) -> None:
+        self.mark_applied(
+            product_id,
+            "completed",
+            fingerprint,
+            proposal_fingerprint,
+        )
+
+    def mark_applied(
+        self,
+        product_id: str,
+        status: str,
+        fingerprint: str,
+        proposal_fingerprint: str,
+    ) -> None:
         self.connection.execute(
             """
             UPDATE product_state
-            SET status = 'completed', source_fingerprint = ?,
+            SET status = ?, source_fingerprint = ?,
                 proposal_fingerprint = ?, last_error = NULL, updated_at = ?
             WHERE product_id = ?
             """,
-            (fingerprint, proposal_fingerprint, utc_now(), str(product_id)),
+            (
+                str(status),
+                fingerprint,
+                proposal_fingerprint,
+                utc_now(),
+                str(product_id),
+            ),
         )
         self.connection.commit()
 
@@ -733,6 +1343,12 @@ def _build_task(
     fingerprint = source_fingerprint(product)
     images = [str(value) for value in product.get("images") or [] if value]
     product_id = str(product.get("product_id") or product.get("id") or "")
+    current = _product_content(product)
+    schema = list(product.get("attribute_schema") or [])
+    seller_status = _seller_status(product)
+    seller_errors = _normalized_seller_errors(product)
+    required_missing = _missing_required_attribute_ids(product, schema)
+    deterministic_findings = _deterministic_findings(product, schema)
     return {
         "product_id": product_id,
         "sku": str(product.get("sku") or ""),
@@ -740,13 +1356,15 @@ def _build_task(
         "source_fingerprint": fingerprint,
         "visibility": str(product.get("visibility") or ""),
         "seller_api_item": product.get("seller_api_item") or dict(product),
-        "current": {
-            "name": str(product.get("name") or ""),
-            "description": str(product.get("description") or ""),
-            "rich_content": product.get("rich_content") or {},
-            "attributes": product.get("attributes") or [],
-        },
-        "attribute_schema": product.get("attribute_schema") or [],
+        "current": current,
+        "attribute_schema": schema,
+        "seller_status": seller_status,
+        "seller_errors": seller_errors,
+        "required_missing_attribute_ids": required_missing,
+        "deterministic_findings": deterministic_findings,
+        "deterministic_risk_codes": [
+            item["code"] for item in deterministic_findings
+        ],
         "objective_evidence": evidence_bundle.get("objective_evidence") or {},
         "read_only_images": images,
         "product_url": str(
@@ -802,6 +1420,58 @@ def scan_store(
         ledger.upsert_task(task, rule_hashes)
         counts["queued"] += 1
     return counts
+
+
+def audit_catalog(products: list[dict[str, Any]]) -> dict[str, Any]:
+    status_counts: dict[str, int] = {}
+    score_available = 0
+    score_unavailable = 0
+    problems: list[dict[str, Any]] = []
+    for product in products:
+        visibility = str(product.get("visibility") or "NOT_IN_SALE")
+        status_counts[visibility] = status_counts.get(visibility, 0) + 1
+        score = non_media_score(
+            product.get("content_score_groups")
+            or product.get("content_rating")
+            or {}
+        )
+        if score is None:
+            score_unavailable += 1
+        else:
+            score_available += 1
+        findings = _deterministic_findings(
+            product, list(product.get("attribute_schema") or [])
+        )
+        risk_codes = [item["code"] for item in findings]
+        if score is None:
+            risk_codes.append("official_non_media_score_unavailable")
+        elif score < MIN_NON_MEDIA_SCORE:
+            risk_codes.append(f"non_media_score_below_{MIN_NON_MEDIA_SCORE}")
+        if not risk_codes:
+            continue
+        status = _seller_status(product)
+        problems.append(
+            {
+                "product_id": str(
+                    product.get("product_id") or product.get("id") or ""
+                ),
+                "offer_id": str(product.get("offer_id") or ""),
+                "visibility": visibility,
+                "seller_status_name": str(status.get("status_name") or ""),
+                "non_media_score": score,
+                "risk_codes": risk_codes,
+            }
+        )
+    return {
+        "catalog_count": len(products),
+        "status_counts": status_counts,
+        "score_evidence": {
+            "available": score_available,
+            "unavailable": score_unavailable,
+        },
+        "problem_product_count": len(problems),
+        "problem_products": problems,
+    }
 
 
 def _walk_dicts(value: Any):
@@ -903,10 +1573,16 @@ def _normalize_visibility(ref: dict[str, Any], info: dict[str, Any]) -> str:
         or ""
     ).strip()
     folded = raw.casefold()
-    if any(token in folded for token in ("прода", "in_sale", "on_sale")):
-        return "IN_SALE"
-    if any(token in folded for token in ("готов", "ready_to_supply", "готов к продаже")):
+    machine = re.sub(r"[\s-]+", "_", folded)
+    if any(
+        token in folded
+        for token in ("не прода", "ошибка", "отклон", "заблокирован")
+    ) or machine in {"not_in_sale", "validation_failed", "failed", "rejected"}:
+        return "NOT_IN_SALE"
+    if "готов" in folded or machine in {"ready_to_supply", "ready_for_sale"}:
         return "READY_TO_SUPPLY"
+    if folded == "продается" or machine in {"in_sale", "on_sale"}:
+        return "IN_SALE"
     if ref.get("has_fbs_stocks") or ref.get("has_fbo_stocks"):
         return "IN_SALE"
     return raw.upper().replace(" ", "_") or "NOT_IN_SALE"
@@ -924,7 +1600,12 @@ class SellerGateway:
                 {"filter": {"product_id": chunk}, "limit": 100},
             )
             result = payload.get("result", payload)
-            items = result.get("items", []) if isinstance(result, dict) else []
+            if isinstance(result, list):
+                items = result
+            elif isinstance(result, dict):
+                items = result.get("items", [])
+            else:
+                items = []
             for item in items:
                 if not isinstance(item, dict):
                     continue
@@ -939,14 +1620,62 @@ class SellerGateway:
         info_by_id = self.adapter._fetch_product_info(product_ids)
         attributes_by_id = self._fetch_attributes(product_ids)
         products: list[dict[str, Any]] = []
+        schema_cache: dict[tuple[int, int], list[dict[str, Any]]] = {}
         for ref in refs:
             product_id = str(ref["product_id"])
             info = info_by_id.get(product_id, {})
             attributes = attributes_by_id.get(product_id, {})
             merged = {**info, **attributes}
             images = merged.get("images") or []
-            seller_item = dict(attributes or merged)
+            raw_stocks = merged.get("stocks") or []
+            stocks = (
+                raw_stocks.get("stocks", [])
+                if isinstance(raw_stocks, dict)
+                else raw_stocks
+            )
+            seller_item = dict(merged)
             seller_item.setdefault("offer_id", ref.get("offer_id"))
+            description_category_id = merged.get("description_category_id")
+            type_id = merged.get("type_id")
+            schema: list[dict[str, Any]] = []
+            if description_category_id is not None and type_id is not None:
+                schema_key = (int(description_category_id), int(type_id))
+                if schema_key not in schema_cache:
+                    raw_schema = self.adapter._fetch_description_category_attributes(
+                        *schema_key
+                    )
+                    current_attributes = _attribute_map(merged.get("attributes") or [])
+                    normalized_schema = []
+                    for field in raw_schema:
+                        if not isinstance(field, dict) or field.get("id") is None:
+                            continue
+                        attribute_id = int(field["id"])
+                        dictionary = bool(field.get("dictionary_id"))
+                        current_values = (
+                            current_attributes.get(attribute_id) or {}
+                        ).get("values") or []
+                        normalized_schema.append(
+                            {
+                                "id": attribute_id,
+                                "name": str(field.get("name") or ""),
+                                "type": str(field.get("type") or ""),
+                                "required": bool(field.get("is_required")),
+                                "dictionary": dictionary,
+                                "dictionary_values": list(current_values)
+                                if dictionary
+                                else [],
+                                "objective": attribute_id
+                                not in {
+                                    TITLE_ATTRIBUTE_ID,
+                                    DESCRIPTION_ATTRIBUTE_ID,
+                                    RICH_CONTENT_ATTRIBUTE_ID,
+                                    23171,
+                                },
+                            }
+                        )
+                    schema_cache[schema_key] = normalized_schema
+                schema = schema_cache[schema_key]
+            current = _product_content({**merged, "seller_api_item": seller_item})
             products.append(
                 {
                     **merged,
@@ -957,15 +1686,16 @@ class SellerGateway:
                     ),
                     "visibility": _normalize_visibility(ref, merged),
                     "archived": bool(ref.get("archived")),
-                    "name": str(merged.get("name") or ""),
-                    "description": str(merged.get("description") or ""),
-                    "rich_content": merged.get("rich_content") or {},
+                    "name": current["name"],
+                    "description": current["description"],
+                    "rich_content": current["rich_content"],
                     "attributes": merged.get("attributes") or [],
+                    "attribute_schema": schema,
                     "images": images,
                     "primary_image": merged.get("primary_image")
                     or (images[0] if images else None),
                     "price": merged.get("price"),
-                    "stocks": merged.get("stocks") or [],
+                    "stocks": stocks,
                     "description_category_id": merged.get(
                         "description_category_id"
                     ),
@@ -982,10 +1712,68 @@ class SellerGateway:
 
     def fetch_product(self, product_id: str) -> dict[str, Any]:
         target = str(product_id)
-        for item in self.fetch_catalog():
-            if str(item.get("product_id") or "") == target:
-                return item
-        raise ApplyError(f"Seller product {target} was not found")
+        try:
+            numeric_id = int(target)
+        except ValueError as exc:
+            raise ApplyError(f"Seller product ID {target} is invalid") from exc
+        info = self.adapter._fetch_product_info([numeric_id]).get(target, {})
+        attributes = self._fetch_attributes([numeric_id]).get(target, {})
+        if not info and not attributes:
+            raise ApplyError(f"Seller product {target} was not found")
+        merged = {**info, **attributes}
+        seller_item = dict(merged)
+        current = _product_content({**merged, "seller_api_item": seller_item})
+        images = merged.get("images") or []
+        stocks = merged.get("stocks") or []
+        return {
+            **merged,
+            "product_id": target,
+            "sku": str(merged.get("sku") or ""),
+            "offer_id": str(merged.get("offer_id") or ""),
+            "visibility": _normalize_visibility({}, merged),
+            "archived": bool(merged.get("archived") or merged.get("is_archived")),
+            "name": current["name"],
+            "description": current["description"],
+            "rich_content": current["rich_content"],
+            "attributes": merged.get("attributes") or [],
+            "images": images,
+            "primary_image": merged.get("primary_image")
+            or (images[0] if images else None),
+            "price": merged.get("price"),
+            "stocks": stocks.get("stocks", [])
+            if isinstance(stocks, dict)
+            else stocks,
+            "description_category_id": merged.get("description_category_id"),
+            "type_id": merged.get("type_id"),
+            "content_score_groups": merged.get("content_score_groups")
+            or merged.get("content_rating")
+            or {},
+            "seller_api_item": seller_item,
+        }
+
+    def resolve_dictionary_value(
+        self,
+        task: dict[str, Any],
+        attribute_id: int,
+        value: str,
+    ) -> dict[str, Any]:
+        source = task.get("seller_api_item") or {}
+        description_category_id = source.get("description_category_id")
+        type_id = source.get("type_id")
+        if description_category_id is None or type_id is None:
+            raise ValidationError(
+                f"attribute {attribute_id} dictionary context is missing"
+            )
+        resolved = self.adapter.resolve_attribute_dictionary_value(
+            description_category_id=int(description_category_id),
+            type_id=int(type_id),
+            attribute_id=int(attribute_id),
+            value=str(value),
+        )
+        return {
+            "dictionary_value_id": int(resolved["dictionary_value_id"]),
+            "value": str(resolved["value"]),
+        }
 
     def _retry_call(self, operation: Any) -> Any:
         delays = (1, 2, 4)
@@ -1003,6 +1791,19 @@ class SellerGateway:
     def import_product(self, item: dict[str, Any]) -> int:
         result = self._retry_call(lambda: self.adapter.import_products([item]))
         return int(result["task_id"])
+
+    def update_product_attributes(self, item: dict[str, Any]) -> int:
+        payload = self._retry_call(
+            lambda: self.adapter._post_json(
+                "/v1/product/attributes/update", {"items": [item]}
+            )
+        )
+        task_id = payload.get("task_id") or (payload.get("result") or {}).get(
+            "task_id"
+        )
+        if task_id is None:
+            raise ApplyError("Seller attribute update did not return a task_id")
+        return int(task_id)
 
     def import_status(self, task_id: int) -> dict[str, Any]:
         return self._retry_call(
@@ -1135,20 +1936,19 @@ def _attribute_values_by_id(product: dict[str, Any]) -> dict[int, Any]:
 def _verify_readback(
     task: dict[str, Any],
     proposal: dict[str, Any],
-    expected: dict[str, Any],
     actual: dict[str, Any],
 ) -> None:
+    actual_content = _product_content(actual)
     for key in ("name", "description", "rich_content"):
-        if canonical_json(actual.get(key)) != canonical_json(expected.get(key)):
+        if canonical_json(actual_content.get(key)) != canonical_json(proposal.get(key)):
             raise ApplyError(f"Seller read-back mismatch for {key}")
     actual_attributes = _attribute_values_by_id(actual)
-    expected_attributes = _attribute_values_by_id(expected)
     for decision in proposal.get("attribute_decisions") or []:
         if str(decision.get("decision")) != "set":
             continue
         attribute_id = int(decision["id"])
         if canonical_json(actual_attributes.get(attribute_id)) != canonical_json(
-            expected_attributes.get(attribute_id)
+            decision.get("values") or []
         ):
             raise ApplyError(
                 f"Seller read-back mismatch for attribute {attribute_id}"
@@ -1165,6 +1965,35 @@ def _verify_readback(
         and int(after_score) < int(before_score)
     ):
         raise ApplyError("Seller non-media score decreased after write")
+
+
+def _original_snapshot_matches(
+    task: dict[str, Any],
+    proposal: dict[str, Any],
+    actual: dict[str, Any],
+) -> bool:
+    current = task.get("current") or {}
+    actual_content = _product_content(actual)
+    for key in ("name", "description", "rich_content"):
+        if canonical_json(actual_content.get(key)) != canonical_json(current.get(key)):
+            return False
+    original_attributes = _attribute_values_by_id(
+        {"attributes": current.get("attributes") or []}
+    )
+    actual_attributes = _attribute_values_by_id(actual)
+    for decision in proposal.get("attribute_decisions") or []:
+        if str(decision.get("decision")) != "set":
+            continue
+        attribute_id = int(decision["id"])
+        if canonical_json(actual_attributes.get(attribute_id) or []) != canonical_json(
+            original_attributes.get(attribute_id) or []
+        ):
+            return False
+    for key in MEDIA_KEYS:
+        original_value = (task.get("seller_api_item") or {}).get(key)
+        if canonical_json(actual.get(key)) != canonical_json(original_value):
+            return False
+    return True
 
 
 def _snapshot_matches(expected: dict[str, Any], actual: dict[str, Any]) -> bool:
@@ -1188,6 +2017,62 @@ def _stock_count(product: dict[str, Any]) -> int:
             continue
         count += int(row.get("present") or row.get("stock") or 0)
     return count
+
+
+def _completion_assessment(
+    task: dict[str, Any], actual: dict[str, Any]
+) -> dict[str, Any]:
+    findings = _deterministic_findings(
+        actual, list(task.get("attribute_schema") or [])
+    )
+    if findings:
+        highest = max(findings, key=lambda item: SEVERITY[item["level"]])["level"]
+        return {
+            "status": "pending_risk",
+            "risk_level": highest,
+            "risk_codes": [item["code"] for item in findings],
+            "non_media_score": non_media_score(
+                actual.get("content_score_groups")
+                or actual.get("content_rating")
+                or {}
+            ),
+        }
+    if task.get("evidence_insufficient"):
+        return {
+            "status": "evidence_insufficient",
+            "risk_level": None,
+            "risk_codes": ["objective_evidence_insufficient"],
+            "non_media_score": non_media_score(
+                actual.get("content_score_groups")
+                or actual.get("content_rating")
+                or {}
+            ),
+        }
+    score = non_media_score(
+        actual.get("content_score_groups")
+        or actual.get("content_rating")
+        or {}
+    )
+    if score is None:
+        return {
+            "status": "score_unverified",
+            "risk_level": None,
+            "risk_codes": ["official_non_media_score_unavailable"],
+            "non_media_score": None,
+        }
+    if score < MIN_NON_MEDIA_SCORE:
+        return {
+            "status": "score_below_target",
+            "risk_level": "medium",
+            "risk_codes": [f"non_media_score_below_{MIN_NON_MEDIA_SCORE}"],
+            "non_media_score": score,
+        }
+    return {
+        "status": "completed",
+        "risk_level": None,
+        "risk_codes": [],
+        "non_media_score": score,
+    }
 
 
 def _guarded_stock_action(
@@ -1225,25 +2110,31 @@ def _rollback_product(
     gateway: Any,
     ledger: Ledger,
     task: dict[str, Any],
-    original: dict[str, Any],
+    proposal: dict[str, Any],
+    original_request: dict[str, Any],
     *,
+    use_import: bool,
     sleep_fn: Any,
 ) -> bool:
     product_id = str(task["product_id"])
     try:
-        rollback_task_id = gateway.import_product(original)
+        rollback_task_id = (
+            gateway.import_product(original_request)
+            if use_import
+            else gateway.update_product_attributes(original_request)
+        )
         _poll_import(
             gateway,
             rollback_task_id,
             sleep_fn=sleep_fn,
         )
         readback = gateway.fetch_product(product_id)
-        if not _snapshot_matches(original, readback):
+        if not _original_snapshot_matches(task, proposal, readback):
             raise ApplyError("Rollback read-back does not match original payload")
     except Exception:
-        ledger.log_action(product_id, "rollback", original, "failed")
+        ledger.log_action(product_id, "rollback", original_request, "failed")
         return False
-    ledger.log_action(product_id, "rollback", original, "success")
+    ledger.log_action(product_id, "rollback", original_request, "success")
     return True
 
 
@@ -1261,6 +2152,7 @@ def apply_one(
         ledger.mark_status(product_id, "pending_risk", risk_codes=["archived"])
         return {"status": "skipped_archived", "product_id": product_id}
 
+    proposal = resolve_proposal_dictionary_values(gateway, task, proposal)
     validation = validate_proposal(task, proposal)
     if validation["unresolved_blocking_risk"]:
         updated, reason = _guarded_stock_action(
@@ -1279,27 +2171,93 @@ def apply_one(
             "reason": reason,
         }
 
-    original = deepcopy(
-        task.get("seller_api_item") or live_before.get("seller_api_item") or {}
+    if not proposal_changes_product(task, proposal):
+        assessment = _completion_assessment(task, live_before)
+        status = str(assessment["status"])
+        if status == "pending_risk":
+            ledger.mark_status(
+                product_id,
+                status,
+                risk_level=assessment["risk_level"],
+                risk_codes=assessment["risk_codes"],
+            )
+        else:
+            ledger.mark_applied(
+                product_id,
+                status,
+                source_fingerprint(live_before),
+                payload_hash(proposal),
+            )
+        return {
+            "status": "reviewed_unchanged" if status == "completed" else status,
+            "product_id": product_id,
+            "risk_codes": assessment["risk_codes"],
+            "non_media_score": assessment["non_media_score"],
+        }
+
+    original = deepcopy(task.get("seller_api_item") or {})
+    has_media = bool(original.get("images")) and bool(
+        _first_media_value(original.get("primary_image"))
     )
-    merged = merge_proposal(task, proposal)
-    if ledger.action_succeeded(product_id, "content_import", merged):
+    title_changed = canonical_json(proposal.get("name")) != canonical_json(
+        (task.get("current") or {}).get("name")
+    )
+    use_import = title_changed
+    if title_changed and not has_media:
+        raise ApplyError("Title cannot change through the media-free update path")
+    request = (
+        build_content_import(task, proposal)
+        if use_import
+        else build_attribute_update(task, proposal)
+    )
+    original_request = (
+        build_original_content_import(task)
+        if use_import
+        else build_original_attribute_update(task, proposal)
+    )
+    action = "content_import" if use_import else "content_attribute_update"
+    if ledger.action_succeeded(product_id, action, request):
         return {"status": "duplicate_skipped", "product_id": product_id}
     ledger.save_original(product_id, original)
 
     try:
-        import_task_id = gateway.import_product(merged)
+        import_task_id = (
+            gateway.import_product(request)
+            if use_import
+            else gateway.update_product_attributes(request)
+        )
         _poll_import(gateway, import_task_id, sleep_fn=sleep_fn)
         readback = gateway.fetch_product(product_id)
-        _verify_readback(task, proposal, merged, readback)
-        ledger.log_action(product_id, "content_import", merged, "success")
+        _verify_readback(task, proposal, readback)
+        ledger.log_action(product_id, action, request, "success")
     except Exception as exc:
-        ledger.log_action(product_id, "content_import", merged, "failed")
+        ledger.log_action(product_id, action, request, "failed")
+        try:
+            unchanged = _original_snapshot_matches(
+                task, proposal, gateway.fetch_product(product_id)
+            )
+        except Exception:
+            unchanged = False
+        if unchanged:
+            ledger.mark_status(
+                product_id,
+                "pending_risk",
+                risk_level="high",
+                risk_codes=["write_rejected_no_change"],
+                error=str(exc),
+            )
+            return {
+                "status": "pending_risk",
+                "product_id": product_id,
+                "reason": "write_rejected_no_change",
+            }
         if _rollback_product(
             gateway,
             ledger,
             task,
-            original,
+            proposal,
+            original_request,
+            use_import=use_import,
             sleep_fn=sleep_fn,
         ):
             ledger.mark_status(
@@ -1322,9 +2280,34 @@ def apply_one(
         return {"status": status, "product_id": product_id, "reason": reason}
 
     live_after = gateway.fetch_product(product_id)
-    if validation["evidence_insufficient"]:
-        ledger.mark_status(product_id, "evidence_insufficient")
-        return {"status": "evidence_insufficient", "product_id": product_id}
+    assessment = _completion_assessment(task, live_after)
+    completion_status = str(assessment["status"])
+    if completion_status == "pending_risk":
+        ledger.mark_status(
+            product_id,
+            "pending_risk",
+            risk_level=assessment["risk_level"],
+            risk_codes=assessment["risk_codes"],
+        )
+        return {
+            "status": "pending_risk",
+            "product_id": product_id,
+            "risk_codes": assessment["risk_codes"],
+            "non_media_score": assessment["non_media_score"],
+        }
+    if completion_status != "completed":
+        ledger.mark_applied(
+            product_id,
+            completion_status,
+            source_fingerprint(live_after),
+            payload_hash(proposal),
+        )
+        return {
+            "status": completion_status,
+            "product_id": product_id,
+            "risk_codes": assessment["risk_codes"],
+            "non_media_score": assessment["non_media_score"],
+        }
     if str(live_after.get("visibility") or "").upper() == "IN_SALE":
         ledger.mark_completed(
             product_id,
@@ -1416,6 +2399,12 @@ def execute_command(
     proposal: dict[str, Any] | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
+    if command == "audit":
+        return {
+            "ok": True,
+            "status": "audited",
+            **audit_catalog(runtime.gateway.fetch_catalog()),
+        }
     if command == "scan":
         counts = scan_store(
             runtime.gateway,
@@ -1468,6 +2457,7 @@ def read_proposal(source: str) -> dict[str, Any]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("audit")
     scan_parser = subparsers.add_parser("scan")
     scan_parser.add_argument("--force", action="store_true")
     subparsers.add_parser("next")

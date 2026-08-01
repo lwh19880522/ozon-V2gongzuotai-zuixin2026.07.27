@@ -9,17 +9,13 @@ import re
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 from urllib.request import ProxyHandler, Request, build_opener
 
 from ozon_v2.adapters.fs_repo import FsRepo
-from ozon_v2.adapters.public_media import (
-    CloudflareR2MediaPublisher,
-    PublicMediaError,
-)
 from ozon_v2.adapters.seller_api import (
     SellerApiAdapter,
     SellerApiError,
@@ -45,11 +41,6 @@ from ozon_v2.domain.validators import validate_attribute_template_result, valida
 from ozon_v2.images.contracts import SubjectMasterSelection
 from ozon_v2.images.queue import ImageGenerationQueue, ImageRepairRequestError
 from ozon_v2.images.worker import is_exact_three_by_four_image
-from ozon_v2.platforms.temu.seller_api import (
-    TemuIdempotencyRegistry,
-    TemuSellerApi,
-    TemuSellerApiError,
-)
 from ozon_v2.services.attribute_mapping_service import (
     attribute_content_score_progress,
     canonical_attribute_label,
@@ -87,6 +78,11 @@ _PRE_UPLOAD_COMPLIANCE_DECISION_LABELS = frozenset(
     {
         "нужен код маркировки",
         "требуется код маркировки",
+        "подпись 18",
+        "признак 18",
+        "знак 18",
+        "маркировка 18",
+        "нужна подпись 18",
     }
 )
 _INTERNAL_LIFECYCLE_ACTIONS = frozenset(
@@ -112,9 +108,7 @@ class WorkbenchService:
         seed_query_service: SeedQueryService | None = None,
         collection_contract_service: CollectionContractService | None = None,
         seller_api_adapter: SellerApiAdapter | None = None,
-        temu_seller_api: TemuSellerApi | None = None,
         supplier_image_downloader: Callable[[str, Path], Path] | None = None,
-        public_media_publisher: CloudflareR2MediaPublisher | None = None,
     ) -> None:
         self.repo = repo or FsRepo()
         self.credential_service = credential_service or CredentialService(self.repo)
@@ -122,18 +116,62 @@ class WorkbenchService:
         self.seed_query_service = seed_query_service or SeedQueryService()
         self.collection_contract_service = collection_contract_service or CollectionContractService(self.repo)
         self.seller_api_adapter = seller_api_adapter or SellerApiAdapter(self.repo)
-        self.temu_seller_api = temu_seller_api or TemuSellerApi(
-            credentials_path=self.repo.config_dir / "temu_credentials.json",
-            signature_provider=None,
-            idempotency_registry=TemuIdempotencyRegistry(
-                self.repo.state_dir / "temu_idempotency.json"
-            ),
-        )
         self.supplier_image_downloader = supplier_image_downloader or self._download_supplier_image
-        self.public_media_publisher = (
-            public_media_publisher or CloudflareR2MediaPublisher()
-        )
         self._upload_state_lock = threading.RLock()
+        self._run_mutation_locks_guard = threading.Lock()
+        self._run_mutation_locks: dict[str, threading.RLock] = {}
+
+    def _run_mutation_lock(self, run_id: str) -> threading.RLock:
+        with self._run_mutation_locks_guard:
+            return self._run_mutation_locks.setdefault(run_id, threading.RLock())
+
+    @staticmethod
+    def _browser_dispatch_token(run: dict[str, Any]) -> str:
+        return str(run.get("browser_task_resumed_at") or run.get("created_at") or "").strip()
+
+    def _reject_stale_stage_result(
+        self,
+        run_id: str,
+        stage: str,
+        run: dict[str, Any],
+        errors: list[str],
+    ) -> Result:
+        event = self.repo.append_run_event(
+            run_id,
+            f"{stage}.ingest_stale",
+            "Browser result was rejected because its collection contract is no longer current.",
+            {"errors": errors},
+        )
+        return Result.failure(
+            f"workbench.{stage}_stale_result",
+            "The browser result belongs to an outdated collection contract and was not saved.",
+            errors=errors,
+            data=self._response_payload(run, event),
+        )
+
+    def _stage_snapshot_errors(
+        self,
+        *,
+        run: dict[str, Any],
+        expected_state: WorkbenchState,
+        expected_seed_ids: list[str],
+        current_seed_ids: list[str],
+        expected_dispatch_token: str,
+        payload_dispatch_token: str,
+    ) -> list[str]:
+        errors: list[str] = []
+        if WorkbenchState(run["status"]) != expected_state:
+            errors.append(
+                f"batch status changed from {expected_state.value} to {run['status']}"
+            )
+        if current_seed_ids != expected_seed_ids:
+            errors.append("sampled seed ids changed while the browser result was being processed")
+        current_dispatch_token = self._browser_dispatch_token(run)
+        if current_dispatch_token != expected_dispatch_token:
+            errors.append("browser dispatch token changed while the result was being processed")
+        if payload_dispatch_token and payload_dispatch_token != current_dispatch_token:
+            errors.append("browser result dispatch token is stale")
+        return errors
 
     def start_batch(self, target_count: int) -> Result:
         if target_count <= 0:
@@ -163,6 +201,7 @@ class WorkbenchService:
                 "workbench.clear_confirmation_required",
                 "Explicit confirmation is required before clearing all workbench batches.",
             )
+        archived_seed_usage = self.repo.archive_recognized_batch_seed_usage()
         cleared = self.repo.clear_workbench_batches()
         bridge = self.repo.clear_browser_bridge_task_status()
         return Result.success(
@@ -170,6 +209,7 @@ class WorkbenchService:
             "All current and historical workbench batches were cleared.",
             {
                 **cleared,
+                **archived_seed_usage,
                 "preserved": [
                     "store_authorization",
                     "existing_store_dedupe",
@@ -182,7 +222,7 @@ class WorkbenchService:
 
     def allowed_actions(self, run_id: str) -> Result:
         try:
-            run = self.repo.load_run(run_id)
+            run = self.recover_browser_task_state(run_id)
         except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
             return Result.failure(
                 "workbench.batch_not_found",
@@ -232,6 +272,21 @@ class WorkbenchService:
         reason: str,
         random_seed: int | None = None,
     ) -> Result:
+        with self._run_mutation_lock(run_id):
+            return self._replace_exhausted_attribute_template_seed(
+                run_id,
+                rejected_seed_id,
+                reason,
+                random_seed=random_seed,
+            )
+
+    def _replace_exhausted_attribute_template_seed(
+        self,
+        run_id: str,
+        rejected_seed_id: str,
+        reason: str,
+        random_seed: int | None = None,
+    ) -> Result:
         run = self.repo.load_run(run_id)
         current_state = WorkbenchState(run["status"])
         if current_state not in {
@@ -253,13 +308,29 @@ class WorkbenchService:
             )
 
         used_ids = self.repo.load_used_seed_ids()
-        rejected_ids = {item.get("seed_id") for item in self.repo.load_rejected_seed_attempts(run_id)}
+        blacklisted_ids = self.repo.load_blacklisted_seed_ids()
+        used_identity_keys = self.repo.load_used_seed_identity_keys()
+        blacklisted_identity_keys = self.repo.load_blacklisted_seed_identity_keys()
+        rejected_attempts = self.repo.load_rejected_seed_attempts(run_id)
+        rejected_ids = {item.get("seed_id") for item in rejected_attempts}
         sampled_ids = {seed.seed_id for seed in sampled}
-        excluded_ids = used_ids | rejected_ids | sampled_ids
+        excluded_ids = used_ids | blacklisted_ids | rejected_ids | sampled_ids
+        excluded_identity_keys = (
+            used_identity_keys
+            | blacklisted_identity_keys
+            | {self.repo.seed_identity_key(seed) for seed in sampled}
+            | {
+                self.repo.seed_identity_key(item.get("seed") or str(item.get("seed_id") or ""))
+                for item in rejected_attempts
+                if item.get("seed") or item.get("seed_id")
+            }
+        )
         existing_products = self.repo.load_existing_products()
         eligible: list[SeedProduct] = []
         for seed in self.repo.load_active_seeds():
             if seed.seed_id in excluded_ids:
+                continue
+            if self.repo.seed_identity_key(seed) in excluded_identity_keys:
                 continue
             decision = decide_seed_existing_product_dedupe(seed, existing_products)
             if decision.kind.value == "clear":
@@ -276,6 +347,7 @@ class WorkbenchService:
         replacement_index = next(index for index, seed in enumerate(sampled) if seed.seed_id == rejected_seed_id)
         sampled[replacement_index] = replacement
         self.repo.save_sampled_seeds(run_id, sampled)
+        self.repo.append_used_seeds(run_id, [replacement], "workbench_replacement_sampled")
         self.repo.append_rejected_seed_attempt(run_id, rejected, reason, replacement.seed_id)
 
         run["sampled_seed_ids"] = [seed.seed_id for seed in sampled]
@@ -327,6 +399,15 @@ class WorkbenchService:
                 "Attribute template result is only accepted while status is attribute_template_collecting.",
                 data=self._response_payload(run, event),
             )
+        dispatch_token = self._browser_dispatch_token(run)
+        payload_dispatch_token = str(payload.get("dispatch_token") or "").strip()
+        if payload_dispatch_token and payload_dispatch_token != dispatch_token:
+            return self._reject_stale_stage_result(
+                run_id,
+                "attribute_template",
+                run,
+                ["browser result dispatch token is stale"],
+            )
         seeds = self._safe_load_sampled_seeds(run_id)
         all_seed_ids = [seed.seed_id for seed in seeds]
         expected_seed_ids = self._pending_or_all_seed_ids(
@@ -377,49 +458,70 @@ class WorkbenchService:
                 errors=seller_schema_errors,
                 data=self._response_payload(run, event),
             )
-        if run.get("replacement_pending_seed_ids"):
-            try:
-                existing_payload = self.repo.load_attribute_template_result(run_id)
-            except FileNotFoundError:
-                existing_payload = {}
-            pending_ids = set(expected_seed_ids)
-            retained_templates = [
-                item
-                for item in existing_payload.get("seed_templates", [])
-                if isinstance(item, dict) and str(item.get("seed_id") or "") not in pending_ids
+        with self._run_mutation_lock(run_id):
+            current_run = self.repo.load_run(run_id)
+            current_seed_ids = [
+                seed.seed_id for seed in self._safe_load_sampled_seeds(run_id)
             ]
-            payload = {**payload, "seed_templates": retained_templates + list(payload.get("seed_templates", []))}
-            merged_errors = validate_attribute_template_result(payload, all_seed_ids, require_seller_schema=True)
-            if merged_errors:
-                event = self.repo.append_run_event(
+            stale_errors = self._stage_snapshot_errors(
+                run=current_run,
+                expected_state=WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTING,
+                expected_seed_ids=all_seed_ids,
+                current_seed_ids=current_seed_ids,
+                expected_dispatch_token=dispatch_token,
+                payload_dispatch_token=payload_dispatch_token,
+            )
+            if stale_errors:
+                return self._reject_stale_stage_result(
                     run_id,
-                    "attribute_template.merge_invalid",
-                    "Replacement attribute template could not be merged with retained evidence.",
-                    {"errors": merged_errors},
+                    "attribute_template",
+                    current_run,
+                    stale_errors,
                 )
-                return Result.failure(
-                    "workbench.attribute_template_merge_invalid",
-                    "Replacement attribute template could not be merged with retained evidence.",
-                    errors=merged_errors,
-                    data=self._response_payload(run, event),
-                )
-        result_path = self.repo.save_attribute_template_result(run_id, payload)
-        current = WorkbenchState(run["status"])
-        run["status"] = transition_workbench_state(current, WorkbenchAction.MARK_ATTRIBUTE_TEMPLATE_COLLECTED).value
-        run["attribute_template_collected"] = True
-        run["attribute_template_result_path"] = str(result_path)
-        self.repo.save_run(run)
-        event = self.repo.append_run_event(
-            run_id,
-            "attribute_template.ingested",
-            "Attribute template result was ingested and the template gate is complete.",
-            {"result_path": str(result_path), "seed_count": len(expected_seed_ids)},
-        )
-        return Result.success(
-            "workbench.attribute_template_ingested",
-            "Attribute template result was ingested and the template gate is complete.",
-            self._response_payload(run, event),
-        )
+            run = current_run
+            if run.get("replacement_pending_seed_ids"):
+                try:
+                    existing_payload = self.repo.load_attribute_template_result(run_id)
+                except FileNotFoundError:
+                    existing_payload = {}
+                pending_ids = set(expected_seed_ids)
+                retained_templates = [
+                    item
+                    for item in existing_payload.get("seed_templates", [])
+                    if isinstance(item, dict) and str(item.get("seed_id") or "") not in pending_ids
+                ]
+                payload = {**payload, "seed_templates": retained_templates + list(payload.get("seed_templates", []))}
+                merged_errors = validate_attribute_template_result(payload, all_seed_ids, require_seller_schema=True)
+                if merged_errors:
+                    event = self.repo.append_run_event(
+                        run_id,
+                        "attribute_template.merge_invalid",
+                        "Replacement attribute template could not be merged with retained evidence.",
+                        {"errors": merged_errors},
+                    )
+                    return Result.failure(
+                        "workbench.attribute_template_merge_invalid",
+                        "Replacement attribute template could not be merged with retained evidence.",
+                        errors=merged_errors,
+                        data=self._response_payload(run, event),
+                    )
+            result_path = self.repo.save_attribute_template_result(run_id, payload)
+            current = WorkbenchState(run["status"])
+            run["status"] = transition_workbench_state(current, WorkbenchAction.MARK_ATTRIBUTE_TEMPLATE_COLLECTED).value
+            run["attribute_template_collected"] = True
+            run["attribute_template_result_path"] = str(result_path)
+            self.repo.save_run(run)
+            event = self.repo.append_run_event(
+                run_id,
+                "attribute_template.ingested",
+                "Attribute template result was ingested and the template gate is complete.",
+                {"result_path": str(result_path), "seed_count": len(expected_seed_ids)},
+            )
+            return Result.success(
+                "workbench.attribute_template_ingested",
+                "Attribute template result was ingested and the template gate is complete.",
+                self._response_payload(run, event),
+            )
 
     def _attach_seller_attribute_templates(self, payload: dict[str, Any]) -> dict[str, Any]:
         enriched = dict(payload)
@@ -849,7 +951,7 @@ class WorkbenchService:
         )
 
     def restart_browser_task(self, run_id: str) -> Result:
-        run = self.repo.load_run(run_id)
+        run = self.recover_browser_task_state(run_id)
         run = self._recover_pending_supplier_replacement(run)
         status = WorkbenchState(run["status"])
         recapture_seed_ids = {
@@ -997,6 +1099,15 @@ class WorkbenchService:
                 "Ozon collection result is only accepted while status is ozon_collecting.",
                 data=self._response_payload(run, event),
             )
+        dispatch_token = self._browser_dispatch_token(run)
+        payload_dispatch_token = str(payload.get("dispatch_token") or "").strip()
+        if payload_dispatch_token and payload_dispatch_token != dispatch_token:
+            return self._reject_stale_stage_result(
+                run_id,
+                "ozon_collection",
+                run,
+                ["browser result dispatch token is stale"],
+            )
         seeds = self._safe_load_sampled_seeds(run_id)
         all_seed_ids = [seed.seed_id for seed in seeds]
         expected_seed_ids = self._pending_or_all_seed_ids(
@@ -1042,59 +1153,80 @@ class WorkbenchService:
                 errors=errors,
                 data=self._response_payload(run, event),
             )
-        if run.get("replacement_pending_seed_ids"):
-            try:
-                existing_payload = self.repo.load_ozon_collection_result(run_id)
-            except FileNotFoundError:
-                existing_payload = {}
-            pending_ids = set(expected_seed_ids)
-            retained_candidates = [
-                item
-                for item in existing_payload.get("ozon_candidates", [])
-                if isinstance(item, dict) and str(item.get("seed_id") or "") not in pending_ids
+        with self._run_mutation_lock(run_id):
+            current_run = self.repo.load_run(run_id)
+            current_seed_ids = [
+                seed.seed_id for seed in self._safe_load_sampled_seeds(run_id)
             ]
-            payload = {**payload, "ozon_candidates": retained_candidates + list(payload.get("ozon_candidates", []))}
-            merged_errors = validate_ozon_collection_result(payload, all_seed_ids)
-            if merged_errors:
-                event = self.repo.append_run_event(
+            stale_errors = self._stage_snapshot_errors(
+                run=current_run,
+                expected_state=WorkbenchState.OZON_COLLECTING,
+                expected_seed_ids=all_seed_ids,
+                current_seed_ids=current_seed_ids,
+                expected_dispatch_token=dispatch_token,
+                payload_dispatch_token=payload_dispatch_token,
+            )
+            if stale_errors:
+                return self._reject_stale_stage_result(
                     run_id,
-                    "ozon_collection.merge_invalid",
-                    "Replacement Ozon result could not be merged with retained evidence.",
-                    {"errors": merged_errors},
+                    "ozon_collection",
+                    current_run,
+                    stale_errors,
                 )
-                return Result.failure(
-                    "workbench.ozon_collection_merge_invalid",
-                    "Replacement Ozon result could not be merged with retained evidence.",
-                    errors=merged_errors,
-                    data=self._response_payload(run, event),
-                )
-        result_path = self.repo.save_ozon_collection_result(run_id, payload)
-        current = WorkbenchState(run["status"])
-        run["status"] = transition_workbench_state(current, WorkbenchAction.MARK_OZON_COLLECTED).value
-        run["ozon_collected"] = True
-        run["ozon_collection_result_path"] = str(result_path)
-        run.pop("replacement_pending_seed_ids", None)
-        review = self._build_supplier_review(run_id, payload)
-        review_path = self.repo.save_supplier_review(run_id, review)
-        run["supplier_review_path"] = str(review_path)
-        run["status"] = transition_workbench_state(
-            WorkbenchState(run["status"]), WorkbenchAction.OPEN_SUPPLIER_REVIEW
-        ).value
-        self.repo.save_run(run)
-        event = self.repo.append_run_event(
-            run_id,
-            "ozon_collection.ingested",
-            "Ozon collection result was ingested and the Ozon gate is complete.",
-            {"result_path": str(result_path), "candidate_count": len(payload.get("ozon_candidates", []))},
-        )
-        return Result.success(
-            "workbench.ozon_collection_ingested",
-            "Ozon collection result was ingested and the Ozon gate is complete.",
-            self._response_payload(run, event),
-        )
+            run = current_run
+            if run.get("replacement_pending_seed_ids"):
+                try:
+                    existing_payload = self.repo.load_ozon_collection_result(run_id)
+                except FileNotFoundError:
+                    existing_payload = {}
+                pending_ids = set(expected_seed_ids)
+                retained_candidates = [
+                    item
+                    for item in existing_payload.get("ozon_candidates", [])
+                    if isinstance(item, dict) and str(item.get("seed_id") or "") not in pending_ids
+                ]
+                payload = {**payload, "ozon_candidates": retained_candidates + list(payload.get("ozon_candidates", []))}
+                merged_errors = validate_ozon_collection_result(payload, all_seed_ids)
+                if merged_errors:
+                    event = self.repo.append_run_event(
+                        run_id,
+                        "ozon_collection.merge_invalid",
+                        "Replacement Ozon result could not be merged with retained evidence.",
+                        {"errors": merged_errors},
+                    )
+                    return Result.failure(
+                        "workbench.ozon_collection_merge_invalid",
+                        "Replacement Ozon result could not be merged with retained evidence.",
+                        errors=merged_errors,
+                        data=self._response_payload(run, event),
+                    )
+            result_path = self.repo.save_ozon_collection_result(run_id, payload)
+            current = WorkbenchState(run["status"])
+            run["status"] = transition_workbench_state(current, WorkbenchAction.MARK_OZON_COLLECTED).value
+            run["ozon_collected"] = True
+            run["ozon_collection_result_path"] = str(result_path)
+            run.pop("replacement_pending_seed_ids", None)
+            review = self._build_supplier_review(run_id, payload)
+            review_path = self.repo.save_supplier_review(run_id, review)
+            run["supplier_review_path"] = str(review_path)
+            run["status"] = transition_workbench_state(
+                WorkbenchState(run["status"]), WorkbenchAction.OPEN_SUPPLIER_REVIEW
+            ).value
+            self.repo.save_run(run)
+            event = self.repo.append_run_event(
+                run_id,
+                "ozon_collection.ingested",
+                "Ozon collection result was ingested and the Ozon gate is complete.",
+                {"result_path": str(result_path), "candidate_count": len(payload.get("ozon_candidates", []))},
+            )
+            return Result.success(
+                "workbench.ozon_collection_ingested",
+                "Ozon collection result was ingested and the Ozon gate is complete.",
+                self._response_payload(run, event),
+            )
 
     def supplier_review(self, run_id: str) -> Result:
-        run = self.repo.load_run(run_id)
+        run = self.recover_browser_task_state(run_id)
         try:
             review = self.repo.load_supplier_review(run_id)
         except FileNotFoundError:
@@ -1322,7 +1454,7 @@ class WorkbenchService:
             gate_message = "主体已确认，但本地生图任务尚未完整入列 (Image queue entry is missing)."
         elif not all_generated:
             gate_code = "waiting_for_codex_workers"
-            gate_message = "任务已进入本地队列，等待全局固定 10 个可见 Codex 生图工作任务按空闲槽位处理 (Waiting for a reusable visible image task)."
+            gate_message = "任务已进入本地队列，等待 Ozon 专用生图技能按单线程顺序处理 (Waiting for the dedicated single-thread image skill)."
         elif not all_approved:
             gate_code = "image_review_required"
             gate_message = "八张图片已回写；请逐件审核，合格后点击“确认本件 8 张图片可用” (Review and approve each eight-image set)."
@@ -1665,14 +1797,6 @@ class WorkbenchService:
                     for seed_id, item in raw_submissions.items()
                     if isinstance(item, dict)
                 }
-        temu_upload_previews = _optional_run_items(
-            self.repo.run_dir(run_id) / "temu_upload_previews.json",
-            lambda: self.repo.load_temu_upload_previews(run_id),
-        )
-        temu_upload_submissions = _optional_run_items(
-            self.repo.run_dir(run_id) / "temu_upload_submissions.json",
-            lambda: self.repo.load_temu_upload_submissions(run_id),
-        )
         candidates = ozon_result.get("ozon_candidates") if isinstance(ozon_result.get("ozon_candidates"), list) else []
         items: list[dict[str, Any]] = []
         for candidate in candidates:
@@ -1707,10 +1831,21 @@ class WorkbenchService:
             pricing_policy_current = (
                 pricing_record.get("parameter_snapshot") == pricing_policy
             )
-            pricing_ready = pricing_confirmed and pricing_policy_current
+            pricing_validation_errors = (
+                _pricing_record_validation_errors(pricing_record)
+                if pricing_confirmed
+                else []
+            )
+            pricing_ready = bool(
+                pricing_confirmed
+                and pricing_policy_current
+                and not pricing_validation_errors
+            )
             pricing_status = (
                 "confirmed"
                 if pricing_ready
+                else "invalid"
+                if pricing_validation_errors
                 else "stale"
                 if pricing_confirmed
                 else "missing"
@@ -1856,6 +1991,8 @@ class WorkbenchService:
                     "required_attribute_count": 0,
                     "required_mapped_count": 0,
                     "missing_required_fields": [],
+                    "skill_pending_required_fields": [],
+                    "manual_required_fields": [],
                     "required_attributes_ready": False,
                     "attribute_score_progress": attribute_content_score_progress([]),
                 }
@@ -1935,6 +2072,10 @@ class WorkbenchService:
                     "excluded_attribute_count": mapping["excluded_attribute_count"],
                     "required_mapped_count": mapping["required_mapped_count"],
                     "missing_required_fields": mapping["missing_required_fields"],
+                    "skill_pending_required_fields": mapping[
+                        "skill_pending_required_fields"
+                    ],
+                    "manual_required_fields": mapping["manual_required_fields"],
                     "attribute_score_progress": mapping[
                         "attribute_score_progress"
                     ],
@@ -1943,6 +2084,7 @@ class WorkbenchService:
                     "generated_images_ready": generated_images_ready,
                     "pricing_ready": pricing_ready,
                     "pricing_status": pricing_status,
+                    "pricing_validation_errors": pricing_validation_errors,
                     "pricing_evidence": (
                         pricing_record if pricing_record else None
                     ),
@@ -1974,8 +2116,6 @@ class WorkbenchService:
                     ],
                     "upload_preview": upload_previews.get(seed_id),
                     "upload_submission": upload_submissions.get(seed_id),
-                    "temu_upload_preview": temu_upload_previews.get(seed_id),
-                    "temu_upload_submission": temu_upload_submissions.get(seed_id),
                 }
             )
 
@@ -2104,13 +2244,20 @@ class WorkbenchService:
             )
         missing_fields = {
             str(field.get("field_key") or ""): field
-            for field in item.get("missing_required_fields", [])
+            for field in item.get("manual_required_fields", [])
             if str(field.get("field_key") or "")
         }
         normalized_values = {
             str(field_key).strip(): value
             for field_key, value in (values or {}).items()
             if str(field_key).strip()
+        }
+        normalized_values = {
+            field_key: _normalized_required_attribute_value(
+                missing_fields.get(field_key),
+                value,
+            )
+            for field_key, value in normalized_values.items()
         }
         invalid_keys = sorted(set(normalized_values) - set(missing_fields))
         empty_keys = sorted(
@@ -2121,7 +2268,7 @@ class WorkbenchService:
         if not normalized_values or invalid_keys or empty_keys:
             return Result.failure(
                 "required_attribute_evidence.invalid_fields",
-                "Only currently missing required fields can be saved, and every value must be non-empty.",
+                "Only required fields confirmed unresolved by the field Skill can be saved, and every value must be non-empty.",
                 errors=[
                     *(
                         ["Not currently missing required: " + ", ".join(invalid_keys)]
@@ -2145,6 +2292,7 @@ class WorkbenchService:
             if (
                 isinstance(allowed_values, list)
                 and allowed_values
+                and value not in allowed_values
                 and str(value) not in {str(candidate) for candidate in allowed_values}
             ):
                 return Result.failure(
@@ -2246,10 +2394,16 @@ class WorkbenchService:
             intelligent_fields = [
                 field
                 for field in item.get("attribute_mapping", [])
-                if field.get("status") in {"rewrite_required", "missing_fact"}
-                or field.get("source")
-                in {"generated_original_content", "generated_evidence_completion"}
-                or field.get("intelligence_decision") == "unresolved"
+                if field.get("required_reason") != "ozon_compliance_decision"
+                and (
+                    field.get("status") in {"rewrite_required", "missing_fact"}
+                    or field.get("source")
+                    in {
+                        "generated_original_content",
+                        "generated_evidence_completion",
+                    }
+                    or field.get("intelligence_decision") == "unresolved"
+                )
             ]
             if not intelligent_fields:
                 continue
@@ -2405,6 +2559,8 @@ class WorkbenchService:
                         "supplier_truth_overrides_ozon": True,
                         "unsupported_claims_forbidden": True,
                         "complete_all_pending_fields": True,
+                        "required_fields_must_be_completed_first": True,
+                        "manual_entry_only_after_intelligence_unresolved": True,
                         "objective_values_require_evidence_refs": True,
                         "unverifiable_fields_must_be_unresolved": True,
                         "visual_supported_fields_must_inspect_supplier_images": True,
@@ -2603,6 +2759,21 @@ class WorkbenchService:
                         errors.append(
                             f"{label}: evidence_refs are required for objective fields."
                         )
+                    field_specific_refs = {
+                        str(reference)
+                        for reference in (
+                            field.get("candidate_evidence_refs") or []
+                        )
+                        if str(reference or "").strip()
+                    }
+                    field_specific_refs.update(visual_evidence_refs)
+                    if evidence_refs and not field_specific_refs.intersection(
+                        evidence_refs
+                    ):
+                        errors.append(
+                            f"{label}: a filled objective field must cite a "
+                            "field-specific evidence_ref."
+                        )
                     allowed_values = field.get("allowed_values") or []
                     if (
                         visual_evidence_refs
@@ -2695,6 +2866,7 @@ class WorkbenchService:
             if not _has_content_value(value):
                 continue
             text_value = str(value).strip()
+            canonical_label = canonical_attribute_label(field.get("label"))
             normalized_label = _normalize_content_text(label)
             normalized_value = _normalize_content_text(text_value)
             if not re.search(r"[А-Яа-яЁё]", text_value):
@@ -2717,9 +2889,12 @@ class WorkbenchService:
                 else:
                     if not isinstance(rich_content, (dict, list)) or not rich_content:
                         errors.append(f"{label}: JSON content must not be empty.")
-            elif "хештег" in normalized_label:
-                if len(re.findall(r"#[\wА-Яа-яЁё]+", text_value)) < 3:
-                    errors.append(f"{label}: at least three relevant Russian hashtags are required.")
+            elif canonical_label == "hashtags":
+                if not _valid_ozon_hashtags(text_value, minimum_count=3):
+                    errors.append(
+                        f"{label}: at least three Russian hashtags are required; "
+                        "every token must start with # and contain no spaces."
+                    )
 
         if errors:
             return Result.failure(
@@ -2892,6 +3067,7 @@ class WorkbenchService:
                     "attribute_id": field["field_key"],
                     "label": field["label"],
                     "value": upload_value,
+                    "attribute_type": field.get("attribute_type"),
                     "dictionary_id": field.get("dictionary_id"),
                     "dictionary_value_id": None,
                     "dictionary_resolution_required": field.get(
@@ -3039,74 +3215,6 @@ class WorkbenchService:
             {**payload, "draft_path": str(path), "last_event": event.to_dict()},
         )
 
-    def public_media_configuration(self) -> dict[str, Any]:
-        saved = self.repo.load_public_media_settings()
-        configured = str(
-            os.environ.get("OZON_V2_PUBLIC_MEDIA_BASE_URL")
-            or saved.get("base_url")
-            or ""
-        ).strip()
-        if configured.startswith("http://"):
-            configured = "https://" + configured.removeprefix("http://")
-        return {
-            "base_url": configured,
-            "provider": "cloudflare_r2_direct",
-            "r2_bucket": str(
-                os.environ.get("OZON_V2_R2_BUCKET")
-                or saved.get("r2_bucket")
-                or "yandex-media"
-            ).strip(),
-            "object_prefix": str(
-                saved.get("object_prefix") or "ozon-v2"
-            ).strip(),
-            "upload_timeout_seconds": int(
-                saved.get("upload_timeout_seconds") or 1200
-            ),
-            "public_probe_timeout_seconds": int(
-                saved.get("public_probe_timeout_seconds") or 30
-            ),
-            "ready": _is_public_https_url(configured),
-            "source": (
-                "environment"
-                if os.environ.get("OZON_V2_PUBLIC_MEDIA_BASE_URL")
-                else "workbench_settings"
-                if configured
-                else "not_configured"
-            ),
-        }
-
-    def configure_public_media_base_url(self, base_url: str) -> Result:
-        normalized = str(base_url or "").strip().rstrip("/")
-        if normalized.startswith("http://"):
-            normalized = "https://" + normalized.removeprefix("http://")
-        if not _is_public_https_url(normalized):
-            return Result.failure(
-                "public_media.invalid_base_url",
-                "请输入 Ozon 能从公网访问的 HTTPS 图片地址；localhost 和内网地址不能用于上传。",
-                data={"base_url": normalized, "ready": False},
-            )
-        path = self.repo.save_public_media_settings(
-            {
-                "base_url": normalized,
-                "provider": "cloudflare_r2_direct",
-                "r2_bucket": "yandex-media",
-                "object_prefix": "ozon-v2",
-                "upload_timeout_seconds": 1200,
-                "public_probe_timeout_seconds": 30,
-                "updated_at": utc_now_iso(),
-            }
-        )
-        return Result.success(
-            "public_media.configured",
-            "Cloudflare R2 公网媒体通道已保存；生图前会校验通道，上传时会逐个验证图片、视频和封面。",
-            {
-                "base_url": normalized,
-                "r2_bucket": "yandex-media",
-                "ready": True,
-                "settings_path": str(path),
-            },
-        )
-
     def preview_product_upload(self, run_id: str, seed_id: str) -> Result:
         draft = self.build_upload_draft(run_id, seed_ids=[seed_id])
         draft_item = next(
@@ -3157,9 +3265,33 @@ class WorkbenchService:
             if draft_item is not None:
                 blocked_item = None
             else:
+                unresolved_dictionary = (
+                    draft.code
+                    == "upload_draft.required_dictionary_values_unresolved"
+                )
+                unresolved_fields = (
+                    blocked_item.get("fields", [])
+                    if isinstance(blocked_item, dict)
+                    else []
+                )
+                unresolved_details = ", ".join(
+                    f"{str(field.get('label') or field.get('field_key') or 'unknown field')}"
+                    f"={str(field.get('value') or '').strip() or '<empty>'}"
+                    for field in unresolved_fields
+                    if isinstance(field, dict)
+                )
                 return Result.failure(
-                    "product_upload.product_not_ready",
-                    "This product does not yet pass its own upload gates.",
+                    (
+                        "product_upload.required_dictionary_values_unresolved"
+                        if unresolved_dictionary
+                        else "product_upload.product_not_ready"
+                    ),
+                    (
+                        "Required Ozon dictionary fields could not be resolved "
+                        f"exactly: {unresolved_details}."
+                        if unresolved_dictionary
+                        else "This product does not yet pass its own upload gates."
+                    ),
                     data={
                         "run_id": run_id,
                         "seed_id": seed_id,
@@ -3271,6 +3403,7 @@ class WorkbenchService:
         run_id: str,
         seed_id: str,
         seller_import_task_id: int,
+        ozon_product_id: int,
         preview: dict[str, Any],
     ) -> dict[str, str]:
         package_id = "ozon-image-" + hashlib.sha256(
@@ -3292,7 +3425,7 @@ class WorkbenchService:
                 "credential_ref": "configured_store",
                 "seller_import_task_id": seller_import_task_id,
                 "offer_id": seller_api_item.get("offer_id"),
-                "product_id": None,
+                "product_id": ozon_product_id,
                 "seller_api_item": seller_api_item,
                 "video_template_fields": image_task_context.get(
                     "video_template_fields"
@@ -3309,10 +3442,12 @@ class WorkbenchService:
             "generation_contract": {
                 "slot_count": 8,
                 "aspect_ratio": "3:4",
+                "generation_mode": "single_thread_8_grid",
+                "grid_layout": "4x2",
+                "public_media": "auto_quick_tunnel",
                 "direct_ozon_upload": True,
                 "replace_complete_gallery": True,
                 "return_to_workbench": False,
-                "r2_preflight_required": True,
                 "identity_reference": {
                     "required": True,
                     "source": "generated_white_anchor",
@@ -3769,6 +3904,29 @@ class WorkbenchService:
                 str(exc),
                 data={"run_id": run_id, "seed_id": seed_id},
             )
+        record["seller_api_import_status"] = seller_status
+        if _product_import_has_status(seller_status, "skipped"):
+            offer_id = str(record.get("offer_id") or "").strip()
+            if not offer_id:
+                offer_id = _offer_id_from_import_status(seller_status)
+            lookup = getattr(
+                self.seller_api_adapter,
+                "get_product_state_by_offer_id",
+                None,
+            )
+            if offer_id and callable(lookup):
+                try:
+                    seller_product_state = lookup(offer_id)
+                except SellerApiError as exc:
+                    record["seller_product_state_error"] = str(exc)
+                else:
+                    if isinstance(seller_product_state, dict) and seller_product_state:
+                        record["seller_product_state"] = seller_product_state
+                        record.pop("seller_product_state_error", None)
+                        seller_status = _reconcile_skipped_import_status(
+                            seller_status,
+                            seller_product_state,
+                        )
         record["seller_api_status"] = seller_status
         record["status"] = _product_import_status(seller_status)
         record["status_checked_at"] = utc_now_iso()
@@ -3799,6 +3957,22 @@ class WorkbenchService:
             record["status"] == "accepted_by_ozon"
             and not record.get("image_task_package_id")
         ):
+            ozon_product_id = _product_id_from_import_status(
+                seller_status,
+                offer_id=str(record.get("offer_id") or ""),
+            )
+            if ozon_product_id is None:
+                record["image_task_package_error"] = (
+                    "Ozon accepted the import task but returned no exact "
+                    "product_id; the image task was not created."
+                )
+                submissions["items"][seed_id] = record
+                self.repo.save_upload_submissions(run_id, submissions)
+                return Result.success(
+                    "product_upload.status_loaded",
+                    "The latest Ozon import status was loaded.",
+                    record,
+                )
             try:
                 previews = self.repo.load_upload_previews(run_id)
             except FileNotFoundError:
@@ -3810,6 +3984,7 @@ class WorkbenchService:
                         run_id=run_id,
                         seed_id=seed_id,
                         seller_import_task_id=int(record["task_id"]),
+                        ozon_product_id=ozon_product_id,
                         preview=preview,
                     )
                 )
@@ -3818,214 +3993,33 @@ class WorkbenchService:
                     "The accepted product has no saved upload preview; "
                     "regenerate the preview before creating its image task."
                 )
+        elif (
+            record["status"] == "accepted_by_ozon"
+            and record.get("image_task_package_id")
+        ):
+            ozon_product_id = _product_id_from_import_status(
+                seller_status,
+                offer_id=str(record.get("offer_id") or ""),
+            )
+            if ozon_product_id is not None:
+                try:
+                    bound_path = self.repo.bind_pending_image_task_product(
+                        str(record["image_task_package_id"]),
+                        run_id=run_id,
+                        seed_id=seed_id,
+                        seller_import_task_id=int(record["task_id"]),
+                        product_id=ozon_product_id,
+                    )
+                except (FileNotFoundError, TypeError, ValueError) as exc:
+                    record["image_task_package_error"] = str(exc)
+                else:
+                    record["image_task_package_path"] = str(bound_path)
+                    record.pop("image_task_package_error", None)
         submissions["items"][seed_id] = record
         self.repo.save_upload_submissions(run_id, submissions)
         return Result.success(
             "product_upload.status_loaded",
             "The latest Ozon import status was loaded.",
-            record,
-        )
-
-    def preview_temu_product_upload(self, run_id: str, seed_id: str) -> Result:
-        workspace = self.upload_workspace(run_id)
-        if not workspace.ok:
-            return workspace
-        item = next(
-            (
-                value
-                for value in workspace.data.get("items", [])
-                if str(value.get("seed_id") or "") == seed_id
-            ),
-            None,
-        )
-        if not isinstance(item, dict):
-            return Result.failure(
-                "temu_product_upload.product_missing",
-                "The requested product is not part of this batch.",
-            )
-        try:
-            request = _temu_request(run_id, item)
-            validated = self.temu_seller_api.preview_publish(request)
-            request = validated["request"]
-        except (TemuSellerApiError, ArithmeticError, TypeError, ValueError) as exc:
-            return Result.failure(
-                "temu_product_upload.preview_failed",
-                str(exc),
-                data={"run_id": run_id, "seed_id": seed_id},
-            )
-        preview_hash = _payload_sha256(request)
-        preview = {
-            "platform": "temu",
-            "run_id": run_id,
-            "seed_id": seed_id,
-            "prepared_at": utc_now_iso(),
-            "preview_hash": preview_hash,
-            "requires_explicit_confirmation": True,
-            "method": validated.get("method"),
-            "idempotency_key": validated.get("idempotency_key"),
-            "temu_request": request,
-            "status": "awaiting_user_confirmation",
-        }
-        payload = _temu_state(self.repo, run_id, "previews")
-        payload["items"][seed_id] = preview
-        path = self.repo.save_temu_upload_previews(run_id, payload)
-        self.repo.append_run_event(
-            run_id,
-            "temu_product_upload.preview_ready",
-            "Temu official API preview is awaiting explicit hash confirmation.",
-            {"seed_id": seed_id, "preview_hash": preview_hash},
-        )
-        return Result.success(
-            "temu_product_upload.preview_ready",
-            "Temu official API preview is ready for explicit confirmation.",
-            {**preview, "preview_path": str(path)},
-        )
-
-    def submit_temu_product_upload(
-        self,
-        run_id: str,
-        seed_id: str,
-        *,
-        preview_hash: str,
-        confirmed: bool,
-    ) -> Result:
-        if confirmed is not True:
-            return Result.failure(
-                "temu_product_upload.confirmation_required",
-                "Explicit confirmation is required before submitting to Temu.",
-            )
-        previews = _temu_state(self.repo, run_id, "previews")
-        preview = previews["items"].get(seed_id)
-        if not isinstance(preview, dict):
-            return Result.failure(
-                "temu_product_upload.preview_required",
-                "Prepare and inspect the Temu request before submitting it.",
-            )
-        expected_hash = str(preview.get("preview_hash") or "")
-        if not preview_hash or preview_hash != expected_hash:
-            return Result.failure(
-                "temu_product_upload.preview_hash_mismatch",
-                "The Temu preview changed or its exact hash was not confirmed.",
-            )
-        submissions = _temu_state(self.repo, run_id, "submissions")
-        existing = submissions["items"].get(seed_id)
-        if isinstance(existing, dict) and existing.get("goods_id"):
-            return Result.success(
-                "temu_product_upload.already_submitted",
-                "This exact Temu product was already submitted; no duplicate request was sent.",
-                existing,
-            )
-        if isinstance(existing, dict) and existing.get("submission_attempted"):
-            return Result.failure(
-                "temu_product_upload.retry_blocked",
-                "The previous Temu request requires operator review before any retry.",
-                data=existing,
-            )
-        request = preview.get("temu_request")
-        if not isinstance(request, dict):
-            return Result.failure(
-                "temu_product_upload.preview_invalid",
-                "The saved Temu request is invalid; prepare it again.",
-            )
-        record = {
-            "platform": "temu",
-            "run_id": run_id,
-            "seed_id": seed_id,
-            "preview_hash": expected_hash,
-            "external_goods_id": request["goodsBasic"]["externalGoodsId"],
-            "explicit_confirmation": True,
-            "submission_attempted": True,
-            "status": "submitting",
-            "submitted_at": utc_now_iso(),
-        }
-        submissions["items"][seed_id] = record
-        self.repo.save_temu_upload_submissions(run_id, submissions)
-        try:
-            response = self.temu_seller_api.publish_product(
-                request,
-                explicit_confirmation=True,
-            )
-        except (TemuSellerApiError, ArithmeticError, TypeError, ValueError) as exc:
-            record.update(
-                status="failed",
-                last_error={
-                    "code": "temu_seller_api_failed",
-                    "message": str(exc),
-                },
-            )
-            submissions["items"][seed_id] = record
-            self.repo.save_temu_upload_submissions(run_id, submissions)
-            return Result.failure(
-                "temu_product_upload.seller_api_failed",
-                str(exc),
-                data=record,
-            )
-        record.update(
-            goods_id=response.get("goodsId"),
-            operation_key=response.get("operation_key"),
-            status_check_after_seconds=response.get("status_check_after_seconds"),
-            publication_confirmed=response.get("publication_confirmed") is True,
-            status="submitted",
-        )
-        submissions["items"][seed_id] = record
-        path = self.repo.save_temu_upload_submissions(run_id, submissions)
-        self.repo.append_run_event(
-            run_id,
-            "temu_product_upload.submitted",
-            "One hash-confirmed product was submitted through the Temu official API.",
-            {"seed_id": seed_id, "goods_id": record["goods_id"]},
-        )
-        return Result.success(
-            "temu_product_upload.submitted",
-            "The confirmed product was submitted to Temu.",
-            {**record, "submission_path": str(path)},
-        )
-
-    def refresh_temu_product_upload_status(
-        self,
-        run_id: str,
-        seed_id: str,
-    ) -> Result:
-        submissions = _temu_state(self.repo, run_id, "submissions")
-        record = submissions["items"].get(seed_id)
-        if not isinstance(record, dict) or not record.get("goods_id"):
-            return Result.failure(
-                "temu_product_upload.status_unavailable",
-                "No Temu goodsId is available for status lookup.",
-                data=record or {"run_id": run_id, "seed_id": seed_id},
-            )
-        try:
-            payload = self.temu_seller_api.query_product_status(
-                record["goods_id"]
-            )
-        except (TemuSellerApiError, TypeError, ValueError) as exc:
-            record["status_query_error"] = {
-                "code": "temu_status_query_failed",
-                "message": str(exc),
-            }
-            submissions["items"][seed_id] = record
-            self.repo.save_temu_upload_submissions(run_id, submissions)
-            return Result.failure(
-                "temu_product_upload.status_failed",
-                str(exc),
-                data=record,
-            )
-        record.pop("status_query_error", None)
-        record.update(
-            temu_status=payload,
-            status=_temu_status(payload),
-            status_checked_at=utc_now_iso(),
-        )
-        if record["status"] == "failed":
-            record["last_error"] = {
-                "code": "temu_product_rejected",
-                "message": _temu_error_message(payload),
-            }
-        submissions["items"][seed_id] = record
-        self.repo.save_temu_upload_submissions(run_id, submissions)
-        return Result.success(
-            "temu_product_upload.status_loaded",
-            "The latest Temu product status was loaded.",
             record,
         )
 
@@ -4231,8 +4225,22 @@ class WorkbenchService:
             ),
         )
 
-    def capture_supplier_selection_product(self, run_id: str, payload: dict[str, Any]) -> Result:
-        run = self.repo.load_run(run_id)
+    def capture_supplier_selection_product(
+        self,
+        run_id: str,
+        payload: dict[str, Any],
+    ) -> Result:
+        with self._run_mutation_lock(run_id):
+            return self._capture_supplier_selection_product_locked(run_id, payload)
+
+    def _capture_supplier_selection_product_locked(
+        self,
+        run_id: str,
+        payload: dict[str, Any],
+    ) -> Result:
+        run = self._restore_completed_ozon_collection_if_valid(
+            self.repo.load_run(run_id)
+        )
         status = WorkbenchState(run["status"])
         recapture_seed_ids = {
             str(value).strip()
@@ -4251,6 +4259,23 @@ class WorkbenchService:
                 data={"run_id": run_id, "status": run["status"]},
             )
         review = self.repo.load_supplier_review(run_id)
+        expected_dispatch_token = str(
+            run.get("browser_task_resumed_at")
+            or review.get("created_at")
+            or run.get("created_at")
+            or ""
+        ).strip()
+        payload_dispatch_token = str(payload.get("dispatch_token") or "").strip()
+        if not payload_dispatch_token or payload_dispatch_token != expected_dispatch_token:
+            return Result.failure(
+                "supplier_selection.dispatch_stale",
+                "This 1688 tab belongs to an outdated supplier-selection dispatch.",
+                data={
+                    "run_id": run_id,
+                    "status": run["status"],
+                    "received_dispatch_token": payload_dispatch_token or None,
+                },
+            )
         items = [item for item in review.get("items", []) if isinstance(item, dict)]
         seed_id = requested_seed_id
         ozon_product_id = str(payload.get("ozon_product_id") or "").strip()
@@ -4289,8 +4314,41 @@ class WorkbenchService:
                 "Open an exact 1688 product detail page before collecting.",
                 data={"run_id": run_id, "seed_id": seed_id, "supplier_url": supplier_url},
             )
+        supplier_offer_match = re.search(r"/offer/(\d+)\.html", supplier_url)
+        supplier_offer_id = supplier_offer_match.group(1) if supplier_offer_match else ""
+        final_url = str(product.get("final_url") or "").strip()
+        final_offer_match = re.search(r"/offer/(\d+)\.html", final_url) if final_url else None
+        final_offer_id = final_offer_match.group(1) if final_offer_match else ""
+        reported_offer_id = str(
+            product.get("offer_id")
+            or product.get("supplier_product_id")
+            or ""
+        ).strip()
+        offer_ids = {
+            value
+            for value in (supplier_offer_id, final_offer_id, reported_offer_id)
+            if value
+        }
+        if (
+            not supplier_offer_id
+            or not reported_offer_id
+            or (final_url and not final_offer_id)
+            or len(offer_ids) != 1
+        ):
+            return Result.failure(
+                "supplier_selection.offer_identity_mismatch",
+                "The 1688 URL, final page and captured Offer ID do not identify one product.",
+                data={
+                    "run_id": run_id,
+                    "seed_id": seed_id,
+                    "supplier_url": supplier_url,
+                    "final_url": final_url or None,
+                    "reported_offer_id": reported_offer_id or None,
+                },
+            )
         product["seed_id"] = seed_id
         product["supplier_url"] = supplier_url
+        product["offer_id"] = supplier_offer_id
         if is_late_recapture:
             missing = self._supplier_product_missing_fields(product)
             if missing:
@@ -4312,6 +4370,58 @@ class WorkbenchService:
             "supplier_products": [],
             "created_at": utc_now_iso(),
         }
+        persisted_products = [
+            item
+            for item in draft.get("supplier_products", [])
+            if isinstance(item, dict)
+        ]
+        if is_late_recapture:
+            persisted_products.extend(
+                item
+                for item in self.repo.load_supplier_collection_result(run_id).get(
+                    "supplier_products",
+                    [],
+                )
+                if isinstance(item, dict)
+            )
+        review_by_seed = {
+            str(item.get("seed_id") or ""): item
+            for item in items
+            if isinstance(item, dict)
+        }
+        for existing in persisted_products:
+            existing_seed_id = str(existing.get("seed_id") or "").strip()
+            if not existing_seed_id or existing_seed_id == seed_id:
+                continue
+            existing_offer_id = str(
+                existing.get("offer_id")
+                or existing.get("supplier_product_id")
+                or ""
+            ).strip()
+            if not existing_offer_id:
+                existing_match = re.search(
+                    r"/offer/(\d+)\.html",
+                    str(existing.get("supplier_url") or ""),
+                )
+                existing_offer_id = (
+                    existing_match.group(1) if existing_match else ""
+                )
+            if existing_offer_id != supplier_offer_id:
+                continue
+            conflicting_review = review_by_seed.get(existing_seed_id) or {}
+            return Result.failure(
+                "supplier_selection.offer_already_assigned",
+                "This 1688 Offer is already assigned to another Ozon product in the batch.",
+                data={
+                    "run_id": run_id,
+                    "seed_id": seed_id,
+                    "offer_id": supplier_offer_id,
+                    "conflicting_seed_id": existing_seed_id,
+                    "conflicting_ozon_product_id": conflicting_review.get(
+                        "ozon_product_id"
+                    ),
+                },
+            )
         captured = {
             str(item.get("seed_id") or ""): item
             for item in draft.get("supplier_products", [])
@@ -4575,17 +4685,29 @@ class WorkbenchService:
                 data={"run_id": run_id, "seed_id": seed_id},
             )
 
+        rejected_attempts = self.repo.load_rejected_seed_attempts(run_id)
         excluded_ids = (
             self.repo.load_used_seed_ids()
             | self.repo.load_blacklisted_seed_ids()
             | {seed.seed_id for seed in sampled}
-            | {str(item.get("seed_id")) for item in self.repo.load_rejected_seed_attempts(run_id) if item.get("seed_id")}
+            | {str(item.get("seed_id")) for item in rejected_attempts if item.get("seed_id")}
+        )
+        excluded_identity_keys = (
+            self.repo.load_used_seed_identity_keys()
+            | self.repo.load_blacklisted_seed_identity_keys()
+            | {self.repo.seed_identity_key(seed) for seed in sampled}
+            | {
+                self.repo.seed_identity_key(item.get("seed") or str(item.get("seed_id") or ""))
+                for item in rejected_attempts
+                if item.get("seed") or item.get("seed_id")
+            }
         )
         existing_products = self.repo.load_existing_products()
         eligible = [
             seed
             for seed in self.repo.load_active_seeds()
             if seed.seed_id not in excluded_ids
+            and self.repo.seed_identity_key(seed) not in excluded_identity_keys
             and decide_seed_existing_product_dedupe(seed, existing_products).kind.value == "clear"
         ]
         if not eligible:
@@ -4628,11 +4750,11 @@ class WorkbenchService:
             },
         )
         self.repo.append_seed_blacklist(run_id, rejected_seed, ozon_product_id, reason)
-        self.repo.remove_active_seeds({seed_id})
         self.repo.append_rejected_seed_attempt(run_id, rejected_seed, reason, replacement.seed_id)
 
         sampled[next(index for index, seed in enumerate(sampled) if seed.seed_id == seed_id)] = replacement
         self.repo.save_sampled_seeds(run_id, sampled)
+        self.repo.append_used_seeds(run_id, [replacement], "workbench_replacement_sampled")
         template_payload["seed_templates"] = [
             item for item in template_payload.get("seed_templates", []) if str(item.get("seed_id") or "") != seed_id
         ]
@@ -4680,6 +4802,334 @@ class WorkbenchService:
                 {"rejected_seed_id": seed_id, "replacement_seed": replacement.to_dict()},
             ),
         )
+
+    def exclude_product_without_replacement(
+        self,
+        run_id: str,
+        seed_id: str,
+        reason: str,
+        *,
+        confirmed: bool = False,
+    ) -> Result:
+        with self._run_mutation_lock(run_id):
+            return self._exclude_product_without_replacement(
+                run_id,
+                seed_id,
+                reason,
+                confirmed=confirmed,
+            )
+
+    def _exclude_product_without_replacement(
+        self,
+        run_id: str,
+        seed_id: str,
+        reason: str,
+        *,
+        confirmed: bool,
+    ) -> Result:
+        if confirmed is not True:
+            return Result.failure(
+                "product_exclusion.confirmation_required",
+                "Explicit confirmation is required before permanently excluding a product.",
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+        run = self.repo.load_run(run_id)
+        current_state = WorkbenchState(run["status"])
+        if current_state not in {
+            WorkbenchState.SUPPLIER_COLLECTED,
+            WorkbenchState.IMAGE_PROCESSING,
+        }:
+            return Result.failure(
+                "product_exclusion.invalid_state",
+                "A product can only be excluded after supplier collection and before upload.",
+                data={"run_id": run_id, "seed_id": seed_id, "status": run["status"]},
+            )
+
+        sampled = self.repo.load_sampled_seeds(run_id)
+        excluded_seed = next(
+            (seed for seed in sampled if seed.seed_id == seed_id),
+            None,
+        )
+        if excluded_seed is None:
+            return Result.failure(
+                "product_exclusion.seed_not_sampled",
+                "The selected product is no longer active in this batch.",
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+
+        submissions_path = self.repo.run_dir(run_id) / "upload_submissions.json"
+        if submissions_path.exists():
+            submissions = self.repo.load_upload_submissions(run_id)
+            submission = (submissions.get("items") or {}).get(seed_id)
+            submission_status = str(
+                (submission or {}).get("status") or ""
+            ).strip().casefold()
+            if submission_status and submission_status not in {
+                "failed",
+                "error",
+                "declined",
+            }:
+                return Result.failure(
+                    "product_exclusion.upload_already_started",
+                    "This product has already been submitted to Ozon and cannot be removed from the local batch.",
+                    data={
+                        "run_id": run_id,
+                        "seed_id": seed_id,
+                        "submission_status": submission_status,
+                    },
+                )
+
+        try:
+            ozon_payload = self.repo.load_ozon_collection_result(run_id)
+        except FileNotFoundError:
+            return Result.failure(
+                "product_exclusion.ozon_evidence_missing",
+                "Ozon evidence is required before a product can be blacklisted safely.",
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+        excluded_candidate = next(
+            (
+                item
+                for item in ozon_payload.get("ozon_candidates", [])
+                if str(item.get("seed_id") or "") == seed_id
+            ),
+            None,
+        )
+        ozon_product_id = str(
+            (excluded_candidate or {}).get("ozon_product_id") or ""
+        ).strip()
+        if not ozon_product_id:
+            return Result.failure(
+                "product_exclusion.ozon_product_id_missing",
+                "The selected product has no Ozon product id and cannot be blacklisted safely.",
+                data={"run_id": run_id, "seed_id": seed_id},
+            )
+
+        normalized_reason = str(reason or "").strip() or (
+            "User marked the product as unsuitable for cross-border sale."
+        )
+        template_payload = self.repo.load_attribute_template_result(run_id)
+        excluded_template = next(
+            (
+                item
+                for item in template_payload.get("seed_templates", [])
+                if str(item.get("seed_id") or "") == seed_id
+            ),
+            None,
+        )
+        supplier_product = None
+        supplier_path = self.repo.run_dir(run_id) / "supplier_collection_result.json"
+        if supplier_path.exists():
+            supplier_payload = self.repo.load_supplier_collection_result(run_id)
+            supplier_product = next(
+                (
+                    item
+                    for item in supplier_payload.get("supplier_products", [])
+                    if str(item.get("seed_id") or "") == seed_id
+                ),
+                None,
+            )
+        selection = None
+        selection_path = self.repo.run_dir(run_id) / "supplier_sku_selections.json"
+        if selection_path.exists():
+            selection = (
+                self.repo.load_supplier_sku_selections(run_id).get("selections")
+                or {}
+            ).get(seed_id)
+
+        self.repo.append_supplier_rejection(
+            run_id,
+            {
+                "seed": excluded_seed.to_dict(),
+                "seed_id": seed_id,
+                "ozon_product_id": ozon_product_id,
+                "reason_code": "cross_border_unsuitable_by_user",
+                "reason": normalized_reason,
+                "replacement_seed_id": None,
+                "attribute_template_evidence": excluded_template,
+                "ozon_candidate_evidence": excluded_candidate,
+                "supplier_product_evidence": supplier_product,
+                "supplier_selection_evidence": selection,
+            },
+        )
+        self.repo.append_seed_blacklist(
+            run_id,
+            excluded_seed,
+            ozon_product_id,
+            normalized_reason,
+            reason_code="cross_border_unsuitable_by_user",
+        )
+        self.repo.append_rejected_seed_attempt(
+            run_id,
+            excluded_seed,
+            normalized_reason,
+            replacement_seed_id=None,
+        )
+
+        remaining = [seed for seed in sampled if seed.seed_id != seed_id]
+        self.repo.save_sampled_seeds(run_id, remaining)
+        template_payload["seed_templates"] = [
+            item
+            for item in template_payload.get("seed_templates", [])
+            if str(item.get("seed_id") or "") != seed_id
+        ]
+        template_payload["updated_at"] = utc_now_iso()
+        self.repo.save_attribute_template_result(run_id, template_payload)
+        ozon_payload["ozon_candidates"] = [
+            item
+            for item in ozon_payload.get("ozon_candidates", [])
+            if str(item.get("seed_id") or "") != seed_id
+        ]
+        ozon_payload["updated_at"] = utc_now_iso()
+        self.repo.save_ozon_collection_result(run_id, ozon_payload)
+        self._prune_excluded_product_artifacts(run_id, seed_id)
+
+        run["sampled_seed_ids"] = [seed.seed_id for seed in remaining]
+        run["active_product_count"] = len(remaining)
+        run["excluded_seed_ids"] = sorted(
+            {
+                str(value)
+                for value in run.get("excluded_seed_ids") or []
+                if str(value)
+            }
+            | {seed_id}
+        )
+        run["removed_seed_ids"] = sorted(
+            {
+                str(value)
+                for value in run.get("removed_seed_ids") or []
+                if str(value)
+            }
+            | {seed_id}
+        )
+        replacement_pending = [
+            str(value)
+            for value in run.get("replacement_pending_seed_ids") or []
+            if str(value) and str(value) != seed_id
+        ]
+        if replacement_pending:
+            run["replacement_pending_seed_ids"] = replacement_pending
+        else:
+            run.pop("replacement_pending_seed_ids", None)
+        self._update_query_summary(run, remaining)
+        self.repo.save_run(run)
+        event = self.repo.append_run_event(
+            run_id,
+            "product_exclusion.completed",
+            "A cross-border unsuitable product was permanently blacklisted and removed without refill.",
+            {
+                "excluded_seed_id": seed_id,
+                "excluded_ozon_product_id": ozon_product_id,
+                "remaining_product_count": len(remaining),
+                "replacement_seed_id": None,
+                "reason": normalized_reason,
+            },
+        )
+        return Result.success(
+            "product_exclusion.completed",
+            "The product was removed without refill and permanently added to the seed blacklist.",
+            self._response_payload(
+                run,
+                event,
+                {
+                    "excluded_seed_id": seed_id,
+                    "excluded_ozon_product_id": ozon_product_id,
+                    "remaining_product_count": len(remaining),
+                    "replacement_seed_id": None,
+                },
+            ),
+        )
+
+    def _prune_excluded_product_artifacts(
+        self,
+        run_id: str,
+        seed_id: str,
+    ) -> None:
+        list_artifacts = (
+            (
+                "supplier_review.json",
+                self.repo.load_supplier_review,
+                self.repo.save_supplier_review,
+                "items",
+            ),
+            (
+                "supplier_selection_draft.json",
+                self.repo.load_supplier_selection_draft,
+                self.repo.save_supplier_selection_draft,
+                "supplier_products",
+            ),
+            (
+                "supplier_collection_result.json",
+                self.repo.load_supplier_collection_result,
+                self.repo.save_supplier_collection_result,
+                "supplier_products",
+            ),
+        )
+        for filename, loader, saver, key in list_artifacts:
+            if not (self.repo.run_dir(run_id) / filename).exists():
+                continue
+            payload = loader(run_id)
+            payload[key] = [
+                item
+                for item in payload.get(key, [])
+                if str(item.get("seed_id") or "") != seed_id
+            ]
+            payload["updated_at"] = utc_now_iso()
+            saver(run_id, payload)
+
+        mapping_artifacts = (
+            (
+                "supplier_sku_selections.json",
+                self.repo.load_supplier_sku_selections,
+                self.repo.save_supplier_sku_selections,
+                "selections",
+            ),
+            (
+                "subject_masters.json",
+                self.repo.load_subject_masters,
+                self.repo.save_subject_masters,
+                "items",
+            ),
+            (
+                "pricing_evidence.json",
+                self.repo.load_pricing_evidence,
+                self.repo.save_pricing_evidence,
+                "items",
+            ),
+            (
+                "generated_content_result.json",
+                self.repo.load_generated_content_result,
+                self.repo.save_generated_content_result,
+                "items",
+            ),
+            (
+                "required_attribute_evidence.json",
+                self.repo.load_required_attribute_evidence,
+                self.repo.save_required_attribute_evidence,
+                "items",
+            ),
+            (
+                "upload_previews.json",
+                self.repo.load_upload_previews,
+                self.repo.save_upload_previews,
+                "items",
+            ),
+            (
+                "upload_submissions.json",
+                self.repo.load_upload_submissions,
+                self.repo.save_upload_submissions,
+                "items",
+            ),
+        )
+        for filename, loader, saver, key in mapping_artifacts:
+            if not (self.repo.run_dir(run_id) / filename).exists():
+                continue
+            payload = loader(run_id)
+            values = dict(payload.get(key) or {})
+            values.pop(seed_id, None)
+            payload[key] = values
+            payload["updated_at"] = utc_now_iso()
+            saver(run_id, payload)
 
     def start_supplier_collection(
         self,
@@ -5432,7 +5882,7 @@ class WorkbenchService:
                     "Autopilot stopped before the next state transition.",
                     history,
                 )
-            run = self.repo.load_run(run_id)
+            run = self.recover_browser_task_state(run_id)
             run = self._recover_pending_supplier_replacement(run)
             state = WorkbenchState(run["status"])
             if state == WorkbenchState.CREATED:
@@ -5872,6 +6322,8 @@ class WorkbenchService:
         target_count = int(run.get("target_count", 0))
         used_seed_ids = self.repo.load_used_seed_ids()
         blacklisted_seed_ids = self.repo.load_blacklisted_seed_ids()
+        used_seed_identity_keys = self.repo.load_used_seed_identity_keys()
+        blacklisted_seed_identity_keys = self.repo.load_blacklisted_seed_identity_keys()
         existing_products = self.repo.load_existing_products()
         eligible: list[SeedProduct] = []
         blocked: list[dict[str, Any]] = []
@@ -5879,8 +6331,14 @@ class WorkbenchService:
             if seed.seed_id in blacklisted_seed_ids:
                 blocked.append({"seed_id": seed.seed_id, "reason": "blacklisted"})
                 continue
+            if self.repo.seed_identity_key(seed) in blacklisted_seed_identity_keys:
+                blocked.append({"seed_id": seed.seed_id, "reason": "blacklisted identity"})
+                continue
             if seed.seed_id in used_seed_ids:
                 blocked.append({"seed_id": seed.seed_id, "reason": "already used"})
+                continue
+            if self.repo.seed_identity_key(seed) in used_seed_identity_keys:
+                blocked.append({"seed_id": seed.seed_id, "reason": "already used identity"})
                 continue
             decision = decide_seed_existing_product_dedupe(seed, existing_products)
             if decision.kind.value != "clear":
@@ -5902,6 +6360,7 @@ class WorkbenchService:
         random_seed = random.SystemRandom().randint(1, 2**31 - 1)
         sampled = self.repo.sample_seeds(eligible, target_count, random_seed)
         self.repo.save_sampled_seeds(run["run_id"], sampled)
+        self.repo.append_used_seeds(run["run_id"], sampled, "workbench_sampled")
         current = WorkbenchState(run["status"])
         run["status"] = transition_workbench_state(current, WorkbenchAction.SELECT_SEEDS).value
         run["random_seed"] = random_seed
@@ -6597,7 +7056,13 @@ class WorkbenchService:
             return all_seed_ids
         return pending_ids
 
-    def _build_supplier_review(self, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _build_supplier_review(
+        self,
+        run_id: str,
+        payload: dict[str, Any],
+        *,
+        preserve_created_at: bool = False,
+    ) -> dict[str, Any]:
         try:
             existing_review = self.repo.load_supplier_review(run_id)
         except FileNotFoundError:
@@ -6611,7 +7076,23 @@ class WorkbenchService:
         for candidate in payload.get("ozon_candidates", []):
             media = candidate.get("selected_sku_media") or {}
             selected_options = (candidate.get("target_sku") or {}).get("selected_options") or {}
-            images = media.get("selected_sku_images") or media.get("main_gallery_images") or []
+            raw_images = [
+                *(media.get("selected_sku_images") or []),
+                *(media.get("main_gallery_images") or []),
+            ]
+            images: list[str] = []
+            seen_image_keys: set[str] = set()
+            for raw_image in raw_images:
+                image_url = re.sub(r"/wc\d+/", "/", str(raw_image or "").strip())
+                if not image_url.startswith("https://"):
+                    continue
+                image_key = image_url.rsplit("/", 1)[-1].lower()
+                if not image_key or image_key in seen_image_keys:
+                    continue
+                seen_image_keys.add(image_key)
+                images.append(image_url)
+                if len(images) >= 5:
+                    break
             existing = existing_by_seed.get(str(candidate.get("seed_id") or ""), {})
             items.append(
                 {
@@ -6620,6 +7101,7 @@ class WorkbenchService:
                     "ozon_title": candidate.get("title"),
                     "ozon_url": candidate.get("ozon_url"),
                     "ozon_main_image": images[0] if images else None,
+                    "ozon_reference_images": images,
                     "selected_options": selected_options,
                     "dimension_evidence": self._dimension_evidence(selected_options, candidate.get("attributes") or {}),
                     "key_attributes": candidate.get("attributes") or {},
@@ -6628,7 +7110,77 @@ class WorkbenchService:
                     "verified_at": existing.get("verified_at"),
                 }
             )
-        return {"run_id": run_id, "items": items, "created_at": utc_now_iso(), "updated_at": utc_now_iso()}
+        now = utc_now_iso()
+        return {
+            "run_id": run_id,
+            "items": items,
+            "created_at": (
+                existing_review.get("created_at")
+                if preserve_created_at and existing_review.get("created_at")
+                else now
+            ),
+            "updated_at": now,
+        }
+
+    def recover_browser_task_state(self, run_id: str) -> dict[str, Any]:
+        with self._run_mutation_lock(run_id):
+            run = self.repo.load_run(run_id)
+            if not self.repo.is_current_workbench_run(run, directory_name=run_id):
+                return run
+            return self._restore_completed_ozon_collection_if_valid(run)
+
+    def _restore_completed_ozon_collection_if_valid(self, run: dict[str, Any]) -> dict[str, Any]:
+        current = WorkbenchState(run["status"])
+        recoverable_states = {
+            WorkbenchState.SEED_SELECTED,
+            WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTING,
+            WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTED,
+            WorkbenchState.OZON_COLLECTING,
+            WorkbenchState.OZON_COLLECTED,
+            WorkbenchState.SUPPLIER_REVIEW,
+            WorkbenchState.NEEDS_MANUAL_REVIEW,
+            WorkbenchState.FAILED_RETRYABLE,
+            WorkbenchState.FAILED_BLOCKED,
+        }
+        if current not in recoverable_states:
+            return run
+        try:
+            payload = self.repo.load_ozon_collection_result(run["run_id"])
+            expected_seed_ids = [seed.seed_id for seed in self._safe_load_sampled_seeds(run["run_id"])]
+        except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+            return run
+        if not expected_seed_ids or validate_ozon_collection_result(payload, expected_seed_ids):
+            return run
+
+        changed = (
+            current != WorkbenchState.SUPPLIER_REVIEW
+            or run.get("ozon_collected") is not True
+            or bool(run.get("replacement_pending_seed_ids"))
+        )
+        if not changed:
+            return run
+        review = self._build_supplier_review(
+            run["run_id"],
+            payload,
+            preserve_created_at=True,
+        )
+        review_path = self.repo.save_supplier_review(run["run_id"], review)
+        run["ozon_collected"] = True
+        run["ozon_collection_result_path"] = str(
+            self.repo.run_dir(run["run_id"]) / "ozon_collection_result.json"
+        )
+        run["supplier_review_path"] = str(review_path)
+        run["status"] = WorkbenchState.SUPPLIER_REVIEW.value
+        run.pop("replacement_pending_seed_ids", None)
+        self.repo.save_run(run)
+        if changed:
+            self.repo.append_run_event(
+                run["run_id"],
+                "ozon_collection.completed_result_restored",
+                "A complete verified Ozon result was restored before browser-task recovery.",
+                {"candidate_count": len(payload.get("ozon_candidates", []))},
+            )
+        return run
 
     def _dimension_evidence(self, selected_options: dict[str, Any], attributes: dict[str, Any]) -> dict[str, Any]:
         markers = ("size", "dimension", "length", "width", "height", "размер", "длина", "ширина", "высота", "尺寸", "长", "宽", "高")
@@ -6695,10 +7247,17 @@ class WorkbenchService:
             if supplier_product is not None:
                 supplier_product["images"] = self._supplier_product_images(supplier_product)
             supplier_sku_options = self._supplier_sku_options(supplier_product) if supplier_product else []
+            supplier_sku_candidates = [
+                dict(candidate)
+                for candidate in (supplier_product or {}).get("sku_option_candidates") or []
+                if isinstance(candidate, dict)
+                and str(candidate.get("supplier_sku_id") or "").strip()
+            ]
             merged = dict(stored_item)
             merged["ozon_product"] = ozon_product
             merged["supplier_product"] = supplier_product
             merged["supplier_sku_options"] = supplier_sku_options
+            merged["supplier_sku_candidates"] = supplier_sku_candidates
             merged["supplier_sku_decision"] = self._supplier_sku_decision(
                 ozon_product,
                 supplier_sku_options,
@@ -7621,9 +8180,20 @@ def _field_candidate_evidence_refs(
     special_suffixes = {
         "quantity": (".set_quantity",),
         "package_contents": (".set_composition.0", ".raw_label"),
+        "set_item_count": (".set_quantity", ".set_composition.0", ".raw_label"),
         "model": (".raw_label", ".combination_key"),
         "article": (".supplier_sku_id",),
     }
+    related_canonical_labels = {
+        "set_item_count": {"package_contents", "quantity"},
+        "factory_package_count": {"quantity"},
+    }
+    candidates.extend(
+        reference
+        for reference in evidence_index
+        if canonical_attribute_label(reference.rsplit(".", 1)[-1])
+        in related_canonical_labels.get(canonical_label, set())
+    )
     for suffix in special_suffixes.get(canonical_label, ()):
         candidates.extend(
             reference
@@ -8035,6 +8605,28 @@ def _has_content_value(value: Any) -> bool:
     return True
 
 
+def _coerce_boolean_value(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value or "").strip().casefold()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    return None
+
+
+def _normalized_required_attribute_value(
+    field: dict[str, Any] | None,
+    value: Any,
+) -> Any:
+    attribute_type = str((field or {}).get("attribute_type") or "").strip().casefold()
+    if attribute_type not in {"bool", "boolean"}:
+        return value
+    normalized = _coerce_boolean_value(value)
+    return normalized if normalized is not None else value
+
+
 def _normalize_content_text(value: Any) -> str:
     return " ".join(
         part
@@ -8065,13 +8657,57 @@ def _dictionary_upload_value(
 ) -> Any:
     value = field.get("value")
     canonical = canonical_attribute_label(field.get("label"))
+    if canonical == "hashtags":
+        return _normalize_ozon_hashtags(value)
     if str(field.get("field_key") or "") == "8229" or canonical == "type":
         category_leaf = str(item.get("category_path") or "").rsplit("/", 1)[-1].strip()
         if category_leaf:
             return category_leaf
+    if str(field.get("field_key") or "") == "9782":
+        normalized_hazard = str(value or "").strip().casefold()
+        if normalized_hazard in {
+            "0",
+            "0.0",
+            "false",
+            "none",
+            "no",
+            "нет",
+            "не опасен",
+            "not dangerous",
+            "无",
+            "不危险",
+            "非危险品",
+        }:
+            return "Не опасен"
     if canonical == "brand" and re.search(r"[\u3400-\u9fff]", str(value or "")):
         return "Нет бренда"
     return value
+
+
+def _normalize_ozon_hashtags(value: Any) -> str:
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for segment in re.findall(r"#([^#]+)", str(value or "")):
+        normalized = re.sub(r"[^\w]+", "_", segment, flags=re.UNICODE).strip("_")
+        if not normalized:
+            continue
+        token = f"#{normalized}"
+        dedupe_key = token.casefold()
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        tokens.append(token)
+    return " ".join(tokens)
+
+
+def _valid_ozon_hashtags(value: Any, *, minimum_count: int = 1) -> bool:
+    text = str(value or "").strip()
+    tokens = text.split()
+    return bool(
+        len(tokens) >= minimum_count
+        and text == " ".join(tokens)
+        and all(re.fullmatch(r"#[\w]+", token, flags=re.UNICODE) for token in tokens)
+    )
 
 
 def _public_reviewed_image_urls(
@@ -8117,6 +8753,11 @@ def _is_public_http_url(value: str) -> bool:
 
 
 def _is_public_https_url(value: str) -> bool:
+    """Validate externally reachable HTTPS evidence URLs.
+
+    This is a generic locked-source image check, not a configurable media
+    publishing setting.
+    """
     try:
         parsed = urlparse(str(value or "").strip())
     except ValueError:
@@ -8272,10 +8913,18 @@ def _seller_api_import_item(
         "barcode": "",
         "complex_attributes": [],
         "currency_code": str(core["currency_code"]),
-        "depth": float(core["depth"]),
+        "depth": int(
+            Decimal(str(core["depth"])).to_integral_value(
+                rounding=ROUND_CEILING
+            )
+        ),
         "description_category_id": int(draft_item["description_category_id"]),
         "dimension_unit": str(core["dimension_unit"]),
-        "height": float(core["height"]),
+        "height": int(
+            Decimal(str(core["height"])).to_integral_value(
+                rounding=ROUND_CEILING
+            )
+        ),
         "images": image_urls,
         "name": title,
         "offer_id": offer_id,
@@ -8288,7 +8937,11 @@ def _seller_api_import_item(
         "vat": "0",
         "weight": float(core["weight"]),
         "weight_unit": str(core["weight_unit"]),
-        "width": float(core["width"]),
+        "width": int(
+            Decimal(str(core["width"])).to_integral_value(
+                rounding=ROUND_CEILING
+            )
+        ),
     }
 
 
@@ -8298,7 +8951,16 @@ def _seller_api_attribute(attribute: dict[str, Any]) -> dict[str, Any] | None:
     if not attribute_id or not _has_content_value(value):
         return None
     dictionary_value_id = attribute.get("dictionary_value_id")
-    seller_value = {"value": str(value)}
+    attribute_type = str(attribute.get("attribute_type") or "").strip().casefold()
+    if attribute_type in {"bool", "boolean"}:
+        boolean_value = _coerce_boolean_value(value)
+        if boolean_value is None:
+            raise ValueError(
+                f"Boolean Seller API attribute {attribute_id} requires true or false."
+            )
+        seller_value = {"value": "true" if boolean_value else "false"}
+    else:
+        seller_value = {"value": str(value)}
     if dictionary_value_id is not None:
         seller_value["dictionary_value_id"] = int(dictionary_value_id)
     return {
@@ -8349,6 +9011,18 @@ def _product_import_status(payload: dict[str, Any]) -> str:
         for item in items
         if isinstance(item, dict)
     }
+    if any(
+        _seller_error_is_blocking(error)
+        for item in items
+        if isinstance(item, dict)
+        for error in (
+            item.get("errors")
+            if isinstance(item.get("errors"), list)
+            else []
+        )
+        if isinstance(error, dict)
+    ):
+        return "failed"
     if any(value in {"failed", "error", "declined"} for value in statuses):
         return "failed"
     if statuses and all(
@@ -8359,182 +9033,118 @@ def _product_import_status(payload: dict[str, Any]) -> str:
     return "processing"
 
 
-def _optional_run_items(
-    path: Path,
-    loader: Callable[[], dict[str, Any]],
-) -> dict[str, dict[str, Any]]:
-    if not path.exists():
-        return {}
-    items = loader().get("items")
-    return (
-        {
-            str(key): value
-            for key, value in items.items()
-            if isinstance(value, dict)
-        }
-        if isinstance(items, dict)
-        else {}
+def _seller_error_is_blocking(error: dict[str, Any]) -> bool:
+    level = str(error.get("level") or "").strip().casefold()
+    if not level or "warning" in level:
+        return False
+    return level in {"error", "critical", "fatal"} or level.endswith(
+        ("_error", "_critical", "_fatal")
     )
 
 
-def _temu_state(repo: FsRepo, run_id: str, kind: str) -> dict[str, Any]:
-    loader = (
-        repo.load_temu_upload_previews
-        if kind == "previews"
-        else repo.load_temu_upload_submissions
-    )
-    try:
-        payload = loader(run_id)
-    except FileNotFoundError:
-        payload = {}
+def _product_import_has_status(payload: dict[str, Any], status: str) -> bool:
+    expected = str(status or "").strip().casefold()
     items = payload.get("items")
-    return {
-        "schema_version": 1,
-        "platform": "temu",
-        "run_id": run_id,
-        **payload,
-        "items": items if isinstance(items, dict) else {},
-    }
-
-
-def _payload_sha256(payload: dict[str, Any]) -> str:
-    canonical = json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-def _temu_request(run_id: str, item: dict[str, Any]) -> dict[str, Any]:
-    title = str(item.get("source_title") or "").strip()
-    image = str(item.get("bootstrap_image_url") or "").strip()
-    pricing = item.get("pricing_evidence") or {}
-    inputs = pricing.get("inputs") or {}
-    calculation = pricing.get("calculation") or {}
-    sku = item.get("supplier_selected_sku") or {}
-    stock = sku.get("stock") or {}
-    options = sku.get("selected_options") or {}
-    required = {
-        "title": title,
-        "locked image": image if item.get("bootstrap_image_ready") else "",
-        "price": calculation.get("listing_price_cny"),
-        "weight": inputs.get("package_weight_g"),
-        "length": inputs.get("package_length_cm"),
-        "width": inputs.get("package_width_cm"),
-        "height": inputs.get("package_height_cm"),
-        "stock": stock.get("quantity"),
-    }
-    missing = [name for name, value in required.items() if value in (None, "")]
-    if missing:
-        raise ValueError("Temu evidence is missing: " + ", ".join(missing) + ".")
-
-    def number(value: Any) -> str:
-        parsed = Decimal(str(value))
-        if parsed < 0:
-            raise ValueError("Temu numeric evidence cannot be negative.")
-        return format(parsed.normalize(), "f")
-
-    def external_id(prefix: str, *parts: Any) -> str:
-        value = "-".join(
-            re.sub(r"[^A-Za-z0-9_-]+", "-", str(part)).strip("-")
-            for part in parts
-            if str(part or "").strip()
+    return bool(
+        isinstance(items, list)
+        and any(
+            isinstance(item, dict)
+            and str(item.get("status") or item.get("state") or "")
+            .strip()
+            .casefold()
+            == expected
+            for item in items
         )
-        return f"{prefix}-{value}"[:128]
-
-    variations = [
-        {"name": str(name)[:128], "value": str(value)[:128]}
-        for name, value in options.items()
-        if str(name).strip() and str(value).strip()
-    ][:5]
-    if not variations:
-        variations = [
-            {"name": "Model", "value": str(sku.get("raw_label") or "")[:128]}
-        ]
-    if not variations[0]["value"]:
-        raise ValueError("Temu SKU variation evidence is required.")
-    goods_id = external_id("OZV2", run_id, item.get("seed_id"))
-    price = {
-        "basePrice": {
-            "amount": number(calculation["listing_price_cny"]),
-            "currency": "CNY",
-        }
-    }
-    if calculation.get("old_price_cny") not in (None, ""):
-        price["listPrice"] = {
-            "amount": number(calculation["old_price_cny"]),
-            "currency": "CNY",
-        }
-    goods_basic = {
-        "externalGoodsId": goods_id,
-        "goodsName": title[:500],
-        "goodsCarouselImage": [image],
-        "productType": 1,
-    }
-    if item.get("category_path"):
-        goods_basic["extCatName"] = str(item["category_path"])[:500]
-    return {
-        "goodsBasic": goods_basic,
-        "attributes": [
-            {"name": str(name)[:128], "value": [str(value)[:128]]}
-            for name, value in list(options.items())[:200]
-            if str(name).strip() and str(value).strip()
-        ],
-        "skuList": [
-            {
-                "externalSkuId": external_id(
-                    "OZV2-SKU",
-                    run_id,
-                    item.get("seed_id"),
-                    sku.get("supplier_sku_id"),
-                ),
-                "images": [image],
-                "price": price,
-                "variations": variations,
-                "quantity": max(0, int(Decimal(str(stock["quantity"])))),
-                "packageInfo": {
-                    "weight": number(inputs["package_weight_g"]),
-                    "length": number(inputs["package_length_cm"]),
-                    "width": number(inputs["package_width_cm"]),
-                    "height": number(inputs["package_height_cm"]),
-                },
-            }
-        ],
-    }
+    )
 
 
-def _temu_status(payload: dict[str, Any]) -> str:
-    text = json.dumps(payload, ensure_ascii=False).casefold()
-    if any(token in text for token in ("reject", "declin", "fail", "error")):
-        return "failed"
-    if any(token in text for token in ("publish", "on_sale", "onsale", "active")):
-        return "published"
-    return "draft" if "draft" in text else "processing"
+def _offer_id_from_import_status(payload: dict[str, Any]) -> str:
+    items = payload.get("items")
+    if not isinstance(items, list):
+        return ""
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        offer_id = str(item.get("offer_id") or "").strip()
+        if offer_id:
+            return offer_id
+    return ""
 
 
-def _temu_error_message(payload: Any) -> str:
-    messages: list[str] = []
-    if isinstance(payload, dict):
-        for key, value in payload.items():
-            if (
-                str(key).casefold()
-                in {"errormsg", "message", "reason", "rejectreason"}
-                and isinstance(value, str)
-                and value.strip()
-            ):
-                messages.append(value.strip())
-            elif isinstance(value, (dict, list)):
-                nested = _temu_error_message(value)
-                if nested != "Temu product was rejected.":
-                    messages.append(nested)
-    elif isinstance(payload, list):
-        for value in payload:
-            nested = _temu_error_message(value)
-            if nested != "Temu product was rejected.":
-                messages.append(nested)
-    return " · ".join(dict.fromkeys(messages))[:500] or "Temu product was rejected."
+def _reconcile_skipped_import_status(
+    payload: dict[str, Any],
+    product_state: dict[str, Any],
+) -> dict[str, Any]:
+    reconciled = json.loads(json.dumps(payload, ensure_ascii=False))
+    items = reconciled.get("items")
+    if not isinstance(items, list):
+        return reconciled
+    target_offer_id = str(product_state.get("offer_id") or "").strip()
+    errors = (
+        product_state.get("errors")
+        if isinstance(product_state.get("errors"), list)
+        else []
+    )
+    has_blocking_error = any(
+        _seller_error_is_blocking(error)
+        for error in errors
+        if isinstance(error, dict)
+    )
+    validation_status = str(
+        product_state.get("validation_status") or ""
+    ).strip().casefold()
+    is_created = product_state.get("is_created") is True
+    final_failed = bool(
+        has_blocking_error
+        or validation_status in {"failed", "error", "declined"}
+    )
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if target_offer_id and str(item.get("offer_id") or "").strip() not in {
+            "",
+            target_offer_id,
+        }:
+            continue
+        if str(item.get("status") or "").strip().casefold() != "skipped":
+            continue
+        item["product_id"] = product_state.get("product_id")
+        item["sku"] = product_state.get("sku")
+        item["is_created"] = product_state.get("is_created")
+        item["validation_status"] = product_state.get("validation_status")
+        item["errors"] = errors
+        if final_failed:
+            item["status"] = "failed"
+        elif is_created:
+            item["status"] = "imported"
+    return reconciled
+
+
+def _product_id_from_import_status(
+    payload: dict[str, Any],
+    *,
+    offer_id: str,
+) -> int | None:
+    items = payload.get("items")
+    if not isinstance(items, list):
+        return None
+    normalized_offer_id = str(offer_id or "").strip()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if (
+            normalized_offer_id
+            and str(item.get("offer_id") or "").strip()
+            != normalized_offer_id
+        ):
+            continue
+        try:
+            product_id = int(item.get("product_id"))
+        except (TypeError, ValueError):
+            continue
+        if product_id > 0:
+            return product_id
+    return None
 
 
 def _required_not_applicable_fields(
@@ -8581,6 +9191,13 @@ def _effective_upload_schema(
         if normalized_label in _PRE_UPLOAD_COMPLIANCE_DECISION_LABELS:
             field["is_required"] = True
             field["required_reason"] = "ozon_compliance_decision"
+            if str(field.get("attribute_type") or "").strip().casefold() in {
+                "bool",
+                "boolean",
+            }:
+                field["attribute_type"] = "Boolean"
+                field["allowed_values"] = [False, True]
+                field["dictionary_id"] = None
         effective.append(field)
     return effective
 
@@ -8880,7 +9497,11 @@ def _pricing_upload_core_fields(
         return format(Decimal(str(value)).normalize(), "f")
 
     def millimeters(key: str) -> str:
-        return normalized(Decimal(str(inputs[key])) * Decimal("10"))
+        return normalized(
+            (Decimal(str(inputs[key])) * Decimal("10")).to_integral_value(
+                rounding=ROUND_CEILING
+            )
+        )
 
     return {
         "price": normalized(price_value),
@@ -8893,6 +9514,44 @@ def _pricing_upload_core_fields(
         "weight": normalized(inputs["package_weight_g"]),
         "weight_unit": "g",
     }
+
+
+def _pricing_record_validation_errors(
+    pricing_record: dict[str, Any],
+) -> list[str]:
+    inputs = pricing_record.get("inputs")
+    if not isinstance(inputs, dict):
+        return ["Confirmed pricing evidence has no input snapshot."]
+    required_keys = {
+        "purchase_price_cny",
+        "domestic_shipping_cny",
+        "package_weight_g",
+        "package_length_cm",
+        "package_width_cm",
+        "package_height_cm",
+        "target_margin_rate",
+    }
+    missing_keys = sorted(
+        key for key in required_keys if inputs.get(key) in (None, "")
+    )
+    if missing_keys:
+        return [
+            "Confirmed pricing evidence is missing inputs: "
+            + ", ".join(missing_keys)
+        ]
+    try:
+        PricingInput.from_values(
+            purchase_price_cny=inputs["purchase_price_cny"],
+            domestic_shipping_cny=inputs["domestic_shipping_cny"],
+            package_weight_g=inputs["package_weight_g"],
+            package_length_cm=inputs["package_length_cm"],
+            package_width_cm=inputs["package_width_cm"],
+            package_height_cm=inputs["package_height_cm"],
+            target_margin_rate=inputs["target_margin_rate"],
+        )
+    except (TypeError, ValueError) as exc:
+        return [str(exc)]
+    return []
 
 
 def _supplier_product_url(

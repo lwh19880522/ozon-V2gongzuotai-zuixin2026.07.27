@@ -21,6 +21,7 @@ $skillNames = @(
     'ozon-intelligent-field-drafter',
     'ozon-store-content-risk-optimizer'
 )
+$retiredSkillNames = @('ozon-image-generation-controller')
 
 function Get-RelativeFileMap {
     param([string]$Root)
@@ -66,6 +67,18 @@ if ($DryRun) {
 }
 
 New-Item -ItemType Directory -Path $SkillTargetRoot -Force | Out-Null
+$resolvedTargetRoot = [System.IO.Path]::GetFullPath($SkillTargetRoot).TrimEnd('\', '/')
+foreach ($retiredSkillName in $retiredSkillNames) {
+    $retiredTarget = [System.IO.Path]::GetFullPath((Join-Path $SkillTargetRoot $retiredSkillName))
+    $expectedPrefix = $resolvedTargetRoot + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $retiredTarget.StartsWith($expectedPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to remove retired Skill outside target root: $retiredTarget"
+    }
+    if (Test-Path -LiteralPath $retiredTarget) {
+        Remove-Item -LiteralPath $retiredTarget -Recurse -Force
+        Write-Output "RETIRED_SKILL_REMOVED NAME=$retiredSkillName TARGET=$retiredTarget"
+    }
+}
 $timestamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssfffZ')
 $backupRoot = Join-Path (Join-Path $SkillTargetRoot '.ozon-v2-backups') $timestamp
 
@@ -83,11 +96,42 @@ foreach ($skillName in $skillNames) {
     $staging = Join-Path $SkillTargetRoot ".$skillName.ozon-v2-new-$PID-$([Guid]::NewGuid().ToString('N'))"
     Copy-Item -LiteralPath $source -Destination $staging -Recurse
     if (Test-Path -LiteralPath $target) {
-        New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
-        Move-Item -LiteralPath $target -Destination (Join-Path $backupRoot $skillName)
+        if ($skillName -eq 'ozon-product-media-generator') {
+            $resolvedTarget = [System.IO.Path]::GetFullPath($target)
+            $expectedPrefix = $resolvedTargetRoot + [System.IO.Path]::DirectorySeparatorChar
+            if (-not $resolvedTarget.StartsWith($expectedPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "Refusing to replace image Skill outside target root: $resolvedTarget"
+            }
+            Remove-Item -LiteralPath $resolvedTarget -Recurse -Force
+        }
+        else {
+            New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
+            Move-Item -LiteralPath $target -Destination (Join-Path $backupRoot $skillName)
+        }
     }
     Move-Item -LiteralPath $staging -Destination $target
     Write-Output "SKILL_INSTALLED NAME=$skillName TARGET=$target"
+}
+
+$backupContainer = Join-Path $SkillTargetRoot '.ozon-v2-backups'
+if (Test-Path -LiteralPath $backupContainer) {
+    $resolvedBackupContainer = [System.IO.Path]::GetFullPath($backupContainer).TrimEnd('\', '/')
+    $backupPrefix = $resolvedBackupContainer + [System.IO.Path]::DirectorySeparatorChar
+    $retiredImageSkillNames = @(
+        'ozon-product-media-generator',
+        'ozon-image-generation-controller'
+    )
+    foreach ($candidate in Get-ChildItem -LiteralPath $backupContainer -Directory -Recurse) {
+        if ($candidate.Name -notin $retiredImageSkillNames) {
+            continue
+        }
+        $resolvedCandidate = [System.IO.Path]::GetFullPath($candidate.FullName)
+        if (-not $resolvedCandidate.StartsWith($backupPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Refusing to remove retired image Skill backup outside backup root: $resolvedCandidate"
+        }
+        Remove-Item -LiteralPath $resolvedCandidate -Recurse -Force
+        Write-Output "RETIRED_IMAGE_SKILL_BACKUP_REMOVED TARGET=$resolvedCandidate"
+    }
 }
 
 Write-Output "SKILLS_INSTALL_OK TARGET=$SkillTargetRoot COUNT=$($skillNames.Count)"

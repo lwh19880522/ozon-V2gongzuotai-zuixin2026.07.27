@@ -231,7 +231,9 @@
   }
 
   function blockingCandidateFields(missingFields, decision) {
-    const fields = Array.from(new Set(Array.isArray(missingFields) ? missingFields : []));
+    const optionalMarketSignals = new Set(["rating", "review_count"]);
+    const fields = Array.from(new Set(Array.isArray(missingFields) ? missingFields : []))
+      .filter((field) => !optionalMarketSignals.has(field));
     const signals = decision && Array.isArray(decision.signals) ? decision.signals : [];
     const hasChinaProductOrigin = Boolean(
       decision

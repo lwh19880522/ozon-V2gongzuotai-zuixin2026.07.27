@@ -38,6 +38,69 @@ class FakeHttpResponse:
 
 
 class SellerCategoryTreeTests(TestCase):
+    def test_product_state_lookup_uses_exact_offer_and_returns_final_errors(
+        self,
+    ) -> None:
+        adapter = SellerApiAdapter(repo=FakeCredentialsRepo())
+        calls: list[tuple[str, dict]] = []
+
+        def fake_post(path: str, payload: dict) -> dict:
+            calls.append((path, payload))
+            if path == "/v3/product/list":
+                return {
+                    "result": {
+                        "items": [
+                            {
+                                "product_id": 5763454848,
+                                "offer_id": "OZV2-PLANT-CLIPS",
+                                "sku": 0,
+                            }
+                        ],
+                        "last_id": "",
+                    }
+                }
+            if path == "/v3/product/info/list":
+                return {
+                    "items": [
+                        {
+                            "id": 5763454848,
+                            "offer_id": "OZV2-PLANT-CLIPS",
+                            "sku": 0,
+                            "statuses": {
+                                "validation_status": "pending",
+                                "is_created": False,
+                            },
+                            "errors": [
+                                {
+                                    "code": "INCORRECT_DENSITY",
+                                    "level": "error",
+                                }
+                            ],
+                        }
+                    ]
+                }
+            self.fail(f"unexpected Seller API path: {path}")
+
+        adapter._post_json = fake_post
+
+        state = adapter.get_product_state_by_offer_id("OZV2-PLANT-CLIPS")
+
+        self.assertEqual(5763454848, state["product_id"])
+        self.assertIs(state["is_created"], False)
+        self.assertEqual("pending", state["validation_status"])
+        self.assertEqual("INCORRECT_DENSITY", state["errors"][0]["code"])
+        self.assertEqual(
+            {
+                "filter": {
+                    "offer_id": ["OZV2-PLANT-CLIPS"],
+                    "visibility": "ALL",
+                },
+                "last_id": "",
+                "limit": 1000,
+            },
+            calls[0][1],
+        )
+
     @patch("ozon_v2.adapters.seller_api.urllib.request.urlopen")
     def test_post_json_retries_once_after_read_timeout(self, urlopen) -> None:
         urlopen.side_effect = [

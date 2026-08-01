@@ -1,6 +1,6 @@
 {
   "name": "ozon-v2-ops-controller",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Ozon V2 controller for verified collection, intelligent field drafting, and evidence-locked image generation.",
   "author": {
     "name": "Ozon V2"
@@ -21,7 +21,7 @@
   "interface": {
     "displayName": "Ozon V2 Ops Controller",
     "shortDescription": "Verified Ozon fields and separated image tasks.",
-    "longDescription": "Coordinates Ozon V2 collection, evidence-backed field drafting, real supplier SKU selection, one-original product creation, and post-product image generation through a fixed pool of ten user-visible tasks that directly replace Ozon galleries without returning files to the workbench.",
+    "longDescription": "Coordinates Ozon V2 collection, evidence-backed field drafting, real supplier SKU selection, one-original product creation, and sequential post-product image generation through one dedicated Skill with a frozen white subject and an automatic public gateway.",
     "developerName": "Ozon V2",
     "category": "Productivity",
     "capabilities": [
@@ -31,7 +31,7 @@
     "defaultPrompt": [
       "完整安装 Ozon V2：只安装 Skill 不算完成；必须验证 http://127.0.0.1:8765/api/health 与桌面启动入口。",
       "使用 $ozon-intelligent-field-drafter 完成批次的证据约束字段草稿。",
-      "使用 $ozon-image-generation-controller 处理已建商品的独立生图任务包。"
+      "使用 $ozon-product-media-generator 单线程处理已建商品的独立生图任务包。"
     ],
     "brandColor": "#2563EB"
   }

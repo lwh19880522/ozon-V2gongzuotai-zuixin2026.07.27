@@ -136,6 +136,27 @@ class CollectionPolicyTests(TestCase):
         self.assertNotIn("Ozon candidate delivery_time is required", errors)
         self.assertNotIn("Ozon candidate fulfillment_label is required", errors)
 
+    def test_product_origin_china_allows_missing_optional_market_signals(self) -> None:
+        candidate = self.ozon_candidate(
+            {
+                "is_chinese_domestic_seller": True,
+                "confidence": "high",
+                "signals": [
+                    {
+                        "kind": "product_origin_china",
+                        "raw_text": "Страна-изготовитель: Китай",
+                    }
+                ],
+            }
+        )
+        candidate.rating = None
+        candidate.review_count = None
+
+        errors = validate_ozon_candidate(candidate)
+
+        self.assertNotIn("Ozon candidate rating is required", errors)
+        self.assertNotIn("Ozon candidate review_count is required", errors)
+
     def test_ozon_candidate_rejects_incomplete_or_placeholder_public_data(self) -> None:
         candidate = self.ozon_candidate(self.verified_seller_decision())
         candidate.attributes = {"Материал": "visible_on_detail_page"}

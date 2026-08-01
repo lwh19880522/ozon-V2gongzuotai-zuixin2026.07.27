@@ -211,10 +211,6 @@ def validate_ozon_candidate(candidate: OzonCandidate) -> list[str]:
         errors.append("Ozon candidate price is required")
     if not (candidate.currency or "").strip():
         errors.append("Ozon candidate currency is required")
-    if not (candidate.rating or "").strip():
-        errors.append("Ozon candidate rating is required")
-    if candidate.review_count is None:
-        errors.append("Ozon candidate review_count is required")
     seller_decision = candidate.domestic_seller_decision or {}
     signals = seller_decision.get("signals") or []
     has_china_product_origin = (

@@ -20,8 +20,15 @@ const chrome = {
 };
 
 const productEvidence = {
-  missingPublicFields() { return []; },
-  blockingCandidateFields(missing) { return missing; },
+  missingPublicFields(snapshot) {
+    const missing = [];
+    if (!snapshot || !snapshot.rating) missing.push("rating");
+    if (!snapshot || !Number.isInteger(snapshot.review_count)) missing.push("review_count");
+    return missing;
+  },
+  blockingCandidateFields(missing) {
+    return (missing || []).filter((field) => !["rating", "review_count"].includes(field));
+  },
   hasUsedProductId() { return false; },
   isExcludedProductId() { return false; },
   matchesQueryIntent() { return true; },
@@ -199,6 +206,38 @@ function assertProgress(value, expected) {
     pending_count: 0,
   });
   assertProgress(progressOf("submitted"), {
+    total_count: 1,
+    processed_count: 1,
+    success_count: 1,
+    failure_count: 0,
+    replacement_count: 0,
+    pending_count: 0,
+  });
+
+  heartbeats.length = 0;
+  const originSnapshotWithoutMarketSignals = snapshot("106");
+  originSnapshotWithoutMarketSignals.rating = null;
+  originSnapshotWithoutMarketSignals.review_count = null;
+  await context.runOzonCollection({
+    data: {
+      run_id: "wb-reusable-origin",
+      dispatch_token: "dispatch-reusable-origin",
+      ingest_url: "/api/batches/wb-reusable-origin/ozon-collection",
+      progress_url: "/api/batches/wb-reusable-origin/ozon-collection-progress",
+      contract: { payload: { excluded_ozon_product_ids: [], seeds: [{
+        seed_id: "seed-reusable-origin",
+        source_text_zh: "金属落地式杂志收纳架",
+        ozon_query_terms_ru: ["металлическая напольная полка для журналов"],
+        public_product_snapshot: originSnapshotWithoutMarketSignals,
+        domestic_seller_decision: {
+          is_chinese_domestic_seller: true,
+          confidence: "high",
+          signals: [{ kind: "product_origin_china", raw_text: "Страна-изготовитель: Китай" }],
+        },
+      }] } },
+    },
+  });
+  assertProgress(progressOf("snapshot_reused"), {
     total_count: 1,
     processed_count: 1,
     success_count: 1,

@@ -577,6 +577,14 @@ function snapshotMissingFields(snapshot) {
     : ["product_evidence_module"];
 }
 
+function snapshotBlockingFields(snapshot, decision) {
+  const missingFields = snapshotMissingFields(snapshot);
+  const evidence = globalThis.OzonV2ProductEvidence;
+  return evidence && typeof evidence.blockingCandidateFields === "function"
+    ? evidence.blockingCandidateFields(missingFields, decision)
+    : missingFields;
+}
+
 function snapshotFingerprint(snapshot, decision) {
   return JSON.stringify({
     product_id: snapshot.product_id,
@@ -614,9 +622,7 @@ async function waitForDetailEvidence(runId, timeoutMs = 30000) {
     accumulatedSnapshot = snapshot;
     const sellerDecision = sellerDecisionForSnapshot(snapshot);
     const missingFields = snapshotMissingFields(snapshot);
-    const blockingFields = evidence && typeof evidence.blockingCandidateFields === "function"
-      ? evidence.blockingCandidateFields(missingFields, sellerDecision)
-      : missingFields;
+    const blockingFields = snapshotBlockingFields(snapshot, sellerDecision);
     latest = {
       url: snapshot.url,
       title: snapshot.title,
@@ -842,7 +848,7 @@ function buildOzonCandidate(seed, query, searchEvidence, detailEvidence, sellerD
   };
 }
 
-async function submit(runId, ingestUrl, templates) {
+async function submit(runId, ingestUrl, templates, dispatchToken) {
   await heartbeat({
     run_id: runId,
     stage: "submitting",
@@ -855,6 +861,7 @@ async function submit(runId, ingestUrl, templates) {
       run_id: runId,
       worker: "workbench_browser_bridge",
       source: "ozon_browser_extension_content_script",
+      dispatch_token: dispatchToken,
       seed_templates: templates,
     }),
   });
@@ -883,6 +890,7 @@ async function submitOzonCollection(runId, ingestUrl, state, totalCount) {
       run_id: runId,
       worker: "workbench_browser_bridge",
       source: "ozon_browser_extension_content_script",
+      dispatch_token: state.dispatchToken,
       ozon_candidates: state.candidates,
     }),
   });
@@ -991,7 +999,7 @@ async function runOzonCollection(task) {
     const reusableQuery = (reusableSeed.ozon_query_terms_ru || [])[0] || reusableSeed.source_text_zh || "";
     if (
       !snapshot
-      || snapshotMissingFields(snapshot).length
+      || snapshotBlockingFields(snapshot, decision).length
       || decision.is_chinese_domestic_seller !== true
       || decision.confidence !== "high"
       || (evidence && evidence.hasUsedProductId(state.candidates, snapshot.product_id))
@@ -1183,7 +1191,12 @@ async function run() {
   };
   const seed = seeds[state.seedIndex];
   if (!seed) {
-    return await submit(runId, task.data.ingest_url, state.templates);
+    return await submit(
+      runId,
+      task.data.ingest_url,
+      state.templates,
+      state.dispatchToken,
+    );
   }
   const query = (seed.ozon_query_terms_ru || [])[0] || seed.source_text_zh || "";
   await heartbeat({
@@ -1286,7 +1299,12 @@ async function run() {
     location.href = searchUrl((next.ozon_query_terms_ru || [])[0] || next.source_text_zh || "");
     return { ok: true, code: "bridge.next_seed" };
   }
-  return await submit(runId, task.data.ingest_url, state.templates);
+  return await submit(
+    runId,
+    task.data.ingest_url,
+    state.templates,
+    state.dispatchToken,
+  );
 }
 
 function triggerRun() {

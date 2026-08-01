@@ -75,7 +75,7 @@ class InstallationContractTests(unittest.TestCase):
         self.assertIn("scripts\\install_ozon_v2.ps1", launch_text)
         self.assertIn(".venv\\Scripts\\python.exe", launch_text)
 
-    def test_codex_skill_installer_copies_all_three_skills_to_an_isolated_root(
+    def test_codex_skill_installer_copies_the_three_active_skills_to_an_isolated_root(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -127,6 +127,64 @@ class InstallationContractTests(unittest.TestCase):
                         (installed / relative_path).read_bytes(),
                     )
 
+    def test_skill_installer_removes_all_retired_image_skill_trees(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target_root = Path(temp_dir) / "skills"
+            legacy_media = target_root / "ozon-product-media-generator"
+            legacy_controller = target_root / "ozon-image-generation-controller"
+            backup_root = target_root / ".ozon-v2-backups" / "legacy"
+            for path in (
+                legacy_media,
+                legacy_controller,
+                backup_root / "ozon-product-media-generator",
+                backup_root / "ozon-image-generation-controller",
+            ):
+                path.mkdir(parents=True)
+                (path / "SKILL.md").write_text("legacy image skill", encoding="utf-8")
+
+            completed = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(SKILL_INSTALLER),
+                    "-SkillTargetRoot",
+                    str(target_root),
+                ],
+                cwd=ROOT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                timeout=20,
+            )
+
+            self.assertEqual(
+                0,
+                completed.returncode,
+                msg=f"{completed.stdout}\n{completed.stderr}",
+            )
+            self.assertFalse(legacy_controller.exists())
+            self.assertEqual(
+                (ROOT / "skills" / "ozon-product-media-generator" / "SKILL.md").read_bytes(),
+                (legacy_media / "SKILL.md").read_bytes(),
+            )
+            self.assertEqual(
+                [],
+                [
+                    path
+                    for path in (target_root / ".ozon-v2-backups").rglob("*")
+                    if path.is_dir()
+                    and path.name
+                    in {
+                        "ozon-product-media-generator",
+                        "ozon-image-generation-controller",
+                    }
+                ],
+            )
+
     def test_doctor_requires_real_runtime_shortcut_skills_and_health(self) -> None:
         text = DOCTOR.read_text(encoding="utf-8-sig")
 
@@ -138,6 +196,7 @@ class InstallationContractTests(unittest.TestCase):
         self.assertIn("ozon-product-media-generator", text)
         self.assertIn("ozon-intelligent-field-drafter", text)
         self.assertIn("ozon-store-content-risk-optimizer", text)
+        self.assertNotIn("ozon-image-generation-controller", text)
         self.assertIn("Get-FileHash", text)
         self.assertIn("DOCTOR_PASSED", text)
         self.assertIn("DOCTOR_FAILED", text)
@@ -206,14 +265,15 @@ class InstallationContractTests(unittest.TestCase):
             (ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
         )
 
-        self.assertEqual("0.4.1", plugin["version"])
+        self.assertEqual("0.5.0", plugin["version"])
         self.assertEqual("./skills/", plugin["skills"])
         self.assertLessEqual(len(plugin["interface"]["defaultPrompt"]), 3)
         prompts = "\n".join(plugin["interface"]["defaultPrompt"])
         self.assertIn("只安装 Skill 不算完成", prompts)
         self.assertIn("api/health", prompts)
         self.assertIn("$ozon-intelligent-field-drafter", prompts)
-        self.assertIn("$ozon-image-generation-controller", prompts)
+        self.assertIn("$ozon-product-media-generator", prompts)
+        self.assertNotIn("$ozon-image-generation-controller", prompts)
 
     def test_readme_links_detailed_installation_and_workflow_guides(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")

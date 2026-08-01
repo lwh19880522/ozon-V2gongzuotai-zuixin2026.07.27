@@ -1,112 +1,62 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
 from ozon_v2.adapters.public_media import (
-    CloudflareR2MediaPublisher,
+    CloudflareQuickTunnelMediaPublisher,
     PublicMediaError,
+    _pid_is_alive,
+    _tunnel_command,
 )
 
 
-def test_cloudflare_publisher_preflight_requires_public_r2_channel() -> None:
-    commands: list[list[str]] = []
-    publisher = CloudflareR2MediaPublisher(
-        command_runner=lambda command, timeout_seconds: (
-            commands.append(command)
-            or {
-                "returncode": 0,
-                "stdout": '[{"name":"ozon-media"}]',
-                "stderr": "",
-            }
-        ),
+def _gateway(tmp_path: Path) -> dict[str, object]:
+    media_root = tmp_path / "public-media"
+    media_root.mkdir()
+    return {
+        "ready": True,
+        "provider": "cloudflare_quick_tunnel",
+        "base_url": "https://quiet-field.trycloudflare.com",
+        "route_token": "private-route",
+        "media_root": str(media_root),
+        "manager_pid": 1234,
+    }
+
+
+def test_quick_tunnel_preflight_starts_automatically_without_user_settings(
+    tmp_path: Path,
+) -> None:
+    starts: list[Path] = []
+    publisher = CloudflareQuickTunnelMediaPublisher(
+        tmp_path,
+        gateway_starter=lambda runtime_root: starts.append(runtime_root)
+        or _gateway(tmp_path),
         public_probe=lambda url, timeout_seconds: None,
-        wrangler_command=["wrangler"],
     )
 
-    result = publisher.preflight(
-        {
-            "base_url": "https://media.example.test",
-            "r2_bucket": "ozon-media",
-            "object_prefix": "ozon-v2",
-        }
-    )
+    result = publisher.preflight()
 
     assert result["ready"] is True
-    assert result["base_url"] == "https://media.example.test"
-    assert result["bucket"] == "ozon-media"
-    assert commands == [["wrangler", "r2", "bucket", "list", "--json"]]
+    assert result["provider"] == "cloudflare_quick_tunnel"
+    assert result["base_url"].endswith(".trycloudflare.com")
+    assert starts == [tmp_path.resolve()]
 
 
-def test_cloudflare_publisher_preflight_falls_back_for_wrangler_v4_text_output() -> None:
-    commands: list[list[str]] = []
-
-    def run(command: list[str], timeout_seconds: int) -> dict[str, str | int]:
-        commands.append(command)
-        if command[-1] == "--json":
-            return {
-                "returncode": 1,
-                "stdout": "",
-                "stderr": "Unknown argument: json",
-            }
-        return {
-            "returncode": 0,
-            "stdout": "name: yandex-media\ncreation_date: 2026-07-03",
-            "stderr": "",
-        }
-
-    publisher = CloudflareR2MediaPublisher(
-        command_runner=run,
-        public_probe=lambda url, timeout_seconds: None,
-        wrangler_command=["wrangler"],
-    )
-
-    result = publisher.preflight(
-        {
-            "base_url": "https://media.example.test",
-            "r2_bucket": "yandex-media",
-        }
-    )
-
-    assert result["ready"] is True
-    assert commands == [
-        ["wrangler", "r2", "bucket", "list", "--json"],
-        ["wrangler", "r2", "bucket", "list"],
-    ]
-
-
-def test_cloudflare_publisher_preflight_rejects_missing_public_url() -> None:
-    publisher = CloudflareR2MediaPublisher(
-        command_runner=lambda command, timeout_seconds: {
-            "returncode": 0,
-            "stdout": "[]",
-            "stderr": "",
-        },
-        wrangler_command=["wrangler"],
-    )
-
-    with pytest.raises(PublicMediaError, match="public HTTPS"):
-        publisher.preflight({"r2_bucket": "ozon-media"})
-
-
-def test_cloudflare_publisher_uploads_every_reviewed_image_and_probes_public_urls(
+def test_quick_tunnel_publisher_copies_media_and_probes_public_urls(
     tmp_path: Path,
 ) -> None:
     first = tmp_path / "main 01.png"
     second = tmp_path / "detail_01.jpg"
     first.write_bytes(b"first-reviewed-image")
     second.write_bytes(b"second-reviewed-image")
-    commands: list[list[str]] = []
     probed: list[str] = []
-
-    publisher = CloudflareR2MediaPublisher(
-        command_runner=lambda command, timeout_seconds: (
-            commands.append(command)
-            or {"returncode": 0, "stdout": "uploaded", "stderr": ""}
-        ),
-        public_probe=lambda url, timeout_seconds: probed.append(url) or None,
-        wrangler_command=["npx.cmd", "--yes", "wrangler"],
+    publisher = CloudflareQuickTunnelMediaPublisher(
+        tmp_path,
+        gateway_starter=lambda runtime_root: _gateway(tmp_path),
+        public_probe=lambda url, timeout_seconds: probed.append(url),
     )
 
     result = publisher.publish_product(
@@ -116,54 +66,37 @@ def test_cloudflare_publisher_uploads_every_reviewed_image_and_probes_public_url
             {"slot_id": "main_01", "path": str(first)},
             {"slot_id": "detail_01", "path": str(second)},
         ],
-        settings={
-            "base_url": "https://media.example.test",
-            "r2_bucket": "yandex-media",
-            "object_prefix": "ozon-v2",
-        },
     )
 
-    assert len(result["urls"]) == 2
+    assert result["provider"] == "cloudflare_quick_tunnel"
+    assert result["base_url"] == "https://quiet-field.trycloudflare.com"
     assert probed == result["urls"]
-    assert all(url.startswith("https://media.example.test/ozon-v2/wb-one/seed-one/") for url in result["urls"])
-    assert commands[0] == [
-        "npx.cmd",
-        "--yes",
-        "wrangler",
-        "r2",
-        "bucket",
-        "list",
-        "--json",
+    assert all(
+        url.startswith(
+            "https://quiet-field.trycloudflare.com/private-route/ozon-v2/"
+            "wb-one/seed-one/"
+        )
+        for url in result["urls"]
+    )
+    copied = [Path(item["published_path"]) for item in result["items"]]
+    assert [path.read_bytes() for path in copied] == [
+        b"first-reviewed-image",
+        b"second-reviewed-image",
     ]
-    assert commands[1][:5] == [
-        "npx.cmd",
-        "--yes",
-        "wrangler",
-        "r2",
-        "object",
-    ]
-    assert commands[1][5] == "put"
-    assert commands[1][6].startswith("yandex-media/ozon-v2/wb-one/seed-one/main_01-")
-    assert "--remote" in commands[1]
-    assert "--content-type" in commands[1]
     assert result["items"][0]["content_type"] == "image/png"
 
 
-def test_cloudflare_publisher_stops_before_ozon_when_public_probe_fails(
+def test_quick_tunnel_publisher_stops_before_ozon_when_public_probe_fails(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "main.png"
     source.write_bytes(b"reviewed-image")
-    publisher = CloudflareR2MediaPublisher(
-        command_runner=lambda command, timeout_seconds: {
-            "returncode": 0,
-            "stdout": "uploaded",
-            "stderr": "",
-        },
+    publisher = CloudflareQuickTunnelMediaPublisher(
+        tmp_path,
+        gateway_starter=lambda runtime_root: _gateway(tmp_path),
         public_probe=lambda url, timeout_seconds: (_ for _ in ()).throw(
             PublicMediaError("public image returned HTTP 404")
         ),
-        wrangler_command=["wrangler"],
     )
 
     with pytest.raises(PublicMediaError, match="HTTP 404"):
@@ -171,9 +104,35 @@ def test_cloudflare_publisher_stops_before_ozon_when_public_probe_fails(
             run_id="wb-one",
             seed_id="seed-one",
             source_files=[{"slot_id": "main_01", "path": str(source)}],
-            settings={
-                "base_url": "https://media.example.test",
-                "r2_bucket": "yandex-media",
-                "object_prefix": "ozon-v2",
-            },
         )
+
+
+def test_quick_tunnel_publisher_rejects_untrusted_gateway_state(
+    tmp_path: Path,
+) -> None:
+    state = _gateway(tmp_path)
+    state["base_url"] = "http://127.0.0.1:8765"
+    publisher = CloudflareQuickTunnelMediaPublisher(
+        tmp_path,
+        gateway_starter=lambda runtime_root: state,
+    )
+
+    with pytest.raises(PublicMediaError, match="public HTTPS"):
+        publisher.preflight()
+
+
+def test_pid_probe_works_for_the_live_manager_process_on_windows() -> None:
+    assert _pid_is_alive(os.getpid()) is True
+
+
+def test_quick_tunnel_uses_http2_for_reliable_windows_networks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = tmp_path / "cloudflared.exe"
+    executable.write_bytes(b"placeholder")
+    monkeypatch.setenv("OZON_V2_CLOUDFLARED", str(executable))
+
+    command = _tunnel_command(tmp_path, 8765)
+
+    assert command[-2:] == ["--protocol", "http2"]

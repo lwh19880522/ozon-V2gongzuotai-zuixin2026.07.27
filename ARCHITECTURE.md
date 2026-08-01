@@ -54,32 +54,6 @@ Runtime Data
   It must not contain business code or be committed to this repository.
 ```
 
-## Temu Official API Extension
-
-The Temu lane is a separately gated extension for a normal store. It does not
-depend on an overseas warehouse or implement the semi-managed workflow, and it
-must not reuse or weaken the Ozon upload path.
-
-- The Adapter Layer owns the official Temu router call, local credential
-  loading, required request signing through an approved injected provider,
-  response parsing, and secret redaction.
-- The Application Layer owns the secret-free request preview, exact SHA-256
-  confirmation gate, pre-call submission journal, idempotency checks, and
-  status-query orchestration.
-- The local HTTP/UI layer exposes thin, separate preview, confirm, and status
-  actions. It must not auto-confirm a preview or treat product creation as
-  publication.
-- Runtime persistence keeps Temu previews, submissions, credentials, and
-  idempotency state separate from Ozon state. These files are machine-local and
-  must not enter source control.
-
-Live Temu submission is fail-closed unless the seller has authorized the
-Partner app, real local credentials are present, and an approved signature
-provider is configured. The publish method is `temu.local.goods.v3.add`; a
-returned `goodsId` remains pending until an official status response from
-`temu.local.goods.list.retrieve` is recorded. The exact captured public
-contract is versioned in `docs/temu/official-api-contract.json`.
-
 ## Directory Design
 
 ```text

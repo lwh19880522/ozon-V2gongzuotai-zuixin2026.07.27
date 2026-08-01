@@ -65,7 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     crop = commands.add_parser("crop-grid")
     crop.add_argument("--source", required=True)
     crop.add_argument("--output-dir", required=True)
-    crop.add_argument("--layout", required=True, choices=("1x2", "1x3"))
+    crop.add_argument("--layout", required=True, choices=("1x2", "1x3", "4x2"))
     crop.add_argument("--basename", required=True)
 
     render = commands.add_parser("render-visual")
@@ -87,7 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
     checkpoint.add_argument("--kind", required=True)
     checkpoint.add_argument("--source", required=True)
     checkpoint.add_argument("--checkpoint-dir", required=True)
-    checkpoint.add_argument("--layout", choices=("1x2", "1x3"))
+    checkpoint.add_argument("--layout", choices=("1x2", "1x3", "4x2"))
     checkpoint.add_argument("--basename")
     checkpoint.add_argument(
         "--lease-seconds", type=float, default=DEFAULT_IMAGE_LEASE_SECONDS

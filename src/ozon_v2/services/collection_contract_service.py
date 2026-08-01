@@ -21,8 +21,6 @@ REQUIRED_PUBLIC_CONTENT_SCORE_FIELDS = [
     "price",
     "currency",
     "old_price_or_discount",
-    "rating",
-    "review_count",
     "seller_name",
     "seller_url",
     "delivery_origin",
@@ -35,6 +33,8 @@ REQUIRED_PUBLIC_CONTENT_SCORE_FIELDS = [
 ]
 
 RECOMMENDED_MARKET_CONTENT_SCORE_SIGNALS = [
+    "rating",
+    "review_count",
     "search_result_position",
     "visible_badges",
     "sales_or_popularity_signal",

@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -13,28 +14,29 @@ from urllib.request import Request, urlopen
 from PIL import Image
 
 from ozon_v2.adapters.fs_repo import FsRepo
+from ozon_v2.adapters.seller_api import SellerApiError
 from ozon_v2.app.result import Result
-from ozon_v2.domain.models import SeedProduct
+from ozon_v2.domain.models import RunStatus, SeedProduct
 from ozon_v2.domain.models import WorkbenchAction, WorkbenchState
 from ozon_v2.domain.supplier_sku import SupplierSkuOption, SupplierSkuSelectionReceipt
 from ozon_v2.images.contracts import SubjectMasterSelection
 from ozon_v2.images.queue import ImageGenerationQueue
-from ozon_v2.platforms.temu.seller_api import TemuSellerApiError
 from ozon_v2.services.collection_contract_service import CollectionContractService
 from ozon_v2.services.attribute_mapping_service import map_template_attributes
 from ozon_v2.services.workbench_service import (
     WorkbenchService,
+    _dictionary_upload_value,
     _normalize_ozon_rich_content_value,
+    _pricing_upload_core_fields,
+    _product_import_status,
+    _seller_api_attribute,
+    _seller_api_import_item,
+    _valid_ozon_hashtags,
     _video_template_fields,
 )
-from ozon_v2.workbench.local_server import create_handler
+from ozon_v2.workbench.local_server import build_upload_workspace_html, create_handler
 
-from tests.helpers import (
-    FakePublicMediaPublisher,
-    FakeSellerApiAdapter,
-    FakeTemuSellerApi,
-    RuntimeTestCase,
-)
+from tests.helpers import FakeSellerApiAdapter, RuntimeTestCase
 
 
 class FakeBusyRunner:
@@ -336,6 +338,90 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             "target_margin_rate": "0.20",
         }
 
+    def test_user_can_exclude_cross_border_unsuitable_product_without_refill(self) -> None:
+        run_id, heavy_seed = self.prepare_supplier_review_run()
+        retained_seed = SeedProduct(
+            seed_id="seed-retained",
+            title_or_keyword="light cross-border product",
+            product_clue="light cross-border product",
+            ozon_query_terms_ru=["легкий товар"],
+            query_generation_status="generated",
+        )
+        self.repo.save_sampled_seeds(run_id, [heavy_seed, retained_seed])
+        self.repo.save_active_seeds([heavy_seed, retained_seed])
+
+        template_payload = self.repo.load_attribute_template_result(run_id)
+        retained_template = json.loads(
+            json.dumps(template_payload["seed_templates"][0])
+        )
+        retained_template["seed_id"] = retained_seed.seed_id
+        template_payload["seed_templates"].append(retained_template)
+        self.repo.save_attribute_template_result(run_id, template_payload)
+
+        ozon_payload = self.repo.load_ozon_collection_result(run_id)
+        ozon_payload["ozon_candidates"] = [
+            self.ozon_candidate_for_seed(heavy_seed, "ozon-heavy"),
+            self.ozon_candidate_for_seed(retained_seed, "ozon-retained"),
+        ]
+        self.repo.save_ozon_collection_result(run_id, ozon_payload)
+        run = self.repo.load_run(run_id)
+        run["status"] = WorkbenchState.IMAGE_PROCESSING.value
+        run["sampled_seed_ids"] = [heavy_seed.seed_id, retained_seed.seed_id]
+        self.repo.save_run(run)
+
+        excluded = self.post_json(
+            f"/api/batches/{run_id}/products/{heavy_seed.seed_id}/exclude",
+            {
+                "confirmed": True,
+                "reason": "包装重量超出跨境可接受范围",
+            },
+        )
+
+        self.assertEqual("product_exclusion.completed", excluded["code"])
+        self.assertEqual(1, excluded["data"]["remaining_product_count"])
+        self.assertIsNone(excluded["data"]["replacement_seed_id"])
+        self.assertEqual(
+            [retained_seed.seed_id],
+            [seed.seed_id for seed in self.repo.load_sampled_seeds(run_id)],
+        )
+        self.assertEqual(
+            [retained_seed.seed_id],
+            [seed.seed_id for seed in self.repo.load_active_seeds()],
+        )
+        self.assertIn(heavy_seed.seed_id, self.repo.load_blacklisted_seed_ids())
+        self.assertIn("ozon-heavy", self.repo.load_blacklisted_ozon_product_ids())
+        self.assertNotIn(
+            "replacement_pending_seed_ids",
+            self.repo.load_run(run_id),
+        )
+        self.assertEqual(
+            [retained_seed.seed_id],
+            [
+                item["seed_id"]
+                for item in self.get_json(f"/api/batches/{run_id}/upload")[
+                    "data"
+                ]["items"]
+            ],
+        )
+        blacklist_rows = [
+            json.loads(line)
+            for line in self.repo.seed_blacklist_path.read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(
+            "cross_border_unsuitable_by_user",
+            blacklist_rows[-1]["reason_code"],
+        )
+
+    def test_upload_pricing_editor_exposes_permanent_exclusion_without_refill(self) -> None:
+        html = build_upload_workspace_html("wb-exclusion-button")
+
+        self.assertIn("剔除商品（不补位）", html)
+        self.assertIn("永久加入黑名单", html)
+        self.assertIn("/products/${encodeURIComponent(item.seed_id)}/exclude", html)
+
     def test_pricing_evidence_round_trips_without_touching_other_batch_files(
         self,
     ) -> None:
@@ -506,6 +592,16 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual("workbench.batch_not_found", result.code)
         self.assertEqual("wb-deleted-or-stale", result.data["run_id"])
 
+    def test_browser_task_endpoint_degrades_to_none_for_deleted_batch(self) -> None:
+        try:
+            result = self.get_json("/api/batches/wb-deleted-or-stale/browser-task")
+        except Exception as exc:
+            self.fail(f"browser task lookup crashed on a deleted batch: {exc}")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("browser_task.none", result["code"])
+        self.assertEqual("wb-deleted-or-stale", result["data"]["stale_run_id"])
+
     def test_allowed_actions_hide_internal_lifecycle_transitions(self) -> None:
         run_id, _seeds = self.prepare_ozon_collecting_run(count=1)
 
@@ -552,6 +648,22 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             result["data"]["task"]["code"],
             {"idle", "running", "blocked", "stopped", "failed"},
         )
+
+    def test_runtime_status_ignores_legacy_run_records(self) -> None:
+        self.repo.create_run_record(
+            target_count=1,
+            sampled_seeds=[],
+            random_seed=1,
+            status=RunStatus.READY_FOR_OZON_COLLECTION,
+        )
+
+        try:
+            result = self.get_json("/api/runtime/status")
+        except Exception as exc:
+            self.fail(f"runtime status crashed on a legacy run record: {exc}")
+
+        self.assertEqual("idle", result["data"]["task"]["code"])
+        self.assertIsNone(result["data"]["task"]["run_id"])
 
     def test_runtime_status_marks_unfinished_idle_run_as_blocked(self) -> None:
         run = self.repo.create_workbench_batch_record(target_count=1)
@@ -817,15 +929,31 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual("workbench.clear_confirmation_required", result["code"])
         self.assertTrue(self.repo.run_dir(run["run_id"]).exists())
 
+    def test_clear_all_batches_archives_sampled_seed_usage_before_deletion(self) -> None:
+        seed = self.repo.load_active_seeds()[0]
+        run = self.repo.create_workbench_batch_record(target_count=1)
+        self.repo.save_sampled_seeds(run["run_id"], [seed])
+
+        result = self.post_json("/api/batches/clear", {"confirm": True})
+
+        self.assertEqual("workbench.batches_cleared", result["code"])
+        self.assertIn(self.repo.seed_identity_key(seed), self.repo.load_used_seed_identity_keys())
+        self.assertNotIn(
+            self.repo.seed_identity_key(seed),
+            {self.repo.seed_identity_key(item) for item in self.repo.load_active_seeds()},
+        )
+
     def test_clear_all_batches_removes_workbench_runs_and_resets_bridge_task(self) -> None:
         first = self.repo.create_workbench_batch_record(target_count=1)
         second = self.repo.create_workbench_batch_record(target_count=2)
-        legacy_dir = self.repo.run_dir("run-legacy-keep")
+        legacy_dir = self.repo.run_dir("run-legacy-clear")
         legacy_dir.mkdir(parents=True)
         (legacy_dir / "run.json").write_text(
-            json.dumps({"run_id": "run-legacy-keep", "status": "finalized"}),
+            json.dumps({"run_id": "run-legacy-clear", "status": "finalized"}),
             encoding="utf-8",
         )
+        malformed_dir = self.repo.run_dir("wb-malformed-clear")
+        malformed_dir.mkdir(parents=True)
         self.repo.save_browser_bridge_status(
             {
                 "source": "ozon_content_script",
@@ -837,16 +965,24 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             }
         )
         seeds_before = self.repo.active_seed_path.read_bytes()
+        used_before = self.repo.used_seed_path.read_bytes()
+        blacklist_before = self.repo.seed_blacklist_path.read_bytes()
         dedupe_before = self.repo.existing_store_dedupe_path.read_bytes()
 
         result = self.post_json("/api/batches/clear", {"confirm": True})
 
         self.assertEqual("workbench.batches_cleared", result["code"])
-        self.assertEqual({first["run_id"], second["run_id"]}, set(result["data"]["deleted_run_ids"]))
+        self.assertEqual(
+            {first["run_id"], second["run_id"], "run-legacy-clear", "wb-malformed-clear"},
+            set(result["data"]["deleted_run_ids"]),
+        )
         self.assertFalse(self.repo.run_dir(first["run_id"]).exists())
         self.assertFalse(self.repo.run_dir(second["run_id"]).exists())
-        self.assertTrue(legacy_dir.exists())
+        self.assertFalse(legacy_dir.exists())
+        self.assertFalse(malformed_dir.exists())
         self.assertEqual(seeds_before, self.repo.active_seed_path.read_bytes())
+        self.assertEqual(used_before, self.repo.used_seed_path.read_bytes())
+        self.assertEqual(blacklist_before, self.repo.seed_blacklist_path.read_bytes())
         self.assertEqual(dedupe_before, self.repo.existing_store_dedupe_path.read_bytes())
         bridge = self.repo.load_browser_bridge_status()
         self.assertIsNone(bridge["run_id"])
@@ -1282,6 +1418,31 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             (self.repo.run_dir(run_id) / "ozon_collection_draft.json").exists()
         )
 
+    def test_autopilot_restores_complete_result_before_pending_replacement_recovery(self) -> None:
+        run_id, seeds = self.prepare_ozon_collecting_run(count=1)
+        candidate = self.ozon_candidate_for_seed(seeds[0], "ozon-complete-autopilot")
+        payload = {
+            "run_id": run_id,
+            "worker": "workbench_browser_bridge",
+            "ozon_candidates": [candidate],
+        }
+        self.repo.save_ozon_collection_result(run_id, payload)
+        service = WorkbenchService(self.repo)
+        self.repo.save_supplier_review(run_id, service._build_supplier_review(run_id, payload))
+        run = self.repo.load_run(run_id)
+        run["status"] = WorkbenchState.FAILED_BLOCKED.value
+        run["replacement_pending_seed_ids"] = [seeds[0].seed_id]
+        run["ozon_collected"] = False
+        self.repo.save_run(run)
+
+        result = service.run_until_blocked(run_id)
+        loaded = self.repo.load_run(run_id)
+
+        self.assertTrue(result.ok)
+        self.assertEqual("supplier_review_required", result.data["blocked_reason"])
+        self.assertEqual(WorkbenchState.SUPPLIER_REVIEW.value, loaded["status"])
+        self.assertNotIn("replacement_pending_seed_ids", loaded)
+
     def test_restart_browser_task_recovers_failed_replacement_and_discards_stale_draft(self) -> None:
         run_id, seeds = self.prepare_ozon_collecting_run(count=2)
         stale_candidate = self.ozon_candidate_for_seed(seeds[0], "ozon-stale")
@@ -1517,6 +1678,12 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
 
     def test_browser_task_endpoint_returns_managed_supplier_selection_channels(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
+        review = self.repo.load_supplier_review(run_id)
+        review["items"][0]["ozon_reference_images"] = [
+            "https://img.example/main.jpg",
+            "https://img.example/alternate.jpg",
+        ]
+        self.repo.save_supplier_review(run_id, review)
 
         task = self.get_json(f"/api/batches/{run_id}/browser-task")
 
@@ -1536,6 +1703,83 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual(seed.seed_id, channel["seed_id"])
         self.assertEqual("ozon-1", channel["ozon_product_id"])
         self.assertEqual("https://img.example/main.jpg", channel["reference_image_url"])
+        self.assertEqual(
+            ["https://img.example/main.jpg", "https://img.example/alternate.jpg"],
+            channel["reference_image_urls"],
+        )
+
+    def test_supplier_review_combines_sku_and_gallery_reference_images(self) -> None:
+        run_id, seeds = self.prepare_ozon_collecting_run(count=1)
+        candidate = self.ozon_candidate_for_seed(seeds[0], "ozon-image-fallbacks")
+        candidate["selected_sku_media"] = {
+            "selected_sku_images": ["https://img.example/wc100/main.jpg"],
+            "main_gallery_images": [
+                "https://img.example/wc300/main.jpg",
+                "https://img.example/wc200/alternate.jpg",
+            ],
+        }
+
+        review = WorkbenchService(self.repo)._build_supplier_review(
+            run_id,
+            {"run_id": run_id, "ozon_candidates": [candidate]},
+        )
+
+        self.assertEqual(
+            ["https://img.example/main.jpg", "https://img.example/alternate.jpg"],
+            review["items"][0]["ozon_reference_images"],
+        )
+
+    def test_restart_restores_complete_ozon_result_before_replacement_recovery(self) -> None:
+        run_id, seeds = self.prepare_ozon_collecting_run(count=2)
+        candidates = [
+            self.ozon_candidate_for_seed(seed, f"ozon-complete-{index}")
+            for index, seed in enumerate(seeds)
+        ]
+        payload = {
+            "run_id": run_id,
+            "worker": "workbench_browser_bridge",
+            "ozon_candidates": candidates,
+        }
+        self.repo.save_ozon_collection_result(run_id, payload)
+        service = WorkbenchService(self.repo)
+        self.repo.save_supplier_review(run_id, service._build_supplier_review(run_id, payload))
+        self.repo.save_ozon_collection_draft(
+            run_id,
+            {
+                "schema_version": 1,
+                "run_id": run_id,
+                "worker": "workbench_browser_bridge",
+                "source": "completed_before_late_retry",
+                "ozon_candidates": candidates,
+                "created_at": "2026-07-31T00:00:00+00:00",
+                "updated_at": "2026-07-31T00:00:00+00:00",
+            },
+        )
+        contract = self.repo.load_ozon_collection_contract(run_id)
+        contract["payload"]["seeds"] = [
+            seed for seed in contract["payload"]["seeds"]
+            if seed["seed_id"] == seeds[1].seed_id
+        ]
+        self.repo.save_ozon_collection_contract(run_id, contract)
+        run = self.repo.load_run(run_id)
+        run["status"] = WorkbenchState.OZON_COLLECTING.value
+        run["replacement_pending_seed_ids"] = [seeds[1].seed_id]
+        run["ozon_collected"] = False
+        run["browser_task_cancelled"] = True
+        run["browser_task_cancel_reason"] = "user_stopped"
+        self.repo.save_run(run)
+
+        restarted = service.restart_browser_task(run_id)
+        loaded = self.repo.load_run(run_id)
+        draft = self.repo.load_ozon_collection_draft(run_id)
+
+        self.assertTrue(restarted.ok)
+        self.assertEqual("supplier_selection", restarted.data["task_type"])
+        self.assertEqual(WorkbenchState.SUPPLIER_REVIEW.value, loaded["status"])
+        self.assertTrue(loaded["ozon_collected"])
+        self.assertNotIn("replacement_pending_seed_ids", loaded)
+        self.assertFalse(loaded["browser_task_cancelled"])
+        self.assertEqual([seed.seed_id for seed in seeds], [item["seed_id"] for item in draft["ozon_candidates"]])
 
     def test_managed_supplier_task_returns_only_five_pending_channels(self) -> None:
         run_id, _seed = self.prepare_supplier_review_run()
@@ -1617,6 +1861,136 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual("supplier_selection.channel_mismatch", result["code"])
         self.assertEqual(WorkbenchState.SUPPLIER_REVIEW.value, self.repo.load_run(run_id)["status"])
 
+    def test_supplier_selection_capture_recovers_completed_ozon_state_without_invalidating_lane(self) -> None:
+        run_id, seeds = self.prepare_ozon_collecting_run(count=1)
+        candidate = self.ozon_candidate_for_seed(seeds[0], "ozon-recovered-capture")
+        payload = {
+            "run_id": run_id,
+            "worker": "workbench_browser_bridge",
+            "ozon_candidates": [candidate],
+        }
+        service = WorkbenchService(self.repo)
+        self.repo.save_ozon_collection_result(run_id, payload)
+        review = service._build_supplier_review(run_id, payload)
+        self.repo.save_supplier_review(run_id, review)
+        run = self.repo.load_run(run_id)
+        run["status"] = WorkbenchState.OZON_COLLECTING.value
+        run["ozon_collected"] = False
+        self.repo.save_run(run)
+
+        result = service.capture_supplier_selection_product(
+            run_id,
+            {
+                "channel_index": 0,
+                "seed_id": seeds[0].seed_id,
+                "ozon_product_id": "ozon-recovered-capture",
+                "dispatch_token": review["created_at"],
+                "supplier_product": self.supplier_product_payload(seeds[0].seed_id),
+            },
+        )
+
+        self.assertTrue(result.ok, result.to_dict())
+        self.assertNotEqual("supplier_selection.not_expected", result.code)
+
+    def test_supplier_selection_capture_rejects_stale_dispatch_generation(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        current_task = self.get_json(f"/api/batches/{run_id}/browser-task")
+        current_token = current_task["data"]["dispatch_token"]
+
+        result = self.post_json(
+            f"/api/batches/{run_id}/supplier-selection/capture",
+            {
+                "channel_index": 0,
+                "seed_id": seed.seed_id,
+                "ozon_product_id": "ozon-1",
+                "dispatch_token": f"{current_token}-stale",
+                "supplier_product": self.supplier_product_payload(seed.seed_id),
+            },
+            ok=False,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("supplier_selection.dispatch_stale", result["code"])
+        self.assertFalse((self.repo.run_dir(run_id) / "supplier_selection_draft.json").exists())
+        self.assertEqual(WorkbenchState.SUPPLIER_REVIEW.value, self.repo.load_run(run_id)["status"])
+
+    def test_supplier_selection_capture_rejects_mixed_offer_identity(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        task = self.get_json(f"/api/batches/{run_id}/browser-task")
+        supplier_product = self.supplier_product_payload(seed.seed_id)
+        supplier_product["final_url"] = supplier_product["supplier_url"]
+        supplier_product["offer_id"] = "999999999999"
+
+        result = self.post_json(
+            f"/api/batches/{run_id}/supplier-selection/capture",
+            {
+                "channel_index": 0,
+                "seed_id": seed.seed_id,
+                "ozon_product_id": "ozon-1",
+                "dispatch_token": task["data"]["dispatch_token"],
+                "supplier_product": supplier_product,
+            },
+            ok=False,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("supplier_selection.offer_identity_mismatch", result["code"])
+        self.assertFalse((self.repo.run_dir(run_id) / "supplier_selection_draft.json").exists())
+
+    def test_supplier_selection_capture_rejects_offer_already_assigned_to_another_product(
+        self,
+    ) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        review = self.repo.load_supplier_review(run_id)
+        second_item = dict(review["items"][0])
+        second_item.update(
+            {
+                "channel_index": 1,
+                "seed_id": "seed-second",
+                "ozon_product_id": "ozon-2",
+                "ozon_title": "Second Ozon product",
+                "supplier_url": None,
+                "user_verified_exact_match": False,
+            }
+        )
+        review["items"].append(second_item)
+        self.repo.save_supplier_review(run_id, review)
+        task = self.get_json(f"/api/batches/{run_id}/browser-task")
+        dispatch_token = task["data"]["dispatch_token"]
+
+        first = self.post_json(
+            f"/api/batches/{run_id}/supplier-selection/capture",
+            {
+                "channel_index": 0,
+                "seed_id": seed.seed_id,
+                "ozon_product_id": "ozon-1",
+                "dispatch_token": dispatch_token,
+                "supplier_product": self.supplier_product_payload(seed.seed_id),
+            },
+        )
+        second_product = self.supplier_product_payload("seed-second")
+        second = self.post_json(
+            f"/api/batches/{run_id}/supplier-selection/capture",
+            {
+                "channel_index": 1,
+                "seed_id": "seed-second",
+                "ozon_product_id": "ozon-2",
+                "dispatch_token": dispatch_token,
+                "supplier_product": second_product,
+            },
+            ok=False,
+        )
+
+        self.assertTrue(first["ok"])
+        self.assertFalse(second["ok"])
+        self.assertEqual("supplier_selection.offer_already_assigned", second["code"])
+        self.assertEqual(seed.seed_id, second["data"]["conflicting_seed_id"])
+        draft = self.repo.load_supplier_selection_draft(run_id)
+        self.assertEqual(
+            [seed.seed_id],
+            [item["seed_id"] for item in draft["supplier_products"]],
+        )
+
     def test_supplier_selection_reset_removes_wrong_capture_and_reopens_lane(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
         review = self.repo.load_supplier_review(run_id)
@@ -1682,6 +2056,11 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         collection = self.repo.load_supplier_collection_result(run_id)
         retained_product = self.supplier_product_payload("seed-retained")
         retained_product["title"] = "Already completed supplier product"
+        retained_product["supplier_url"] = (
+            "https://detail.1688.com/offer/987654321098.html"
+        )
+        retained_product["final_url"] = retained_product["supplier_url"]
+        retained_product["offer_id"] = "987654321098"
         collection["supplier_products"].append(retained_product)
         self.repo.save_supplier_collection_result(run_id, collection)
         run = self.repo.load_run(run_id)
@@ -1830,6 +2209,73 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         )
         self.assertTrue(item["supplier_sku_options"][0]["complete"])
         self.assertEqual(WorkbenchState.SUPPLIER_COLLECTED.value, self.repo.load_run(run_id)["status"])
+
+    def test_supplier_review_exposes_multi_sku_candidates_without_variant_images_read_only(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        task = self.get_json(f"/api/batches/{run_id}/browser-task")
+        supplier_product = self.supplier_product_payload(seed.seed_id)
+        supplier_product["sku_groups"] = [
+            {
+                "name": "颜色",
+                "options": [
+                    {"label": "银色一个", "supplier_sku_id": "", "image_url": ""},
+                    {"label": "蓝色一个", "supplier_sku_id": "", "image_url": ""},
+                ],
+            }
+        ]
+        supplier_product["sku_options"] = [
+            {
+                "supplier_sku_id": "sku-silver",
+                "combination_key": "银色一个",
+                "raw_label": "银色一个",
+                "selected_options": {"颜色": "银色一个"},
+                "set_quantity": 1,
+                "set_composition": ["银色一个"],
+                "price": {"currency": "CNY", "amount": "110.00"},
+                "stock": {"status": "in_stock", "quantity": 4753},
+                "image_urls": [],
+                "evidence_source": "embedded_sku_map",
+                "complete": False,
+            },
+            {
+                "supplier_sku_id": "sku-blue",
+                "combination_key": "蓝色一个",
+                "raw_label": "蓝色一个",
+                "selected_options": {"颜色": "蓝色一个"},
+                "set_quantity": 1,
+                "set_composition": ["蓝色一个"],
+                "price": {"currency": "CNY", "amount": "110.00"},
+                "stock": {"status": "in_stock", "quantity": 4946},
+                "image_urls": [],
+                "evidence_source": "embedded_sku_map",
+                "complete": False,
+            },
+        ]
+
+        captured = self.post_json(
+            f"/api/batches/{run_id}/supplier-selection/capture",
+            {
+                "channel_index": 0,
+                "seed_id": seed.seed_id,
+                "ozon_product_id": "ozon-1",
+                "dispatch_token": task["data"]["dispatch_token"],
+                "supplier_product": supplier_product,
+            },
+        )
+        review = self.get_json(f"/api/batches/{run_id}/supplier-review")
+        item = review["data"]["items"][0]
+        page = self.get_text(f"/batches/{run_id}/supplier-review")
+
+        self.assertTrue(captured["ok"])
+        self.assertEqual([], item["supplier_sku_options"])
+        self.assertEqual(
+            ["sku-silver", "sku-blue"],
+            [candidate["supplier_sku_id"] for candidate in item["supplier_sku_candidates"]],
+        )
+        self.assertTrue(all(not candidate["image_urls"] for candidate in item["supplier_sku_candidates"]))
+        self.assertIn("supplier_sku_candidates", page)
+        self.assertIn("已识别但不可锁定", page)
+        self.assertIn("公共商品图", page)
 
     def test_supplier_selection_capture_exposes_page_unique_sku_for_confirmation(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
@@ -2215,7 +2661,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
     def test_extension_manifest_registers_1688_supplier_content_script(self) -> None:
         manifest_path = self.project_root / "browser_extension" / "ozon_v2_bridge" / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self.assertEqual("0.1.63", manifest["version"])
+        self.assertEqual("0.1.67", manifest["version"])
 
         supplier_scripts = [
             item
@@ -2233,6 +2679,8 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn("seed_id: seedId", content)
         self.assertIn("state.dispatchToken === dispatchToken", content)
         self.assertIn("dispatchToken: task.data.dispatch_token", content)
+        self.assertIn("dispatch_token: dispatchToken", content)
+        self.assertIn("dispatch_token: state.dispatchToken", content)
 
     def test_runner_stop_cancels_current_browser_task(self) -> None:
         seed = SeedProduct(
@@ -2932,7 +3380,15 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             "已由用户确认；构建草稿时自动写入。包装字段不会冒充商品净尺寸字段",
             page,
         )
-        self.assertIn("全部模板字段", page)
+        self.assertIn("查看全部模板字段（只读）", page)
+        self.assertIn("item.manual_required_fields", page)
+        self.assertIn("item.skill_pending_required_fields", page)
+        self.assertIn("无需用户填写", page)
+        self.assertNotIn(
+            "const fields = (item.missing_required_fields || [])",
+            page,
+        )
+        self.assertIn("details.open = false", page)
         self.assertIn("待原创", page)
         self.assertIn("缺少事实", page)
         self.assertIn("未提供可选素材", page)
@@ -3234,6 +3690,207 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             },
             item["upload_core_fields"],
         )
+
+    def test_decimal_package_dimensions_are_rounded_up_to_int32_millimeters(
+        self,
+    ) -> None:
+        core = _pricing_upload_core_fields(
+            {
+                "inputs": {
+                    "package_length_cm": "2.02",
+                    "package_width_cm": "2.01",
+                    "package_height_cm": "1.5",
+                    "package_weight_g": "300",
+                },
+                "calculation": {
+                    "listing_price_rub": "383",
+                    "old_price_rub": "479",
+                },
+            }
+        )
+
+        self.assertIsNotNone(core)
+        self.assertEqual("21", core["depth"])
+        self.assertEqual("21", core["width"])
+        self.assertEqual("15", core["height"])
+        seller_item = _seller_api_import_item(
+            {
+                "upload_core_fields": core,
+                "description_category_id": 17028745,
+                "type_id": 92767,
+                "source_title": "Plant clips",
+                "seed_id": "seed-plant-clips",
+                "attributes": [],
+            },
+            ["https://example.test/plant-clips.jpg"],
+        )
+        self.assertEqual(21, seller_item["depth"])
+        self.assertEqual(21, seller_item["width"])
+        self.assertEqual(15, seller_item["height"])
+        self.assertIsInstance(seller_item["depth"], int)
+
+    def test_pricing_confirmation_rejects_impossible_package_density(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+        payload = self.pricing_input_payload(seed.seed_id)
+        payload.update(
+            {
+                "package_weight_g": "300",
+                "package_length_cm": "2.02",
+                "package_width_cm": "2.01",
+                "package_height_cm": "1.5",
+            }
+        )
+
+        result = WorkbenchService(self.repo).confirm_pricing_evidence(
+            run_id,
+            payload,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual("pricing_evidence.calculation_invalid", result.code)
+        self.assertIn("package density", " ".join(result.errors))
+
+    def test_multiword_hashtags_are_normalized_to_valid_ozon_tokens(self) -> None:
+        value = _dictionary_upload_value(
+            {"category_path": "Дом и сад / Садовый декор"},
+            {
+                "field_key": "hashtags",
+                "label": "#Хештеги",
+                "value": (
+                    "#растения #подвязка растений "
+                    "#держатели для цветов #садовый декор"
+                ),
+            },
+        )
+
+        self.assertEqual(
+            (
+                "#растения #подвязка_растений "
+                "#держатели_для_цветов #садовый_декор"
+            ),
+            value,
+        )
+
+    def test_hashtag_validator_rejects_internal_spaces(self) -> None:
+        self.assertFalse(
+            _valid_ozon_hashtags(
+                "#растения #подвязка растений #садовый декор",
+                minimum_count=3,
+            )
+        )
+        self.assertTrue(
+            _valid_ozon_hashtags(
+                "#растения #подвязка_растений #садовый_декор",
+                minimum_count=3,
+            )
+        )
+
+    def test_saved_confirmed_pricing_is_revalidated_before_upload(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+        service = WorkbenchService(self.repo)
+        confirmed = service.confirm_pricing_evidence(
+            run_id,
+            self.pricing_input_payload(seed.seed_id),
+        )
+        self.assertTrue(confirmed.ok, confirmed.to_dict())
+        stored = self.repo.load_pricing_evidence(run_id)
+        stored["items"][seed.seed_id]["inputs"].update(
+            {
+                "package_weight_g": "300",
+                "package_length_cm": "2.02",
+                "package_width_cm": "2.01",
+                "package_height_cm": "1.5",
+            }
+        )
+        self.repo.save_pricing_evidence(run_id, stored)
+
+        workspace = service.upload_workspace(run_id)
+
+        self.assertTrue(workspace.ok, workspace.to_dict())
+        item = workspace.data["items"][0]
+        self.assertFalse(item["pricing_ready"])
+        self.assertEqual("invalid", item["pricing_status"])
+        self.assertIn("pricing", item["blocking_gates"])
+        self.assertIn(
+            "package density",
+            " ".join(item["pricing_validation_errors"]),
+        )
+
+    def test_zero_hazard_class_uses_the_official_ozon_dictionary_label(self) -> None:
+        value = _dictionary_upload_value(
+            {"category_path": "Бытовая химия / Чистящее средство"},
+            {
+                "field_key": "9782",
+                "label": "Класс опасности товара",
+                "value": "0",
+            },
+        )
+
+        self.assertEqual("Не опасен", value)
+
+    def test_imported_item_with_error_level_is_not_accepted_for_image_tasks(
+        self,
+    ) -> None:
+        status = _product_import_status(
+            {
+                "items": [
+                    {
+                        "status": "imported",
+                        "product_id": 5762820950,
+                        "errors": [
+                            {
+                                "code": "INCORRECT_DENSITY",
+                                "level": "error",
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual("failed", status)
+
+    def test_imported_item_with_warning_only_remains_accepted(self) -> None:
+        status = _product_import_status(
+            {
+                "items": [
+                    {
+                        "status": "imported",
+                        "product_id": 5762846829,
+                        "errors": [
+                            {
+                                "code": "BR_hashtag_validation",
+                                "level": "warning",
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual("accepted_by_ozon", status)
+
+    def test_ozon_enum_error_level_is_blocking(self) -> None:
+        status = _product_import_status(
+            {
+                "items": [
+                    {
+                        "status": "imported",
+                        "product_id": 5763454848,
+                        "errors": [
+                            {
+                                "code": "INCORRECT_DENSITY",
+                                "level": "ERROR_LEVEL_ERROR",
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual("failed", status)
 
     def test_pricing_confirmation_requires_locked_supplier_sku(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
@@ -3608,6 +4265,10 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual("evidence_inference", field_tasks["tools-count"]["mode"])
         self.assertEqual("evidence_inference", field_tasks["warranty"]["mode"])
         self.assertEqual("creative_rewrite", field_tasks["title"]["mode"])
+        self.assertTrue(task["rules"]["required_fields_must_be_completed_first"])
+        self.assertTrue(
+            task["rules"]["manual_entry_only_after_intelligence_unresolved"]
+        )
         self.assertEqual(
             "1 инструмент",
             task["evidence_index"]["ozon.attributes.Комплектация"],
@@ -3638,6 +4299,35 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual("content_task.validation_failed", invalid["code"])
         self.assertTrue(
             any("evidence_refs" in error for error in invalid.get("errors", []))
+        )
+
+        unrelated = self.post_json(
+            f"/api/batches/{run_id}/content-tasks/complete",
+            {
+                "seed_id": seed.seed_id,
+                "fields": {
+                    "tools-count": {
+                        "decision": "filled",
+                        "value": "1",
+                        "evidence_refs": ["ozon.attributes.Комплектация"],
+                        "reason": "Количество извлечено из собранной комплектации.",
+                    },
+                    "warranty": {
+                        "decision": "filled",
+                        "value": "1 год",
+                        "evidence_refs": ["ozon.attributes.Комплектация"],
+                        "reason": "Гарантия якобы выведена из комплектации.",
+                    },
+                    "title": (
+                        "Комплект ручных инструментов для точной работы, 1 предмет"
+                    ),
+                },
+            },
+            ok=False,
+        )
+        self.assertEqual("content_task.validation_failed", unrelated["code"])
+        self.assertTrue(
+            any("field-specific evidence_ref" in error for error in unrelated["errors"])
         )
 
         completed = self.post_json(
@@ -4527,6 +5217,60 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             value="белый",
         )
 
+    def test_product_preview_reports_the_exact_unresolved_required_dictionary(
+        self,
+    ) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        ozon_result = self.repo.load_ozon_collection_result(run_id)
+        ozon_result["ozon_candidates"][0]["attributes"]["Цвет"] = "белый"
+        self.repo.save_ozon_collection_result(run_id, ozon_result)
+        template_result = self.repo.load_attribute_template_result(run_id)
+        template_result["seed_templates"][0]["upload_attribute_schema"][0][
+            "dictionary_id"
+        ] = 100
+        self.repo.save_attribute_template_result(run_id, template_result)
+        self.attach_locked_subject_master(run_id, seed.seed_id)
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+        selections = self.repo.load_supplier_sku_selections(run_id)
+        selections["selections"][seed.seed_id]["supplier_sku"][
+            "selected_options"
+        ] = {"Цвет": "белый"}
+        self.repo.save_supplier_sku_selections(run_id, selections)
+        supplier_result = self.repo.load_supplier_collection_result(run_id)
+        supplier_result["supplier_products"][0]["attributes"] = {
+            "Цвет": "белый"
+        }
+        self.repo.save_supplier_collection_result(run_id, supplier_result)
+        service = WorkbenchService(self.repo)
+        self.assertTrue(
+            service.confirm_pricing_evidence(
+                run_id,
+                self.pricing_input_payload(seed.seed_id),
+            ).ok
+        )
+
+        with patch.object(
+            service.seller_api_adapter,
+            "resolve_attribute_dictionary_value",
+            side_effect=SellerApiError("no exact Ozon dictionary value"),
+        ):
+            result = service.preview_product_upload(run_id, seed.seed_id)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(
+            "product_upload.required_dictionary_values_unresolved",
+            result.code,
+        )
+        self.assertEqual(
+            "required_dictionary_value_unresolved",
+            result.data["blocked_item"]["reason"],
+        )
+        self.assertEqual(
+            "85",
+            result.data["blocked_item"]["fields"][0]["field_key"],
+        )
+        self.assertIn("Цвет", result.message)
+
     def test_upload_draft_omits_an_unresolved_optional_dictionary_value(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
         template_result = self.repo.load_attribute_template_result(run_id)
@@ -4741,11 +5485,9 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         subject = self.attach_locked_subject_master(run_id, seed.seed_id)
         self.prepare_pricing_sources(run_id, seed.seed_id)
         adapter = FakeSellerApiAdapter()
-        publisher = FakePublicMediaPublisher()
         service = WorkbenchService(
             self.repo,
             seller_api_adapter=adapter,
-            public_media_publisher=publisher,
         )
         self.assertTrue(
             service.confirm_pricing_evidence(
@@ -4767,7 +5509,6 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
                 preview.data["seller_api_item"]["primary_image"],
             )
             self.assertEqual([], adapter.imported_items)
-            self.assertEqual([], publisher.published_products)
             self.assertEqual(
                 "CNY",
                 preview.data["seller_api_item"]["currency_code"],
@@ -4826,6 +5567,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             7001,
             package["store_target"]["seller_import_task_id"],
         )
+        self.assertEqual(900001, package["store_target"]["product_id"])
         self.assertEqual(
             subject["source_image_url"],
             package["bootstrap_image"]["url"],
@@ -4833,8 +5575,14 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertFalse(
             package["generation_contract"]["return_to_workbench"],
         )
-        self.assertTrue(
-            package["generation_contract"]["r2_preflight_required"],
+        self.assertEqual(
+            "single_thread_8_grid",
+            package["generation_contract"]["generation_mode"],
+        )
+        self.assertEqual("4x2", package["generation_contract"]["grid_layout"])
+        self.assertEqual(
+            "auto_quick_tunnel",
+            package["generation_contract"]["public_media"],
         )
         self.assertEqual(
             {
@@ -4883,6 +5631,20 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             accepted.data["image_task_package_id"],
             repeated_status.data["image_task_package_id"],
         )
+        package["store_target"]["product_id"] = None
+        package_path.write_text(
+            json.dumps(package, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        repaired_status = service.refresh_product_upload_status(
+            run_id,
+            seed.seed_id,
+        )
+        repaired_package = json.loads(package_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(repaired_status.ok)
+        self.assertEqual(900001, repaired_package["store_target"]["product_id"])
         self.assertEqual(
             1,
             len(
@@ -4992,6 +5754,145 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             quarantined_payload["quarantine_reason"],
         )
 
+    def test_skipped_import_is_reconciled_to_created_product_final_state(self) -> None:
+        class SkippedCreatedAdapter(FakeSellerApiAdapter):
+            def get_product_import_info(self, task_id: int) -> dict:
+                return {
+                    "task_id": task_id,
+                    "items": [
+                        {
+                            "status": "skipped",
+                            "offer_id": item.get("offer_id"),
+                            "errors": [],
+                        }
+                        for item in self.imported_items
+                    ],
+                }
+
+            def get_product_state_by_offer_id(self, offer_id: str) -> dict:
+                return {
+                    "offer_id": offer_id,
+                    "product_id": 5763448787,
+                    "sku": 5301617949,
+                    "is_created": True,
+                    "validation_status": "success",
+                    "errors": [
+                        {
+                            "code": "BR_hashtag_validation",
+                            "level": "warning",
+                        }
+                    ],
+                }
+
+        run_id, seed = self.prepare_supplier_review_run()
+        ozon_result = self.repo.load_ozon_collection_result(run_id)
+        ozon_result["ozon_candidates"][0]["attributes"]["Цвет"] = "белый"
+        self.repo.save_ozon_collection_result(run_id, ozon_result)
+        self.attach_locked_subject_master(run_id, seed.seed_id)
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+        service = WorkbenchService(
+            self.repo,
+            seller_api_adapter=SkippedCreatedAdapter(),
+        )
+        self.assertTrue(
+            service.confirm_pricing_evidence(
+                run_id,
+                self.pricing_input_payload(seed.seed_id),
+            ).ok
+        )
+        preview = service.preview_product_upload(run_id, seed.seed_id)
+        self.assertTrue(preview.ok, preview.to_dict())
+        submitted = service.submit_product_upload(
+            run_id,
+            seed.seed_id,
+            confirmation_token=preview.data["confirmation_token"],
+        )
+        self.assertTrue(submitted.ok, submitted.to_dict())
+
+        accepted = service.refresh_product_upload_status(run_id, seed.seed_id)
+
+        self.assertTrue(accepted.ok, accepted.to_dict())
+        self.assertEqual("accepted_by_ozon", accepted.data["status"])
+        self.assertEqual(
+            5763448787,
+            accepted.data["seller_product_state"]["product_id"],
+        )
+        self.assertIn("image_task_package_id", accepted.data)
+
+    def test_skipped_import_with_final_density_error_is_failed(self) -> None:
+        class SkippedFailedAdapter(FakeSellerApiAdapter):
+            def get_product_import_info(self, task_id: int) -> dict:
+                return {
+                    "task_id": task_id,
+                    "items": [
+                        {
+                            "status": "skipped",
+                            "offer_id": item.get("offer_id"),
+                            "errors": [],
+                        }
+                        for item in self.imported_items
+                    ],
+                }
+
+            def get_product_state_by_offer_id(self, offer_id: str) -> dict:
+                return {
+                    "offer_id": offer_id,
+                    "product_id": 5763454848,
+                    "sku": 0,
+                    "is_created": False,
+                    "validation_status": "pending",
+                    "errors": [
+                        {
+                            "code": "INCORRECT_DENSITY",
+                            "level": "error",
+                        }
+                    ],
+                }
+
+        run_id, seed = self.prepare_supplier_review_run()
+        ozon_result = self.repo.load_ozon_collection_result(run_id)
+        ozon_result["ozon_candidates"][0]["attributes"]["Цвет"] = "белый"
+        self.repo.save_ozon_collection_result(run_id, ozon_result)
+        self.attach_locked_subject_master(run_id, seed.seed_id)
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+        service = WorkbenchService(
+            self.repo,
+            seller_api_adapter=SkippedFailedAdapter(),
+        )
+        self.assertTrue(
+            service.confirm_pricing_evidence(
+                run_id,
+                self.pricing_input_payload(seed.seed_id),
+            ).ok
+        )
+        preview = service.preview_product_upload(run_id, seed.seed_id)
+        self.assertTrue(preview.ok, preview.to_dict())
+        submitted = service.submit_product_upload(
+            run_id,
+            seed.seed_id,
+            confirmation_token=preview.data["confirmation_token"],
+        )
+        self.assertTrue(submitted.ok, submitted.to_dict())
+
+        failed = service.refresh_product_upload_status(run_id, seed.seed_id)
+
+        self.assertTrue(failed.ok, failed.to_dict())
+        self.assertEqual("failed", failed.data["status"])
+        self.assertNotIn("image_task_package_id", failed.data)
+
+    def test_upload_page_separates_blocking_errors_from_warnings_and_optional_gaps(
+        self,
+    ) -> None:
+        html = build_upload_workspace_html("wb-diagnostic-layering")
+
+        self.assertIn("sellerUploadDiagnostics", html)
+        self.assertIn("ERROR_LEVEL_WARNING", html)
+        self.assertIn("non-blocking-warning", html)
+        self.assertIn("optional-evidence-gap", html)
+        self.assertIn("不阻止上传", html)
+        self.assertIn("pricing_validation_errors", html)
+        self.assertIn("包装重量或尺寸不符合 Ozon 密度范围", html)
+
     def test_product_upload_preview_builds_only_the_requested_product_draft(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
         ozon_result = self.repo.load_ozon_collection_result(run_id)
@@ -5045,6 +5946,49 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             "900",
             [field["field_key"] for field in item_before["missing_required_fields"]],
         )
+        self.assertEqual([], item_before["manual_required_fields"])
+
+        pending_save = service.save_required_attribute_evidence(
+            run_id,
+            seed.seed_id,
+            {"900": "1 год"},
+        )
+        self.assertFalse(pending_save.ok)
+
+        self.repo.save_generated_content_result(
+            run_id,
+            {
+                "schema_version": 2,
+                "run_id": run_id,
+                "items": {
+                    seed.seed_id: {
+                        "status": "blocked",
+                        "field_results": {
+                            "85": {
+                                "decision": "filled",
+                                "value": "белый",
+                                "evidence_refs": ["ozon.attributes.Цвет"],
+                                "reason": "Цвет подтвержден собранными данными.",
+                            },
+                            "900": {
+                                "decision": "unresolved",
+                                "resolution_class": "source_fact_missing",
+                                "evidence_refs": [],
+                                "reason": "Гарантия отсутствует в собранных данных.",
+                            },
+                        },
+                    }
+                },
+            },
+        )
+        after_skill = service.upload_workspace(run_id)
+        self.assertEqual(
+            ["900"],
+            [
+                field["field_key"]
+                for field in after_skill.data["items"][0]["manual_required_fields"]
+            ],
+        )
 
         rejected = service.save_required_attribute_evidence(
             run_id,
@@ -5054,7 +5998,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         saved = service.save_required_attribute_evidence(
             run_id,
             seed.seed_id,
-            {"85": "белый", "900": "1 год"},
+            {"900": "1 год"},
         )
         after = service.upload_workspace(run_id)
 
@@ -5082,8 +6026,18 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             {
                 "attribute_id": "901",
                 "attribute_label": "Нужен код маркировки",
-                "attribute_type": "dictionary",
-                "dictionary_id": 9010,
+                "attribute_type": "Boolean",
+                "is_required": False,
+                "schema_source": (
+                    "ozon_seller_api_description_category_attribute"
+                ),
+            }
+        )
+        template_result["seed_templates"][0]["upload_attribute_schema"].append(
+            {
+                "attribute_id": "902",
+                "attribute_label": "Подпись 18+",
+                "attribute_type": "Boolean",
                 "is_required": False,
                 "schema_source": (
                     "ozon_seller_api_description_category_attribute"
@@ -5092,6 +6046,9 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         )
         self.repo.save_attribute_template_result(run_id, template_result)
         service = WorkbenchService(self.repo)
+        upload_html = build_upload_workspace_html(run_id)
+        self.assertIn("需要标记代码", upload_html)
+        self.assertIn("商品需要 18+ 标识", upload_html)
 
         before = service.upload_workspace(run_id)
 
@@ -5106,13 +6063,46 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             "ozon_compliance_decision",
             missing["901"]["required_reason"],
         )
+        self.assertEqual(
+            "ozon_compliance_decision",
+            missing["902"]["required_reason"],
+        )
         self.assertIn("required_attributes", item_before["blocking_gates"])
-        self.assertEqual(2, item_before["required_attribute_count"])
+        self.assertEqual(3, item_before["required_attribute_count"])
+        self.assertEqual(
+            ["901", "902"],
+            [
+                field["field_key"]
+                for field in item_before["manual_required_fields"]
+            ],
+        )
+        self.assertEqual(
+            [False, True],
+            item_before["manual_required_fields"][0]["allowed_values"],
+        )
+        self.assertEqual(
+            [False, True],
+            item_before["manual_required_fields"][1]["allowed_values"],
+        )
+        tasks = service.content_tasks(run_id)
+        self.assertTrue(tasks.ok, tasks.to_dict())
+        task_field_keys = {
+            field["field_key"]
+            for item in tasks.data["items"]
+            for field in item["field_tasks"]
+        }
+        self.assertTrue(
+            {"901", "902"}.isdisjoint(task_field_keys),
+            (
+                "compliance decisions must remain user-owned instead of being "
+                "sent to the field drafting Skill"
+            ),
+        )
 
         saved = service.save_required_attribute_evidence(
             run_id,
             seed.seed_id,
-            {"901": "Нет"},
+            {"901": "false", "902": "true"},
         )
         after = service.upload_workspace(run_id)
 
@@ -5123,7 +6113,8 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             field["field_key"]: field
             for field in item_after["attribute_mapping"]
         }
-        self.assertEqual("Нет", mapped["901"]["value"])
+        self.assertIs(False, mapped["901"]["value"])
+        self.assertIs(True, mapped["902"]["value"])
         self.assertEqual(
             "user_confirmed_required_attribute",
             mapped["901"]["source"],
@@ -5132,6 +6123,43 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             "901",
             [field["field_key"] for field in item_after["missing_required_fields"]],
         )
+        self.assertNotIn(
+            "902",
+            [field["field_key"] for field in item_after["missing_required_fields"]],
+        )
+
+    def test_seller_api_attribute_serializes_boolean_values_for_ozon(self) -> None:
+        for stored_value, seller_value in (
+            (False, "false"),
+            (True, "true"),
+            ("false", "false"),
+            ("true", "true"),
+        ):
+            with self.subTest(stored_value=stored_value):
+                attribute = _seller_api_attribute(
+                    {
+                        "attribute_id": "901",
+                        "attribute_type": "Boolean",
+                        "value": stored_value,
+                    }
+                )
+
+                self.assertEqual(
+                    {
+                        "complex_id": 0,
+                        "id": 901,
+                        "values": [{"value": seller_value}],
+                    },
+                    attribute,
+                )
+        with self.assertRaisesRegex(ValueError, "requires true or false"):
+            _seller_api_attribute(
+                {
+                    "attribute_id": "901",
+                    "attribute_type": "Boolean",
+                    "value": "Нет",
+                }
+            )
 
     def test_batch_upload_requires_confirmation_and_submits_ready_product(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
@@ -5269,11 +6297,9 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         )
         first_slot = queue.list_slots(job["job_id"])[0]
         Image.new("RGB", (800, 800), "navy").save(first_slot["accepted_path"])
-        publisher = FakePublicMediaPublisher()
         service = WorkbenchService(
             self.repo,
             seller_api_adapter=FakeSellerApiAdapter(),
-            public_media_publisher=publisher,
         )
         self.assertTrue(
             service.confirm_pricing_evidence(
@@ -5281,12 +6307,6 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
                 self.pricing_input_payload(seed.seed_id),
             ).ok
         )
-        self.assertTrue(
-            service.configure_public_media_base_url(
-                "https://media.example.test"
-            ).ok
-        )
-
         preview = service.preview_product_upload(run_id, seed.seed_id)
 
         self.assertTrue(preview.ok, preview.to_dict())
@@ -5294,40 +6314,6 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             [f"https://cbu01.alicdn.com/img/ibank/{seed.seed_id}.jpg"],
             preview.data["seller_api_item"]["images"],
         )
-        self.assertEqual([], publisher.published_products)
-
-    def test_product_upload_does_not_call_public_media_publisher(self) -> None:
-        run_id, seed = self.prepare_supplier_review_run()
-        ozon_result = self.repo.load_ozon_collection_result(run_id)
-        ozon_result["ozon_candidates"][0]["attributes"]["Цвет"] = "белый"
-        self.repo.save_ozon_collection_result(run_id, ozon_result)
-        self.attach_completed_image_job(run_id, seed.seed_id)
-        self.prepare_pricing_sources(run_id, seed.seed_id)
-        adapter = FakeSellerApiAdapter()
-        publisher = FakePublicMediaPublisher()
-        publisher.failure = RuntimeError("public image returned HTTP 404")
-        service = WorkbenchService(
-            self.repo,
-            seller_api_adapter=adapter,
-            public_media_publisher=publisher,
-        )
-        self.assertTrue(
-            service.confirm_pricing_evidence(
-                run_id,
-                self.pricing_input_payload(seed.seed_id),
-            ).ok
-        )
-        self.assertTrue(
-            service.configure_public_media_base_url(
-                "https://media.example.test"
-            ).ok
-        )
-
-        preview = service.preview_product_upload(run_id, seed.seed_id)
-
-        self.assertTrue(preview.ok, preview.to_dict())
-        self.assertEqual([], publisher.published_products)
-        self.assertEqual([], adapter.imported_items)
 
     def test_failed_ozon_submission_can_be_reprepared_and_retried(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
@@ -5337,21 +6323,14 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.attach_completed_image_job(run_id, seed.seed_id)
         self.prepare_pricing_sources(run_id, seed.seed_id)
         adapter = FakeSellerApiAdapter()
-        publisher = FakePublicMediaPublisher()
         service = WorkbenchService(
             self.repo,
             seller_api_adapter=adapter,
-            public_media_publisher=publisher,
         )
         self.assertTrue(
             service.confirm_pricing_evidence(
                 run_id,
                 self.pricing_input_payload(seed.seed_id),
-            ).ok
-        )
-        self.assertTrue(
-            service.configure_public_media_base_url(
-                "https://media.example.test"
             ).ok
         )
         preview = service.preview_product_upload(run_id, seed.seed_id)
@@ -5409,180 +6388,16 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn("批量校验并上传可用商品", page)
         self.assertIn("batchUploadProducts", page)
         self.assertIn("/product-upload/batch", page)
-        self.assertIn("补充缺失必填字段", page)
+        self.assertIn("补充技能无法确认的必填字段", page)
         self.assertIn("保存必填证据", page)
         self.assertIn("/required-attributes/", page)
 
-    def test_temu_lane_requires_preview_hash_and_is_idempotent(self) -> None:
-        run_id, seed = self.prepare_supplier_review_run()
-        ozon_result = self.repo.load_ozon_collection_result(run_id)
-        ozon_result["ozon_candidates"][0]["attributes"]["Цвет"] = "белый"
-        self.repo.save_ozon_collection_result(run_id, ozon_result)
-        subject = self.attach_locked_subject_master(run_id, seed.seed_id)
-        self.prepare_pricing_sources(run_id, seed.seed_id)
-        temu_api = FakeTemuSellerApi()
-        service = WorkbenchService(
-            self.repo,
-            seller_api_adapter=FakeSellerApiAdapter(),
-            temu_seller_api=temu_api,
-        )
-        pricing = service.confirm_pricing_evidence(
-            run_id,
-            self.pricing_input_payload(seed.seed_id),
-        )
-        self.assertTrue(pricing.ok, pricing.to_dict())
-
-        preview = service.preview_temu_product_upload(run_id, seed.seed_id)
-
-        self.assertTrue(preview.ok, preview.to_dict())
-        self.assertEqual(64, len(preview.data["preview_hash"]))
-        self.assertTrue(preview.data["requires_explicit_confirmation"])
-        request = preview.data["temu_request"]
-        self.assertEqual(
-            subject["source_image_url"],
-            request["goodsBasic"]["goodsCarouselImage"][0],
-        )
-        self.assertEqual("CNY", request["skuList"][0]["price"]["basePrice"]["currency"])
-        self.assertEqual("380", request["skuList"][0]["packageInfo"]["weight"])
-        self.assertEqual([], temu_api.published_requests)
-
-        missing_confirmation = service.submit_temu_product_upload(
-            run_id,
-            seed.seed_id,
-            preview_hash=preview.data["preview_hash"],
-            confirmed=False,
-        )
-        mismatched = service.submit_temu_product_upload(
-            run_id,
-            seed.seed_id,
-            preview_hash="wrong-hash",
-            confirmed=True,
-        )
-
-        self.assertFalse(missing_confirmation.ok)
-        self.assertFalse(mismatched.ok)
-        self.assertEqual([], temu_api.published_requests)
-
-        submitted = service.submit_temu_product_upload(
-            run_id,
-            seed.seed_id,
-            preview_hash=preview.data["preview_hash"],
-            confirmed=True,
-        )
-        repeated = service.submit_temu_product_upload(
-            run_id,
-            seed.seed_id,
-            preview_hash=preview.data["preview_hash"],
-            confirmed=True,
-        )
-
-        self.assertTrue(submitted.ok, submitted.to_dict())
-        self.assertTrue(repeated.ok, repeated.to_dict())
-        self.assertEqual("temu_product_upload.already_submitted", repeated.code)
-        self.assertEqual(1, len(temu_api.published_requests))
-        self.assertEqual(
-            "608573962731830",
-            str(submitted.data["goods_id"]),
-        )
-
-        refreshed = service.refresh_temu_product_upload_status(
-            run_id,
-            seed.seed_id,
-        )
-
-        self.assertTrue(refreshed.ok, refreshed.to_dict())
-        self.assertEqual("published", refreshed.data["status"])
-        self.assertEqual(["608573962731830"], temu_api.status_queries)
-        reloaded = service.upload_workspace(run_id).data["items"][0]
-        self.assertEqual(
-            preview.data["preview_hash"],
-            reloaded["temu_upload_preview"]["preview_hash"],
-        )
-        self.assertEqual(
-            "published",
-            reloaded["temu_upload_submission"]["status"],
-        )
-        self.assertTrue(
-            (self.repo.run_dir(run_id) / "temu_upload_previews.json").exists()
-        )
-        self.assertTrue(
-            (self.repo.run_dir(run_id) / "temu_upload_submissions.json").exists()
-        )
-
-    def test_temu_lane_persists_readable_publish_failure(self) -> None:
-        run_id, seed = self.prepare_supplier_review_run()
-        ozon_result = self.repo.load_ozon_collection_result(run_id)
-        ozon_result["ozon_candidates"][0]["attributes"]["Цвет"] = "белый"
-        self.repo.save_ozon_collection_result(run_id, ozon_result)
-        self.attach_locked_subject_master(run_id, seed.seed_id)
-        self.prepare_pricing_sources(run_id, seed.seed_id)
-        temu_api = FakeTemuSellerApi()
-        temu_api.publish_error = TemuSellerApiError(
-            "Temu Partner API error 300001: invalid package dimensions."
-        )
-        service = WorkbenchService(
-            self.repo,
-            seller_api_adapter=FakeSellerApiAdapter(),
-            temu_seller_api=temu_api,
-        )
-        self.assertTrue(
-            service.confirm_pricing_evidence(
-                run_id,
-                self.pricing_input_payload(seed.seed_id),
-            ).ok
-        )
-        preview = service.preview_temu_product_upload(run_id, seed.seed_id)
-
-        failed = service.submit_temu_product_upload(
-            run_id,
-            seed.seed_id,
-            preview_hash=preview.data["preview_hash"],
-            confirmed=True,
-        )
-
-        self.assertFalse(failed.ok)
-        self.assertEqual("failed", failed.data["status"])
-        self.assertIn(
-            "invalid package dimensions",
-            failed.data["last_error"]["message"],
-        )
-        saved = self.repo.load_temu_upload_submissions(run_id)["items"][
-            seed.seed_id
-        ]
-        self.assertEqual("failed", saved["status"])
-        self.assertNotIn("access_token", json.dumps(saved))
-
-    def test_temu_upload_page_exposes_independent_official_api_controls(self) -> None:
-        run_id, _seed = self.prepare_supplier_review_run()
-
-        page = self.get_text(f"/batches/{run_id}/upload")
-
-        self.assertIn("Temu 官方 API", page)
-        self.assertIn("previewTemuProductUpload", page)
-        self.assertIn("confirmTemuProductUpload", page)
-        self.assertIn("pollTemuProductUploadStatus", page)
-        self.assertIn("/temu-product-upload/", page)
-        self.assertIn("确认提交到 Temu", page)
-        self.assertIn("预览哈希", page)
-        self.assertIn("confirmed:true", page)
-
-    def test_public_media_base_url_rejects_localhost_and_persists_public_https(self) -> None:
+    def test_public_media_configuration_is_not_a_user_setting(self) -> None:
         service = WorkbenchService(self.repo)
 
-        rejected = service.configure_public_media_base_url(
-            "http://127.0.0.1:8765"
-        )
-        accepted = service.configure_public_media_base_url(
-            "https://media.example.test/ozon-v2"
-        )
-
-        self.assertFalse(rejected.ok)
-        self.assertTrue(accepted.ok, accepted.to_dict())
-        self.assertEqual(
-            "https://media.example.test/ozon-v2",
-            self.repo.load_public_media_settings()["base_url"],
-        )
-        self.assertTrue(service.public_media_configuration()["ready"])
+        self.assertFalse(hasattr(service, "configure_public_media_base_url"))
+        self.assertFalse(hasattr(service, "public_media_configuration"))
+        self.assertFalse(hasattr(self.repo, "load_public_media_settings"))
 
     def test_refresh_attribute_template_replaces_only_the_mismatched_product(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
@@ -5766,13 +6581,14 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
 
     def test_browser_bridge_heartbeat_status_is_visible(self) -> None:
         self.repo.browser_bridge_status_path.unlink(missing_ok=True)
+        run_id = self.repo.create_workbench_batch_record(target_count=1)["run_id"]
         before = self.get_json("/api/browser-bridge/status")
 
         saved = self.post_json(
             "/api/browser-bridge/heartbeat",
             {
                 "source": "workbench_content_script",
-                "run_id": "wb-test",
+                "run_id": run_id,
                 "task_type": "ozon_attribute_template",
                 "stage": "task_ready",
                 "code": "browser_task.attribute_template_ready",
@@ -5787,8 +6603,29 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertTrue(saved["ok"])
         self.assertTrue(after["data"]["online"])
         self.assertEqual("workbench_content_script", after["data"]["source"])
-        self.assertEqual("wb-test", after["data"]["run_id"])
+        self.assertEqual(run_id, after["data"]["run_id"])
         self.assertEqual("task_ready", after["data"]["stage"])
+
+    def test_browser_bridge_heartbeat_discards_deleted_batch_reference(self) -> None:
+        saved = self.post_json(
+            "/api/browser-bridge/heartbeat",
+            {
+                "source": "workbench_content_script",
+                "run_id": "wb-deleted-batch",
+                "task_type": "ozon_attribute_template",
+                "stage": "task_ready",
+                "code": "browser_task.attribute_template_ready",
+                "message": "Task is ready.",
+                "extension_version": self.required_extension_version(),
+            },
+        )
+        status = self.get_json("/api/browser-bridge/status")
+
+        self.assertTrue(saved["ok"])
+        self.assertIsNone(status["data"]["run_id"])
+        self.assertIsNone(status["data"]["task_type"])
+        self.assertEqual("stale_task_ignored", status["data"]["stage"])
+        self.assertEqual("browser_task.stale_ignored", status["data"]["code"])
 
     def test_bridge_status_reports_loaded_required_and_ready_versions(self) -> None:
         required = self.required_extension_version()
@@ -5991,7 +6828,8 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertNotEqual(rejected_seed.seed_id, replacement.seed_id)
         self.assertIn("browser_candidate.exhausted", event_types)
         self.assertIn("seed_sampling.replaced_after_exhaustion", event_types)
-        self.assertEqual(5000, len(self.repo.load_active_seeds()))
+        self.assertEqual(4999, len(self.repo.load_active_seeds()))
+        self.assertIn(self.repo.seed_identity_key(replacement), self.repo.load_used_seed_identity_keys())
         progress = self.get_json(f"/api/batches/{run_id}")["data"]["progress"]["ozon_collection_progress"]
         self.assertEqual(0, progress["replacement_count"])
         self.assertEqual(0, progress["failure_count"])
@@ -6036,7 +6874,8 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn("seed_sampling.replaced_after_exhaustion", event_types)
         self.assertEqual(1, event_types.count("browser_candidate.replaced"))
         self.assertNotIn("browser_candidate.failed", event_types)
-        self.assertEqual(5000, len(self.repo.load_active_seeds()))
+        self.assertEqual(4999, len(self.repo.load_active_seeds()))
+        self.assertIn(self.repo.seed_identity_key(replacement), self.repo.load_used_seed_identity_keys())
 
         self.post_json(
             "/api/browser-bridge/heartbeat",
@@ -6296,6 +7135,18 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         return result
 
     def post_json(self, path: str, payload: dict, ok: bool = True) -> dict:
+        supplier_capture_match = re.fullmatch(
+            r"/api/batches/([^/]+)/supplier-selection/capture",
+            path,
+        )
+        if supplier_capture_match and "dispatch_token" not in payload:
+            task = self.get_json(
+                f"/api/batches/{supplier_capture_match.group(1)}/browser-task"
+            )
+            payload = {
+                **payload,
+                "dispatch_token": task["data"]["dispatch_token"],
+            }
         request = Request(
             self.base_url + path,
             data=json.dumps(payload).encode("utf-8"),

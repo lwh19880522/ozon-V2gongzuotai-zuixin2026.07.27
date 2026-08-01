@@ -20,6 +20,9 @@ _STANDARD_CHANNEL_CODES = {
     "premium_big_standard",
 }
 
+OZON_MIN_PACKAGE_DENSITY_KG_M3 = Decimal("1.293")
+OZON_MAX_PACKAGE_DENSITY_KG_M3 = Decimal("13546")
+
 
 def _decimal(value: Any, field_name: str) -> Decimal:
     try:
@@ -64,7 +67,7 @@ class PricingInput:
         package_height_cm: Any,
         target_margin_rate: Any,
     ) -> "PricingInput":
-        return cls(
+        parsed = cls(
             purchase_price_cny=_positive(
                 purchase_price_cny, "purchase_price_cny"
             ),
@@ -79,6 +82,26 @@ class PricingInput:
                 target_margin_rate, "target_margin_rate"
             ),
         )
+        density = package_density_kg_m3(
+            weight_g=parsed.package_weight_g,
+            length_cm=parsed.package_length_cm,
+            width_cm=parsed.package_width_cm,
+            height_cm=parsed.package_height_cm,
+        )
+        if not (
+            OZON_MIN_PACKAGE_DENSITY_KG_M3
+            <= density
+            <= OZON_MAX_PACKAGE_DENSITY_KG_M3
+        ):
+            raise ValueError(
+                "package density "
+                f"{density.quantize(Decimal('0.001'))} kg/m3 is outside "
+                "the Ozon range "
+                f"{OZON_MIN_PACKAGE_DENSITY_KG_M3}-"
+                f"{OZON_MAX_PACKAGE_DENSITY_KG_M3} kg/m3; verify package "
+                "weight and all three package dimensions."
+            )
+        return parsed
 
     def to_dict(self) -> dict[str, str]:
         return {
@@ -90,6 +113,22 @@ class PricingInput:
             "package_height_cm": str(self.package_height_cm),
             "target_margin_rate": str(self.target_margin_rate),
         }
+
+
+def package_density_kg_m3(
+    *,
+    weight_g: Number,
+    length_cm: Number,
+    width_cm: Number,
+    height_cm: Number,
+) -> Decimal:
+    parsed_weight = _positive(weight_g, "package_weight_g")
+    volume_cm3 = (
+        _positive(length_cm, "package_length_cm")
+        * _positive(width_cm, "package_width_cm")
+        * _positive(height_cm, "package_height_cm")
+    )
+    return parsed_weight * Decimal("1000") / volume_cm3
 
 
 @dataclass(frozen=True)

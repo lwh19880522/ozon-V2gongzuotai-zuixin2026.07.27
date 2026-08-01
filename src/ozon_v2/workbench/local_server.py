@@ -15,8 +15,6 @@ from urllib.parse import urlparse
 from ozon_v2.adapters.fs_repo import FsRepo
 from ozon_v2.app.result import Result
 from ozon_v2.domain.models import utc_now_iso
-from ozon_v2.images.queue import REGULAR_IMAGE_WORKER_IDS
-from ozon_v2.platforms.temu.seller_api import TemuSellerApi
 from ozon_v2.services.credential_service import CredentialService
 from ozon_v2.services.diagnostics_export_service import DiagnosticsExportService
 from ozon_v2.services.workbench_service import WorkbenchService
@@ -1744,20 +1742,21 @@ def build_supplier_review_html(run_id: str) -> str:
     function renderSupplierSkuCandidate(candidate, context) {{
       const option = candidate.option;
       const label = document.createElement("label"); label.className = "sku-option";
+      if (context.readOnly) label.classList.add("blocked");
       if (context.analysis.recommendedSkuId === option.supplier_sku_id) label.classList.add("recommended");
       const radio = document.createElement("input"); radio.type = "radio"; radio.name = "supplierSku"; radio.value = option.supplier_sku_id || "";
-      radio.checked = (!!context.lockedSku && context.lockedSku.supplier_sku_id === option.supplier_sku_id)
+      radio.checked = !context.readOnly && ((!!context.lockedSku && context.lockedSku.supplier_sku_id === option.supplier_sku_id)
         || (!context.receipt && (context.selectedSupplierSkuId
           ? context.selectedSupplierSkuId === option.supplier_sku_id
-          : context.singlePageSku || context.analysis.recommendedSkuId === option.supplier_sku_id));
-      radio.disabled = !!context.receipt;
+          : context.singlePageSku || context.analysis.recommendedSkuId === option.supplier_sku_id)));
+      radio.disabled = !!context.receipt || context.readOnly === true;
       radio.addEventListener("change", updateSkuLockButton);
       const main = document.createElement("div"); main.className = "sku-option-main";
       const imageUrl = Array.isArray(option.image_urls) ? String(option.image_urls[0] || "") : "";
-      if (imageUrl) {{
-        const fallbackUrls = [imageUrl, ...(context.supplierFallbackImages || [])]
-          .map((value) => String(value || "").trim())
-          .filter((value, index, values) => value && values.indexOf(value) === index);
+      const fallbackUrls = [imageUrl, ...(context.supplierFallbackImages || [])]
+        .map((value) => String(value || "").trim())
+        .filter((value, index, values) => value && values.indexOf(value) === index);
+      if (fallbackUrls.length) {{
         let fallbackIndex = 0;
         const image = document.createElement("img"); image.className = "sku-option-image"; image.src = fallbackUrls[0]; image.alt = option.raw_label || "1688 SKU"; image.loading = "lazy"; image.referrerPolicy = "no-referrer";
         image.addEventListener("error", () => {{
@@ -1774,6 +1773,13 @@ def build_supplier_review_html(run_id: str) -> str:
         main.classList.add("no-image");
       }}
       const copy = document.createElement("div");
+      if (context.readOnly) {{
+        const badge = document.createElement("span"); badge.className = "sku-badge"; badge.textContent = "已识别但不可锁定"; copy.append(badge);
+        const mediaNote = document.createElement("span"); mediaNote.className = "sku-comparison"; mediaNote.textContent = imageUrl
+          ? "SKU 证据仍不完整"
+          : "无 SKU 专属图；下方仅显示公共商品图";
+        copy.append(mediaNote);
+      }}
       if (context.analysis.recommendedSkuId === option.supplier_sku_id) {{
         const badge = document.createElement("span"); badge.className = "sku-badge"; badge.textContent = "建议选择 (Recommended)"; copy.append(badge);
       }}
@@ -1832,6 +1838,19 @@ def build_supplier_review_html(run_id: str) -> str:
       return stageAllowsRecapture
         && !item.supplier_sku_selection
         && !item.subject_master;
+    }}
+
+    function candidateOnlyMissingSkuImage(candidate) {{
+      const allowed = new Set([
+        "SKU-bound image_urls are required",
+        "complete supplier SKU evidence is required",
+      ]);
+      const errors = Array.isArray(candidate && candidate.validation_errors)
+        ? candidate.validation_errors
+        : [];
+      return !!String(candidate && candidate.supplier_sku_id || "").trim()
+        && errors.length > 0
+        && errors.every((error) => allowed.has(String(error)));
     }}
 
     function updateSkuLockButton() {{
@@ -1915,6 +1934,7 @@ def build_supplier_review_html(run_id: str) -> str:
       optionsRoot.dataset.seedId = String(item.seed_id || "");
       subjectRoot.dataset.seedId = String(item.seed_id || "");
       const options = item.supplier_sku_options || [];
+      const blockedOptions = item.supplier_sku_candidates || [];
       const skuGroups = item.supplier_sku_groups || [];
       const receipt = item.supplier_sku_selection || null;
       const lockedSku = receipt && receipt.supplier_sku ? receipt.supplier_sku : null;
@@ -1924,6 +1944,9 @@ def build_supplier_review_html(run_id: str) -> str:
       const skuNeedsConfirmation = !!item.supplier_product && !options.length && !receipt;
       const singlePageSku = isPageUniqueSupplierSku(item, options);
       const analysis = analyzeSupplierSkuOptions(item, options);
+      const blockedAnalysis = analyzeSupplierSkuOptions(item, blockedOptions);
+      const candidatesOnlyMissingImages = blockedOptions.length > 0
+        && blockedOptions.every(candidateOnlyMissingSkuImage);
       $("skuDecisionContext").textContent = `${{state.evidenceIndex + 1}} / ${{state.items.length}} · ${{item.ozon_title || item.seed_id}}`;
       $("skuDecisionStatus").textContent = subjectMaster
         ? "主体已锁定 (Subject Locked)"
@@ -1944,7 +1967,9 @@ def build_supplier_review_html(run_id: str) -> str:
       const matchingCandidates = analysis.candidates.filter((candidate) => strongestScore > 0 && candidate.score === strongestScore);
       const otherCandidates = analysis.candidates.filter((candidate) => !matchingCandidates.includes(candidate));
       const modeNote = document.createElement("div"); modeNote.className = "sku-mode-note";
-      modeNote.textContent = singlePageSku
+      modeNote.textContent = !options.length && blockedOptions.length
+        ? `已识别 ${{blockedOptions.length}} 个真实 SKU，但证据不完整，当前不可锁定。公共商品图仅供核对。`
+        : singlePageSku
         ? "页面只有一个真实 SKU，无需选择规格；请核对商品和数量后确认。"
         : matchingCandidates.length > 1
           ? `已根据 Ozon 标题和属性收窄为 ${{matchingCandidates.length}} 项；只需判断剩余差异，其他 ${{otherCandidates.length}} 项已折叠。`
@@ -1991,6 +2016,19 @@ def build_supplier_review_html(run_id: str) -> str:
         renderSupplierSkuGroup(otherRoot, matchingCandidates.length ? "其他未匹配规格" : "全部真实规格", hiddenCandidates, candidateContext);
         otherDetails.append(summary, otherRoot); candidatesRoot.append(otherDetails);
       }}
+      if (blockedOptions.length) {{
+        const blockedContext = {{
+          ...candidateContext,
+          analysis: blockedAnalysis,
+          readOnly: true,
+        }};
+        renderSupplierSkuGroup(
+          candidatesRoot,
+          `已识别但不可锁定（${{blockedOptions.length}}）`,
+          blockedAnalysis.candidates,
+          blockedContext,
+        );
+      }}
       optionsRoot.append(candidatesRoot);
       if (!options.length) {{
         const visibleGroups = skuGroups
@@ -2002,7 +2040,7 @@ def build_supplier_review_html(run_id: str) -> str:
           .filter(Boolean)
           .join("\\n");
         candidatesRoot.append(field("可见规格组 (Visible SKU Groups)", visibleGroups || null));
-        if (canRecaptureSupplier(item)) {{
+        if (!candidatesOnlyMissingImages && canRecaptureSupplier(item)) {{
           const recaptureSkuButton = document.createElement("button");
           recaptureSkuButton.type = "button";
           recaptureSkuButton.className = "secondary-button";
@@ -2015,6 +2053,8 @@ def build_supplier_review_html(run_id: str) -> str:
       $("skuDecisionMessage").className = receipt ? "success" : "muted";
       $("skuDecisionMessage").textContent = receipt
         ? "真实供应商 SKU 已锁定，后续采购、标题、属性和图片均以此为准。"
+        : candidatesOnlyMissingImages
+          ? "已识别真实 SKU，但 1688 未提供 SKU 专属图；公共商品图已展示供核对，系统不会放宽锁定门禁，也无需反复重新采集。"
         : skuNeedsConfirmation
           ? "商品公开证据已采集；完整 SKU 矩阵未解析，已转入用户确认门禁，不会伪造 SKU。"
           : singlePageSku
@@ -2439,30 +2479,22 @@ def build_supplier_review_html(run_id: str) -> str:
 </html>"""
 
 
-def build_image_controller_command(run_id: str) -> str:
-    worker_ids = "、".join(REGULAR_IMAGE_WORKER_IDS)
+def build_image_generation_command(run_id: str) -> str:
     return (
-        f"\u542f\u52a8 Ozon V2 \u751f\u56fe\u603b\u63a7\uff1a\u6279\u6b21 {run_id}\u3002"
-        "读取并严格执行工作区技能 skills/ozon-image-generation-controller/SKILL.md。"
-        "工作台只提供队列、证据和结果回写承载。"
-        "使用全局固定 10 个可见 Codex 生图工作任务，按槽位 01-10 顺序复用；"
-        f"稳定槽位为：{worker_ids}。"
-        "每个任务一次只负责一件商品，最多同时处理 10 件商品，总控任务不计入上限；"
-        "新商品复用空闲任务，返修优先回到原任务，不得为商品自动新建或替换任务；"
-        "只有用户明确要求“重新开新的任务”时，才允许替换指定槽位。"
-        "manual_review_required 只暂停对应商品，必须跳过该商品并继续派发其他 pending 或含 repair_pending 的商品；"
-        "未锁定 SKU 或主体证据只阻塞对应商品，不得阻塞其他已经入队的商品；"
-        "stopped 商品不阻塞其他商品，不得自动恢复 stopped 商品；"
-        "已验签 accepted 槽位的显示元数据异常不得停止整件商品；以冻结回执哈希、文件哈希和 visual_spec 为准，保留该槽位并继续所有 pending 槽位。只有文件或回执验签失败且无法隔离时才允许停止该商品；"
-        "每张图片验收成功后立即幂等回写，不得等八张全部完成后一次性回写；"
-        "持续处理当前批次，直到没有可调度的 pending 或 repair_pending 商品、发生影响全部剩余任务的系统级故障，或用户明确停止批次；"
-        "不得上传、发布、最终审批或修改业务代码。"
+        f"启动 Ozon V2 工作台专用生图：批次 {run_id}。"
+        "读取并严格执行 skills/ozon-product-media-generator/SKILL.md；这是唯一生图技能入口。"
+        "自动启动免费公网媒体通道，不要求用户提供域名、账户、令牌或公网地址。"
+        "全程单线程，一次只处理一件商品；先生成并锁定白底主体图，冻结路径和哈希。"
+        "随后只把这同一张白底主体图作为唯一图片参考，结合固定提示词一次生成 4×2 八宫格，"
+        "再按行优先裁成 8 张严格 3:4 图片。主体外形、颜色、数量、结构、配件和规格不得改变。"
+        "逐图验收、只返修失败槽位，完成图库与视频上传后再领取下一件商品。"
+        "持续到 pending=0 且 in_progress=0，最后关闭临时公网通道。"
     )
 
 
 def build_image_workspace_html(run_id: str) -> str:
     safe_run_id = json.dumps(run_id)
-    controller_command = build_image_controller_command(run_id)
+    controller_command = build_image_generation_command(run_id)
     controller_command_html = html.escape(controller_command)
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -2624,10 +2656,10 @@ def build_image_workspace_html(run_id: str) -> str:
             <div class="gate-row"><span class="gate-icon">2</span><div><strong>供应商原图 (Supplier Source)</strong><span>保持真实商品主体、颜色和结构。</span></div></div>
             <div class="gate-row blocked"><span class="gate-icon">!</span><div><strong>Codex 生图队列 (Codex Image Queue)</strong><span id="gateMessage">等待真实 SKU 与主体证据确认。</span></div></div>
           <div class="controller-panel">
-            <strong>生图总控 (Production Image Controller)</strong>
+            <strong>Ozon 专用生图执行 (Product Media Generation)</strong>
             <p>用于日常整批生图和返修续跑。已审核通过的图片会保留，只处理待生成或待返修槽位；不会上传。</p>
             <div class="controller-variant">
-              <div class="controller-variant-head"><strong>生图总控命令 (Production Controller Command)</strong><span class="controller-badge">整批生产 / 返修续跑</span></div>
+              <div class="controller-variant-head"><strong>唯一生图 Skill 命令 (Single Skill Command)</strong><span class="controller-badge">单线程生产 / 返修续跑</span></div>
               <div id="imageControllerCommand" class="controller-command">{controller_command_html}</div>
               <div class="controller-actions">
                 <button id="copyImageControllerCommand" class="production-copy" type="button">复制整批生图命令 (Copy Production Command)</button>
@@ -2635,7 +2667,7 @@ def build_image_workspace_html(run_id: str) -> str:
               <span id="imageControllerCopyStatus" class="copy-status" aria-live="polite">复制后粘贴到当前 Codex 对话执行</span>
             </div>
           </div>
-          </div><div class="gate-callout">全局固定 10 个可见 Codex 生图工作任务按槽位顺序长期复用；一个任务一次只处理一件商品，最多并行 10 件，总控不计入上限。新商品不新增任务，返修回到原任务；只有用户明确要求时才替换指定槽位。工作台仅承载队列、证据与逐图回写结果，不负责复制 Skill 内部生图规则。</div><div id="imageJobControls" class="job-controls"><div id="imageJobStatus" class="job-status">当前商品尚未入队</div><button id="approveImageJob" class="approve-submit" type="button" disabled>确认本件 8 张图片可用</button><button id="submitImageRepairs" class="repair-submit" type="button" disabled>提交选中图片返修 (Repair Selected)</button><div id="repairSelectionStatus" class="repair-selection-status" aria-live="polite"></div><button id="stopImageJob" type="button" disabled>停止生图 (Stop Generation)</button><button id="resumeImageJob" type="button" disabled>继续生图 (Resume Generation)</button></div></aside>
+          </div><div class="gate-callout">Ozon 工作台只使用一个专用生图 Skill，并严格单线程处理：一次完成一件商品后再领取下一件。每件商品先锁定白底主体图，再以该图作为唯一图片参考一次生成 4×2 八宫格并裁成 8 张 3:4 图片；公网媒体通道由 Codex 自动启动。</div><div id="imageJobControls" class="job-controls"><div id="imageJobStatus" class="job-status">当前商品尚未入队</div><button id="approveImageJob" class="approve-submit" type="button" disabled>确认本件 8 张图片可用</button><button id="submitImageRepairs" class="repair-submit" type="button" disabled>提交选中图片返修 (Repair Selected)</button><div id="repairSelectionStatus" class="repair-selection-status" aria-live="polite"></div><button id="stopImageJob" type="button" disabled>停止生图 (Stop Generation)</button><button id="resumeImageJob" type="button" disabled>继续生图 (Resume Generation)</button></div></aside>
         </div>
       </main>
     </div>
@@ -3009,8 +3041,8 @@ def build_upload_workspace_html(run_id: str) -> str:
     .upload-core {{ margin-top:10px; padding:9px; border:1px solid #b9ddcf; border-radius:5px; background:#f2fbf8; }} .upload-core-head {{ display:flex; align-items:center; justify-content:space-between; gap:10px; }} .upload-core-head strong {{ color:var(--green); font-size:11px; }} .upload-core-head span {{ color:var(--muted); font-size:9px; }} .upload-core-grid {{ display:grid; grid-template-columns:repeat(4,minmax(110px,1fr)); gap:6px; margin-top:8px; }} .upload-core-field {{ padding:7px 8px; border:1px solid #d8ebe4; border-radius:4px; background:#fff; }} .upload-core-field span {{ display:block; color:var(--muted); font-size:9px; }} .upload-core-field strong {{ display:block; margin-top:2px; color:var(--text); font-size:10px; }}
     .mapping-summary {{ display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }} .mapping-chip {{ padding:3px 7px; border-radius:4px; color:var(--green); background:var(--green-soft); font-size:10px; }} .mapping-chip.warn {{ color:var(--red); background:var(--red-soft); }}
     .score-progress {{ margin-top:8px; padding:8px 9px; border-left:3px solid var(--blue); color:#29456f; background:#f1f5ff; font-size:10px; }}
-    .required-field-editor {{ margin-top:10px; padding:10px; border:1px solid #efbd68; border-radius:5px; background:#fffaf0; }} .required-field-editor h4 {{ margin:0; color:#74410a; font-size:12px; }} .required-field-editor p {{ margin:3px 0 9px; color:var(--muted); font-size:10px; }} .required-field-grid {{ display:grid; grid-template-columns:repeat(2,minmax(180px,1fr)); gap:8px; }} .required-field-input {{ display:grid; gap:4px; }} .required-field-input label {{ color:#74410a; font-size:10px; font-weight:650; }} .required-field-input input,.required-field-input select {{ width:100%; height:34px; padding:0 8px; border:1px solid #d7b574; border-radius:4px; color:var(--text); background:#fff; }} .required-field-actions {{ display:flex; align-items:center; gap:9px; margin-top:9px; }} .required-field-actions button {{ min-height:34px; padding:0 13px; border:1px solid var(--blue); border-radius:4px; color:#fff; background:var(--blue); cursor:pointer; }} .required-field-actions button:disabled {{ opacity:.5; cursor:wait; }} .required-field-status {{ color:var(--muted); font-size:10px; }} .required-field-status.error {{ color:var(--red); }} .required-field-status.success {{ color:var(--green); }}
-    .attribute-grid {{ display:grid; grid-template-columns:1fr 1fr; margin-top:8px; border:1px solid var(--line); border-radius:4px; overflow:hidden; }} .attribute {{ display:grid; grid-template-columns:minmax(110px,.8fr) minmax(0,1.2fr); gap:10px; padding:8px 9px; border-right:1px solid var(--line); border-bottom:1px solid #edf0f4; font-size:10px; }} .attribute:nth-child(2n) {{ border-right:0; }} .attribute span {{ color:var(--muted); }} .attribute strong {{ overflow-wrap:anywhere; }} .attribute.missing_fact strong {{ color:var(--red); }} .attribute.rewrite_required strong {{ color:var(--amber); }} .attribute.not_applicable strong {{ color:var(--muted); font-weight:500; }} .all-mappings {{ margin-top:8px; color:var(--muted); font-size:10px; }} .all-mappings summary {{ cursor:pointer; color:var(--blue); font-weight:650; }}
+    .required-field-skill-pending {{ margin-top:10px; padding:9px 10px; border-left:3px solid var(--blue); color:#29456f; background:#f1f5ff; font-size:10px; }} .required-field-editor {{ margin-top:10px; padding:10px; border:1px solid #efbd68; border-radius:5px; background:#fffaf0; }} .required-field-editor h4 {{ margin:0; color:#74410a; font-size:12px; }} .required-field-editor p {{ margin:3px 0 9px; color:var(--muted); font-size:10px; }} .required-field-grid {{ display:grid; grid-template-columns:repeat(2,minmax(180px,1fr)); gap:8px; }} .required-field-input {{ display:grid; gap:4px; }} .required-field-input label {{ color:#74410a; font-size:10px; font-weight:650; }} .required-field-input input,.required-field-input select {{ width:100%; height:34px; padding:0 8px; border:1px solid #d7b574; border-radius:4px; color:var(--text); background:#fff; }} .required-field-actions {{ display:flex; align-items:center; gap:9px; margin-top:9px; }} .required-field-actions button {{ min-height:34px; padding:0 13px; border:1px solid var(--blue); border-radius:4px; color:#fff; background:var(--blue); cursor:pointer; }} .required-field-actions button:disabled {{ opacity:.5; cursor:wait; }} .required-field-status {{ color:var(--muted); font-size:10px; }} .required-field-status.error {{ color:var(--red); }} .required-field-status.success {{ color:var(--green); }}
+    .attribute-grid {{ display:grid; grid-template-columns:1fr 1fr; margin-top:8px; border:1px solid var(--line); border-radius:4px; overflow:hidden; }} .attribute {{ display:grid; grid-template-columns:minmax(110px,.8fr) minmax(0,1.2fr); gap:10px; padding:8px 9px; border-right:1px solid var(--line); border-bottom:1px solid #edf0f4; font-size:10px; }} .attribute:nth-child(2n) {{ border-right:0; }} .attribute span {{ color:var(--muted); }} .attribute strong {{ overflow-wrap:anywhere; }} .attribute.missing_fact strong {{ color:var(--red); }} .attribute.optional-evidence-gap strong {{ color:var(--muted); font-weight:500; }} .attribute.rewrite_required strong {{ color:var(--amber); }} .attribute.not_applicable strong {{ color:var(--muted); font-weight:500; }} .all-mappings {{ margin-top:8px; color:var(--muted); font-size:10px; }} .all-mappings summary {{ cursor:pointer; color:var(--blue); font-weight:650; }}
     .gate-list {{ padding:6px 14px 12px; }} .gate-row {{ display:grid; grid-template-columns:22px minmax(0,1fr); gap:9px; padding:10px 0; border-bottom:1px solid #edf0f4; }} .gate-row:last-child {{ border-bottom:0; }} .gate-icon {{ width:22px; height:22px; display:grid; place-items:center; border-radius:50%; color:var(--green); background:var(--green-soft); font-size:11px; font-weight:700; }} .gate-row.blocked .gate-icon {{ color:var(--amber); background:var(--amber-soft); }} .gate-row strong {{ display:block; font-size:11px; }} .gate-row span {{ display:block; margin-top:2px; color:var(--muted); font-size:10px; }}
     .content-controller {{ margin:12px 14px; padding:11px; border:1px solid #bfd0f8; border-radius:5px; background:var(--blue-soft); }} .content-controller strong {{ display:block; font-size:11px; }} .content-controller p {{ margin:4px 0 8px; color:var(--muted); font-size:10px; }} .content-command {{ max-height:190px; overflow:auto; padding:9px; border:1px solid #c9d5ec; border-radius:4px; white-space:pre-wrap; color:#263756; background:#fff; font:10px/1.5 Consolas,"Courier New",monospace; }} .content-copy {{ width:100%; min-height:34px; margin-top:8px; border:1px solid var(--blue); border-radius:4px; color:#fff; background:var(--blue); cursor:pointer; }} .content-copy-status {{ display:block; min-height:16px; margin-top:4px; color:var(--green); font-size:10px; text-align:center; }}
     .pricing-workspace {{ margin-bottom:14px; }} .pricing-head-note {{ color:var(--muted); font-size:11px; }}
@@ -3020,12 +3052,11 @@ def build_upload_workspace_html(run_id: str) -> str:
     .pricing-editor {{ min-width:0; padding:16px; }} .pricing-editor-empty {{ min-height:430px; display:grid; place-items:center; color:var(--muted); }} .pricing-reference {{ display:grid; grid-template-columns:86px minmax(0,1fr); gap:13px; padding-bottom:14px; border-bottom:1px solid var(--line); }} .pricing-reference img {{ width:86px; height:86px; object-fit:contain; border:1px solid var(--line); border-radius:5px; background:#fff; }} .pricing-reference h4 {{ margin:0 0 7px; font-size:15px; }} .pricing-reference-row {{ display:flex; flex-wrap:wrap; gap:7px 14px; color:var(--muted); font-size:11px; }} .supplier-link {{ color:var(--blue); font-weight:650; text-decoration:none; }} .supplier-link:hover {{ text-decoration:underline; }}
     .pricing-policy {{ display:flex; flex-wrap:wrap; gap:6px; margin:12px 0; }} .policy-chip {{ padding:4px 8px; border-radius:4px; color:#38506f; background:#edf3fb; font-size:10px; }}
     .pricing-form {{ display:grid; grid-template-columns:repeat(4,minmax(130px,1fr)); gap:10px; }} .pricing-field {{ align-content:start; display:grid; gap:5px; }} .pricing-field label {{ color:var(--muted); font-size:10px; }} .pricing-field input {{ width:100%; height:36px; padding:0 9px; border:1px solid #cbd4e1; border-radius:5px; color:var(--text); background:#fff; }} .pricing-field input:focus {{ outline:2px solid rgba(36,87,214,.16); border-color:var(--blue); }} .pricing-prefill-note {{ color:var(--green); font-size:9px; line-height:1.35; }}
-    .pricing-actions {{ display:flex; align-items:center; gap:9px; margin-top:14px; }} .pricing-action {{ min-height:38px; padding:0 16px; border:1px solid var(--blue); border-radius:5px; color:var(--blue); background:#fff; cursor:pointer; }} .pricing-action.primary-action {{ color:#fff; background:var(--blue); }} .pricing-action:disabled {{ opacity:.5; cursor:not-allowed; }} .pricing-message {{ min-height:20px; margin-top:8px; color:var(--muted); font-size:11px; }} .pricing-message.error {{ color:var(--red); }} .pricing-message.success {{ color:var(--green); }}
+    .pricing-actions {{ display:flex; align-items:center; gap:9px; margin-top:14px; }} .pricing-action {{ min-height:38px; padding:0 16px; border:1px solid var(--blue); border-radius:5px; color:var(--blue); background:#fff; cursor:pointer; }} .pricing-action.primary-action {{ color:#fff; background:var(--blue); }} .pricing-action.danger-action {{ margin-left:auto; border-color:var(--red); color:var(--red); background:#fff; }} .pricing-action:disabled {{ opacity:.5; cursor:not-allowed; }} .pricing-message {{ min-height:20px; margin-top:8px; color:var(--muted); font-size:11px; }} .pricing-message.error {{ color:var(--red); }} .pricing-message.success {{ color:var(--green); }}
     .pricing-result {{ display:grid; grid-template-columns:repeat(6,minmax(105px,1fr)); margin-top:14px; overflow:hidden; border:1px solid var(--line); border-radius:6px; }} .pricing-result-cell {{ min-height:70px; padding:10px; border-right:1px solid var(--line); background:#fbfcfe; }} .pricing-result-cell:last-child {{ border-right:0; }} .pricing-result-cell span {{ display:block; color:var(--muted); font-size:9px; }} .pricing-result-cell strong {{ display:block; margin-top:5px; font-size:14px; }} .pricing-result-cell.price {{ background:var(--green-soft); }} .pricing-result-cell.price strong {{ color:var(--green); }}
     .publish-lock {{ margin:0 14px 12px; padding:11px 12px; border-left:3px solid var(--amber); color:#74410a; background:#fff8eb; }} .publish-lock strong {{ display:block; font-size:11px; }} .publish-lock span {{ display:block; margin-top:3px; font-size:10px; }}
     .primary {{ width:calc(100% - 28px); height:38px; margin:0 14px 14px; border:1px solid var(--blue); border-radius:5px; color:#fff; background:var(--blue); }} .primary:disabled {{ opacity:.48; cursor:not-allowed; }} .empty {{ padding:26px; color:var(--muted); text-align:center; }}
-    .product-upload-actions {{ display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-top:10px; padding:10px; border:1px solid #bfd0f8; border-radius:5px; background:#f5f8ff; }} .product-upload-actions button {{ min-height:34px; padding:0 12px; border:1px solid var(--blue); border-radius:4px; color:var(--blue); background:#fff; cursor:pointer; }} .product-upload-actions button.confirm {{ color:#fff; background:var(--blue); }} .product-upload-actions button:disabled {{ opacity:.48; cursor:not-allowed; }} .product-upload-status {{ flex:1 1 260px; color:var(--muted); font-size:10px; }} .product-upload-status.error {{ color:var(--red); }} .product-upload-status.success {{ color:var(--green); }}
-    .temu-upload-actions {{ display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-top:8px; padding:10px; border:1px solid #e6b96c; border-radius:5px; background:#fffaf0; }} .temu-upload-label {{ flex:0 0 100%; color:#8a4b05; font-size:11px; font-weight:700; }} .temu-upload-actions button {{ min-height:34px; padding:0 12px; border:1px solid #bd690a; border-radius:4px; color:#9a5407; background:#fff; cursor:pointer; }} .temu-upload-actions button.confirm {{ color:#fff; background:#bd690a; }} .temu-upload-actions button:disabled {{ opacity:.48; cursor:not-allowed; }} .temu-upload-status {{ flex:1 1 260px; color:var(--muted); font-size:10px; }} .temu-upload-status.error {{ color:var(--red); }} .temu-upload-status.success {{ color:var(--green); }}
+    .product-upload-actions {{ display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-top:10px; padding:10px; border:1px solid #bfd0f8; border-radius:5px; background:#f5f8ff; }} .product-upload-actions button {{ min-height:34px; padding:0 12px; border:1px solid var(--blue); border-radius:4px; color:var(--blue); background:#fff; cursor:pointer; }} .product-upload-actions button.confirm {{ color:#fff; background:var(--blue); }} .product-upload-actions button:disabled {{ opacity:.48; cursor:not-allowed; }} .product-upload-status {{ flex:1 1 260px; color:var(--muted); font-size:10px; }} .product-upload-status.error {{ color:var(--red); }} .product-upload-status.success {{ color:var(--green); }} .product-upload-status.non-blocking-warning {{ color:var(--amber); }}
     .batch-upload-controller {{ margin:0 14px 12px; padding:11px; border:1px solid #bfd0f8; border-radius:5px; background:#f5f8ff; }} .batch-upload-controller strong {{ display:block; font-size:11px; }} .batch-upload-controller p {{ margin:4px 0 8px; color:var(--muted); font-size:10px; }} .batch-upload-controller button {{ width:100%; min-height:38px; border:1px solid var(--blue); border-radius:4px; color:#fff; background:var(--blue); cursor:pointer; }} .batch-upload-controller button:disabled {{ opacity:.5; cursor:wait; }} .batch-upload-status {{ display:block; min-height:17px; margin-top:6px; color:var(--muted); font-size:10px; }} .batch-upload-status.error {{ color:var(--red); }} .batch-upload-status.success {{ color:var(--green); }}
     @media(max-width:1100px) {{ .pricing-form {{ grid-template-columns:repeat(2,minmax(130px,1fr)); }} .pricing-result {{ grid-template-columns:repeat(3,1fr); }} .pricing-result-cell:nth-child(3) {{ border-right:0; }} }}
     @media(max-width:1000px) {{ .upload-layout {{ grid-template-columns:1fr; }} .pricing-layout {{ grid-template-columns:250px minmax(0,1fr); }} }}
@@ -3058,7 +3089,6 @@ def build_upload_workspace_html(run_id: str) -> str:
     const pricingState = {{ selectedSeedId:null, items:[], drafts:new Map(), previews:new Map(), page:0, pageSize:5 }};
     const draftState = {{ page:0, pageSize:5, items:[] }};
     const productUploadState = {{ previews:new Map(), submissions:new Map() }};
-    const temuUploadState = {{ previews:new Map(), submissions:new Map() }};
     let latestUploadData = null;
     const pricingEndpoints = {{
       preview:`/api/batches/${{encodeURIComponent(runId)}}/pricing-evidence/preview`,
@@ -3091,6 +3121,7 @@ def build_upload_workspace_html(run_id: str) -> str:
     }}
     function pricingStatusLabel(item) {{
       if (item.pricing_status === "confirmed") return "已确认";
+      if (item.pricing_status === "invalid") return "包装密度或数据无效";
       if (item.pricing_status === "stale") return "参数已变，需重算";
       return "待填写";
     }}
@@ -3156,12 +3187,23 @@ def build_upload_workspace_html(run_id: str) -> str:
       const savedInputs = item.pricing_evidence && item.pricing_evidence.inputs ? item.pricing_evidence.inputs : {{}};
       const prefillFields = item.pricing_prefill && item.pricing_prefill.fields ? item.pricing_prefill.fields : {{}};
       pricingFieldDefinitions.forEach(([key,label,unit]) => {{ const field = document.createElement("div"); field.className = "pricing-field"; const name = document.createElement("label"); name.htmlFor = `pricing-${{key}}`; name.textContent = `${{label}}（${{unit}}）`; const input = document.createElement("input"); input.id = `pricing-${{key}}`; input.type = "number"; input.step = "any"; input.min = key === "domestic_shipping_cny" || key === "target_margin_rate" ? "0" : "0.000001"; input.value = draft[key] || ""; input.dataset.pricingField = key; input.addEventListener("input", () => {{ pricingState.previews.delete(item.seed_id); const message = $("pricingMessage"); if (message) {{ message.className = "pricing-message"; message.textContent = "输入已保留，点击“计算建议价格”查看新结果。"; }} }}); field.append(name,input); const prefill = prefillFields[key]; if (prefill && !Object.prototype.hasOwnProperty.call(savedInputs,key)) {{ const note = document.createElement("span"); note.className = "pricing-prefill-note"; note.textContent = `该项已按${{prefill.label || "现有证据"}}预填，仍需用户确认。`; field.append(note); }} form.append(field); }}); editor.append(form);
-      const actions = document.createElement("div"); actions.className = "pricing-actions"; const previewButton = document.createElement("button"); previewButton.type = "button"; previewButton.className = "pricing-action"; previewButton.textContent = "计算建议价格"; const confirmButton = document.createElement("button"); confirmButton.type = "button"; confirmButton.className = "pricing-action primary-action"; confirmButton.textContent = "确认并写入本件价格与包装证据"; actions.append(previewButton,confirmButton); editor.append(actions);
+      const actions = document.createElement("div"); actions.className = "pricing-actions"; const previewButton = document.createElement("button"); previewButton.type = "button"; previewButton.className = "pricing-action"; previewButton.textContent = "计算建议价格"; const confirmButton = document.createElement("button"); confirmButton.type = "button"; confirmButton.className = "pricing-action primary-action"; confirmButton.textContent = "确认并写入本件价格与包装证据"; const excludeButton = document.createElement("button"); excludeButton.type = "button"; excludeButton.className = "pricing-action danger-action"; excludeButton.textContent = "剔除商品（不补位）"; excludeButton.title = "从本批次剔除且永久加入黑名单，后续选品不再出现"; const submissionStatus = String(((item.upload_submission || {{}}).status || "")).toLowerCase(); excludeButton.disabled = submissionStatus && !["failed","error","declined"].includes(submissionStatus); actions.append(previewButton,confirmButton,excludeButton); editor.append(actions);
       const preview = pricingState.previews.get(item.seed_id) || item.pricing_evidence;
-      const message = document.createElement("div"); message.id = "pricingMessage"; message.className = `pricing-message${{item.pricing_ready || preview ? " success" : ""}}`; message.textContent = item.pricing_ready ? "本件价格与包装证据已确认，可独立进入后续门禁。" : item.pricing_status === "stale" ? "固定参数已变化，请重新计算并确认本件。" : preview ? "建议价格已计算；确认无误后写入本件价格与包装证据。" : "已按真实证据预填可确认项；请补齐剩余空白，再计算并确认写入。"; editor.append(message);
+      const validationErrors = item.pricing_validation_errors || [];
+      const message = document.createElement("div"); message.id = "pricingMessage"; message.className = `pricing-message${{item.pricing_ready || (preview && item.pricing_status !== "invalid") ? " success" : (item.pricing_status === "invalid" ? " error" : "")}}`; message.textContent = item.pricing_ready ? "本件价格与包装证据已确认，可独立进入后续门禁。" : item.pricing_status === "invalid" ? `包装重量或尺寸不符合 Ozon 密度范围：${{validationErrors.join("；") || "请核对含包装重量和长宽高"}}。修改后重新计算并确认。` : item.pricing_status === "stale" ? "固定参数已变化，请重新计算并确认本件。" : preview ? "建议价格已计算；确认无误后写入本件价格与包装证据。" : "已按真实证据预填可确认项；请补齐剩余空白，再计算并确认写入。"; editor.append(message);
       const resultView = pricingResultView(preview); if (resultView) editor.append(resultView);
       const submit = async (mode, button) => {{ saveVisiblePricingDraft(); const payload = {{ seed_id:item.seed_id, ...pricingState.drafts.get(item.seed_id) }}; previewButton.disabled = true; confirmButton.disabled = true; message.className = "pricing-message"; message.textContent = mode === "preview" ? "正在计算 GUOO 运费与建议上架价…" : "正在确认本件价格与包装证据…"; try {{ const response = await api(pricingEndpoints[mode], {{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify(payload)}}); pricingState.previews.set(item.seed_id,response.data); if (mode === "confirm") {{ await loadUploadWorkspace(); }} else {{ renderPricingEditor(); }} }} catch (error) {{ message.className = "pricing-message error"; message.textContent = (error.errors && error.errors[0]) || error.message || "价格计算失败"; previewButton.disabled = false; confirmButton.disabled = false; }} }};
-      previewButton.addEventListener("click", () => submit("preview",previewButton)); confirmButton.addEventListener("click", () => submit("confirm",confirmButton));
+      const excludeProduct = async () => {{
+        const productName = item.source_title || item.seed_id;
+        if (!window.confirm(`确认剔除“${{productName}}”？\n\n本操作不会补抽新商品；当前批次将继续处理剩余商品。该种子和 Ozon 商品会永久加入黑名单，后续选品不再出现。`)) return;
+        previewButton.disabled = true; confirmButton.disabled = true; excludeButton.disabled = true; message.className = "pricing-message"; message.textContent = "正在剔除商品并写入永久黑名单…";
+        try {{
+          await api(`/api/batches/${{encodeURIComponent(runId)}}/products/${{encodeURIComponent(item.seed_id)}}/exclude`, {{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify({{confirmed:true,reason:"用户判定商品重量、体积或成本不适合跨境销售"}})}});
+          pricingState.drafts.delete(item.seed_id); pricingState.previews.delete(item.seed_id); await loadUploadWorkspace();
+          $("workspaceStatus").textContent = "已剔除 1 件商品；未补位，剩余商品继续处理";
+        }} catch (error) {{ message.className = "pricing-message error"; message.textContent = (error.errors && error.errors[0]) || error.message || "剔除失败"; previewButton.disabled = false; confirmButton.disabled = false; excludeButton.disabled = false; }}
+      }};
+      previewButton.addEventListener("click", () => submit("preview",previewButton)); confirmButton.addEventListener("click", () => submit("confirm",confirmButton)); excludeButton.addEventListener("click", excludeProduct);
     }}
     function renderPricingWorkspace(data) {{
       saveVisiblePricingDraft(); pricingState.items = data.items || [];
@@ -3188,15 +3230,23 @@ def build_upload_workspace_html(run_id: str) -> str:
       ].forEach(([label,value]) => {{ const cell = document.createElement("div"); cell.className = "upload-core-field"; const name = document.createElement("span"); name.textContent = label; const fact = document.createElement("strong"); fact.textContent = value; cell.append(name,fact); grid.append(cell); }});
       section.append(grid); container.append(section);
     }}
-    function mappingGrid(fields) {{ const statusText = {{ rewrite_required:"待原创（依据采集事实，不复制 Ozon 原文）", missing_fact:"缺少事实，需补充", not_applicable:"未提供可选素材", excluded:"不参与本阶段" }}; const grid = document.createElement("div"); grid.className = "attribute-grid"; (fields || []).forEach((field) => {{ const row = document.createElement("div"); row.className = `attribute ${{field.status || "missing_fact"}}`; const label = document.createElement("span"); label.textContent = `${{field.label || field.field_key}}${{field.required ? " *" : ""}}`; const fact = document.createElement("strong"); const pendingVisual = field.status === "missing_fact" && field.visual_inference_supported; fact.textContent = field.status === "mapped" ? String(field.value) : (pendingVisual ? "可从锁定 1688 原图判定，等待智能字段 Skill 重判" : (field.intelligence_decision === "unresolved" ? `证据不足：${{field.reason || "无法确认"}}` : (statusText[field.status] || "缺少事实，需补充"))); row.append(label,fact); grid.append(row); }}); return grid; }}
+    function mappingGrid(fields) {{ const statusText = {{ rewrite_required:"待原创（依据采集事实，不复制 Ozon 原文）", missing_fact:"缺少事实，需补充", not_applicable:"未提供可选素材", excluded:"不参与本阶段" }}; const grid = document.createElement("div"); grid.className = "attribute-grid"; (fields || []).forEach((field) => {{ const row = document.createElement("div"); const optionalGap = field.status === "missing_fact" && !field.required; row.className = `attribute ${{optionalGap ? "optional-evidence-gap" : (field.status || "missing_fact")}}`; const label = document.createElement("span"); label.textContent = `${{field.label || field.field_key}}${{field.required ? " *" : ""}}`; const fact = document.createElement("strong"); const pendingVisual = field.status === "missing_fact" && field.visual_inference_supported; fact.textContent = field.status === "mapped" ? String(field.value) : (optionalGap ? `可选属性证据不足（不阻止上传）：${{field.reason || "来源未提供"}}` : (pendingVisual ? "可从锁定 1688 原图判定，等待智能字段 Skill 重判" : (field.intelligence_decision === "unresolved" ? `证据不足：${{field.reason || "无法确认"}}` : (statusText[field.status] || "缺少事实，需补充")))); row.append(label,fact); grid.append(row); }}); return grid; }}
     function requiredOptionValue(option) {{ if (option && typeof option === "object") return String(option.id ?? option.value ?? option.name ?? option.label ?? ""); return String(option ?? ""); }}
     function requiredOptionLabel(option) {{ if (option && typeof option === "object") return String(option.name ?? option.label ?? option.value ?? option.id ?? ""); return String(option ?? ""); }}
+    function requiredBooleanOptionLabel(field,value) {{ const positive = value === "true"; const label = String(field.label || "").toLowerCase(); if (label.includes("18+")) return positive ? "商品需要 18+ 标识" : "商品不需要 18+ 标识"; return positive ? "需要标记代码" : "不需要标记代码"; }}
     function renderRequiredAttributeEditor(container,item) {{
-      const fields = (item.missing_required_fields || []).filter((field) => field && field.field_key);
-      if (!item.template_ready || !fields.length) return;
+      const pendingFields = (item.skill_pending_required_fields || []).filter((field) => field && field.field_key);
+      const fields = (item.manual_required_fields || []).filter((field) => field && field.field_key);
+      if (!item.template_ready) return;
+      if (pendingFields.length) {{
+        const pending = document.createElement("div"); pending.className = "required-field-skill-pending";
+        pending.textContent = `${{pendingFields.length}} 项必填字段正在等待智能字段 Skill 补足，当前无需用户填写。`;
+        container.append(pending);
+      }}
+      if (!fields.length) return;
       const editor = document.createElement("section"); editor.className = "required-field-editor";
-      const title = document.createElement("h4"); title.textContent = "补充缺失必填字段";
-      const note = document.createElement("p"); note.textContent = "这里只显示 Seller API 当前仍缺失的必填项；填写值会作为用户确认的字段证据，不会覆盖已映射字段。";
+      const title = document.createElement("h4"); title.textContent = "补充技能无法确认的必填字段";
+      const note = document.createElement("p"); note.textContent = "这里只显示智能字段 Skill 已穷尽采集证据后仍无法确认的必填项；不会显示待技能处理或已经映射的字段。";
       const grid = document.createElement("div"); grid.className = "required-field-grid";
       fields.forEach((field) => {{
         const wrapper = document.createElement("div"); wrapper.className = "required-field-input";
@@ -3206,7 +3256,7 @@ def build_upload_workspace_html(run_id: str) -> str:
         input.id = label.htmlFor; input.dataset.fieldKey = field.field_key;
         if (options.length) {{
           const placeholder = document.createElement("option"); placeholder.value = ""; placeholder.textContent = "请选择"; input.append(placeholder);
-          options.forEach((option) => {{ const choice = document.createElement("option"); choice.value = requiredOptionValue(option); choice.textContent = requiredOptionLabel(option); input.append(choice); }});
+          options.forEach((option) => {{ const choice = document.createElement("option"); choice.value = requiredOptionValue(option); const rawLabel = requiredOptionLabel(option); choice.textContent = String(field.attribute_type || "").toLowerCase() === "boolean" ? requiredBooleanOptionLabel(field,choice.value) : rawLabel; input.append(choice); }});
         }} else {{
           input.type = field.attribute_type === "integer" || field.attribute_type === "decimal" ? "number" : "text";
           input.placeholder = field.reason ? `缺失：${{field.reason}}` : "请输入真实值";
@@ -3232,7 +3282,7 @@ def build_upload_workspace_html(run_id: str) -> str:
       }});
       actions.append(save,status); editor.append(title,note,grid,actions); container.append(editor);
     }}
-    function renderMapping(container, item) {{ if (!item.template_ready) {{ const summary = document.createElement("div"); summary.className = "mapping-summary"; const blocked = document.createElement("span"); blocked.className = "mapping-chip warn"; blocked.textContent = "模板错配，未执行字段映射"; summary.append(blocked); container.append(summary); return; }} const fields = item.attribute_mapping || []; const summary = document.createElement("div"); summary.className = "mapping-summary"; const ready = document.createElement("span"); ready.className = `mapping-chip${{item.required_attributes_ready ? "" : " warn"}}`; ready.textContent = `必填 ${{item.required_mapped_count || 0}} / ${{item.required_attribute_count || 0}}`; const mapped = document.createElement("span"); mapped.className = "mapping-chip"; mapped.textContent = `模板已填 ${{item.mapped_attribute_count || 0}}`; const rewrite = document.createElement("span"); rewrite.className = `mapping-chip${{(item.rewrite_required_count || 0) ? " warn" : ""}}`; rewrite.textContent = `待智能生成/规范 ${{item.rewrite_required_count || 0}}`; const missing = document.createElement("span"); missing.className = `mapping-chip${{(item.missing_fact_count || 0) ? " warn" : ""}}`; missing.textContent = `缺少事实 ${{item.missing_fact_count || 0}}`; const assets = document.createElement("span"); assets.className = "mapping-chip"; assets.textContent = `未提供可选素材 ${{item.not_applicable_count || 0}}`; summary.append(ready,mapped,rewrite,missing,assets); container.append(summary); const score = item.attribute_score_progress || {{}}; if (score.scorable_attribute_count) {{ const progress = document.createElement("div"); progress.className = "score-progress"; const paths = []; if (score.fields_to_50_percent > 0) paths.push(`再补 ${{score.fields_to_50_percent}} 项进入 15 分档`); if (score.fields_to_70_percent > 0) paths.push(`再补 ${{score.fields_to_70_percent}} 项进入 30 分档`); if (!paths.length) paths.push("已达到属性完整度 30 分档"); progress.textContent = `Ozon 属性分预估 ${{score.estimated_attribute_points}} / 30 · 计分属性 ${{score.filled_attribute_count}} / ${{score.scorable_attribute_count}} (${{score.completion_percent}}%) · ${{paths.join("；")}}`; container.append(progress); }} const details = document.createElement("details"); details.className = "all-mappings"; details.open = true; const label = document.createElement("summary"); label.textContent = `全部模板字段 (${{fields.length}})`; details.append(label,mappingGrid(fields)); container.append(details); }}
+    function renderMapping(container, item) {{ if (!item.template_ready) {{ const summary = document.createElement("div"); summary.className = "mapping-summary"; const blocked = document.createElement("span"); blocked.className = "mapping-chip warn"; blocked.textContent = "模板错配，未执行字段映射"; summary.append(blocked); container.append(summary); return; }} const fields = item.attribute_mapping || []; const summary = document.createElement("div"); summary.className = "mapping-summary"; const ready = document.createElement("span"); ready.className = `mapping-chip${{item.required_attributes_ready ? "" : " warn"}}`; ready.textContent = `必填 ${{item.required_mapped_count || 0}} / ${{item.required_attribute_count || 0}}`; const mapped = document.createElement("span"); mapped.className = "mapping-chip"; mapped.textContent = `模板已填 ${{item.mapped_attribute_count || 0}}`; const rewrite = document.createElement("span"); rewrite.className = `mapping-chip${{(item.rewrite_required_count || 0) ? " warn" : ""}}`; rewrite.textContent = `待智能生成/规范 ${{item.rewrite_required_count || 0}}`; const missing = document.createElement("span"); missing.className = `mapping-chip${{(item.missing_fact_count || 0) ? " warn" : ""}}`; missing.textContent = `缺少事实 ${{item.missing_fact_count || 0}}`; const assets = document.createElement("span"); assets.className = "mapping-chip"; assets.textContent = `未提供可选素材 ${{item.not_applicable_count || 0}}`; summary.append(ready,mapped,rewrite,missing,assets); container.append(summary); const score = item.attribute_score_progress || {{}}; if (score.scorable_attribute_count) {{ const progress = document.createElement("div"); progress.className = "score-progress"; const paths = []; if (score.fields_to_50_percent > 0) paths.push(`再补 ${{score.fields_to_50_percent}} 项进入 15 分档`); if (score.fields_to_70_percent > 0) paths.push(`再补 ${{score.fields_to_70_percent}} 项进入 30 分档`); if (!paths.length) paths.push("已达到属性完整度 30 分档"); progress.textContent = `Ozon 属性分预估 ${{score.estimated_attribute_points}} / 30 · 计分属性 ${{score.filled_attribute_count}} / ${{score.scorable_attribute_count}} (${{score.completion_percent}}%) · ${{paths.join("；")}}`; container.append(progress); }} const details = document.createElement("details"); details.className = "all-mappings"; details.open = false; const label = document.createElement("summary"); label.textContent = `查看全部模板字段（只读） (${{fields.length}})`; details.append(label,mappingGrid(fields)); container.append(details); }}
     async function previewProductUpload(item, controls) {{
       const previewButton = controls.querySelector("[data-action=preview]");
       const confirmButton = controls.querySelector("[data-action=confirm]");
@@ -3252,20 +3302,34 @@ def build_upload_workspace_html(run_id: str) -> str:
         previewButton.disabled = false;
       }}
     }}
-    function sellerUploadError(submission) {{
+    function sellerUploadDiagnostics(submission) {{
       const payload = submission && submission.seller_api_status;
-      if (!payload) return "Ozon 未返回详细失败原因";
-      const codes = [];
+      const diagnostics = {{blocking:[], warnings:[]}};
+      if (!payload) return diagnostics;
+      const warningLevels = new Set(["warning", "ERROR_LEVEL_WARNING".toLowerCase()]);
+      const blockingLevels = new Set(["error", "critical", "fatal", "error_level_error", "error_level_critical", "error_level_fatal"]);
       const visit = (value) => {{
         if (Array.isArray(value)) {{ value.forEach(visit); return; }}
         if (!value || typeof value !== "object") return;
-        if (value.code) codes.push(String(value.code));
-        if (value.message) codes.push(String(value.message));
-        if (value.description) codes.push(String(value.description));
-        Object.values(value).forEach(visit);
+        const level = String(value.level || "").trim().toLowerCase();
+        const details = [value.code,value.message,value.description].filter(Boolean).map(String);
+        if (details.length) {{
+          const rendered = [...new Set(details)].join("：");
+          if (warningLevels.has(level) || level.includes("warning")) diagnostics.warnings.push(rendered);
+          else if (blockingLevels.has(level) || level.endsWith("_error") || level.endsWith("_critical") || level.endsWith("_fatal") || String(submission.status || "").toLowerCase() === "failed") diagnostics.blocking.push(rendered);
+        }}
+        Object.entries(value).forEach(([key,nested]) => {{ if (!["code","message","description","level"].includes(key)) visit(nested); }});
       }};
       visit(payload);
-      return [...new Set(codes)].slice(0,4).join(" · ") || "Ozon 未返回详细失败原因";
+      diagnostics.blocking = [...new Set(diagnostics.blocking)].slice(0,4);
+      diagnostics.warnings = [...new Set(diagnostics.warnings)].slice(0,4);
+      return diagnostics;
+    }}
+    function sellerUploadError(submission) {{
+      return sellerUploadDiagnostics(submission).blocking.join(" · ") || "Ozon 未返回详细阻断原因";
+    }}
+    function sellerUploadWarning(submission) {{
+      return sellerUploadDiagnostics(submission).warnings.join(" · ");
     }}
     function scheduleProductUploadStatusRetry(item, controls, remaining) {{
       if (remaining <= 0) return false;
@@ -3286,14 +3350,16 @@ def build_upload_workspace_html(run_id: str) -> str:
         const submission = result.data || {{}};
         productUploadState.submissions.set(item.seed_id,submission);
         if (submission.status === "accepted_by_ozon") {{
-          status.className = "product-upload-status success";
-          status.textContent = `Ozon 已确认接收 · task_id ${{submission.task_id}} · 图片任务包 ${{submission.image_task_package_id || "已写入"}}。本商品工作台流程完成。`;
+          const warning = sellerUploadWarning(submission);
+          status.className = warning ? "product-upload-status non-blocking-warning" : "product-upload-status success";
+          status.textContent = `Ozon 已确认接收 · task_id ${{submission.task_id}} · 图片任务包 ${{submission.image_task_package_id || "已写入"}}。本商品工作台流程完成。${{warning ? ` 非阻断警告：${{warning}}。` : ""}}`;
           confirmButton.disabled = true; previewButton.disabled = true; confirmButton.textContent = "上传完成";
           return;
         }}
         if (submission.status === "failed") {{
+          const warning = sellerUploadWarning(submission);
           status.className = "product-upload-status error";
-          status.textContent = `Ozon 上传失败：${{sellerUploadError(submission)}}。修正后可重新准备并上传。`;
+          status.textContent = `Ozon 上传失败：${{sellerUploadError(submission)}}。${{warning ? `非阻断警告另列：${{warning}}。` : ""}}修正后可重新准备并上传。`;
           previewButton.disabled = !item.ready_to_build; confirmButton.disabled = true; previewButton.textContent = "修正后重新准备";
           return;
         }}
@@ -3345,7 +3411,7 @@ def build_upload_workspace_html(run_id: str) -> str:
         if (submissionStatus === "failed") {{
           previewButton.disabled = !item.ready_to_build; confirmButton.disabled = true; previewButton.textContent = "修正后重新准备"; status.className = "product-upload-status error"; status.textContent = `上次上传失败：${{sellerUploadError(item.upload_submission)}}。`;
         }} else if (submissionStatus === "accepted_by_ozon") {{
-          previewButton.disabled = true; confirmButton.disabled = true; confirmButton.textContent = "上传完成"; status.className = "product-upload-status success"; status.textContent = `Ozon 已确认接收 · task_id ${{item.upload_submission.task_id}} · 图片任务包 ${{item.upload_submission.image_task_package_id || "已写入"}}`;
+          const warning = sellerUploadWarning(item.upload_submission); previewButton.disabled = true; confirmButton.disabled = true; confirmButton.textContent = "上传完成"; status.className = warning ? "product-upload-status non-blocking-warning" : "product-upload-status success"; status.textContent = `Ozon 已确认接收 · task_id ${{item.upload_submission.task_id}} · 图片任务包 ${{item.upload_submission.image_task_package_id || "已写入"}}${{warning ? ` · 非阻断警告：${{warning}}` : ""}}`;
         }} else {{
           previewButton.disabled = true; confirmButton.disabled = true; confirmButton.textContent = "Ozon 处理中"; status.textContent = `Ozon 正在处理 · task_id ${{item.upload_submission.task_id}}`;
           setTimeout(() => pollProductUploadStatus(item,controls),0);
@@ -3353,128 +3419,6 @@ def build_upload_workspace_html(run_id: str) -> str:
       }}
       previewButton.addEventListener("click",() => previewProductUpload(item,controls)); confirmButton.addEventListener("click",() => confirmProductUpload(item,controls));
       controls.append(previewButton,confirmButton,status); container.append(controls);
-    }}
-    function temuUploadError(submission) {{
-      const error = (submission && (submission.last_error || submission.status_query_error)) || {{}};
-      return error.message || "Temu 未返回可读的失败原因";
-    }}
-    async function previewTemuProductUpload(item, controls) {{
-      const previewButton = controls.querySelector("[data-temu-action=preview]");
-      const confirmButton = controls.querySelector("[data-temu-action=confirm]");
-      const statusButton = controls.querySelector("[data-temu-action=status]");
-      const status = controls.querySelector(".temu-upload-status");
-      previewButton.disabled = true; confirmButton.disabled = true; statusButton.disabled = true;
-      status.className = "temu-upload-status";
-      status.textContent = "正在用已锁定的商品、SKU、价格和包装证据生成 Temu 官方 API 预览…";
-      try {{
-        const result = await api(`/api/batches/${{encodeURIComponent(runId)}}/temu-product-upload/${{encodeURIComponent(item.seed_id)}}/preview`, {{method:"POST",headers:{{"Content-Type":"application/json"}},body:"{{}}"}});
-        const preview = result.data || {{}};
-        temuUploadState.previews.set(item.seed_id,preview);
-        const request = preview.temu_request || {{}};
-        const goods = request.goodsBasic || {{}};
-        status.className = "temu-upload-status success";
-        status.textContent = `Temu 预览已就绪：${{goods.goodsName || item.source_title}} · 预览哈希 ${{String(preview.preview_hash || "").slice(0,12)}}…；请核对后显式确认。`;
-        previewButton.textContent = "重新生成 Temu 预览";
-        previewButton.disabled = false; confirmButton.disabled = false;
-      }} catch (error) {{
-        status.className = "temu-upload-status error";
-        status.textContent = error.message || "Temu 官方 API 预览生成失败";
-        previewButton.disabled = false;
-      }}
-    }}
-    async function pollTemuProductUploadStatus(item, controls) {{
-      const statusButton = controls.querySelector("[data-temu-action=status]");
-      const status = controls.querySelector(".temu-upload-status");
-      statusButton.disabled = true; status.className = "temu-upload-status";
-      status.textContent = "正在通过 Temu 官方 API 回查商品状态…";
-      try {{
-        const result = await api(`/api/batches/${{encodeURIComponent(runId)}}/temu-product-upload/${{encodeURIComponent(item.seed_id)}}/status`, {{method:"POST",headers:{{"Content-Type":"application/json"}},body:"{{}}"}});
-        const submission = result.data || {{}};
-        temuUploadState.submissions.set(item.seed_id,submission);
-        if (submission.status === "published") {{
-          status.className = "temu-upload-status success";
-          status.textContent = `Temu 已发布 · goodsId ${{submission.goods_id}}。`;
-          statusButton.textContent = "Temu 已发布";
-          return;
-        }}
-        if (submission.status === "failed") {{
-          status.className = "temu-upload-status error";
-          status.textContent = `Temu 审核失败：${{temuUploadError(submission)}}。`;
-        }} else if (submission.status === "draft") {{
-          status.textContent = `Temu 商品仍为草稿 · goodsId ${{submission.goods_id}}；可稍后再次回查。`;
-        }} else {{
-          status.textContent = `Temu 正在处理 · goodsId ${{submission.goods_id}}；可稍后再次回查。`;
-        }}
-        statusButton.disabled = false;
-      }} catch (error) {{
-        const saved = error.data || {{}};
-        status.className = "temu-upload-status error";
-        status.textContent = `Temu 状态回查失败：${{temuUploadError(saved) || error.message || error}}。不会重复提交商品。`;
-        statusButton.disabled = false;
-      }}
-    }}
-    async function confirmTemuProductUpload(item, controls) {{
-      const preview = temuUploadState.previews.get(item.seed_id);
-      const previewButton = controls.querySelector("[data-temu-action=preview]");
-      const confirmButton = controls.querySelector("[data-temu-action=confirm]");
-      const statusButton = controls.querySelector("[data-temu-action=status]");
-      const status = controls.querySelector(".temu-upload-status");
-      if (!preview || !preview.preview_hash) {{
-        status.className = "temu-upload-status error";
-        status.textContent = "请先生成 Temu 预览并核对预览哈希。";
-        return;
-      }}
-      const request = preview.temu_request || {{}};
-      const goods = request.goodsBasic || {{}};
-      if (!window.confirm(`确认把“${{goods.goodsName || item.source_title}}”提交到 Temu 官方 API？\\n预览哈希：${{preview.preview_hash}}`)) return;
-      previewButton.disabled = true; confirmButton.disabled = true; statusButton.disabled = true;
-      status.className = "temu-upload-status"; status.textContent = "正在提交这一件商品到 Temu 官方 API…";
-      try {{
-        const result = await api(`/api/batches/${{encodeURIComponent(runId)}}/temu-product-upload/${{encodeURIComponent(item.seed_id)}}/confirm`, {{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify({{preview_hash:preview.preview_hash,confirmed:true}})}});
-        const submission = result.data || {{}};
-        temuUploadState.submissions.set(item.seed_id,submission);
-        status.className = "temu-upload-status success";
-        status.textContent = `Temu 已受理 · goodsId ${{submission.goods_id}}；按官方建议等待后再回查状态，不会重复提交。`;
-        confirmButton.textContent = "Temu 已提交";
-        statusButton.disabled = false;
-      }} catch (error) {{
-        const failed = error.data || {{}};
-        temuUploadState.submissions.set(item.seed_id,failed);
-        status.className = "temu-upload-status error";
-        status.textContent = `Temu 提交失败：${{temuUploadError(failed) || error.message || error}}。本次尝试已记录，禁止盲目重复提交。`;
-      }}
-    }}
-    function renderTemuUploadActions(container,item) {{
-      const controls = document.createElement("div"); controls.className = "temu-upload-actions";
-      const label = document.createElement("strong"); label.className = "temu-upload-label"; label.textContent = "Temu 官方 API · 独立发布通道";
-      const evidenceReady = !!(item.bootstrap_image_ready && item.pricing_ready && item.supplier_selected_sku);
-      const previewButton = document.createElement("button"); previewButton.type = "button"; previewButton.dataset.temuAction = "preview"; previewButton.textContent = "生成 Temu 预览"; previewButton.disabled = !evidenceReady;
-      const confirmButton = document.createElement("button"); confirmButton.type = "button"; confirmButton.dataset.temuAction = "confirm"; confirmButton.className = "confirm"; confirmButton.textContent = "确认提交到 Temu"; confirmButton.disabled = true;
-      const statusButton = document.createElement("button"); statusButton.type = "button"; statusButton.dataset.temuAction = "status"; statusButton.textContent = "查询 Temu 状态"; statusButton.disabled = true;
-      const status = document.createElement("span"); status.className = "temu-upload-status"; status.textContent = evidenceReady ? "使用同一套已锁定商品证据，Temu 预览和提交记录与 Ozon 完全分开。" : "Temu 通道仍缺少锁定原图、SKU 或已确认价格包装证据。";
-      if (item.temu_upload_preview && item.temu_upload_preview.preview_hash) {{
-        temuUploadState.previews.set(item.seed_id,item.temu_upload_preview);
-        previewButton.textContent = "重新生成 Temu 预览"; confirmButton.disabled = false;
-        status.textContent = `Temu 预览待确认 · 预览哈希 ${{String(item.temu_upload_preview.preview_hash).slice(0,12)}}…`;
-      }}
-      if (item.temu_upload_submission) {{
-        const submission = item.temu_upload_submission;
-        temuUploadState.submissions.set(item.seed_id,submission);
-        previewButton.disabled = true; confirmButton.disabled = true;
-        if (submission.goods_id) statusButton.disabled = false;
-        if (submission.status === "published") {{
-          statusButton.disabled = true; statusButton.textContent = "Temu 已发布";
-          status.className = "temu-upload-status success"; status.textContent = `Temu 已发布 · goodsId ${{submission.goods_id}}。`;
-        }} else if (submission.status === "failed") {{
-          status.className = "temu-upload-status error"; status.textContent = `Temu 提交失败：${{temuUploadError(submission)}}。已阻止相同标识盲目重试。`;
-        }} else {{
-          status.textContent = `Temu 已提交 · goodsId ${{submission.goods_id || "-"}} · 当前状态 ${{submission.status || "processing"}}。`;
-        }}
-      }}
-      previewButton.addEventListener("click",() => previewTemuProductUpload(item,controls));
-      confirmButton.addEventListener("click",() => confirmTemuProductUpload(item,controls));
-      statusButton.addEventListener("click",() => pollTemuProductUploadStatus(item,controls));
-      controls.append(label,previewButton,confirmButton,statusButton,status); container.append(controls);
     }}
     async function batchUploadProducts() {{
       const button = $("batchUploadProducts"); const status = $("batchUploadStatus");
@@ -3540,7 +3484,7 @@ def build_upload_workspace_html(run_id: str) -> str:
         (item.blocking_gates || []).forEach((gate) => {{ const chip = document.createElement("span"); chip.className = "item-gate-chip"; chip.textContent = `缺少：${{blockerLabels[gate] || gate}}`; gateSummary.append(chip); }});
         if (item.ready_to_build) {{ const ready = document.createElement("span"); ready.className = "item-gate-chip"; ready.textContent = "不等待其他商品"; gateSummary.append(ready); }}
         const meta = document.createElement("div"); meta.className = "meta-grid"; meta.innerHTML = `<div class="meta"><span>精准类目</span><strong>${{item.category_path || "-"}}</strong></div><div class="meta"><span>属性模板</span><strong>${{item.attribute_schema_count || 0}} 字段</strong></div><div class="meta"><span>建品图片</span><strong>${{item.bootstrap_image_ready ? "锁定原图已就绪" : "缺少锁定原图"}}</strong></div>`;
-        body.append(label,title,notice,gateSummary,meta); renderUploadCoreFields(body,item); renderRequiredAttributeEditor(body,item); renderMapping(body,item); renderProductUploadActions(body,item); renderTemuUploadActions(body,item); card.append(body); $("draftItems").append(card);
+        body.append(label,title,notice,gateSummary,meta); renderUploadCoreFields(body,item); renderRequiredAttributeEditor(body,item); renderMapping(body,item); renderProductUploadActions(body,item); card.append(body); $("draftItems").append(card);
       }});
       if (!items.length) {{ const empty = document.createElement("div"); empty.className = "empty"; empty.textContent = "当前批次没有可用的类目模板与商品证据"; $("draftItems").append(empty); }}
     }}
@@ -3631,17 +3575,9 @@ def create_handler(
     repo: FsRepo | None = None,
     background_runner: WorkbenchBackgroundRunner | None = None,
     runtime_controller: WorkbenchRuntimeController | None = None,
-    temu_seller_api: TemuSellerApi | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     selected_repo = repo or FsRepo()
-    service = (
-        background_runner.service
-        if background_runner is not None
-        else WorkbenchService(
-            selected_repo,
-            temu_seller_api=temu_seller_api,
-        )
-    )
+    service = background_runner.service if background_runner is not None else WorkbenchService(selected_repo)
     credential_service = CredentialService(selected_repo)
     diagnostics_exporter = DiagnosticsExportService(selected_repo)
     runner = background_runner or WorkbenchBackgroundRunner(
@@ -3889,6 +3825,18 @@ def create_handler(
                     "connection_only": payload.get("connection_only") is True,
                     "details": payload.get("details") if isinstance(payload.get("details"), dict) else None,
                 }
+                incoming_run_id = str(incoming.get("run_id") or "").strip()
+                if incoming_run_id and not selected_repo.is_current_workbench_run_id(incoming_run_id):
+                    incoming.update(
+                        {
+                            "run_id": None,
+                            "task_type": None,
+                            "stage": "stale_task_ignored",
+                            "code": "browser_task.stale_ignored",
+                            "message": f"Stale browser task reference was discarded: {incoming_run_id}",
+                            "details": {"stale_run_id": incoming_run_id},
+                        }
+                    )
                 if self._should_ignore_invalidated_heartbeat(incoming):
                     saved = selected_repo.load_browser_bridge_status()
                     response_code = "browser_bridge.heartbeat_ignored"
@@ -3897,7 +3845,7 @@ def create_handler(
                     saved = selected_repo.save_browser_bridge_status(incoming)
                     response_code = "browser_bridge.heartbeat"
                     response_message = "Browser bridge heartbeat saved."
-                run_id = str(payload.get("run_id") or "").strip()
+                run_id = str(incoming.get("run_id") or "").strip()
                 code = str(payload.get("code") or "")
                 if run_id and code.endswith(".candidate_rejected"):
                     selected_repo.append_run_event(
@@ -3985,13 +3933,6 @@ def create_handler(
                 )
                 return
             parts = self._path_parts(path)
-            if parts == ["api", "settings", "public-media"]:
-                self._send_result(
-                    service.configure_public_media_base_url(
-                        str(payload.get("base_url") or "")
-                    )
-                )
-                return
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "actions":
                 if runner.status(parts[2]).get("running"):
                     self._send_result(
@@ -4057,6 +3998,22 @@ def create_handler(
             if (
                 len(parts) == 6
                 and parts[:2] == ["api", "batches"]
+                and parts[3] == "products"
+                and parts[5] == "exclude"
+            ):
+                self._send_result(
+                    service.exclude_product_without_replacement(
+                        parts[2],
+                        parts[4],
+                        str(payload.get("reason") or ""),
+                        confirmed=payload.get("confirmed") is True,
+                    ),
+                    run_id=parts[2],
+                )
+                return
+            if (
+                len(parts) == 6
+                and parts[:2] == ["api", "batches"]
                 and parts[3] == "product-upload"
                 and parts[5] == "confirm"
             ):
@@ -4079,52 +4036,6 @@ def create_handler(
             ):
                 self._send_result(
                     service.refresh_product_upload_status(parts[2], parts[4]),
-                    run_id=parts[2],
-                )
-                return
-            if (
-                len(parts) == 6
-                and parts[:2] == ["api", "batches"]
-                and parts[3] == "temu-product-upload"
-                and parts[5] == "preview"
-            ):
-                self._send_result(
-                    service.preview_temu_product_upload(
-                        parts[2],
-                        parts[4],
-                    ),
-                    run_id=parts[2],
-                )
-                return
-            if (
-                len(parts) == 6
-                and parts[:2] == ["api", "batches"]
-                and parts[3] == "temu-product-upload"
-                and parts[5] == "confirm"
-            ):
-                self._send_result(
-                    service.submit_temu_product_upload(
-                        parts[2],
-                        parts[4],
-                        preview_hash=str(
-                            payload.get("preview_hash") or ""
-                        ),
-                        confirmed=payload.get("confirmed") is True,
-                    ),
-                    run_id=parts[2],
-                )
-                return
-            if (
-                len(parts) == 6
-                and parts[:2] == ["api", "batches"]
-                and parts[3] == "temu-product-upload"
-                and parts[5] == "status"
-            ):
-                self._send_result(
-                    service.refresh_temu_product_upload_status(
-                        parts[2],
-                        parts[4],
-                    ),
                     run_id=parts[2],
                 )
                 return
@@ -4319,7 +4230,16 @@ def create_handler(
             return json.loads(raw.decode("utf-8"))
 
         def _browser_task(self, run_id: str) -> dict[str, Any]:
-            run = selected_repo.load_run(run_id)
+            try:
+                run = service.recover_browser_task_state(run_id)
+            except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+                return {
+                    "ok": True,
+                    "code": "browser_task.none",
+                    "message": "The referenced browser task no longer belongs to a current workbench batch.",
+                    "data": {"stale_run_id": run_id},
+                    "errors": [],
+                }
             if run.get("browser_task_cancelled"):
                 return {
                     "ok": True,
@@ -4439,6 +4359,11 @@ def create_handler(
                         continue
                     if str(item.get("seed_id") or "") in captured_seed_ids:
                         continue
+                    reference_image_urls = []
+                    for value in item.get("ozon_reference_images") or [item.get("ozon_main_image")]:
+                        image_url = str(value or "").strip()
+                        if image_url.startswith("https://") and image_url not in reference_image_urls:
+                            reference_image_urls.append(image_url)
                     channels.append(
                         {
                             "channel_index": channel_index,
@@ -4447,6 +4372,7 @@ def create_handler(
                             "ozon_title": item.get("ozon_title"),
                             "ozon_url": item.get("ozon_url"),
                             "reference_image_url": item.get("ozon_main_image"),
+                            "reference_image_urls": reference_image_urls,
                             "selected_options": item.get("selected_options") or {},
                             "dimension_evidence": item.get("dimension_evidence") or {},
                         }
@@ -4561,12 +4487,7 @@ def create_handler(
                     "errors": [],
                 }
             newest_run: dict[str, Any] | None = None
-            for run_dir in selected_repo.runs_dir.iterdir():
-                if not run_dir.is_dir():
-                    continue
-                if not (run_dir / "run.json").exists():
-                    continue
-                run = selected_repo.load_run(run_dir.name)
+            for run in selected_repo.list_workbench_runs():
                 if newest_run is None or str(run.get("created_at") or "") > str(newest_run.get("created_at") or ""):
                     newest_run = run
             if newest_run is not None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 
 from ozon_v2.adapters.fs_repo import FsRepo
 from ozon_v2.app.result import Result
@@ -34,6 +35,28 @@ class FakeDedupeRefreshService:
 
 
 class WorkbenchSkeletonTests(RuntimeTestCase):
+    def test_workbench_seed_selection_consumes_sampled_seeds_immediately(self) -> None:
+        repo = FsRepo(self.context)
+        first = self.ready_seed("seed-5000-0101", "first product")
+        second = self.ready_seed("seed-5000-0102", "second product")
+        repo.save_active_seeds([first, second])
+        self.save_test_credentials(repo)
+        run = repo.create_workbench_batch_record(target_count=2)
+        run["status"] = WorkbenchState.STORE_DEDUPED.value
+        repo.save_run(run)
+
+        result = WorkbenchService(repo).dispatch(run["run_id"], WorkbenchAction.SELECT_SEEDS.value)
+
+        self.assertTrue(result.ok)
+        sampled = repo.load_sampled_seeds(run["run_id"])
+        sampled_ids = {seed.seed_id for seed in sampled}
+        self.assertEqual({first.seed_id, second.seed_id}, sampled_ids)
+        self.assertTrue(sampled_ids.issubset(repo.load_used_seed_ids()))
+        self.assertTrue(
+            {repo.seed_identity_key(seed) for seed in sampled}.issubset(repo.load_used_seed_identity_keys())
+        )
+        self.assertTrue(sampled_ids.isdisjoint({seed.seed_id for seed in repo.load_active_seeds()}))
+
     def test_image_skill_builds_white_subject_from_locked_multi_image_evidence(self) -> None:
         root = Path(__file__).resolve().parents[1] / "skills" / "ozon-product-media-generator"
         skill = (root / "SKILL.md").read_text(encoding="utf-8")
@@ -128,7 +151,10 @@ class WorkbenchSkeletonTests(RuntimeTestCase):
         self.assertEqual(2, loaded["target_count"])
         self.assertNotIn(rejected.seed_id, {seed.seed_id for seed in repo.load_active_seeds()})
         self.assertIn(rejected.seed_id, repo.load_blacklisted_seed_ids())
+        self.assertIn(repo.seed_identity_key(rejected), repo.load_blacklisted_seed_identity_keys())
         self.assertIn("ozon-rejected", repo.load_blacklisted_ozon_product_ids())
+        self.assertIn(replacement.seed_id, repo.load_used_seed_ids())
+        self.assertNotIn(replacement.seed_id, {seed.seed_id for seed in repo.load_active_seeds()})
         self.assertEqual(
             [retained.seed_id],
             [item["seed_id"] for item in repo.load_attribute_template_result(run_id)["seed_templates"]],
@@ -312,7 +338,7 @@ class WorkbenchSkeletonTests(RuntimeTestCase):
         self.assertEqual(["летнее одеяло", "легкое одеяло"], sampled[0].ozon_query_terms_ru)
         self.assertEqual(1, dedupe.refresh_count)
 
-    def test_select_seeds_samples_without_removing_active_pool(self) -> None:
+    def test_select_seeds_consumes_sampled_items_from_active_pool(self) -> None:
         repo = FsRepo(self.context)
         self.save_test_credentials(repo)
         seller_api = FakeSellerApiAdapter()
@@ -327,11 +353,13 @@ class WorkbenchSkeletonTests(RuntimeTestCase):
         self.assertTrue(result.ok)
         self.assertEqual("workbench.seeds_selected", result.code)
         self.assertEqual(WorkbenchState.SEED_SELECTED.value, repo.load_run(run_id)["status"])
-        self.assertEqual(2, len(repo.load_sampled_seeds(run_id)))
-        self.assertEqual(5000, len(repo.load_active_seeds()))
+        sampled = repo.load_sampled_seeds(run_id)
+        self.assertEqual(2, len(sampled))
+        self.assertEqual(4998, len(repo.load_active_seeds()))
+        self.assertTrue({repo.seed_identity_key(seed) for seed in sampled} <= repo.load_used_seed_identity_keys())
         self.assertEqual("seed_sampling.selected", repo.load_run_events(run_id)[-1].event_type)
 
-    def test_exhausted_attribute_template_seed_is_replaced_without_removing_active_pool(self) -> None:
+    def test_exhausted_attribute_template_seed_replacement_is_consumed_from_active_pool(self) -> None:
         repo = FsRepo(self.context)
         repo.initialize_runtime()
         active_before = repo.load_active_seeds()
@@ -364,9 +392,130 @@ class WorkbenchSkeletonTests(RuntimeTestCase):
         self.assertEqual([replacement.seed_id], loaded["replacement_pending_seed_ids"])
         self.assertFalse(loaded["attribute_template_contract_ready"])
         self.assertNotIn("attribute_template_contract_path", loaded)
-        self.assertEqual(5000, len(repo.load_active_seeds()))
+        self.assertEqual(4999, len(repo.load_active_seeds()))
+        self.assertIn(repo.seed_identity_key(replacement), repo.load_used_seed_identity_keys())
         self.assertEqual(rejected_seed.seed_id, repo.load_rejected_seed_attempts(run_id)[0]["seed_id"])
         self.assertEqual("seed_sampling.replaced_after_exhaustion", repo.load_run_events(run_id)[-1].event_type)
+
+    def test_inflight_attribute_template_result_cannot_overwrite_replacement(self) -> None:
+        class BlockingSellerApiAdapter(FakeSellerApiAdapter):
+            def __init__(self) -> None:
+                super().__init__()
+                self.entered = threading.Event()
+                self.release = threading.Event()
+
+            def resolve_attribute_template(self, category_candidate: dict) -> dict:
+                self.entered.set()
+                if not self.release.wait(timeout=5):
+                    raise TimeoutError("test did not release the seller template request")
+                return super().resolve_attribute_template(category_candidate)
+
+        repo = FsRepo(self.context)
+        repo.initialize_runtime()
+        rejected_seed = repo.load_active_seeds()[0]
+        run = repo.create_workbench_batch_record(target_count=1)
+        run_id = run["run_id"]
+        repo.save_sampled_seeds(run_id, [rejected_seed])
+        run["status"] = WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTING.value
+        run["sampled_seed_ids"] = [rejected_seed.seed_id]
+        run["attribute_template_contract_ready"] = True
+        run["browser_task_resumed_at"] = "dispatch-before-replacement"
+        repo.save_run(run)
+        adapter = BlockingSellerApiAdapter()
+        service = WorkbenchService(repo, seller_api_adapter=adapter)
+        result_holder: dict[str, Result] = {}
+
+        def ingest_stale_result() -> None:
+            result_holder["result"] = service.ingest_attribute_template_result(
+                run_id,
+                self.attribute_template_payload(run_id, rejected_seed.seed_id),
+            )
+
+        ingest_thread = threading.Thread(target=ingest_stale_result)
+        ingest_thread.start()
+        self.assertTrue(adapter.entered.wait(timeout=5))
+        try:
+            replacement = service.replace_exhausted_attribute_template_seed(
+                run_id,
+                rejected_seed.seed_id,
+                "no verified Chinese cross-border product",
+                random_seed=9,
+            )
+            self.assertTrue(replacement.ok)
+        finally:
+            adapter.release.set()
+            ingest_thread.join(timeout=5)
+
+        self.assertFalse(ingest_thread.is_alive())
+        stale_result = result_holder["result"]
+        self.assertFalse(stale_result.ok)
+        self.assertEqual("workbench.attribute_template_stale_result", stale_result.code)
+        replacement_seed = repo.load_sampled_seeds(run_id)[0]
+        self.assertNotEqual(rejected_seed.seed_id, replacement_seed.seed_id)
+        loaded = repo.load_run(run_id)
+        self.assertEqual(WorkbenchState.SEED_SELECTED.value, loaded["status"])
+        self.assertEqual([replacement_seed.seed_id], loaded["replacement_pending_seed_ids"])
+        with self.assertRaises(FileNotFoundError):
+            repo.load_attribute_template_result(run_id)
+
+    def test_attribute_template_result_with_stale_dispatch_token_is_rejected(self) -> None:
+        repo = FsRepo(self.context)
+        seed = self.ready_seed("seed-current", "current")
+        run = repo.create_workbench_batch_record(target_count=1)
+        run_id = run["run_id"]
+        repo.save_sampled_seeds(run_id, [seed])
+        run["status"] = WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTING.value
+        run["sampled_seed_ids"] = [seed.seed_id]
+        run["browser_task_resumed_at"] = "dispatch-current"
+        repo.save_run(run)
+        payload = self.attribute_template_payload(run_id, seed.seed_id)
+        payload["dispatch_token"] = "dispatch-stale"
+
+        result = WorkbenchService(
+            repo,
+            seller_api_adapter=FakeSellerApiAdapter(),
+        ).ingest_attribute_template_result(run_id, payload)
+
+        self.assertFalse(result.ok)
+        self.assertEqual("workbench.attribute_template_stale_result", result.code)
+        self.assertEqual(
+            WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTING.value,
+            repo.load_run(run_id)["status"],
+        )
+        with self.assertRaises(FileNotFoundError):
+            repo.load_attribute_template_result(run_id)
+
+    def test_ozon_collection_result_with_stale_dispatch_token_is_rejected(self) -> None:
+        repo = FsRepo(self.context)
+        seed = self.ready_seed("seed-current", "current")
+        run = repo.create_workbench_batch_record(target_count=1)
+        run_id = run["run_id"]
+        repo.save_sampled_seeds(run_id, [seed])
+        run["status"] = WorkbenchState.OZON_COLLECTING.value
+        run["sampled_seed_ids"] = [seed.seed_id]
+        run["browser_task_resumed_at"] = "dispatch-current"
+        repo.save_run(run)
+
+        result = WorkbenchService(repo).ingest_ozon_collection_result(
+            run_id,
+            {
+                "run_id": run_id,
+                "worker": "workbench_browser_bridge",
+                "dispatch_token": "dispatch-stale",
+                "ozon_candidates": [
+                    self.saved_ozon_candidate(seed.seed_id, "ozon-stale"),
+                ],
+            },
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual("workbench.ozon_collection_stale_result", result.code)
+        self.assertEqual(
+            WorkbenchState.OZON_COLLECTING.value,
+            repo.load_run(run_id)["status"],
+        )
+        with self.assertRaises(FileNotFoundError):
+            repo.load_ozon_collection_result(run_id)
 
     def test_generate_queries_without_mapping_keeps_query_gate_closed(self) -> None:
         repo = FsRepo(self.context)

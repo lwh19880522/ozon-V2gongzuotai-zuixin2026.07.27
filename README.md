@@ -1,76 +1,74 @@
-# Ozon V2 工具台 (Ozon V2 Workbench)
+# Ozon V2 工作台 (Ozon V2 Workbench)
 
-本仓库包含 Ozon V2 工具台的完整可复现程序本体：本地工具台服务、浏览器扩展、MCP 控制器、采集与生图队列、Codex 技能、Windows 一键启动脚本、测试和设计文档。
+本仓库包含 Ozon V2 工作台、本地浏览器桥接、字段草稿 Skill、专用生图
+Skill、安装脚本和自动化测试。
 
 仓库地址：<https://github.com/lwh19880522/ozon-V2gongzuotai-zuixin2026.07.27>
-
-完整文档：
 
 - [详细安装说明](docs/INSTALLATION.md)
 - [完整使用流程](docs/USER_GUIDE.md)
 - [干净发布与隐私边界](docs/RELEASE_AND_PRIVACY.md)
-- [Temu 官方 API 操作说明](docs/temu/README.md)
 
-## Temu 常规店铺通道
-
-工作台现在包含一条与 Ozon 上传隔离的 Temu 官方 API 通道，当前边界按常规店铺设计，不依赖海外仓，也不包含半托管流程。操作员先生成无密钥预览，核对后必须同时提交 `confirmed=true` 和该预览的精确 SHA-256 哈希，工作台才会尝试调用 `temu.local.goods.v3.add`；返回 `goodsId` 只代表商品已创建，不代表已经发布，后续还要通过 `temu.local.goods.list.retrieve` 查询官方状态。
-
-真实请求默认保持关闭。只有本机已配置真实 Temu 授权凭据，并注入经过批准的签名提供器时，提交才可能发出；不要在仓库、预览、日志或诊断信息中填写或保存密钥。完整配置、授权、确认、状态查询和错误恢复流程见 [Temu 官方 API 操作说明](docs/temu/README.md)。
-
-## 组件一览
+## 组件
 
 | 组件 | 用途 | 安装结果 |
 | --- | --- | --- |
-| 本地工具台 | 批次、采集审核、SKU 主体、价格、字段草稿与逐商品建品 | `http://127.0.0.1:8765/` |
-| Edge 扩展 | 受管浏览器采集桥接 | 从 `browser_extension/ozon_v2_bridge` 加载 |
-| 字段 Skill | 基于已锁定 1688 SKU、Ozon 证据与模板补全字段 | 安装到 Codex Skills |
-| 生图总控 Skill | 从固定任务目录调度最多 10 个生图任务 | 安装到 Codex Skills |
-| 商品媒体 Skill | 锁定主体、生成俄文图库、视频并通过 R2 更新商品 | 安装到 Codex Skills |
+| 本地工作台 | 批次、采集审核、SKU 主体、价格、字段草稿与建品 | `http://127.0.0.1:8765/` |
+| Edge 扩展 | 受管浏览器采集桥接 | 加载 `browser_extension/ozon_v2_bridge` |
+| 字段 Skill | 根据已锁定证据补全字段 | 安装到 Codex Skills |
+| Ozon 专用生图 Skill | 单线程锁定主体、生成图库和视频并更新 Ozon | 安装到 Codex Skills |
 
 主流程：
 
 ```text
 安装并启动 → 店铺授权 → 创建批次 → Ozon/1688 采集
-→ 锁定真实 SKU 与主体 → 填价格和包装证据 → 智能字段草稿
-→ 只补录仍缺失的必填项 → 逐商品预览与建品
-→ 写入独立图片任务包 → 生图 Skill 后台更新商品媒体
+→ 锁定真实 SKU 与主体 → 智能字段草稿 → 逐商品建品
+→ 写入 image_tasks/pending → 专用生图 Skill 单线程更新商品媒体
 ```
 
-## 新电脑一键安装与启动
+## 安装和启动
 
 运行环境：Windows、PowerShell 5.1+、Python 3.11+。
 
-下载或克隆完整仓库后，直接双击仓库根目录的：
+双击：
 
 ```text
 安装并启动 Ozon V2.cmd
 ```
 
-它会一次完成工作台依赖、3 个配套 Skill、桌面快捷方式、本地服务启动和真实健康检查，并自动打开：
-
-```text
-http://127.0.0.1:8765/
-```
-
-也可以在仓库根目录执行同一安装器：
+或运行：
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_ozon_v2.ps1
 ```
 
-之后双击桌面的“`Ozon V2 工具台`”或仓库根目录的“`启动 Ozon V2.cmd`”即可启动。
-
-> 只安装 Skill 或复制 `ozon-product-media-generator`、`ozon-intelligent-field-drafter`、`ozon-image-generation-controller` 这 3 个目录，不代表工作台安装完成。完整安装必须同时通过本地健康接口、桌面启动入口、运行依赖和 Skill 版本一致性检查。
-
-工具台右上角的一体化运行胶囊提供真实服务、Edge 扩展和当前任务状态，并支持快速重启、停止和诊断。
-
-严格检查完整安装：
+完整安装必须同时通过本地健康接口、桌面启动入口、运行依赖和 Skill
+版本一致性检查。只安装 Skill 不代表工作台安装完成。
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify_ozon_v2_install.ps1
 ```
 
-## 生命周期控制 (Lifecycle control)
+## 专用生图契约
+
+- 用户侧只有一个生图入口：`ozon-product-media-generator`。
+- 严格单线程，一次完整处理一件商品，再领取下一件。
+- Codex 自动启动本地只读媒体服务和免费的 Cloudflare Quick Tunnel；用户
+  不需要提供 bucket、域名、账号、Token 或公网地址。
+- 每件商品先根据已锁定 1688 SKU 证据生成一张白底主体图，校验后冻结
+  路径和 SHA-256。
+- 成品生成只允许使用这同一张白底主体图作为唯一图片参考，同时结合固定
+  提示词一次生成 4×2 八宫格。
+- 八宫格按行优先裁成 8 张严格 3:4 图片，不拉伸、不重排。任何主体外形、
+  颜色、数量、结构、零件、配件、印花或规格变化都必须拒绝。
+- 只返修失败槽位，仍使用同一张冻结白底主体图作为唯一图片参考。
+- 8 张图片通过验收后，本地生成滚动视频和封面，经自动公网通道提交到
+  同一个 Ozon 商品；任务结果写入独立图片任务区，不回传工作台。
+
+Cloudflare Quick Tunnel 是匿名临时通道。专用 Skill 会在批次开始前启动，
+在所有 Ozon 媒体提交完成后关闭。
+
+## 生命周期控制
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\workbench_control.ps1 -Action Status
@@ -79,49 +77,20 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\workbench_cont
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\workbench_control.ps1 -Action Stop
 ```
 
-运行状态、浏览器配置、日志、采集证据和生成图片只保存在本机，不进入 Git 仓库。
-
-## 隐私与干净发布
-
-仓库只包含可安装程序、静态种子池、3 个配套 Skill、测试和公开文档。下列内容不会进入发布包：Seller API 凭证、R2 配置、浏览器资料、运行数据库、采集证据、生成媒体、日志、临时目录、本机用户名和绝对路径。
-
-维护者生成新发布包时使用显式白名单和隐私扫描：
-
-```powershell
-python .\scripts\build_clean_release.py --destination .\.release\ozon-v2
-python .\scripts\build_clean_release.py --scan-only .\.release\ozon-v2
-```
-
-每个发布包都会生成 `RELEASE_MANIFEST.json`，记录仓库地址、文件数量和逐文件 SHA-256。完整边界与复核方法见[干净发布与隐私边界](docs/RELEASE_AND_PRIVACY.md)。
-
-## 生图并发契约 (Image worker contract)
-
-- 可用生图身份为 `ozon-image-worker-01` 至 `ozon-image-worker-10`，分别对应全局固定的 10 个用户可见 Codex 生图工作任务。
-- 首次使用且固定任务注册表为空时，直接要求开始或继续生图即可一次性初始化缺失槽位，不需要额外确认口令；初始化后永久复用登记结果。
-- 总控按槽位顺序复用这 10 个任务；一个任务一次只处理一件商品，全局最多并发处理 10 件商品，总控本身不计入并发数。
-- 新商品、继续生图和返修都复用已有任务；返修优先回到原任务。只有用户明确要求“重新开新的任务”时，才允许替换指定槽位，替换后总数仍为 10。
-- 工作台用一张已锁定的 1688 原图完成建品，随后把无密钥任务包写入固定 `image_tasks/pending` 目录；图片页不再参与工作台流程。
-- 生图前必须先保存可公网访问的 Cloudflare R2 HTTPS 通道并通过真实 bucket 预检；未配置时不领取任务、不消耗生图调用。
-- 商品媒体 Skill 先把每张有效 Ozon 参考图分类为主视觉、生活场景、功能信息图、结构标注、步骤说明、材质特写、尺寸适配、对比或套装陈列，再按槽位逐张重建其主体比例、信息层级、标注几何和留白；只换背景判定为不合格。
-- 生图 Skill 固定加载仓库内的高端俄文商业信息图核心提示词。白底图只负责锁定主体，不进入成品；成品固定为 `2+3+3`：一个 1×2 主图网格和两个 1×3 附图网格，共 8 张严格 3:4 图片。
-- 八张成图至少覆盖六种布局原型；每张只表达一个核心主题，俄文标题、副标题和 2—4 个功能标签在第一次场景生成时自然融入构图，不允许先生成空场景、再额外消耗一次生图贴字。参考不足时使用明确的 Ozon 审美兜底布局，不中断整件商品。
-- 生图任务按整件商品原子领取，生成 8 张 3:4 图片后直接替换对应 Ozon 商品图库，并由这 8 张图本地合成一段 3:4 滚动视频及 `main_01` 视频封面；图片、视频和封面经 R2 发布后更新同一 Ozon 商品，结果只写入图片任务区，不回传工作台。
-
-## 验证 (Verification)
+## 验证
 
 ```powershell
 python -m pytest -q
 ```
 
-测试不应触发真实 Ozon/1688 采集、真实上传或真实生图。
+测试不得触发真实 Ozon/1688 采集、真实上传或真实生图。
 
-## 目录 (Structure)
+## 隐私与发布
 
-- `src/ozon_v2/`：领域、服务、适配器和本地工具台。
-- `browser_extension/`：Edge 浏览器桥接扩展。
-- `scripts/`：启动、停止、重启、快捷方式和 worker 工具。
-- `skills/`：Ozon V2 总控与商品媒体执行技能。
-- `mcp/`：FastMCP 入口。
-- `tests/`：自动化测试。
-- `docs/`：安装、使用、隐私发布和公开架构契约。
-- `assets/`：版本化种子池等静态资产。
+店铺凭证、浏览器资料、运行数据库、采集证据、生成媒体、临时公网通道
+状态、日志、本机用户名和绝对路径都不得进入发布包。
+
+```powershell
+python .\scripts\build_clean_release.py --destination .\.release\ozon-v2
+python .\scripts\build_clean_release.py --scan-only .\.release\ozon-v2
+```

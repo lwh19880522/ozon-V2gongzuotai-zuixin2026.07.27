@@ -23,7 +23,8 @@ PREVIOUS_PROMPT_VERSION = "ozon-image-v4"
 REFERENCE_LAYOUT_PROMPT_VERSION = "ozon-image-v5"
 INTEGRATED_COPY_PROMPT_VERSION = "ozon-image-v6"
 IDENTITY_ANCHOR_PROMPT_VERSION = "ozon-image-v7"
-CURRENT_PROMPT_VERSION = "ozon-image-v8"
+SINGLE_ANCHOR_PROMPT_VERSION = "ozon-image-v8"
+CURRENT_PROMPT_VERSION = "ozon-image-v9"
 SUPPORTED_PROMPT_VERSIONS = frozenset(
     {
         LEGACY_PROMPT_VERSION,
@@ -32,6 +33,7 @@ SUPPORTED_PROMPT_VERSIONS = frozenset(
         REFERENCE_LAYOUT_PROMPT_VERSION,
         INTEGRATED_COPY_PROMPT_VERSION,
         IDENTITY_ANCHOR_PROMPT_VERSION,
+        SINGLE_ANCHOR_PROMPT_VERSION,
         CURRENT_PROMPT_VERSION,
     }
 )
@@ -42,6 +44,7 @@ VISUAL_PROMPT_VERSIONS = frozenset(
         REFERENCE_LAYOUT_PROMPT_VERSION,
         INTEGRATED_COPY_PROMPT_VERSION,
         IDENTITY_ANCHOR_PROMPT_VERSION,
+        SINGLE_ANCHOR_PROMPT_VERSION,
         CURRENT_PROMPT_VERSION,
     }
 )
@@ -89,6 +92,7 @@ REFERENCE_PROMPT_VERSIONS = frozenset(
         REFERENCE_LAYOUT_PROMPT_VERSION,
         INTEGRATED_COPY_PROMPT_VERSION,
         IDENTITY_ANCHOR_PROMPT_VERSION,
+        SINGLE_ANCHOR_PROMPT_VERSION,
     }
 )
 ADAPTIVE_REFERENCE_PROMPT_VERSIONS = frozenset(
@@ -99,20 +103,32 @@ ADAPTIVE_REFERENCE_PROMPT_VERSIONS = frozenset(
     }
 )
 INTEGRATED_COPY_PROMPT_VERSIONS = frozenset(
-    {*ADAPTIVE_REFERENCE_PROMPT_VERSIONS, CURRENT_PROMPT_VERSION}
+    {
+        *ADAPTIVE_REFERENCE_PROMPT_VERSIONS,
+        SINGLE_ANCHOR_PROMPT_VERSION,
+        CURRENT_PROMPT_VERSION,
+    }
 )
 CURRENT_VISUAL_PROMPT_VERSIONS = frozenset(
     {
         INTEGRATED_COPY_PROMPT_VERSION,
         IDENTITY_ANCHOR_PROMPT_VERSION,
+        SINGLE_ANCHOR_PROMPT_VERSION,
         CURRENT_PROMPT_VERSION,
     }
 )
 IDENTITY_ANCHOR_PROMPT_VERSIONS = frozenset(
-    {IDENTITY_ANCHOR_PROMPT_VERSION, CURRENT_PROMPT_VERSION}
+    {
+        IDENTITY_ANCHOR_PROMPT_VERSION,
+        SINGLE_ANCHOR_PROMPT_VERSION,
+        CURRENT_PROMPT_VERSION,
+    }
 )
 FINISHED_SCENE_PROMPT_VERSIONS = frozenset(
     {*REFERENCE_PROMPT_VERSIONS, CURRENT_PROMPT_VERSION}
+)
+PROMPT_ONLY_ANCHOR_PROMPT_VERSIONS = frozenset(
+    {SINGLE_ANCHOR_PROMPT_VERSION, CURRENT_PROMPT_VERSION}
 )
 V5_GUIDANCE_MODES = frozenset(
     {"reference_guided", "ozon_aesthetic_fallback"}
@@ -369,9 +385,14 @@ def crop_grid(
     layout: str,
     basename: str,
 ) -> list[Path]:
-    panel_count = {"1x2": 2, "1x3": 3}.get(layout)
-    if panel_count is None:
-        raise ValueError("layout must be 1x2 or 1x3")
+    grid_shape = {
+        "1x2": (2, 1),
+        "1x3": (3, 1),
+        "4x2": (4, 2),
+    }.get(layout)
+    if grid_shape is None:
+        raise ValueError("layout must be 1x2, 1x3, or 4x2")
+    columns, rows = grid_shape
     source = Path(source_path)
     if not source.is_file():
         raise ValueError("grid source file does not exist")
@@ -380,16 +401,20 @@ def crop_grid(
 
     outputs: list[Path] = []
     with Image.open(source) as image:
-        if image.width < panel_count or image.height < 1:
+        if image.width < columns or image.height < rows:
             raise ValueError("grid image is too small for the requested layout")
-        for index in range(panel_count):
-            left = image.width * index // panel_count
-            right = image.width * (index + 1) // panel_count
-            panel = image.crop((left, 0, right, image.height))
-            panel = _normalize_panel_to_three_by_four(panel)
-            output = destination / f"{basename}-{index + 1:02d}.png"
-            panel.save(output, format="PNG")
-            outputs.append(output)
+        for row in range(rows):
+            top = image.height * row // rows
+            bottom = image.height * (row + 1) // rows
+            for column in range(columns):
+                left = image.width * column // columns
+                right = image.width * (column + 1) // columns
+                panel = image.crop((left, top, right, bottom))
+                panel = _normalize_panel_to_three_by_four(panel)
+                index = row * columns + column + 1
+                output = destination / f"{basename}-{index:02d}.png"
+                panel.save(output, format="PNG")
+                outputs.append(output)
     return outputs
 
 
@@ -684,9 +709,12 @@ class SlotResultReceipt:
                     _validate_integrated_copy_payload(self.validation, errors)
             if self.prompt_version in IDENTITY_ANCHOR_PROMPT_VERSIONS:
                 _validate_identity_anchor_payload(self.validation, errors)
-            if self.prompt_version == CURRENT_PROMPT_VERSION:
+            if self.prompt_version in PROMPT_ONLY_ANCHOR_PROMPT_VERSIONS:
                 _validate_prompt_only_anchor_payload(self.validation, errors)
-        if self.prompt_version == CURRENT_PROMPT_VERSION:
+        if (
+            isinstance(self.prompt_version, str)
+            and self.prompt_version in PROMPT_ONLY_ANCHOR_PROMPT_VERSIONS
+        ):
             _validate_current_visual_payload(
                 self.validation,
                 self.output_sha256,
@@ -717,7 +745,8 @@ def validate_identity_anchor_consistency(
     current_receipts = tuple(
         receipt
         for receipt in receipts
-        if receipt.prompt_version in IDENTITY_ANCHOR_PROMPT_VERSIONS
+        if isinstance(receipt.prompt_version, str)
+        and receipt.prompt_version in IDENTITY_ANCHOR_PROMPT_VERSIONS
     )
     if not current_receipts:
         return []
@@ -777,8 +806,12 @@ def validate_reference_layout_diversity(
         receipt
         for receipt in receipts
         if (
-            receipt.prompt_version
-            in {*ADAPTIVE_REFERENCE_PROMPT_VERSIONS, CURRENT_PROMPT_VERSION}
+            isinstance(receipt.prompt_version, str)
+            and receipt.prompt_version
+            in {
+                *ADAPTIVE_REFERENCE_PROMPT_VERSIONS,
+                *PROMPT_ONLY_ANCHOR_PROMPT_VERSIONS,
+            }
             and receipt.accepted
         )
     )
@@ -789,7 +822,8 @@ def validate_reference_layout_diversity(
         str(
             receipt.validation.get(
                 "layout_archetype"
-                if receipt.prompt_version == CURRENT_PROMPT_VERSION
+                if isinstance(receipt.prompt_version, str)
+                and receipt.prompt_version in PROMPT_ONLY_ANCHOR_PROMPT_VERSIONS
                 else "reference_layout_archetype"
             )
             or ""

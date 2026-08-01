@@ -83,10 +83,6 @@ class FsRepo:
         return self.config_dir / "pricing_settings.json"
 
     @property
-    def public_media_settings_path(self) -> Path:
-        return self.config_dir / "public_media_settings.json"
-
-    @property
     def credential_assistant_state_path(self) -> Path:
         return self.state_dir / "credential_assistant_state.json"
 
@@ -98,9 +94,9 @@ class FsRepo:
         self.config_dir.mkdir(parents=True, exist_ok=True)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.runs_dir.mkdir(parents=True, exist_ok=True)
-        self.used_seed_path.touch(exist_ok=True)
-        self.seed_blacklist_path.touch(exist_ok=True)
-        self.existing_store_dedupe_path.touch(exist_ok=True)
+        for ledger_path in (self.used_seed_path, self.seed_blacklist_path, self.existing_store_dedupe_path):
+            if not ledger_path.exists():
+                ledger_path.touch()
 
         bundled_package = self._read_json(self.context.paths.initial_seed_json)
         bundled_version = str(bundled_package["package_version"])
@@ -158,6 +154,7 @@ class FsRepo:
                         "seeds": migrated_seeds,
                     },
                 )
+        self._reconcile_active_seed_exclusions()
         if not self.credentials_template_path.exists():
             self.write_credentials_template()
 
@@ -222,18 +219,44 @@ class FsRepo:
                 used.add(seed_id)
         return used
 
+    def load_used_seed_identity_keys(self) -> set[str]:
+        self.initialize_runtime()
+        return {
+            self._seed_identity_key_from_row(item)
+            for item in self._read_jsonl(self.used_seed_path)
+            if item.get("seed_id") or item.get("seed_identity_key")
+        }
+
     def append_used_seeds(self, run_id: str, seeds: Iterable[SeedProduct], result: str) -> None:
-        rows = [
-            {
-                "run_id": run_id,
-                "seed_id": seed.seed_id,
-                "title_or_keyword": seed.title_or_keyword,
-                "result": result,
-                "archived_at": utc_now_iso(),
+        seed_list = list(seeds)
+        if not seed_list:
+            return
+        with _JSON_WRITE_LOCK:
+            existing = self._read_jsonl(self.used_seed_path)
+            existing_keys = {
+                self._seed_identity_key_from_row(item)
+                for item in existing
+                if item.get("seed_id") or item.get("seed_identity_key")
             }
-            for seed in seeds
-        ]
-        self._append_jsonl(self.used_seed_path, rows)
+            rows: list[dict[str, Any]] = []
+            for seed in seed_list:
+                identity_key = self.seed_identity_key(seed)
+                if identity_key in existing_keys:
+                    continue
+                rows.append(
+                    {
+                        "run_id": run_id,
+                        "seed_id": seed.seed_id,
+                        "seed_identity_key": identity_key,
+                        "title_or_keyword": seed.title_or_keyword,
+                        "product_clue": seed.product_clue,
+                        "result": result,
+                        "archived_at": utc_now_iso(),
+                    }
+                )
+                existing_keys.add(identity_key)
+            self._append_jsonl(self.used_seed_path, rows)
+        self.remove_active_seed_identities({self.seed_identity_key(seed) for seed in seed_list})
 
     def append_seed_blacklist(
         self,
@@ -241,28 +264,34 @@ class FsRepo:
         seed: SeedProduct,
         ozon_product_id: str,
         reason: str,
+        *,
+        reason_code: str = "supplier_not_found_by_user",
     ) -> None:
-        existing = self._read_jsonl(self.seed_blacklist_path)
-        if any(
-            str(item.get("seed_id") or "") == seed.seed_id
-            and str(item.get("ozon_product_id") or "") == ozon_product_id
-            for item in existing
-        ):
-            return
-        self._append_jsonl(
-            self.seed_blacklist_path,
-            [
-                {
-                    "run_id": run_id,
-                    "seed_id": seed.seed_id,
-                    "ozon_product_id": ozon_product_id,
-                    "title_or_keyword": seed.title_or_keyword,
-                    "reason_code": "supplier_not_found_by_user",
-                    "reason": reason,
-                    "blacklisted_at": utc_now_iso(),
-                }
-            ],
-        )
+        identity_key = self.seed_identity_key(seed)
+        with _JSON_WRITE_LOCK:
+            existing = self._read_jsonl(self.seed_blacklist_path)
+            if not any(
+                self._seed_identity_key_from_row(item) == identity_key
+                and str(item.get("ozon_product_id") or "") == ozon_product_id
+                for item in existing
+            ):
+                self._append_jsonl(
+                    self.seed_blacklist_path,
+                    [
+                        {
+                            "run_id": run_id,
+                            "seed_id": seed.seed_id,
+                            "seed_identity_key": identity_key,
+                            "ozon_product_id": ozon_product_id,
+                            "title_or_keyword": seed.title_or_keyword,
+                            "product_clue": seed.product_clue,
+                            "reason_code": reason_code,
+                            "reason": reason,
+                            "blacklisted_at": utc_now_iso(),
+                        }
+                    ],
+                )
+        self.remove_active_seed_identities({identity_key})
 
     def load_blacklisted_seed_ids(self) -> set[str]:
         self.initialize_runtime()
@@ -270,6 +299,14 @@ class FsRepo:
             str(item.get("seed_id"))
             for item in self._read_jsonl(self.seed_blacklist_path)
             if item.get("seed_id")
+        }
+
+    def load_blacklisted_seed_identity_keys(self) -> set[str]:
+        self.initialize_runtime()
+        return {
+            self._seed_identity_key_from_row(item)
+            for item in self._read_jsonl(self.seed_blacklist_path)
+            if item.get("seed_id") or item.get("seed_identity_key")
         }
 
     def load_blacklisted_ozon_product_ids(self) -> set[str]:
@@ -378,11 +415,82 @@ class FsRepo:
         )
 
     def workbench_run_ids(self) -> list[str]:
-        return [
-            str(run["run_id"])
-            for run in self.list_runs()
-            if run.get("kind") == "workbench_batch" and str(run.get("run_id") or "").startswith("wb-")
-        ]
+        self.initialize_runtime()
+        return sorted(
+            candidate.name
+            for candidate in self.runs_dir.iterdir()
+            if candidate.is_dir() and self._is_recognized_batch_directory_name(candidate.name)
+        )
+
+    @staticmethod
+    def is_current_workbench_run(run: dict[str, Any], directory_name: str | None = None) -> bool:
+        run_id = str(run.get("run_id") or "").strip()
+        if run.get("kind") != "workbench_batch" or not run_id.startswith("wb-"):
+            return False
+        if directory_name is not None and run_id != directory_name:
+            return False
+        try:
+            WorkbenchState(str(run.get("status") or ""))
+        except ValueError:
+            return False
+        return True
+
+    def list_workbench_runs(self) -> list[dict[str, Any]]:
+        self.initialize_runtime()
+        runs: list[dict[str, Any]] = []
+        for directory in self.runs_dir.iterdir():
+            run_path = directory / "run.json"
+            if not directory.is_dir() or not run_path.exists():
+                continue
+            try:
+                run = self._read_json(run_path)
+            except (json.JSONDecodeError, OSError, TypeError):
+                continue
+            if self.is_current_workbench_run(run, directory_name=directory.name):
+                runs.append(run)
+        return sorted(
+            runs,
+            key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""),
+            reverse=True,
+        )
+
+    def is_current_workbench_run_id(self, run_id: str) -> bool:
+        normalized = str(run_id or "").strip()
+        if not normalized.startswith("wb-"):
+            return False
+        try:
+            run = self.load_run(normalized)
+        except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError):
+            return False
+        return self.is_current_workbench_run(run, directory_name=normalized)
+
+    @staticmethod
+    def _is_recognized_batch_directory_name(name: str) -> bool:
+        return re.fullmatch(r"(?:wb|run)-[A-Za-z0-9][A-Za-z0-9._-]*", str(name or "")) is not None
+
+    def archive_recognized_batch_seed_usage(self) -> dict[str, Any]:
+        self.initialize_runtime()
+        archived_run_ids: list[str] = []
+        archived_identity_keys: set[str] = set()
+        for candidate in list(self.runs_dir.iterdir()):
+            if not candidate.is_dir() or not self._is_recognized_batch_directory_name(candidate.name):
+                continue
+            sampled_path = candidate / "sampled_seeds.json"
+            if not sampled_path.exists():
+                continue
+            try:
+                seeds = [SeedProduct.from_dict(item) for item in self._read_json(sampled_path)]
+            except (json.JSONDecodeError, OSError, TypeError, ValueError, KeyError):
+                continue
+            if not seeds:
+                continue
+            self.append_used_seeds(candidate.name, seeds, "batch_cleared_after_sampling")
+            archived_run_ids.append(candidate.name)
+            archived_identity_keys.update(self.seed_identity_key(seed) for seed in seeds)
+        return {
+            "archived_seed_run_ids": sorted(archived_run_ids),
+            "archived_seed_identity_count": len(archived_identity_keys),
+        }
 
     def clear_workbench_batches(self) -> dict[str, Any]:
         self.initialize_runtime()
@@ -391,19 +499,10 @@ class FsRepo:
         skipped_entries: list[str] = []
         with _JSON_WRITE_LOCK:
             for candidate in list(self.runs_dir.iterdir()):
-                if not candidate.is_dir() or not candidate.name.startswith("wb-"):
+                if not candidate.is_dir() or not self._is_recognized_batch_directory_name(candidate.name):
                     continue
                 resolved = candidate.resolve(strict=False)
                 if resolved.parent != runs_root:
-                    skipped_entries.append(candidate.name)
-                    continue
-                run_path = candidate / "run.json"
-                try:
-                    run = self._read_json(run_path)
-                except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError):
-                    skipped_entries.append(candidate.name)
-                    continue
-                if run.get("kind") != "workbench_batch" or run.get("run_id") != candidate.name:
                     skipped_entries.append(candidate.name)
                     continue
                 shutil.rmtree(candidate)
@@ -535,15 +634,6 @@ class FsRepo:
             return PricingPolicy.default().to_dict()
         return self._read_json(self.pricing_settings_path)
 
-    def save_public_media_settings(self, payload: dict[str, Any]) -> Path:
-        self._write_json(self.public_media_settings_path, payload)
-        return self.public_media_settings_path
-
-    def load_public_media_settings(self) -> dict[str, Any]:
-        if not self.public_media_settings_path.exists():
-            return {"base_url": ""}
-        return self._read_json(self.public_media_settings_path)
-
     def save_pricing_evidence(self, run_id: str, payload: dict[str, Any]) -> Path:
         path = self.run_dir(run_id) / "pricing_evidence.json"
         self._write_json(path, payload)
@@ -606,34 +696,6 @@ class FsRepo:
     def load_upload_submissions(self, run_id: str) -> dict[str, Any]:
         return self._read_json(self.run_dir(run_id) / "upload_submissions.json")
 
-    def save_temu_upload_previews(
-        self,
-        run_id: str,
-        payload: dict[str, Any],
-    ) -> Path:
-        path = self.run_dir(run_id) / "temu_upload_previews.json"
-        self._write_json(path, payload)
-        return path
-
-    def load_temu_upload_previews(self, run_id: str) -> dict[str, Any]:
-        return self._read_json(
-            self.run_dir(run_id) / "temu_upload_previews.json"
-        )
-
-    def save_temu_upload_submissions(
-        self,
-        run_id: str,
-        payload: dict[str, Any],
-    ) -> Path:
-        path = self.run_dir(run_id) / "temu_upload_submissions.json"
-        self._write_json(path, payload)
-        return path
-
-    def load_temu_upload_submissions(self, run_id: str) -> dict[str, Any]:
-        return self._read_json(
-            self.run_dir(run_id) / "temu_upload_submissions.json"
-        )
-
     def image_task_pending_dir(self) -> Path:
         path = self.runtime_root / "image_tasks" / "pending"
         path.mkdir(parents=True, exist_ok=True)
@@ -657,6 +719,39 @@ class FsRepo:
         if not safe_package_id:
             raise ValueError("Image task package_id must contain a safe filename.")
         path = self.image_task_pending_dir() / f"{safe_package_id}.json"
+        self._write_json(path, payload)
+        return path
+
+    def bind_pending_image_task_product(
+        self,
+        package_id: str,
+        *,
+        run_id: str,
+        seed_id: str,
+        seller_import_task_id: int,
+        product_id: int,
+    ) -> Path:
+        safe_package_id = re.sub(
+            r"[^A-Za-z0-9_.-]+",
+            "-",
+            str(package_id or "").strip(),
+        ).strip(".-")
+        path = self.image_task_pending_dir() / f"{safe_package_id}.json"
+        payload = self._read_json(path)
+        target = payload.get("store_target")
+        if (
+            payload.get("status") != "pending"
+            or str(payload.get("run_id") or "") != str(run_id)
+            or str(payload.get("seed_id") or "") != str(seed_id)
+            or not isinstance(target, dict)
+            or int(target.get("seller_import_task_id") or 0)
+            != int(seller_import_task_id)
+        ):
+            raise ValueError(
+                "Pending image task identity does not match the accepted Ozon product."
+            )
+        target["product_id"] = int(product_id)
+        payload["store_target"] = target
         self._write_json(path, payload)
         return path
 
@@ -858,12 +953,98 @@ class FsRepo:
                 )
         return path
 
+    @staticmethod
+    def _canonical_source_seed_id(value: str) -> str | None:
+        normalized = str(value or "").strip().casefold().replace("_", "-")
+        match = re.fullmatch(r"seed-(?:5000-)?(\d{4})", normalized)
+        if match:
+            return f"seed-{match.group(1)}"
+        return normalized or None
+
+    def seed_identity_key(self, seed: SeedProduct | dict[str, Any] | str) -> str:
+        if isinstance(seed, SeedProduct):
+            payload = seed.to_dict()
+        elif isinstance(seed, dict):
+            payload = dict(seed)
+        else:
+            payload = {"seed_id": str(seed)}
+
+        notes = payload.get("notes")
+        source_seed_id = ""
+        if isinstance(notes, str) and notes.strip().startswith("{"):
+            try:
+                parsed_notes = json.loads(notes)
+            except (json.JSONDecodeError, TypeError):
+                parsed_notes = {}
+            if isinstance(parsed_notes, dict):
+                source_seed_id = str(parsed_notes.get("source_seed_id") or "")
+        canonical = self._canonical_source_seed_id(source_seed_id or str(payload.get("seed_id") or ""))
+        if canonical and re.fullmatch(r"seed-\d{4}", canonical):
+            return f"source:{canonical}"
+
+        clue = str(payload.get("product_clue") or payload.get("title_or_keyword") or "").casefold()
+        normalized_clue = re.sub(r"[^0-9a-z\u0400-\u04ff\u4e00-\u9fff]+", "", clue)
+        if normalized_clue:
+            return f"clue:{normalized_clue}"
+        return f"seed:{canonical or 'unknown'}"
+
+    def _seed_identity_key_from_row(self, row: dict[str, Any]) -> str:
+        stored = str(row.get("seed_identity_key") or "").strip()
+        if stored:
+            return stored
+        return self.seed_identity_key(row)
+
+    def _seed_exclusion_revision(self) -> str:
+        parts: list[str] = []
+        for path in (self.used_seed_path, self.seed_blacklist_path):
+            try:
+                stat = path.stat()
+            except OSError:
+                parts.append("missing")
+            else:
+                parts.append(f"{stat.st_size}:{stat.st_mtime_ns}")
+        return "|".join(parts)
+
+    def _reconcile_active_seed_exclusions(self) -> None:
+        if not self.active_seed_path.exists():
+            return
+        with _JSON_WRITE_LOCK:
+            payload = self._read_json(self.active_seed_path)
+            revision = self._seed_exclusion_revision()
+            if str(payload.get("seed_exclusion_revision") or "") == revision:
+                return
+            excluded = {
+                self._seed_identity_key_from_row(item)
+                for path in (self.used_seed_path, self.seed_blacklist_path)
+                for item in self._read_jsonl(path)
+                if item.get("seed_id") or item.get("seed_identity_key")
+            }
+            seeds = [SeedProduct.from_dict(item) for item in payload.get("seeds", [])]
+            retained = [seed for seed in seeds if self.seed_identity_key(seed) not in excluded]
+            payload["seeds"] = [seed.to_dict() for seed in retained]
+            payload["excluded_identity_count"] = len(seeds) - len(retained)
+            payload["seed_exclusion_revision"] = revision
+            payload["updated_at"] = utc_now_iso()
+            self._write_json(self.active_seed_path, payload)
+
     def remove_active_seeds(self, seed_ids: set[str]) -> list[SeedProduct]:
         seeds = self.load_active_seeds()
         removed = [seed for seed in seeds if seed.seed_id in seed_ids]
         remaining = [seed for seed in seeds if seed.seed_id not in seed_ids]
         self.save_active_seeds(remaining)
         return removed
+
+    def remove_active_seed_identities(self, identity_keys: set[str]) -> list[SeedProduct]:
+        if not identity_keys or not self.active_seed_path.exists():
+            return []
+        with _JSON_WRITE_LOCK:
+            seeds = self.load_active_seeds()
+            removed = [seed for seed in seeds if self.seed_identity_key(seed) in identity_keys]
+            if removed:
+                self.save_active_seeds(
+                    [seed for seed in seeds if self.seed_identity_key(seed) not in identity_keys]
+                )
+            return removed
 
     def sample_seeds(self, seeds: list[SeedProduct], target_count: int, random_seed: int) -> list[SeedProduct]:
         sampler = random.Random(random_seed)

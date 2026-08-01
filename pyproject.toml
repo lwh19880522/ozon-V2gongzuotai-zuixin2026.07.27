@@ -1,6 +1,6 @@
 [project]
 name = "ozon-v2-ops-controller"
-version = "0.4.1"
+version = "0.5.0"
 description = "Ozon V2 workbench, field drafting, and post-upload image task controller."
 requires-python = ">=3.11"
 dependencies = [

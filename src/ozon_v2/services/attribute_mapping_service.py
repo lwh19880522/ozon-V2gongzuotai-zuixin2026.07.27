@@ -593,11 +593,23 @@ def map_template_attributes(
                 "dictionary_id",
                 "allowed_values",
                 "required_reason",
+                "intelligence_decision",
                 "reason",
             )
         }
         for field in required_fields
         if field["status"] != "mapped"
+    ]
+    manual_required = [
+        field
+        for field in missing_required
+        if field.get("intelligence_decision") == "unresolved"
+        or field.get("required_reason") == "ozon_compliance_decision"
+    ]
+    skill_pending_required = [
+        field
+        for field in missing_required
+        if field not in manual_required
     ]
     return {
         "fields": mapped_fields,
@@ -617,6 +629,8 @@ def map_template_attributes(
         "required_attribute_count": len(required_fields),
         "required_mapped_count": len(required_mapped),
         "missing_required_fields": missing_required,
+        "skill_pending_required_fields": skill_pending_required,
+        "manual_required_fields": manual_required,
         "required_attributes_ready": bool(required_fields) and not missing_required,
         "attribute_score_progress": attribute_content_score_progress(mapped_fields),
     }
