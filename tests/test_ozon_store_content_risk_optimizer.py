@@ -230,3 +230,209 @@ def test_ledger_schema_is_limited_to_product_state_and_action_log(
         if not str(row[0]).startswith("sqlite_")
     }
     assert names == {"product_state", "action_log"}
+
+
+def task(
+    *,
+    evidence_insufficient: bool = False,
+    objective_value: str = "1",
+) -> dict[str, Any]:
+    original = product("11", "sale-11")
+    return {
+        "product_id": "11",
+        "sku": "sku-11",
+        "offer_id": "sale-11",
+        "source_fingerprint": "base-fingerprint",
+        "visibility": "IN_SALE",
+        "seller_api_item": original["seller_api_item"],
+        "current": {
+            "name": original["name"],
+            "description": original["description"],
+            "rich_content": original["rich_content"],
+            "attributes": original["attributes"],
+        },
+        "attribute_schema": [
+            {"id": 6318, "name": "Количество", "objective": True},
+            {
+                "id": 100,
+                "name": "Тип монтажа",
+                "dictionary": True,
+                "dictionary_values": [{"id": 10, "value": "Настенный"}],
+            },
+        ],
+        "objective_evidence": {
+            "6318": {
+                "value": objective_value,
+                "refs": ["seller.attributes.6318"],
+            },
+            "quantity": {
+                "value": objective_value,
+                "refs": ["seller.attributes.6318"],
+            },
+        },
+        "read_only_images": original["images"],
+        "product_url": "https://www.ozon.ru/product/11/",
+        "storefront_facts": {},
+        "pricing_evidence": {},
+        "evidence_insufficient": evidence_insufficient,
+        "non_media_score": 80,
+    }
+
+
+def valid_proposal(
+    *,
+    attribute_decisions: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "base_fingerprint": "base-fingerprint",
+        "product_id": "11",
+        "name": "Настенный светильник LED 5 Вт с питанием от USB",
+        "description": (
+            "Компактный настенный светильник создаёт мягкое освещение. "
+            "Подходит для установки рядом с рабочим столом или кроватью."
+        ),
+        "rich_content": {
+            "content": [
+                {
+                    "widgetName": "raTextBlock",
+                    "text": "Три режима света и плавная регулировка яркости.",
+                }
+            ]
+        },
+        "storefront_observations": [],
+        "attribute_decisions": attribute_decisions
+        if attribute_decisions is not None
+        else [
+            {
+                "id": 6318,
+                "decision": "keep",
+                "values": [{"value": "1"}],
+                "evidence_refs": ["seller.attributes.6318"],
+            }
+        ],
+        "risk_findings": [
+            {
+                "code": "quantity_consistent",
+                "level": "low",
+                "resolution": "verified",
+                "evidence_refs": ["seller.attributes.6318"],
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "bad_text",
+    [
+        "Настенный светильник 墙灯",
+        "Товар 1688 от поставщика",
+        "Опт, дропшиппинг и доставка от фабрики",
+        "лампа лампа лампа лампа LED LED LED",
+        "РЎРІРµС‚РёР»СЊРЅРёРє",
+    ],
+)
+def test_customer_text_gate_rejects_forbidden_or_broken_text(
+    optimizer, bad_text: str
+) -> None:
+    proposal = valid_proposal()
+    proposal["name"] = bad_text
+    with pytest.raises(optimizer.ValidationError):
+        optimizer.validate_proposal(task(), proposal)
+
+
+def test_objective_attribute_requires_exact_evidence(optimizer) -> None:
+    proposal = valid_proposal(
+        attribute_decisions=[
+            {
+                "id": 6318,
+                "decision": "set",
+                "values": [{"value": "29"}],
+                "evidence_refs": ["seller.attributes.6318"],
+            }
+        ]
+    )
+    with pytest.raises(optimizer.ValidationError, match="objective evidence mismatch"):
+        optimizer.validate_proposal(task(objective_value="1"), proposal)
+
+
+def test_missing_workbench_evidence_keeps_objective_fields_and_blocks_stock(
+    optimizer,
+) -> None:
+    proposal = valid_proposal(attribute_decisions=[])
+    result = optimizer.validate_proposal(
+        task(evidence_insufficient=True), proposal
+    )
+    assert result["evidence_insufficient"] is True
+    assert result["allow_inventory_restore"] is False
+
+
+def test_merge_preserves_every_media_value_exactly(optimizer) -> None:
+    original = task()["seller_api_item"]
+    merged = optimizer.merge_proposal(task(), valid_proposal())
+    for key in optimizer.MEDIA_KEYS:
+        assert merged.get(key) == original.get(key)
+
+
+def test_rich_content_must_be_valid_non_media_json(optimizer) -> None:
+    proposal = valid_proposal()
+    optimizer.validate_proposal(task(), proposal)
+    proposal["rich_content"] = {
+        "content": [
+            {"widgetName": "video", "url": "https://example.test/v.mp4"}
+        ]
+    }
+    with pytest.raises(optimizer.ValidationError, match="media"):
+        optimizer.validate_proposal(task(), proposal)
+
+
+def test_dictionary_attribute_rejects_unknown_value_id(optimizer) -> None:
+    proposal = valid_proposal(
+        attribute_decisions=[
+            {
+                "id": 100,
+                "decision": "set",
+                "values": [{"dictionary_value_id": 99, "value": "Потолочный"}],
+                "evidence_refs": ["seller.attributes.100"],
+            }
+        ]
+    )
+    with pytest.raises(optimizer.ValidationError, match="dictionary"):
+        optimizer.validate_proposal(task(), proposal)
+
+
+def test_unproven_compliance_claim_is_rejected(optimizer) -> None:
+    proposal = valid_proposal()
+    proposal["description"] += " Сертифицированная безопасность гарантирована."
+    with pytest.raises(optimizer.ValidationError, match="compliance"):
+        optimizer.validate_proposal(task(), proposal)
+
+
+def test_stale_fingerprint_is_rejected_before_merge(optimizer) -> None:
+    proposal = valid_proposal()
+    proposal["base_fingerprint"] = "stale"
+    with pytest.raises(optimizer.ValidationError, match="stale"):
+        optimizer.validate_proposal(task(), proposal)
+
+
+def test_storefront_quantity_divergence_blocks_inventory_restore(optimizer) -> None:
+    proposal = valid_proposal()
+    proposal["storefront_observations"] = [
+        {
+            "field_key": "quantity",
+            "value": "29",
+            "source_url": "https://www.ozon.ru/product/11/",
+        }
+    ]
+    result = optimizer.validate_proposal(task(), proposal)
+    assert "storefront_divergence:quantity" in result["risk_codes"]
+    assert result["risk_level"] == "high"
+    assert result["allow_inventory_restore"] is False
+
+
+def test_known_price_loss_is_classified_as_severe(optimizer) -> None:
+    current_task = task()
+    current_task["seller_api_item"]["price"] = "50.00"
+    current_task["pricing_evidence"] = {"minimum_safe_price": "100.00"}
+    result = optimizer.validate_proposal(current_task, valid_proposal())
+    assert "price_loss" in result["risk_codes"]
+    assert result["risk_level"] == "severe"

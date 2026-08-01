@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 from pathlib import Path
+import re
 import sqlite3
 import sys
 from typing import Any
+import unicodedata
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -25,6 +29,59 @@ MEDIA_KEYS = frozenset(
 TERMINAL_UNCHANGED_STATUSES = frozenset(
     {"completed", "pending_risk", "evidence_insufficient", "paused"}
 )
+PROPOSAL_KEYS = frozenset(
+    {
+        "base_fingerprint",
+        "product_id",
+        "name",
+        "description",
+        "rich_content",
+        "storefront_observations",
+        "attribute_decisions",
+        "risk_findings",
+    }
+)
+REQUIRED_PROPOSAL_KEYS = PROPOSAL_KEYS
+SEVERITY = {"low": 1, "medium": 2, "high": 3, "severe": 4}
+SAFE_RESOLUTIONS = frozenset({"verified", "fixed", "removed", "not_applicable"})
+SUPPLIER_PHRASES = (
+    "1688",
+    "поставщик",
+    "опт",
+    "дропшип",
+    "от фабрик",
+    "доставка от фабрик",
+    "supplier",
+    "wholesale",
+    "dropship",
+    "factory shipping",
+    "供应商",
+    "批发",
+    "代发",
+)
+COMPLIANCE_PHRASES = (
+    "сертифицирован",
+    "сертификация",
+    "гарантированная безопасность",
+    "медицинский эффект",
+    "лечебный",
+    "certified",
+    "guaranteed safe",
+)
+MOJIBAKE_MARKERS = (
+    "РЎ",
+    "РІ",
+    "Рµ",
+    "С‚",
+    "Рё",
+    "Р»",
+    "СЊ",
+    "РЅ",
+)
+
+
+class ValidationError(ValueError):
+    pass
 
 
 def utc_now() -> str:
@@ -82,6 +139,361 @@ def non_media_score(groups: dict[str, dict[str, float]]) -> int | None:
         return None
     earned = sum(float(item.get("earned") or 0) for item in included)
     return round(100 * earned / maximum)
+
+
+def _normalized_text(value: Any) -> str:
+    return unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
+
+
+def _has_cjk(text: str) -> bool:
+    return bool(
+        re.search(
+            "[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff]",
+            text,
+        )
+    )
+
+
+def _supports_compliance(task: dict[str, Any]) -> bool:
+    evidence = canonical_json(task.get("objective_evidence") or {}).casefold()
+    return any(
+        token in evidence
+        for token in ("certificate", "certification", "сертифик", "认证")
+    )
+
+
+def _validate_customer_text(
+    field_name: str,
+    value: Any,
+    *,
+    compliance_supported: bool,
+) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(f"{field_name} must be non-empty text")
+    text = unicodedata.normalize("NFKC", value).strip()
+    folded = text.casefold()
+    if _has_cjk(text):
+        raise ValidationError(f"{field_name} contains Chinese or Japanese text")
+    if any(phrase in folded for phrase in SUPPLIER_PHRASES):
+        raise ValidationError(f"{field_name} contains supplier language")
+    if sum(marker in text for marker in MOJIBAKE_MARKERS) >= 3:
+        raise ValidationError(f"{field_name} contains mojibake")
+    if not re.search("[А-Яа-яЁё]", text):
+        raise ValidationError(f"{field_name} must contain natural Russian")
+    tokens = re.findall("[A-Za-zА-Яа-яЁё0-9]+", folded)
+    if re.search(r"\b([A-Za-zА-Яа-яЁё0-9]+)(?:\s+\1){3,}\b", folded):
+        raise ValidationError(f"{field_name} repeats keywords")
+    if len(tokens) >= 7:
+        most_common = max(tokens.count(token) for token in set(tokens))
+        if most_common >= 3 and most_common / len(tokens) > 0.30:
+            raise ValidationError(f"{field_name} contains keyword stuffing")
+    if re.search(r"https?://|www\.|@[A-Za-z0-9_.-]+", text, re.IGNORECASE):
+        raise ValidationError(f"{field_name} contains external contact information")
+    if re.search(r"(?:\+?\d[\s()-]*){10,}", text):
+        raise ValidationError(f"{field_name} contains a phone number")
+    if any(
+        phrase in folded
+        for phrase in (
+            "доставка за один день",
+            "доставим сегодня",
+            "самый лучший",
+            "номер один",
+            "100% гарантия",
+        )
+    ):
+        raise ValidationError(f"{field_name} contains an unsupported claim")
+    if not compliance_supported and any(
+        phrase in folded for phrase in COMPLIANCE_PHRASES
+    ):
+        raise ValidationError(f"{field_name} contains unsupported compliance claim")
+
+
+def _validate_rich_content(
+    value: Any,
+    *,
+    compliance_supported: bool,
+) -> None:
+    if not isinstance(value, dict):
+        raise ValidationError("Rich Content must be a JSON object")
+    media_tokens = ("image", "video", "media", "url", "cover")
+    customer_text_keys = {"text", "title", "subtitle", "description", "caption"}
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, child in node.items():
+                folded_key = str(key).casefold()
+                if any(token in folded_key for token in media_tokens):
+                    raise ValidationError("Rich Content media is not allowed")
+                if folded_key == "widgetname" and any(
+                    token in str(child).casefold() for token in media_tokens
+                ):
+                    raise ValidationError("Rich Content media widget is not allowed")
+                if folded_key in customer_text_keys and isinstance(child, str):
+                    _validate_customer_text(
+                        f"rich_content.{key}",
+                        child,
+                        compliance_supported=compliance_supported,
+                    )
+                else:
+                    visit(child)
+        elif isinstance(node, list):
+            for child in node:
+                visit(child)
+
+    visit(value)
+
+
+def _schema_by_id(task: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    result: dict[int, dict[str, Any]] = {}
+    for item in task.get("attribute_schema") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            attribute_id = int(item.get("id") or item.get("attribute_id"))
+        except (TypeError, ValueError):
+            continue
+        result[attribute_id] = item
+    return result
+
+
+def _decision_value_strings(decision: dict[str, Any]) -> list[str]:
+    values: list[str] = []
+    for item in decision.get("values") or []:
+        if isinstance(item, dict) and item.get("value") is not None:
+            values.append(_normalized_text(item["value"]))
+    return values
+
+
+def _evidence_for_attribute(
+    task: dict[str, Any], attribute_id: int
+) -> dict[str, Any]:
+    evidence = task.get("objective_evidence") or {}
+    item = evidence.get(str(attribute_id)) or evidence.get(attribute_id) or {}
+    return item if isinstance(item, dict) else {}
+
+
+def _validate_attribute_decisions(
+    task: dict[str, Any],
+    proposal: dict[str, Any],
+    *,
+    compliance_supported: bool,
+) -> None:
+    schema = _schema_by_id(task)
+    seen: set[int] = set()
+    for decision in proposal.get("attribute_decisions") or []:
+        if not isinstance(decision, dict):
+            raise ValidationError("attribute decision must be an object")
+        try:
+            attribute_id = int(decision.get("id"))
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("attribute decision id is invalid") from exc
+        if attribute_id in seen:
+            raise ValidationError(f"attribute {attribute_id} is duplicated")
+        seen.add(attribute_id)
+        field = schema.get(attribute_id)
+        if field is None:
+            raise ValidationError(f"attribute {attribute_id} is outside current schema")
+        action = str(decision.get("decision") or "")
+        if action not in {"keep", "set"}:
+            raise ValidationError(f"attribute {attribute_id} decision is invalid")
+        if action == "keep":
+            continue
+        values = decision.get("values")
+        if not isinstance(values, list) or not values:
+            raise ValidationError(f"attribute {attribute_id} needs values")
+        dictionary_values = field.get("dictionary_values") or []
+        if field.get("dictionary") or dictionary_values:
+            allowed_ids = {
+                str(item.get("id") or item.get("dictionary_value_id"))
+                for item in dictionary_values
+                if isinstance(item, dict)
+                and (item.get("id") is not None or item.get("dictionary_value_id") is not None)
+            }
+            proposed_ids = {
+                str(item.get("dictionary_value_id") or item.get("id"))
+                for item in values
+                if isinstance(item, dict)
+            }
+            if not proposed_ids or not proposed_ids.issubset(allowed_ids):
+                raise ValidationError(
+                    f"attribute {attribute_id} dictionary value is not allowed"
+                )
+        evidence = _evidence_for_attribute(task, attribute_id)
+        objective = bool(field.get("objective")) or bool(evidence)
+        if objective:
+            if task.get("evidence_insufficient"):
+                raise ValidationError(
+                    f"attribute {attribute_id} cannot change without locked evidence"
+                )
+            expected = _normalized_text(evidence.get("value"))
+            proposed = _decision_value_strings(decision)
+            evidence_refs = {str(value) for value in evidence.get("refs") or []}
+            proposed_refs = {
+                str(value) for value in decision.get("evidence_refs") or []
+            }
+            if proposed != [expected] or not expected or not proposed_refs.intersection(
+                evidence_refs
+            ):
+                raise ValidationError(
+                    f"attribute {attribute_id} objective evidence mismatch"
+                )
+        for value in values:
+            if not isinstance(value, dict) or value.get("value") is None:
+                continue
+            visible = str(value["value"])
+            if _has_cjk(visible) or any(
+                phrase in visible.casefold() for phrase in SUPPLIER_PHRASES
+            ):
+                raise ValidationError(
+                    f"attribute {attribute_id} contains prohibited customer text"
+                )
+
+
+def _price_loss(task: dict[str, Any]) -> bool:
+    evidence = task.get("pricing_evidence") or {}
+    minimum = evidence.get("minimum_safe_price")
+    current = (task.get("seller_api_item") or {}).get("price")
+    if minimum is None or current is None:
+        return False
+    try:
+        return Decimal(str(current)) < Decimal(str(minimum))
+    except InvalidOperation:
+        return False
+
+
+def _risk_summary(
+    task: dict[str, Any], proposal: dict[str, Any]
+) -> tuple[str | None, list[str], bool]:
+    findings: list[dict[str, str]] = []
+    for item in proposal.get("risk_findings") or []:
+        if not isinstance(item, dict):
+            raise ValidationError("risk finding must be an object")
+        level = str(item.get("level") or "").casefold()
+        if level not in SEVERITY:
+            raise ValidationError("risk finding level is invalid")
+        findings.append(
+            {
+                "code": str(item.get("code") or "unspecified"),
+                "level": level,
+                "resolution": str(item.get("resolution") or "unresolved").casefold(),
+            }
+        )
+
+    product_url = str(task.get("product_url") or "")
+    objective = task.get("objective_evidence") or {}
+    for observation in proposal.get("storefront_observations") or []:
+        if not isinstance(observation, dict):
+            raise ValidationError("storefront observation must be an object")
+        if str(observation.get("source_url") or "") != product_url:
+            raise ValidationError("storefront observation source URL is invalid")
+        field_key = str(observation.get("field_key") or "")
+        seller_fact = objective.get(field_key) or {}
+        expected = _normalized_text(
+            seller_fact.get("value") if isinstance(seller_fact, dict) else seller_fact
+        )
+        observed = _normalized_text(observation.get("value"))
+        if expected and observed and expected != observed:
+            findings.append(
+                {
+                    "code": f"storefront_divergence:{field_key}",
+                    "level": "high",
+                    "resolution": "unresolved",
+                }
+            )
+
+    if _price_loss(task):
+        findings.append(
+            {"code": "price_loss", "level": "severe", "resolution": "unresolved"}
+        )
+    if not findings:
+        return None, [], False
+    highest = max(findings, key=lambda item: SEVERITY[item["level"]])["level"]
+    codes = [item["code"] for item in findings]
+    unresolved_blocking = any(
+        SEVERITY[item["level"]] >= SEVERITY["high"]
+        and item["resolution"] not in SAFE_RESOLUTIONS
+        for item in findings
+    )
+    return highest, codes, unresolved_blocking
+
+
+def validate_proposal(
+    task: dict[str, Any], proposal: dict[str, Any]
+) -> dict[str, Any]:
+    if not isinstance(proposal, dict):
+        raise ValidationError("proposal must be a JSON object")
+    unknown = set(proposal) - PROPOSAL_KEYS
+    missing = REQUIRED_PROPOSAL_KEYS - set(proposal)
+    if unknown:
+        raise ValidationError(f"proposal contains unknown keys: {sorted(unknown)}")
+    if missing:
+        raise ValidationError(f"proposal is missing keys: {sorted(missing)}")
+    if str(proposal.get("product_id")) != str(task.get("product_id")):
+        raise ValidationError("proposal product_id does not match task")
+    if str(proposal.get("base_fingerprint")) != str(
+        task.get("source_fingerprint")
+    ):
+        raise ValidationError("proposal base fingerprint is stale")
+    compliance_supported = _supports_compliance(task)
+    _validate_customer_text(
+        "name",
+        proposal.get("name"),
+        compliance_supported=compliance_supported,
+    )
+    _validate_customer_text(
+        "description",
+        proposal.get("description"),
+        compliance_supported=compliance_supported,
+    )
+    _validate_rich_content(
+        proposal.get("rich_content"),
+        compliance_supported=compliance_supported,
+    )
+    _validate_attribute_decisions(
+        task,
+        proposal,
+        compliance_supported=compliance_supported,
+    )
+    risk_level, risk_codes, unresolved_blocking = _risk_summary(task, proposal)
+    evidence_insufficient = bool(task.get("evidence_insufficient"))
+    return {
+        "risk_level": risk_level,
+        "risk_codes": risk_codes,
+        "unresolved_blocking_risk": unresolved_blocking,
+        "evidence_insufficient": evidence_insufficient,
+        "allow_inventory_restore": not evidence_insufficient
+        and not unresolved_blocking,
+    }
+
+
+def merge_proposal(
+    task: dict[str, Any], proposal: dict[str, Any]
+) -> dict[str, Any]:
+    validate_proposal(task, proposal)
+    original = deepcopy(task.get("seller_api_item") or {})
+    merged = deepcopy(original)
+    merged["name"] = str(proposal["name"]).strip()
+    merged["description"] = str(proposal["description"]).strip()
+    merged["rich_content"] = deepcopy(proposal["rich_content"])
+    attributes = {
+        int(item["id"]): deepcopy(item)
+        for item in merged.get("attributes") or []
+        if isinstance(item, dict) and item.get("id") is not None
+    }
+    for decision in proposal.get("attribute_decisions") or []:
+        if str(decision.get("decision")) != "set":
+            continue
+        attribute_id = int(decision["id"])
+        prior = attributes.get(attribute_id, {"id": attribute_id, "complex_id": 0})
+        prior["values"] = deepcopy(decision["values"])
+        attributes[attribute_id] = prior
+    merged["attributes"] = list(attributes.values())
+    for key in MEDIA_KEYS:
+        if key in original:
+            merged[key] = deepcopy(original[key])
+        else:
+            merged.pop(key, None)
+    return merged
 
 
 class Ledger:
