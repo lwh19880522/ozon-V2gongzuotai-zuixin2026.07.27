@@ -9,7 +9,7 @@ def test_skill_has_only_the_approved_runtime_files() -> None:
     files = {
         path.relative_to(SKILL_ROOT).as_posix()
         for path in SKILL_ROOT.rglob("*")
-        if path.is_file()
+        if path.is_file() and "__pycache__" not in path.parts
     }
     assert files == {
         "SKILL.md",
