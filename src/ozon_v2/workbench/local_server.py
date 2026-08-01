@@ -3351,9 +3351,13 @@ def build_upload_workspace_html(run_id: str) -> str:
         productUploadState.submissions.set(item.seed_id,submission);
         if (submission.status === "accepted_by_ozon") {{
           const warning = sellerUploadWarning(submission);
-          status.className = warning ? "product-upload-status non-blocking-warning" : "product-upload-status success";
-          status.textContent = `Ozon 已确认接收 · task_id ${{submission.task_id}} · 图片任务包 ${{submission.image_task_package_id || "已写入"}}。本商品工作台流程完成。${{warning ? ` 非阻断警告：${{warning}}。` : ""}}`;
+          const packageId = String(submission.image_task_package_id || "");
+          status.className = packageId ? (warning ? "product-upload-status non-blocking-warning" : "product-upload-status success") : "product-upload-status error";
+          status.textContent = packageId
+            ? `Ozon 已确认接收 · task_id ${{submission.task_id}} · 生图任务包 ${{packageId}} · ${{submission.image_task_package_status || "pending"}}。本商品工作台流程完成。${{warning ? ` 非阻断警告：${{warning}}。` : ""}}`
+            : "Ozon 已确认接收，但生图任务包尚未写入，工作台正在自动补建。";
           confirmButton.disabled = true; previewButton.disabled = true; confirmButton.textContent = "上传完成";
+          if (!packageId) scheduleProductUploadStatusRetry(item, controls, remaining);
           return;
         }}
         if (submission.status === "failed") {{
@@ -3411,7 +3415,7 @@ def build_upload_workspace_html(run_id: str) -> str:
         if (submissionStatus === "failed") {{
           previewButton.disabled = !item.ready_to_build; confirmButton.disabled = true; previewButton.textContent = "修正后重新准备"; status.className = "product-upload-status error"; status.textContent = `上次上传失败：${{sellerUploadError(item.upload_submission)}}。`;
         }} else if (submissionStatus === "accepted_by_ozon") {{
-          const warning = sellerUploadWarning(item.upload_submission); previewButton.disabled = true; confirmButton.disabled = true; confirmButton.textContent = "上传完成"; status.className = warning ? "product-upload-status non-blocking-warning" : "product-upload-status success"; status.textContent = `Ozon 已确认接收 · task_id ${{item.upload_submission.task_id}} · 图片任务包 ${{item.upload_submission.image_task_package_id || "已写入"}}${{warning ? ` · 非阻断警告：${{warning}}` : ""}}`;
+          const warning = sellerUploadWarning(item.upload_submission); const packageId = String(item.upload_submission.image_task_package_id || ""); previewButton.disabled = true; confirmButton.disabled = true; confirmButton.textContent = "上传完成"; status.className = packageId ? (warning ? "product-upload-status non-blocking-warning" : "product-upload-status success") : "product-upload-status error"; status.textContent = packageId ? `Ozon 已确认接收 · task_id ${{item.upload_submission.task_id}} · 生图任务包 ${{packageId}} · ${{item.upload_submission.image_task_package_status || "pending"}}${{warning ? ` · 非阻断警告：${{warning}}` : ""}}` : "Ozon 已确认接收，但生图任务包尚未写入，工作台正在自动补建。"; if (!packageId) setTimeout(() => pollProductUploadStatus(item,controls),0);
         }} else {{
           previewButton.disabled = true; confirmButton.disabled = true; confirmButton.textContent = "Ozon 处理中"; status.textContent = `Ozon 正在处理 · task_id ${{item.upload_submission.task_id}}`;
           setTimeout(() => pollProductUploadStatus(item,controls),0);
@@ -3419,6 +3423,22 @@ def build_upload_workspace_html(run_id: str) -> str:
       }}
       previewButton.addEventListener("click",() => previewProductUpload(item,controls)); confirmButton.addEventListener("click",() => confirmProductUpload(item,controls));
       controls.append(previewButton,confirmButton,status); container.append(controls);
+    }}
+    function renderUploadSubmissionSummary(gates) {{
+      let summary = $("batchUploadReconciliation");
+      if (!summary) {{
+        summary = document.createElement("span");
+        summary.id = "batchUploadReconciliation";
+        summary.className = "batch-upload-status";
+        $("batchUploadProducts").parentElement.insertBefore(summary, $("batchUploadStatus"));
+      }}
+      const attempted = gates.submission_attempted_count || 0;
+      const accepted = gates.submission_accepted_count || 0;
+      const failed = gates.submission_failed_count || 0;
+      const packages = gates.image_task_package_count || 0;
+      const missing = gates.image_task_missing_count || 0;
+      summary.className = `batch-upload-status${{missing ? " error" : " success"}}`;
+      summary.textContent = `已提交 ${{attempted}} 件 · Ozon 已确认 ${{accepted}} 件 · 上传失败 ${{failed}} 件 · 生图任务包 ${{packages}} 个${{missing ? ` · 缺失 ${{missing}} 个，正在自动补建` : ""}}`;
     }}
     async function batchUploadProducts() {{
       const button = $("batchUploadProducts"); const status = $("batchUploadStatus");
@@ -3451,6 +3471,7 @@ def build_upload_workspace_html(run_id: str) -> str:
       const pageStart = draftState.page * draftState.pageSize;
       const pageItems = draftState.items.slice(pageStart, pageStart + draftState.pageSize);
       const gates = data.gates || {{}};
+      renderUploadSubmissionSummary(gates);
       const total = gates.product_count || items.length;
       const readyCount = gates.ready_to_build_count || 0;
       $("productCount").textContent = String(items.length);

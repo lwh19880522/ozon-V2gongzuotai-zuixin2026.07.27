@@ -21,6 +21,7 @@ from ozon_v2.domain.models import WorkbenchAction, WorkbenchState
 from ozon_v2.domain.supplier_sku import SupplierSkuOption, SupplierSkuSelectionReceipt
 from ozon_v2.images.contracts import SubjectMasterSelection
 from ozon_v2.images.queue import ImageGenerationQueue
+from ozon_v2.images.task_inbox import ImageTaskInbox
 from ozon_v2.services.collection_contract_service import CollectionContractService
 from ozon_v2.services.attribute_mapping_service import map_template_attributes
 from ozon_v2.services.workbench_service import (
@@ -5661,6 +5662,105 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             reloaded_item["upload_preview"]["confirmation_token"],
         )
         self.assertEqual(7001, reloaded_item["upload_submission"]["task_id"])
+
+    def test_refresh_keeps_claimed_image_task_bound_without_pending_file_error(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        ozon_result = self.repo.load_ozon_collection_result(run_id)
+        ozon_result["ozon_candidates"][0]["attributes"]["Цвет"] = "белый"
+        self.repo.save_ozon_collection_result(run_id, ozon_result)
+        self.attach_locked_subject_master(run_id, seed.seed_id)
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+        adapter = FakeSellerApiAdapter()
+        service = WorkbenchService(self.repo, seller_api_adapter=adapter)
+        self.assertTrue(
+            service.confirm_pricing_evidence(
+                run_id,
+                self.pricing_input_payload(seed.seed_id),
+            ).ok
+        )
+        preview = service.preview_product_upload(run_id, seed.seed_id)
+        submitted = service.submit_product_upload(
+            run_id,
+            seed.seed_id,
+            confirmation_token=preview.data["confirmation_token"],
+        )
+        self.assertTrue(submitted.ok, submitted.to_dict())
+        accepted = service.refresh_product_upload_status(run_id, seed.seed_id)
+        package_id = accepted.data["image_task_package_id"]
+        claimed = ImageTaskInbox(self.context.runtime_root).claim_next()
+        self.assertEqual(package_id, claimed["package_id"])
+
+        refreshed = service.refresh_product_upload_status(run_id, seed.seed_id)
+
+        self.assertTrue(refreshed.ok, refreshed.to_dict())
+        self.assertEqual("in_progress", refreshed.data["image_task_package_status"])
+        self.assertIn("image_tasks\\in_progress", refreshed.data["image_task_package_path"])
+        self.assertNotIn("image_task_package_error", refreshed.data)
+        self.assertEqual(
+            [],
+            list((self.context.runtime_root / "image_tasks" / "pending").glob("*.json")),
+        )
+
+    def test_upload_workspace_recreates_missing_package_for_confirmed_product(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        ozon_result = self.repo.load_ozon_collection_result(run_id)
+        ozon_result["ozon_candidates"][0]["attributes"]["Цвет"] = "белый"
+        self.repo.save_ozon_collection_result(run_id, ozon_result)
+        self.attach_locked_subject_master(run_id, seed.seed_id)
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+        adapter = FakeSellerApiAdapter()
+        service = WorkbenchService(self.repo, seller_api_adapter=adapter)
+        self.assertTrue(
+            service.confirm_pricing_evidence(
+                run_id,
+                self.pricing_input_payload(seed.seed_id),
+            ).ok
+        )
+        preview = service.preview_product_upload(run_id, seed.seed_id)
+        self.assertTrue(preview.ok, preview.to_dict())
+        self.assertTrue(
+            service.submit_product_upload(
+                run_id,
+                seed.seed_id,
+                confirmation_token=preview.data["confirmation_token"],
+            ).ok
+        )
+        accepted = service.refresh_product_upload_status(run_id, seed.seed_id)
+        package_id = accepted.data["image_task_package_id"]
+        package_path = (
+            self.context.runtime_root
+            / "image_tasks"
+            / "pending"
+            / f"{package_id}.json"
+        )
+        package_path.unlink()
+        submissions = self.repo.load_upload_submissions(run_id)
+        record = submissions["items"][seed.seed_id]
+        record.pop("image_task_package_id", None)
+        record.pop("image_task_package_path", None)
+        self.repo.save_upload_submissions(run_id, submissions)
+
+        workspace = service.upload_workspace(run_id)
+
+        self.assertTrue(workspace.ok, workspace.to_dict())
+        submission = workspace.data["items"][0]["upload_submission"]
+        self.assertEqual(package_id, submission["image_task_package_id"])
+        self.assertEqual("pending", submission["image_task_package_status"])
+        self.assertTrue(package_path.is_file())
+        self.assertEqual(1, workspace.data["gates"]["submission_accepted_count"])
+        self.assertEqual(1, workspace.data["gates"]["image_task_package_count"])
+        self.assertEqual(0, workspace.data["gates"]["image_task_missing_count"])
+
+    def test_upload_page_reports_submitted_accepted_failed_and_image_task_counts(self) -> None:
+        run_id, _seed = self.prepare_supplier_review_run()
+
+        page = self.get_text(f"/batches/{run_id}/upload")
+
+        self.assertIn("已提交", page)
+        self.assertIn("Ozon 已确认", page)
+        self.assertIn("上传失败", page)
+        self.assertIn("生图任务包", page)
+        self.assertNotIn('submission.image_task_package_id || "已写入"', page)
 
     def test_failed_ozon_upload_never_emits_an_image_task_package(self) -> None:
         class FailedImportAdapter(FakeSellerApiAdapter):

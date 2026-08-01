@@ -706,6 +706,24 @@ class FsRepo:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
+    def find_image_task_package(
+        self,
+        package_id: str,
+    ) -> tuple[Path, dict[str, Any]] | None:
+        safe_package_id = re.sub(
+            r"[^A-Za-z0-9_.-]+",
+            "-",
+            str(package_id or "").strip(),
+        ).strip(".-")
+        if not safe_package_id:
+            raise ValueError("Image task package_id must contain a safe filename.")
+        root = self.runtime_root / "image_tasks"
+        for status in ("pending", "in_progress", "completed", "failed"):
+            path = root / status / f"{safe_package_id}.json"
+            if path.is_file():
+                return path, self._read_json(path)
+        return None
+
     def save_image_task_package(
         self,
         package_id: str,
@@ -736,12 +754,15 @@ class FsRepo:
             "-",
             str(package_id or "").strip(),
         ).strip(".-")
-        path = self.image_task_pending_dir() / f"{safe_package_id}.json"
-        payload = self._read_json(path)
+        located = self.find_image_task_package(safe_package_id)
+        if located is None:
+            raise FileNotFoundError(
+                self.image_task_pending_dir() / f"{safe_package_id}.json"
+            )
+        path, payload = located
         target = payload.get("store_target")
         if (
-            payload.get("status") != "pending"
-            or str(payload.get("run_id") or "") != str(run_id)
+            str(payload.get("run_id") or "") != str(run_id)
             or str(payload.get("seed_id") or "") != str(seed_id)
             or not isinstance(target, dict)
             or int(target.get("seller_import_task_id") or 0)
@@ -750,9 +771,20 @@ class FsRepo:
             raise ValueError(
                 "Pending image task identity does not match the accepted Ozon product."
             )
-        target["product_id"] = int(product_id)
-        payload["store_target"] = target
-        self._write_json(path, payload)
+        package_status = str(payload.get("status") or path.parent.name)
+        if package_status != path.parent.name:
+            raise ValueError(
+                "Image task package status does not match its lifecycle directory."
+            )
+        existing_product_id = int(target.get("product_id") or 0)
+        if package_status == "pending":
+            target["product_id"] = int(product_id)
+            payload["store_target"] = target
+            self._write_json(path, payload)
+        elif existing_product_id != int(product_id):
+            raise ValueError(
+                "Claimed image task product binding does not match the accepted Ozon product."
+            )
         return path
 
     def quarantine_image_task_package(
