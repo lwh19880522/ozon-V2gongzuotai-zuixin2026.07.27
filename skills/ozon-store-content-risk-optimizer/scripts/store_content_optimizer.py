@@ -1343,10 +1343,123 @@ def apply_one(
     return {"status": "completed", "product_id": product_id}
 
 
+class Runtime:
+    def __init__(
+        self,
+        *,
+        ledger: Ledger,
+        gateway: Any,
+        evidence: Any,
+        rule_hashes: dict[str, str],
+    ) -> None:
+        self.ledger = ledger
+        self.gateway = gateway
+        self.evidence = evidence
+        self.rule_hashes = rule_hashes
+
+
+def policy_rule_hashes(path: Path | None = None) -> dict[str, str]:
+    policy_path = path or (
+        Path(__file__).resolve().parents[1]
+        / "references"
+        / "optimization-policy.md"
+    )
+    text = policy_path.read_text(encoding="utf-8")
+    sections: dict[str, list[str]] = {}
+    current = "policy"
+    for line in text.splitlines():
+        if line.startswith("## "):
+            current = line[3:].strip().casefold()
+            sections[current] = [line]
+        else:
+            sections.setdefault(current, []).append(line)
+    return {
+        key: payload_hash("\n".join(lines))
+        for key, lines in sections.items()
+    }
+
+
+def build_runtime(repo: FsRepo | None = None) -> Runtime:
+    selected_repo = repo or FsRepo()
+    credentials = selected_repo.load_credentials()
+    if credentials is None:
+        raise ApplyError("Seller credentials are missing")
+    key = store_key(credentials.client_id)
+    ledger_path = (
+        selected_repo.runtime_root
+        / "store_content_optimizer"
+        / key
+        / "optimizer.sqlite3"
+    )
+    return Runtime(
+        ledger=Ledger(ledger_path),
+        gateway=SellerGateway(SellerApiAdapter(repo=selected_repo)),
+        evidence=WorkbenchEvidence(selected_repo),
+        rule_hashes=policy_rule_hashes(),
+    )
+
+
+def execute_command(
+    command: str,
+    runtime: Runtime,
+    *,
+    proposal: dict[str, Any] | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    if command == "scan":
+        counts = scan_store(
+            runtime.gateway,
+            runtime.ledger,
+            runtime.evidence,
+            runtime.rule_hashes,
+            force=force,
+        )
+        return {"ok": True, "status": "scanned", "counts": counts}
+    if command == "next":
+        task = runtime.ledger.next_task()
+        if task is None:
+            return {"ok": True, "status": "empty"}
+        return {"ok": True, "status": "task", "task": task}
+    if command == "status":
+        return {
+            "ok": True,
+            "status": "summary",
+            "counts": runtime.ledger.status_summary(),
+        }
+    if command == "apply":
+        if proposal is None:
+            raise ValidationError("apply requires a proposal")
+        product_id = str(proposal.get("product_id") or "")
+        state = runtime.ledger.get_state(product_id)
+        if state is None:
+            raise ValidationError("proposal product has no queued ledger task")
+        task = json.loads(str(state["task_json"]))
+        return {
+            "ok": True,
+            **apply_one(runtime.gateway, runtime.ledger, task, proposal),
+        }
+    raise ValidationError(f"unknown command: {command}")
+
+
+def read_proposal(source: str) -> dict[str, Any]:
+    if source == "-":
+        text = sys.stdin.read()
+    else:
+        text = Path(source).read_text(encoding="utf-8")
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValidationError("proposal is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValidationError("proposal must be a JSON object")
+    return payload
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("scan")
+    scan_parser = subparsers.add_parser("scan")
+    scan_parser.add_argument("--force", action="store_true")
     subparsers.add_parser("next")
     apply_parser = subparsers.add_parser("apply")
     apply_parser.add_argument("--proposal", default="-")
@@ -1356,7 +1469,26 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    payload: dict[str, Any] = {"ok": True, "command": args.command}
+    try:
+        runtime = build_runtime()
+        proposal = (
+            read_proposal(str(args.proposal)) if args.command == "apply" else None
+        )
+        payload = execute_command(
+            str(args.command),
+            runtime,
+            proposal=proposal,
+            force=bool(getattr(args, "force", False)),
+        )
+    except Exception as exc:
+        payload = {
+            "ok": False,
+            "error": type(exc).__name__,
+            "message": str(exc)[:500],
+        }
+        print(str(exc)[:500], file=sys.stderr)
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 1
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     return 0
 

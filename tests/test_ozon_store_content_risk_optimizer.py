@@ -717,3 +717,22 @@ def test_duplicate_successful_import_is_not_submitted_again_or_left_applying(
     assert second["status"] == "duplicate_skipped"
     assert len(gateway.import_requests) == 1
     assert ledger.get_state("11")["status"] == "completed"
+
+
+def test_execute_command_drives_scan_next_and_status_without_live_api(
+    optimizer, tmp_path: Path
+) -> None:
+    runtime = optimizer.Runtime(
+        ledger=optimizer.Ledger(tmp_path / "optimizer.sqlite3"),
+        gateway=FakeGateway([product("11", "sale-11")]),
+        evidence=FakeEvidence(),
+        rule_hashes=rule_hashes(),
+    )
+    scan_result = optimizer.execute_command("scan", runtime)
+    assert scan_result["status"] == "scanned"
+    assert scan_result["counts"]["queued"] == 1
+    next_result = optimizer.execute_command("next", runtime)
+    assert next_result["status"] == "task"
+    assert next_result["task"]["product_id"] == "11"
+    status_result = optimizer.execute_command("status", runtime)
+    assert status_result["counts"] == {"drafting": 1}

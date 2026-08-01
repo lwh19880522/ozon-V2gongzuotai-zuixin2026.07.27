@@ -25,3 +25,58 @@ def test_skill_entrypoint_exposes_the_fixed_commands() -> None:
     )
     for command in ("scan", "next", "apply", "status"):
         assert f'add_parser("{command}")' in script
+
+
+def test_skill_is_automatic_incremental_non_media_and_risk_first() -> None:
+    text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+    policy = (SKILL_ROOT / "references" / "optimization-policy.md").read_text(
+        encoding="utf-8"
+    )
+    for phrase in (
+        "scan",
+        "next",
+        "apply",
+        "status",
+        "automatic",
+        "SQLite ledger",
+        "all unarchived products",
+        "unchanged completed products",
+        "natural Russian",
+        "semantic self-review",
+        "evidence_insufficient",
+        "FBS stock 10",
+        "FBS stock 0",
+        "never archive",
+        "archived products",
+        "active orders",
+        "rollback",
+    ):
+        assert phrase.casefold() in text.casefold()
+    for phrase in (
+        "title",
+        "description",
+        "Rich Content",
+        "attributes",
+        "content score",
+        "media score",
+        "Chinese",
+        "1688",
+        "supplier",
+        "quantity",
+        "set composition",
+        "dimensions",
+        "weight",
+        "capacity",
+        "power",
+        "voltage",
+        "dictionary",
+        "price",
+        "compliance",
+        "storefront divergence",
+    ):
+        assert phrase.casefold() in policy.casefold()
+    assert "Do not generate, modify, upload, or delete images or video" in text
+    assert "Do not ask the user to approve routine safe optimization" in text
+    forbidden_marker = "TO" + "DO"
+    assert forbidden_marker not in text
+    assert forbidden_marker not in policy
