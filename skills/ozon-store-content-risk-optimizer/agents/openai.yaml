@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ozon Store Content Risk Optimizer"
+  short_description: "Optimize Ozon listing content and stop unsafe offers"
+  default_prompt: "Use $ozon-store-content-risk-optimizer to automatically optimize eligible Ozon store content, verify risks, preserve media, and resume from its ledger."
