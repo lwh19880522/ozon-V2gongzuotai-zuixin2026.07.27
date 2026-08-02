@@ -2144,7 +2144,11 @@ class WorkbenchService:
                         }
                         for slot in accepted_slots
                     ],
-                    "upload_preview": upload_previews.get(seed_id),
+                    "upload_preview": (
+                        upload_previews.get(seed_id)
+                        if not blocking_gates
+                        else None
+                    ),
                     "upload_submission": upload_submissions.get(seed_id),
                 }
             )
@@ -3725,6 +3729,23 @@ class WorkbenchService:
                 "This product upload is already being processed or was accepted.",
                 existing,
             )
+        current_preview = self.preview_product_upload(run_id, seed_id)
+        if not current_preview.ok:
+            return current_preview
+        current_token = str(
+            current_preview.data.get("confirmation_token") or ""
+        )
+        if current_token != expected_token:
+            return Result.failure(
+                "product_upload.confirmation_mismatch",
+                "The product evidence changed after the saved preview. Review and confirm the refreshed upload payload.",
+                data={
+                    "run_id": run_id,
+                    "seed_id": seed_id,
+                    "confirmation_token": current_token,
+                },
+            )
+        preview = current_preview.data
         seller_api_item = preview.get("seller_api_item")
         if not isinstance(seller_api_item, dict):
             return Result.failure(

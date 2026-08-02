@@ -3820,6 +3820,86 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             "package density",
             " ".join(item["pricing_validation_errors"]),
         )
+        self.assertIsNone(item["upload_preview"])
+
+    def test_submit_revalidates_saved_preview_before_calling_seller_api(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+        self.attach_locked_subject_master(run_id, seed.seed_id)
+        adapter = FakeSellerApiAdapter()
+        service = WorkbenchService(self.repo, seller_api_adapter=adapter)
+        confirmed = service.confirm_pricing_evidence(
+            run_id,
+            self.pricing_input_payload(seed.seed_id),
+        )
+        self.assertTrue(confirmed.ok, confirmed.to_dict())
+        preview = service.preview_product_upload(run_id, seed.seed_id)
+        self.assertTrue(preview.ok, preview.to_dict())
+
+        stored = self.repo.load_pricing_evidence(run_id)
+        stored["items"][seed.seed_id]["inputs"].update(
+            {
+                "package_weight_g": "300",
+                "package_length_cm": "2.02",
+                "package_width_cm": "2.01",
+                "package_height_cm": "1.5",
+            }
+        )
+        self.repo.save_pricing_evidence(run_id, stored)
+
+        workspace = service.upload_workspace(run_id)
+        self.assertTrue(workspace.ok, workspace.to_dict())
+        self.assertIsNone(workspace.data["items"][0]["upload_preview"])
+
+        submitted = service.submit_product_upload(
+            run_id,
+            seed.seed_id,
+            confirmation_token=preview.data["confirmation_token"],
+        )
+
+        self.assertFalse(submitted.ok)
+        self.assertEqual("product_upload.product_not_ready", submitted.code)
+        self.assertEqual([], adapter.imported_items)
+        self.assertEqual(
+            [],
+            list(
+                (self.context.runtime_root / "image_tasks" / "pending").glob(
+                    "*.json"
+                )
+            ),
+        )
+
+    def test_submit_requires_confirmation_again_when_valid_payload_changed(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+        self.attach_locked_subject_master(run_id, seed.seed_id)
+        adapter = FakeSellerApiAdapter()
+        service = WorkbenchService(self.repo, seller_api_adapter=adapter)
+        confirmed = service.confirm_pricing_evidence(
+            run_id,
+            self.pricing_input_payload(seed.seed_id),
+        )
+        self.assertTrue(confirmed.ok, confirmed.to_dict())
+        preview = service.preview_product_upload(run_id, seed.seed_id)
+        self.assertTrue(preview.ok, preview.to_dict())
+
+        stored = self.repo.load_pricing_evidence(run_id)
+        stored["items"][seed.seed_id]["inputs"]["package_length_cm"] = "29"
+        self.repo.save_pricing_evidence(run_id, stored)
+
+        submitted = service.submit_product_upload(
+            run_id,
+            seed.seed_id,
+            confirmation_token=preview.data["confirmation_token"],
+        )
+
+        self.assertFalse(submitted.ok)
+        self.assertEqual("product_upload.confirmation_mismatch", submitted.code)
+        self.assertNotEqual(
+            preview.data["confirmation_token"],
+            submitted.data["confirmation_token"],
+        )
+        self.assertEqual([], adapter.imported_items)
 
     def test_zero_hazard_class_uses_the_official_ozon_dictionary_label(self) -> None:
         value = _dictionary_upload_value(
@@ -5797,6 +5877,8 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn("Ozon 已确认", page)
         self.assertIn("上传失败", page)
         self.assertIn("生图任务包", page)
+        self.assertIn("已提交 Seller API，但 Ozon 建品校验失败", page)
+        self.assertIn("productUploadState.previews.delete(item.seed_id)", page)
         self.assertNotIn('submission.image_task_package_id || "已写入"', page)
 
     def test_failed_ozon_upload_keeps_deferred_image_task_package(self) -> None:
