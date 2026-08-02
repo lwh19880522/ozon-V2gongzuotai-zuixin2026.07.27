@@ -17,7 +17,14 @@ class ImageTaskInbox:
         self.root = Path(runtime_root) / "image_tasks"
 
     def directory(self, status: str) -> Path:
-        if status not in {"pending", "in_progress", "completed", "failed"}:
+        if status not in {
+            "pending",
+            "in_progress",
+            "grid_ready",
+            "awaiting_product",
+            "completed",
+            "failed",
+        }:
             raise ImageTaskInboxError(f"Unsupported image task status: {status}")
         path = self.root / status
         path.mkdir(parents=True, exist_ok=True)
@@ -26,13 +33,21 @@ class ImageTaskInbox:
     def status(self) -> dict[str, Any]:
         counts = {
             status: len(list(self.directory(status).glob("*.json")))
-            for status in ("pending", "in_progress", "completed", "failed")
+            for status in (
+                "pending",
+                "in_progress",
+                "grid_ready",
+                "awaiting_product",
+                "completed",
+                "failed",
+            )
         }
         return {"root": str(self.root.resolve()), "counts": counts}
 
     def claim_next(self) -> dict[str, Any] | None:
         pending = self.directory("pending")
         in_progress = self.directory("in_progress")
+        grid_ready = self.directory("grid_ready")
         lock_path = self.root / ".claim.lock"
         try:
             lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -42,26 +57,59 @@ class ImageTaskInbox:
             if any(in_progress.glob("*.json")):
                 return None
             candidates: list[tuple[Path, dict[str, Any]]] = []
-            for source in pending.glob("*.json"):
-                payload = _read_json(source)
-                _validate_package_contract(payload, source.stem)
-                candidates.append((source, payload))
+            for lifecycle in (pending, grid_ready):
+                for source in lifecycle.glob("*.json"):
+                    payload = _read_json(source)
+                    _validate_package_contract(payload, source.stem)
+                    candidates.append((source, payload))
             if not candidates:
                 return None
             _, oldest_payload = min(
                 candidates,
                 key=lambda item: (
+                    str(
+                        item[1].get("batch_created_at")
+                        or item[1].get("created_at")
+                        or ""
+                    ),
                     str(item[1].get("created_at") or ""),
                     item[0].name,
                 ),
             )
             active_run_id = str(oldest_payload.get("run_id") or "")
+            active_candidates = [
+                item
+                for item in candidates
+                if str(item[1].get("run_id") or "") == active_run_id
+            ]
+            generation_candidates = [
+                item
+                for item in active_candidates
+                if item[0].parent.name == "pending"
+                and str(item[1].get("resume_mode") or "") != "upload_only"
+            ]
+            crop_candidates = [
+                item
+                for item in active_candidates
+                if item[0].parent.name == "grid_ready"
+            ]
+            upload_candidates = [
+                item
+                for item in active_candidates
+                if item[0].parent.name == "pending"
+                and str(item[1].get("resume_mode") or "") == "upload_only"
+            ]
+            if generation_candidates:
+                phase = "grid_generation"
+                phase_candidates = generation_candidates
+            elif crop_candidates:
+                phase = "grid_crop"
+                phase_candidates = crop_candidates
+            else:
+                phase = "upload_only"
+                phase_candidates = upload_candidates
             source, payload = min(
-                (
-                    item
-                    for item in candidates
-                    if str(item[1].get("run_id") or "") == active_run_id
-                ),
+                phase_candidates,
                 key=lambda item: (
                     str(item[1].get("created_at") or ""),
                     item[0].name,
@@ -72,15 +120,18 @@ class ImageTaskInbox:
                 source.replace(target)
             except FileNotFoundError:
                 return None
-            if payload.get("status") != "pending":
+            expected_status = "grid_ready" if phase == "grid_crop" else "pending"
+            if payload.get("status") != expected_status:
                 _write_json(target, payload)
                 raise ImageTaskInboxError(
-                    f"Package {source.stem} is not pending: {payload.get('status')}"
+                    f"Package {source.stem} is not {expected_status}: "
+                    f"{payload.get('status')}"
                 )
             payload["status"] = "in_progress"
             payload["assignment"] = {
                 "executor": "ozon-product-media-generator",
                 "execution_mode": "single_thread",
+                "phase": phase,
                 "claimed_at": _utc_now(),
             }
             _write_json(target, payload)
@@ -89,16 +140,77 @@ class ImageTaskInbox:
             os.close(lock_fd)
             lock_path.unlink(missing_ok=True)
 
+    def stage_grid(
+        self,
+        package_id: str,
+        checkpoint: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload, source = self._claimed_package(package_id)
+        self._require_phase(payload, package_id, "grid_generation")
+        required = (
+            "raw_grid_path",
+            "raw_grid_sha256",
+            "white_anchor_path",
+            "white_anchor_sha256",
+        )
+        normalized = {field: str(checkpoint.get(field) or "").strip() for field in required}
+        for field in ("raw_grid_path", "white_anchor_path"):
+            if not normalized[field] or not Path(normalized[field]).is_absolute():
+                raise ImageTaskInboxError(
+                    f"Grid checkpoint {field} must be an absolute path."
+                )
+        for field in ("raw_grid_sha256", "white_anchor_sha256"):
+            if not re.fullmatch(r"[0-9a-fA-F]{64}", normalized[field]):
+                raise ImageTaskInboxError(
+                    f"Grid checkpoint {field} must be a SHA-256 digest."
+                )
+            normalized[field] = normalized[field].lower()
+        normalized["staged_at"] = _utc_now()
+        payload["status"] = "grid_ready"
+        payload["grid_checkpoint"] = normalized
+        payload.pop("assignment", None)
+        target = self.directory("grid_ready") / source.name
+        _write_json(target, payload)
+        source.unlink()
+        return {**payload, "package_path": str(target.resolve())}
+
     def complete(
         self,
         package_id: str,
         receipt: dict[str, Any],
     ) -> dict[str, Any]:
         payload, source = self._claimed_package(package_id)
+        self._require_phase(payload, package_id, "grid_crop", "upload_only")
         payload["status"] = "completed"
         payload["completed_at"] = _utc_now()
         payload["result"] = dict(receipt)
         target = self.directory("completed") / source.name
+        _write_json(target, payload)
+        source.unlink()
+        return {**payload, "package_path": str(target.resolve())}
+
+    def await_product(
+        self,
+        package_id: str,
+        generated_media: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload, source = self._claimed_package(package_id)
+        self._require_phase(payload, package_id, "grid_crop", "upload_only")
+        target_info = payload.get("store_target") or {}
+        if int(target_info.get("product_id") or 0) > 0:
+            raise ImageTaskInboxError(
+                f"Package {package_id} is already bound to an Ozon product."
+            )
+        images = generated_media.get("images")
+        if not isinstance(images, list) or len(images) != 8:
+            raise ImageTaskInboxError(
+                "Deferred upload requires exactly eight generated images."
+            )
+        payload["status"] = "awaiting_product"
+        payload["awaiting_product_since"] = _utc_now()
+        payload["generated_media"] = dict(generated_media)
+        payload.pop("assignment", None)
+        target = self.directory("awaiting_product") / source.name
         _write_json(target, payload)
         source.unlink()
         return {**payload, "package_path": str(target.resolve())}
@@ -123,14 +235,16 @@ class ImageTaskInbox:
         reason: str,
     ) -> dict[str, Any]:
         payload, source = self._claimed_package(package_id)
-        payload["status"] = "pending"
+        phase = str((payload.get("assignment") or {}).get("phase") or "")
+        return_status = "grid_ready" if phase == "grid_crop" else "pending"
+        payload["status"] = return_status
         payload["last_release"] = {
             "executor": "ozon-product-media-generator",
             "released_at": _utc_now(),
             "reason": str(reason or "").strip() or "released",
         }
         payload.pop("assignment", None)
-        target = self.directory("pending") / source.name
+        target = self.directory(return_status) / source.name
         _write_json(target, payload)
         source.unlink()
         return {**payload, "package_path": str(target.resolve())}
@@ -155,6 +269,19 @@ class ImageTaskInbox:
                 f"Package {safe_id} is not owned by the dedicated single-thread skill."
             )
         return payload, source
+
+    @staticmethod
+    def _require_phase(
+        payload: dict[str, Any],
+        package_id: str,
+        *allowed: str,
+    ) -> None:
+        phase = str((payload.get("assignment") or {}).get("phase") or "")
+        if phase not in allowed:
+            raise ImageTaskInboxError(
+                f"Package {package_id} phase {phase!r} is not allowed for this action; "
+                f"expected one of {', '.join(allowed)}."
+            )
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -181,9 +308,10 @@ def _validate_package_contract(
     payload: dict[str, Any],
     package_id: str,
 ) -> None:
-    if payload.get("schema_version") != 2:
+    schema_version = payload.get("schema_version")
+    if schema_version not in {2, 3}:
         raise ImageTaskInboxError(
-            f"Package {package_id} must use image task schema_version=2."
+            f"Package {package_id} must use image task schema_version=2 or 3."
         )
     if payload.get("kind") != "ozon_product_image_generation_and_upload":
         raise ImageTaskInboxError(f"Package {package_id} has an unsupported kind.")
@@ -194,7 +322,7 @@ def _validate_package_contract(
     target = payload.get("store_target")
     if not isinstance(target, dict):
         raise ImageTaskInboxError(f"Package {package_id} has no store target.")
-    for field in ("seller_import_task_id", "product_id"):
+    for field in ("seller_import_task_id",):
         try:
             value = int(target.get(field))
         except (TypeError, ValueError):
@@ -203,6 +331,21 @@ def _validate_package_contract(
             raise ImageTaskInboxError(
                 f"Package {package_id} requires a positive {field}."
             )
+    try:
+        product_id = int(target.get("product_id") or 0)
+    except (TypeError, ValueError):
+        product_id = 0
+    binding_state = str(target.get("binding_state") or "").strip()
+    if product_id <= 0 and not (
+        schema_version == 3 and binding_state == "awaiting_ozon_product"
+    ):
+        raise ImageTaskInboxError(
+            f"Package {package_id} requires a positive product_id."
+        )
+    if product_id > 0 and schema_version == 3 and binding_state != "bound":
+        raise ImageTaskInboxError(
+            f"Package {package_id} with a product_id must have binding_state='bound'."
+        )
     contract = payload.get("generation_contract")
     if not isinstance(contract, dict):
         raise ImageTaskInboxError(

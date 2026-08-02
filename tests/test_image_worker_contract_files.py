@@ -45,7 +45,7 @@ def test_worker_contract_uses_only_claimed_task_package_assignments() -> None:
 
     assert "scripts/ozon_image_task_inbox.py" in files["skill"]
     assert "image_tasks/in_progress" in files["skill"]
-    assert "schema_version=2" in files["skill"]
+    assert "schema_version=3" in files["skill"]
     assert "RUN package_id=" in files["agent"]
 
 
@@ -106,6 +106,11 @@ def test_product_media_generates_one_four_by_two_grid_then_crops_eight_slots() -
 
     assert "exactly two image-generation calls" in files["skill"]
     assert "one 4x2 grid" in files["skill"]
+    assert "stage-grid" in files["skill"]
+    assert "Do not crop any grid until every eligible product" in files["skill"]
+    assert "all raw 4x2 grids first" in files["agent"]
+    assert "immediately crop" not in files["skill"]
+    assert "Never generate grids for several products first" not in files["skill"]
     assert "complete canvas aspect ratio of exactly 3:2" in gallery
     assert "four columns and two rows" in gallery
     for slot in (
@@ -132,7 +137,8 @@ def test_workbench_package_contract_declares_single_grid_and_auto_gateway() -> N
         service.index("def submit_product_upload")
     ]
 
-    assert '"schema_version": 2' in package_builder
+    assert '"schema_version": 3' in package_builder
+    assert '"awaiting_ozon_product"' in package_builder
     assert '"reference_count": 1' in package_builder
     assert '"additional_image_references_allowed": False' in package_builder
     assert '"generation_mode": "single_thread_8_grid"' in package_builder

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
 from typing import Any
+
+from PIL import Image, UnidentifiedImageError
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,6 +46,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     commands.add_parser("claim-next")
 
+    stage = commands.add_parser("stage-grid")
+    stage.add_argument("--package", required=True)
+    stage.add_argument("--grid", required=True)
+    stage.add_argument("--white-anchor", required=True)
+
     slideshow = commands.add_parser("build-slideshow")
     slideshow.add_argument("--package", required=True)
     slideshow.add_argument("--output-dir", required=True)
@@ -59,11 +67,10 @@ def build_parser() -> argparse.ArgumentParser:
     upload.add_argument(
         "--image",
         action="append",
-        required=True,
         help="Ordered slot_id=absolute_path entry; provide exactly eight.",
     )
-    upload.add_argument("--video", required=True)
-    upload.add_argument("--video-cover", required=True)
+    upload.add_argument("--video")
+    upload.add_argument("--video-cover")
 
     fail = commands.add_parser("fail")
     fail.add_argument("--package", required=True)
@@ -100,8 +107,47 @@ def main() -> int:
     if args.command == "release":
         _print(inbox.release(args.package, args.reason))
         return 0
+    if args.command == "stage-grid":
+        package = inbox.load_in_progress(args.package)
+        phase = str((package.get("assignment") or {}).get("phase") or "")
+        if phase != "grid_generation":
+            raise ImageTaskInboxError(
+                f"Package {args.package} is not assigned for grid generation."
+            )
+        grid_path = _media_path(args.grid, (".jpg", ".jpeg", ".png", ".webp"), "4x2 grid")
+        anchor_path = _media_path(
+            args.white_anchor,
+            (".jpg", ".jpeg", ".png", ".webp"),
+            "white identity anchor",
+        )
+        if not _is_exact_three_by_two_image(grid_path):
+            raise ImageTaskInboxError(f"Raw 4x2 grid is not exact 3:2: {grid_path}")
+        if not is_exact_three_by_four_image(anchor_path):
+            raise ImageTaskInboxError(
+                f"White identity anchor is not exact 3:4: {anchor_path}"
+            )
+        staged = inbox.stage_grid(
+            args.package,
+            {
+                "raw_grid_path": str(grid_path),
+                "raw_grid_sha256": _sha256(grid_path),
+                "white_anchor_path": str(anchor_path),
+                "white_anchor_sha256": _sha256(anchor_path),
+            },
+        )
+        _print(staged)
+        return 0
 
     package = inbox.load_in_progress(args.package)
+    if args.command == "upload-gallery" and not args.image:
+        generated_media = package.get("generated_media") or {}
+        args.image = [
+            f"{item.get('slot_id')}={item.get('path')}"
+            for item in generated_media.get("images") or []
+            if isinstance(item, dict)
+        ]
+        args.video = args.video or generated_media.get("video")
+        args.video_cover = args.video_cover or generated_media.get("video_cover")
     source_files = _ordered_source_files(args.image)
     if args.command == "build-slideshow":
         result = build_product_slideshow(
@@ -122,7 +168,19 @@ def main() -> int:
             f"Slideshow video cover is not exact 3:4: {cover_path}"
         )
     seller_api = SellerApiAdapter(repo)
-    product_id = int(args.product_id or _resolve_product_id(package, seller_api))
+    try:
+        product_id = int(args.product_id or _resolve_product_id(package, seller_api))
+    except SellerApiError:
+        waiting = inbox.await_product(
+            args.package,
+            {
+                "images": source_files,
+                "video": str(video_path),
+                "video_cover": str(cover_path),
+            },
+        )
+        _print(waiting)
+        return 0
     publication = publisher.publish_product(
         run_id=str(package["run_id"]),
         seed_id=str(package["seed_id"]),
@@ -194,6 +252,23 @@ def _media_path(
     return path
 
 
+def _is_exact_three_by_two_image(path: Path) -> bool:
+    try:
+        with Image.open(path) as image:
+            width, height = image.size
+    except (OSError, UnidentifiedImageError):
+        return False
+    return width > 0 and height > 0 and width * 2 == height * 3
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _resolve_product_id(
     package: dict[str, Any],
     seller_api: SellerApiAdapter,
@@ -202,16 +277,33 @@ def _resolve_product_id(
     stored_product_id = target.get("product_id")
     if stored_product_id:
         return int(stored_product_id)
+    offer_id = str(target.get("offer_id") or "").strip()
+    lookup = getattr(seller_api, "get_product_state_by_offer_id", None)
+    if offer_id and callable(lookup):
+        product_state = lookup(offer_id)
+        if (
+            isinstance(product_state, dict)
+            and product_state.get("is_created") is True
+            and int(product_state.get("product_id") or 0) > 0
+        ):
+            return int(product_state["product_id"])
     task_id = target.get("seller_import_task_id")
     if task_id is None:
         raise SellerApiError("Image task package has no Seller import task ID.")
     status = seller_api.get_product_import_info(int(task_id))
-    offer_id = str(target.get("offer_id") or "")
     for item in status.get("items") or []:
         if offer_id and str(item.get("offer_id") or "") != offer_id:
             continue
         product_id = item.get("product_id")
-        if product_id:
+        item_status = str(item.get("status") or "").strip().casefold()
+        created = item.get("is_created") is True or item_status in {
+            "accepted",
+            "created",
+            "imported",
+            "processed",
+            "success",
+        }
+        if product_id and created:
             return int(product_id)
     raise SellerApiError("Ozon product_id is not ready for this image task package.")
 

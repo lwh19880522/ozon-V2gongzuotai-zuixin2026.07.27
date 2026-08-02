@@ -3362,8 +3362,9 @@ def build_upload_workspace_html(run_id: str) -> str:
         }}
         if (submission.status === "failed") {{
           const warning = sellerUploadWarning(submission);
+          const packageId = String(submission.image_task_package_id || "");
           status.className = "product-upload-status error";
-          status.textContent = `Ozon 上传失败：${{sellerUploadError(submission)}}。${{warning ? `非阻断警告另列：${{warning}}。` : ""}}修正后可重新准备并上传。`;
+          status.textContent = `Ozon 上传失败：${{sellerUploadError(submission)}}。${{warning ? `非阻断警告另列：${{warning}}。` : ""}}${{packageId ? `生图任务包 ${{packageId}} 已保留并继续执行；建品成功后自动绑定上传。` : "生图任务包正在自动补建。"}}修正后可重新准备并上传。`;
           previewButton.disabled = !item.ready_to_build; confirmButton.disabled = true; previewButton.textContent = "修正后重新准备";
           return;
         }}
@@ -3395,7 +3396,7 @@ def build_upload_workspace_html(run_id: str) -> str:
         const result = await api(`/api/batches/${{encodeURIComponent(runId)}}/product-upload/${{encodeURIComponent(item.seed_id)}}/confirm`, {{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify({{confirmation_token:preview.confirmation_token}})}});
         productUploadState.submissions.set(item.seed_id,result.data);
         status.className = "product-upload-status";
-        status.textContent = `Ozon 已受理任务 · task_id ${{result.data.task_id}}，正在确认建品结果；只有 Ozon 确认上传成功后才会创建图片任务包…`;
+        status.textContent = `Ozon 已受理任务 · task_id ${{result.data.task_id}} · 生图任务包 ${{result.data.image_task_package_id || "正在补建"}}；建品与生图独立继续执行。`;
         confirmButton.textContent = "Ozon 处理中";
         await pollProductUploadStatus(item,controls);
       }} catch (error) {{
@@ -3407,13 +3408,13 @@ def build_upload_workspace_html(run_id: str) -> str:
       const controls = document.createElement("div"); controls.className = "product-upload-actions";
       const previewButton = document.createElement("button"); previewButton.type = "button"; previewButton.dataset.action = "preview"; previewButton.textContent = "预览单原图建品"; previewButton.disabled = !item.ready_to_build;
       const confirmButton = document.createElement("button"); confirmButton.type = "button"; confirmButton.dataset.action = "confirm"; confirmButton.className = "confirm"; confirmButton.textContent = "确认上传到 Ozon"; confirmButton.disabled = true;
-      const status = document.createElement("span"); status.className = "product-upload-status"; status.textContent = item.ready_to_build ? "建品载荷只使用锁定的 1688 原图；Ozon 确认上传成功后才输出独立图片任务包。" : "本商品尚有门禁未完成，不能提交。";
+      const status = document.createElement("span"); status.className = "product-upload-status"; status.textContent = item.ready_to_build ? "建品载荷只使用锁定的 1688 原图；提交后立即输出独立生图任务包，Ozon 建品成功后再绑定上传。" : "本商品尚有门禁未完成，不能提交。";
       if (item.upload_preview && item.upload_preview.confirmation_token) {{ productUploadState.previews.set(item.seed_id,item.upload_preview); previewButton.textContent = "重新预览载荷"; confirmButton.disabled = false; const payload = item.upload_preview.seller_api_item || {{}}; status.textContent = `已准备：1 张锁定原图 · ${{payload.price || "-"}} ${{payload.currency_code || "-"}}。`; }}
       if (item.upload_submission && item.upload_submission.task_id != null) {{
         productUploadState.submissions.set(item.seed_id,item.upload_submission);
         const submissionStatus = item.upload_submission.status || "processing";
         if (submissionStatus === "failed") {{
-          previewButton.disabled = !item.ready_to_build; confirmButton.disabled = true; previewButton.textContent = "修正后重新准备"; status.className = "product-upload-status error"; status.textContent = `上次上传失败：${{sellerUploadError(item.upload_submission)}}。`;
+          const packageId = String(item.upload_submission.image_task_package_id || ""); previewButton.disabled = !item.ready_to_build; confirmButton.disabled = true; previewButton.textContent = "修正后重新准备"; status.className = "product-upload-status error"; status.textContent = `上次上传失败：${{sellerUploadError(item.upload_submission)}}。${{packageId ? ` 生图任务包 ${{packageId}} · ${{item.upload_submission.image_task_package_status || "pending"}} 已保留。` : " 生图任务包正在自动补建。"}}`;
         }} else if (submissionStatus === "accepted_by_ozon") {{
           const warning = sellerUploadWarning(item.upload_submission); const packageId = String(item.upload_submission.image_task_package_id || ""); previewButton.disabled = true; confirmButton.disabled = true; confirmButton.textContent = "上传完成"; status.className = packageId ? (warning ? "product-upload-status non-blocking-warning" : "product-upload-status success") : "product-upload-status error"; status.textContent = packageId ? `Ozon 已确认接收 · task_id ${{item.upload_submission.task_id}} · 生图任务包 ${{packageId}} · ${{item.upload_submission.image_task_package_status || "pending"}}${{warning ? ` · 非阻断警告：${{warning}}` : ""}}` : "Ozon 已确认接收，但生图任务包尚未写入，工作台正在自动补建。"; if (!packageId) setTimeout(() => pollProductUploadStatus(item,controls),0);
         }} else {{

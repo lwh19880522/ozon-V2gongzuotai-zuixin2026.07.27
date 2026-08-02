@@ -718,7 +718,14 @@ class FsRepo:
         if not safe_package_id:
             raise ValueError("Image task package_id must contain a safe filename.")
         root = self.runtime_root / "image_tasks"
-        for status in ("pending", "in_progress", "completed", "failed"):
+        for status in (
+            "pending",
+            "in_progress",
+            "grid_ready",
+            "awaiting_product",
+            "completed",
+            "failed",
+        ):
             path = root / status / f"{safe_package_id}.json"
             if path.is_file():
                 return path, self._read_json(path)
@@ -765,8 +772,6 @@ class FsRepo:
             str(payload.get("run_id") or "") != str(run_id)
             or str(payload.get("seed_id") or "") != str(seed_id)
             or not isinstance(target, dict)
-            or int(target.get("seller_import_task_id") or 0)
-            != int(seller_import_task_id)
         ):
             raise ValueError(
                 "Pending image task identity does not match the accepted Ozon product."
@@ -777,14 +782,23 @@ class FsRepo:
                 "Image task package status does not match its lifecycle directory."
             )
         existing_product_id = int(target.get("product_id") or 0)
-        if package_status == "pending":
-            target["product_id"] = int(product_id)
-            payload["store_target"] = target
-            self._write_json(path, payload)
-        elif existing_product_id != int(product_id):
+        if existing_product_id and existing_product_id != int(product_id):
             raise ValueError(
                 "Claimed image task product binding does not match the accepted Ozon product."
             )
+        target["seller_import_task_id"] = int(seller_import_task_id)
+        target["product_id"] = int(product_id)
+        target["binding_state"] = "bound"
+        payload["store_target"] = target
+        if package_status == "awaiting_product":
+            payload["status"] = "pending"
+            payload["resume_mode"] = "upload_only"
+            payload.pop("assignment", None)
+            destination = self.image_task_pending_dir() / path.name
+            self._write_json(destination, payload)
+            path.unlink(missing_ok=True)
+            return destination
+        self._write_json(path, payload)
         return path
 
     def quarantine_image_task_package(

@@ -1799,7 +1799,7 @@ class WorkbenchService:
                 }
         submissions_changed = False
         for submitted_seed_id, submission in upload_submissions.items():
-            if str(submission.get("status") or "") != "accepted_by_ozon":
+            if submission.get("task_id") is None:
                 continue
             before = json.dumps(
                 submission,
@@ -1807,7 +1807,7 @@ class WorkbenchService:
                 sort_keys=True,
             )
             preview = upload_previews.get(submitted_seed_id)
-            self._sync_accepted_image_task_record(
+            self._sync_image_task_record(
                 run_id=run_id,
                 seed_id=submitted_seed_id,
                 record=submission,
@@ -2214,15 +2214,27 @@ class WorkbenchService:
         image_task_package_count = sum(
             1
             for submission in active_submissions
-            if str(submission.get("status") or "") == "accepted_by_ozon"
-            and str(submission.get("image_task_package_id") or "").strip()
+            if str(submission.get("image_task_package_id") or "").strip()
             and str(submission.get("image_task_package_status") or "").strip()
-            in {"pending", "in_progress", "completed", "failed"}
+            in {
+                "pending",
+                "in_progress",
+                "grid_ready",
+                "awaiting_product",
+                "completed",
+                "failed",
+            }
             and not submission.get("image_task_package_error")
+        )
+        image_task_waiting_binding_count = sum(
+            1
+            for submission in active_submissions
+            if str(submission.get("image_task_package_status") or "")
+            == "awaiting_product"
         )
         image_task_missing_count = max(
             0,
-            submission_accepted_count - image_task_package_count,
+            submission_attempted_count - image_task_package_count,
         )
         all_products_ready = bool(items) and ready_to_build_count == len(items)
         draft_ready = run.get("status") in {
@@ -2269,6 +2281,9 @@ class WorkbenchService:
                     "submission_accepted_count": submission_accepted_count,
                     "submission_failed_count": submission_failed_count,
                     "image_task_package_count": image_task_package_count,
+                    "image_task_waiting_binding_count": (
+                        image_task_waiting_binding_count
+                    ),
                     "image_task_missing_count": image_task_missing_count,
                     "all_products_ready": all_products_ready,
                     "product_count": len(items),
@@ -3469,22 +3484,30 @@ class WorkbenchService:
         run_id: str,
         seed_id: str,
         seller_import_task_id: int,
-        ozon_product_id: int,
+        ozon_product_id: int | None,
         preview: dict[str, Any],
     ) -> dict[str, str]:
         package_id = "ozon-image-" + hashlib.sha256(
-            f"{run_id}:{seed_id}:{seller_import_task_id}".encode("utf-8")
+            f"{run_id}:{seed_id}".encode("utf-8")
         ).hexdigest()[:24]
         seller_api_item = preview.get("seller_api_item") or {}
         image_task_context = preview.get("image_task_context") or {}
         subject_master = image_task_context.get("subject_master") or {}
         bootstrap_image = preview.get("bootstrap_image") or {}
+        package_created_at = utc_now_iso()
+        try:
+            batch_created_at = str(
+                self.repo.load_run(run_id).get("created_at") or package_created_at
+            )
+        except FileNotFoundError:
+            batch_created_at = package_created_at
         package = {
-            "schema_version": 2,
+            "schema_version": 3,
             "kind": "ozon_product_image_generation_and_upload",
             "package_id": package_id,
             "status": "pending",
-            "created_at": utc_now_iso(),
+            "created_at": package_created_at,
+            "batch_created_at": batch_created_at,
             "run_id": run_id,
             "seed_id": seed_id,
             "store_target": {
@@ -3492,6 +3515,9 @@ class WorkbenchService:
                 "seller_import_task_id": seller_import_task_id,
                 "offer_id": seller_api_item.get("offer_id"),
                 "product_id": ozon_product_id,
+                "binding_state": (
+                    "bound" if ozon_product_id else "awaiting_ozon_product"
+                ),
                 "seller_api_item": seller_api_item,
                 "video_template_fields": image_task_context.get(
                     "video_template_fields"
@@ -3553,7 +3579,7 @@ class WorkbenchService:
             "image_task_package_status": "pending",
         }
 
-    def _sync_accepted_image_task_record(
+    def _sync_image_task_record(
         self,
         *,
         run_id: str,
@@ -3562,31 +3588,31 @@ class WorkbenchService:
         preview: dict[str, Any] | None,
         seller_status: dict[str, Any] | None = None,
     ) -> None:
-        if str(record.get("status") or "") != "accepted_by_ozon":
+        try:
+            seller_import_task_id = int(record.get("task_id") or 0)
+        except (TypeError, ValueError):
+            seller_import_task_id = 0
+        if seller_import_task_id <= 0:
             return
         effective_status = seller_status or record.get("seller_api_status") or {}
-        ozon_product_id = _product_id_from_import_status(
-            effective_status,
-            offer_id=str(record.get("offer_id") or ""),
-        )
-        if ozon_product_id is None:
-            product_state = record.get("seller_product_state")
-            if isinstance(product_state, dict):
-                ozon_product_id = _product_id_from_import_status(
-                    {"items": [product_state]},
-                    offer_id=str(record.get("offer_id") or ""),
-                )
-        if ozon_product_id is None:
-            record["image_task_package_error"] = (
-                "Ozon accepted the import task but returned no exact "
-                "product_id; the image task was not created."
+        ozon_product_id: int | None = None
+        if str(record.get("status") or "") == "accepted_by_ozon":
+            ozon_product_id = _product_id_from_import_status(
+                effective_status,
+                offer_id=str(record.get("offer_id") or ""),
             )
-            return
+            if ozon_product_id is None:
+                product_state = record.get("seller_product_state")
+                if isinstance(product_state, dict):
+                    ozon_product_id = _product_id_from_import_status(
+                        {"items": [product_state]},
+                        offer_id=str(record.get("offer_id") or ""),
+                    )
         package_id = str(record.get("image_task_package_id") or "").strip()
         if not package_id:
             if not isinstance(preview, dict):
                 record["image_task_package_error"] = (
-                    "The accepted product has no saved upload preview; "
+                    "The submitted product has no saved upload preview; "
                     "regenerate the preview before creating its image task."
                 )
                 return
@@ -3594,18 +3620,48 @@ class WorkbenchService:
                 self._emit_image_task_package(
                     run_id=run_id,
                     seed_id=seed_id,
-                    seller_import_task_id=int(record["task_id"]),
+                    seller_import_task_id=seller_import_task_id,
                     ozon_product_id=ozon_product_id,
                     preview=preview,
                 )
             )
             package_id = str(record["image_task_package_id"])
+        located = self.repo.find_image_task_package(package_id)
+        if located is None:
+            if not isinstance(preview, dict):
+                record["image_task_package_error"] = (
+                    "The submitted product has no saved upload preview; "
+                    "regenerate the preview before recreating its image task."
+                )
+                return
+            record.update(
+                self._emit_image_task_package(
+                    run_id=run_id,
+                    seed_id=seed_id,
+                    seller_import_task_id=seller_import_task_id,
+                    ozon_product_id=ozon_product_id,
+                    preview=preview,
+                )
+            )
+            package_id = str(record["image_task_package_id"])
+        if ozon_product_id is None:
+            located = self.repo.find_image_task_package(package_id)
+            if located is None:
+                record["image_task_package_error"] = (
+                    "The deferred image task package could not be located."
+                )
+                return
+            bound_path, _payload = located
+            record["image_task_package_path"] = str(bound_path)
+            record["image_task_package_status"] = bound_path.parent.name
+            record.pop("image_task_package_error", None)
+            return
         try:
             bound_path = self.repo.bind_pending_image_task_product(
                 package_id,
                 run_id=run_id,
                 seed_id=seed_id,
-                seller_import_task_id=int(record["task_id"]),
+                seller_import_task_id=seller_import_task_id,
                 product_id=ozon_product_id,
             )
         except (FileNotFoundError, TypeError, ValueError) as exc:
@@ -3707,6 +3763,19 @@ class WorkbenchService:
                 }
             )
             record["attempt_history"] = history
+            for key in (
+                "image_task_package_id",
+                "image_task_package_path",
+                "image_task_package_status",
+            ):
+                if existing.get(key):
+                    record[key] = existing[key]
+        self._sync_image_task_record(
+            run_id=run_id,
+            seed_id=seed_id,
+            record=record,
+            preview=preview,
+        )
         submissions["items"][seed_id] = record
         path = self.repo.save_upload_submissions(run_id, submissions)
         event = self.repo.append_run_event(
@@ -3940,6 +4009,19 @@ class WorkbenchService:
                     }
                 )
                 record["attempt_history"] = history
+                for key in (
+                    "image_task_package_id",
+                    "image_task_package_path",
+                    "image_task_package_status",
+                ):
+                    if existing.get(key):
+                        record[key] = existing[key]
+            self._sync_image_task_record(
+                run_id=run_id,
+                seed_id=seed_id,
+                record=record,
+                preview=preview,
+            )
             submissions["items"][seed_id] = record
             result_items[seed_id] = record
 
@@ -4059,42 +4141,18 @@ class WorkbenchService:
         record["seller_api_status"] = seller_status
         record["status"] = _product_import_status(seller_status)
         record["status_checked_at"] = utc_now_iso()
-        if (
-            record["status"] != "accepted_by_ozon"
-            and record.get("image_task_package_id")
-        ):
-            premature_package_id = str(record["image_task_package_id"])
-            quarantined_path = self.repo.quarantine_image_task_package(
-                premature_package_id,
-                reason="ozon_upload_not_accepted",
-                details={
-                    "run_id": run_id,
-                    "seed_id": seed_id,
-                    "seller_import_task_id": record.get("task_id"),
-                    "seller_import_status": record["status"],
-                },
-            )
-            record.pop("image_task_package_id", None)
-            record.pop("image_task_package_path", None)
-            record["quarantined_image_task_package_id"] = (
-                premature_package_id
-            )
-            record["quarantined_image_task_package_path"] = (
-                str(quarantined_path) if quarantined_path else None
-            )
-        if record["status"] == "accepted_by_ozon":
-            try:
-                previews = self.repo.load_upload_previews(run_id)
-            except FileNotFoundError:
-                previews = {}
-            preview = (previews.get("items") or {}).get(seed_id)
-            self._sync_accepted_image_task_record(
-                run_id=run_id,
-                seed_id=seed_id,
-                record=record,
-                preview=preview if isinstance(preview, dict) else None,
-                seller_status=seller_status,
-            )
+        try:
+            previews = self.repo.load_upload_previews(run_id)
+        except FileNotFoundError:
+            previews = {}
+        preview = (previews.get("items") or {}).get(seed_id)
+        self._sync_image_task_record(
+            run_id=run_id,
+            seed_id=seed_id,
+            record=record,
+            preview=preview if isinstance(preview, dict) else None,
+            seller_status=seller_status,
+        )
         submissions["items"][seed_id] = record
         self.repo.save_upload_submissions(run_id, submissions)
         return Result.success(

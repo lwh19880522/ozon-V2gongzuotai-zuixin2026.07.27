@@ -1,4 +1,4 @@
 interface:
   display_name: "Ozon Product Media Generator"
   short_description: "Single-thread Ozon gallery generation"
-  default_prompt: "Use $ozon-product-media-generator to process RUN package_id=<id> assignments sequentially: automatically start the free public gateway, freeze one verified white-background subject as the sole image reference, generate one 4x2 eight-panel grid, crop eight exact 3:4 images, validate unchanged product identity, and upload the gallery and video to Ozon."
+  default_prompt: "Use $ozon-product-media-generator to process RUN package_id=<id> assignments as one single-thread two-phase batch: generate and stage all raw 4x2 grids first with each product's verified frozen white-background subject as its sole image reference, then crop and validate the staged grids one at a time into eight exact 3:4 images, and upload after exact Ozon binding or preserve generated media while awaiting binding."

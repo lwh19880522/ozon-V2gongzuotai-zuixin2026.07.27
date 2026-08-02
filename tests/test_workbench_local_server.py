@@ -7,6 +7,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -3398,7 +3399,8 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn("item.blocking_gates", page)
         self.assertIn("预览单原图建品", page)
         self.assertIn("确认上传到 Ozon", page)
-        self.assertIn("Ozon 确认上传成功后才输出独立图片任务包", page)
+        self.assertIn("提交后立即输出独立生图任务包", page)
+        self.assertIn("建品成功后再绑定上传", page)
         self.assertNotIn('href="/images"', page)
         self.assertEqual(seed.seed_id, item["seed_id"])
         self.assertEqual(1, item["required_attribute_count"])
@@ -5478,7 +5480,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             workspace.data["gates"]["bootstrap_image_ready_count"],
         )
 
-    def test_product_upload_emits_one_image_task_only_after_ozon_acceptance(self) -> None:
+    def test_product_upload_emits_one_deferred_image_task_then_binds_after_ozon_acceptance(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
         ozon_result = self.repo.load_ozon_collection_result(run_id)
         ozon_result["ozon_candidates"][0]["attributes"]["Цвет"] = "белый"
@@ -5533,12 +5535,15 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
 
         self.assertTrue(submitted.ok, submitted.to_dict())
         self.assertEqual(7001, submitted.data["task_id"])
-        self.assertNotIn("image_task_package_id", submitted.data)
+        deferred_package_id = submitted.data["image_task_package_id"]
+        self.assertEqual("pending", submitted.data["image_task_package_status"])
         self.assertEqual(
-            [],
-            list(
-                (self.context.runtime_root / "image_tasks" / "pending").glob(
-                    "*.json"
+            1,
+            len(
+                list(
+                    (self.context.runtime_root / "image_tasks" / "pending").glob(
+                        "*.json"
+                    )
                 )
             ),
         )
@@ -5548,7 +5553,37 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             confirmation_token=preview.data["confirmation_token"],
         )
         self.assertTrue(repeated.ok)
-        self.assertNotIn("image_task_package_id", repeated.data)
+        self.assertEqual(deferred_package_id, repeated.data["image_task_package_id"])
+        inbox = ImageTaskInbox(self.context.runtime_root)
+        generated = inbox.claim_next()
+        self.assertEqual(deferred_package_id, generated["package_id"])
+        self.assertEqual("grid_generation", generated["assignment"]["phase"])
+        inbox.stage_grid(
+            deferred_package_id,
+            {
+                "raw_grid_path": "C:/generated/gallery-grid.png",
+                "raw_grid_sha256": "a" * 64,
+                "white_anchor_path": "C:/generated/white-anchor.png",
+                "white_anchor_sha256": "b" * 64,
+            },
+        )
+        claimed = inbox.claim_next()
+        self.assertEqual("grid_crop", claimed["assignment"]["phase"])
+        waiting = inbox.await_product(
+            deferred_package_id,
+            {
+                "images": [
+                    {
+                        "slot_id": f"slot-{index}",
+                        "path": f"C:/generated/{index}.jpg",
+                    }
+                    for index in range(8)
+                ],
+                "video": "C:/generated/slideshow.mp4",
+                "video_cover": "C:/generated/video_cover.jpg",
+            },
+        )
+        self.assertEqual("awaiting_product", waiting["status"])
 
         accepted = service.refresh_product_upload_status(run_id, seed.seed_id)
 
@@ -5562,13 +5597,15 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             accepted.data["image_task_package_path"],
         )
         package = json.loads(package_path.read_text(encoding="utf-8"))
-        self.assertEqual(2, package["schema_version"])
+        self.assertEqual(3, package["schema_version"])
         self.assertEqual("pending", package["status"])
+        self.assertEqual("upload_only", package["resume_mode"])
         self.assertEqual(
             7001,
             package["store_target"]["seller_import_task_id"],
         )
         self.assertEqual(900001, package["store_target"]["product_id"])
+        self.assertEqual("bound", package["store_target"]["binding_state"])
         self.assertEqual(
             subject["source_image_url"],
             package["bootstrap_image"]["url"],
@@ -5762,7 +5799,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn("生图任务包", page)
         self.assertNotIn('submission.image_task_package_id || "已写入"', page)
 
-    def test_failed_ozon_upload_never_emits_an_image_task_package(self) -> None:
+    def test_failed_ozon_upload_keeps_deferred_image_task_package(self) -> None:
         class FailedImportAdapter(FakeSellerApiAdapter):
             def get_product_import_info(self, task_id: int) -> dict:
                 return {
@@ -5801,58 +5838,32 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             confirmation_token=preview.data["confirmation_token"],
         )
         self.assertTrue(submitted.ok, submitted.to_dict())
-        legacy_package_id = "legacy-premature-package"
-        legacy_pending_path = self.repo.save_image_task_package(
-            legacy_package_id,
-            {
-                "schema_version": 1,
-                "package_id": legacy_package_id,
-                "run_id": run_id,
-                "seed_id": seed.seed_id,
-                "status": "pending",
-            },
-        )
-        submissions = self.repo.load_upload_submissions(run_id)
-        submissions["items"][seed.seed_id]["image_task_package_id"] = (
-            legacy_package_id
-        )
-        submissions["items"][seed.seed_id]["image_task_package_path"] = str(
-            legacy_pending_path
-        )
-        self.repo.save_upload_submissions(run_id, submissions)
+        package_id = submitted.data["image_task_package_id"]
+        package_path = Path(submitted.data["image_task_package_path"])
+        package = json.loads(package_path.read_text(encoding="utf-8"))
+        self.assertEqual(3, package["schema_version"])
+        self.assertEqual("awaiting_ozon_product", package["store_target"]["binding_state"])
+        self.assertIsNone(package["store_target"]["product_id"])
 
         failed = service.refresh_product_upload_status(run_id, seed.seed_id)
 
         self.assertTrue(failed.ok, failed.to_dict())
         self.assertEqual("failed", failed.data["status"])
-        self.assertNotIn("image_task_package_id", failed.data)
-        self.assertEqual(
-            legacy_package_id,
-            failed.data["quarantined_image_task_package_id"],
+        self.assertEqual(package_id, failed.data["image_task_package_id"])
+        self.assertEqual("pending", failed.data["image_task_package_status"])
+        self.assertTrue(package_path.is_file())
+        self.assertFalse(
+            (
+                self.context.runtime_root
+                / "image_tasks"
+                / "quarantined"
+                / f"{package_id}.json"
+            ).exists()
         )
-        self.assertEqual(
-            [],
-            list(
-                (self.context.runtime_root / "image_tasks" / "pending").glob(
-                    "*.json"
-                )
-            ),
-        )
-        quarantined = (
-            self.context.runtime_root
-            / "image_tasks"
-            / "quarantined"
-            / f"{legacy_package_id}.json"
-        )
-        self.assertTrue(quarantined.is_file())
-        quarantined_payload = json.loads(
-            quarantined.read_text(encoding="utf-8")
-        )
-        self.assertEqual("quarantined", quarantined_payload["status"])
-        self.assertEqual(
-            "ozon_upload_not_accepted",
-            quarantined_payload["quarantine_reason"],
-        )
+        workspace = service.upload_workspace(run_id)
+        self.assertEqual(1, workspace.data["gates"]["submission_attempted_count"])
+        self.assertEqual(1, workspace.data["gates"]["image_task_package_count"])
+        self.assertEqual(0, workspace.data["gates"]["image_task_missing_count"])
 
     def test_skipped_import_is_reconciled_to_created_product_final_state(self) -> None:
         class SkippedCreatedAdapter(FakeSellerApiAdapter):
@@ -5978,7 +5989,14 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
 
         self.assertTrue(failed.ok, failed.to_dict())
         self.assertEqual("failed", failed.data["status"])
-        self.assertNotIn("image_task_package_id", failed.data)
+        self.assertEqual("pending", failed.data["image_task_package_status"])
+        package_path = Path(failed.data["image_task_package_path"])
+        package = json.loads(package_path.read_text(encoding="utf-8"))
+        self.assertIsNone(package["store_target"]["product_id"])
+        self.assertEqual(
+            "awaiting_ozon_product",
+            package["store_target"]["binding_state"],
+        )
 
     def test_upload_page_separates_blocking_errors_from_warnings_and_optional_gaps(
         self,
@@ -6293,14 +6311,15 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual(1, submitted.data["submitted_product_count"])
         self.assertEqual("submitted", submitted.data["items"][0]["status"])
         self.assertEqual(1, len(adapter.imported_items))
-        self.assertEqual(
-            [],
-            list(
-                (self.context.runtime_root / "image_tasks" / "pending").glob(
-                    "*.json"
-                )
-            ),
+        package_paths = list(
+            (self.context.runtime_root / "image_tasks" / "pending").glob(
+                "*.json"
+            )
         )
+        self.assertEqual(1, len(package_paths))
+        package = json.loads(package_paths[0].read_text(encoding="utf-8"))
+        self.assertEqual(3, package["schema_version"])
+        self.assertEqual("awaiting_ozon_product", package["store_target"]["binding_state"])
 
     def test_batch_upload_validates_and_submits_products_concurrently(self) -> None:
         run = self.repo.create_workbench_batch_record(target_count=2)
