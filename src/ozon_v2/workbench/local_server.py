@@ -2069,24 +2069,18 @@ def build_supplier_review_html(run_id: str) -> str:
       const supplierImages = item.supplier_product && Array.isArray(item.supplier_product.images)
         ? item.supplier_product.images.filter(Boolean)
         : [];
-      const candidateMap = new Map();
-      skuImages.forEach((url) => candidateMap.set(url, {{ url, sources:["SKU 绑定图"] }}));
-      supplierImages.forEach((url) => {{
-        const candidate = candidateMap.get(url);
-        if (candidate) {{
-          if (!candidate.sources.includes("供应商商品图")) candidate.sources.push("供应商商品图");
-        }} else {{
-          candidateMap.set(url, {{ url, sources:["供应商商品图"] }});
-        }}
-      }});
-      const candidates = Array.from(candidateMap.values());
+      const candidates = skuImages.length ? skuImages : supplierImages.slice(0, 1);
+      const candidateMap = new Map(candidates.map((url) => [url, {{
+        url,
+        sources:[skuImages.length ? "SKU 绑定图" : "供应商商品图"]
+      }}]));
       const savedUrls = subjectMaster
         ? (subjectMaster.source_image_urls || [subjectMaster.source_image_url]).filter(Boolean)
         : [];
       const recommendedUrls = new Set(savedUrls.length
         ? savedUrls
-        : subjectDraft ? subjectDraft.sourceImageUrls : (skuImages.length ? skuImages : candidates.slice(0, 1).map((item) => item.url)));
-      candidates.forEach((candidate, index) => {{
+        : subjectDraft ? subjectDraft.sourceImageUrls : (skuImages.length ? skuImages : candidates.slice(0, 1)));
+      Array.from(candidateMap.values()).forEach((candidate, index) => {{
         const url = candidate.url;
         const label = document.createElement("label"); label.className = "subject-choice";
         const checkbox = document.createElement("input"); checkbox.type = "checkbox"; checkbox.name = "subjectEvidence"; checkbox.value = url;

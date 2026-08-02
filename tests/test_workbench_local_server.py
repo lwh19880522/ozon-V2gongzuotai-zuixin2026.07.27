@@ -197,9 +197,9 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             supplier_sku_id=f"approved-{seed_id}",
             combination_key=f"approved>{seed_id}",
             raw_label=f"approved {seed_id}",
-            selected_options={"颜色": "黑色"},
+            selected_options={"颜色": "Черный", "数量": "1"},
             set_quantity=1,
-            set_composition=["1 件"],
+            set_composition=["Черный", "1 шт."],
             price={"currency": "CNY", "amount": "12.80"},
             stock={"status": "in_stock", "quantity": 10},
             image_urls=[f"https://cbu01.alicdn.com/img/ibank/{seed_id}.jpg"],
@@ -251,6 +251,14 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             "image_job_id": job["job_id"],
         }
         self.repo.save_subject_masters(run_id, {"run_id": run_id, "items": subject_items})
+        selection_path = self.repo.run_dir(run_id) / "supplier_sku_selections.json"
+        selections = (
+            self.repo.load_supplier_sku_selections(run_id)
+            if selection_path.exists()
+            else {"run_id": run_id, "selections": {}}
+        )
+        selections.setdefault("selections", {})[seed_id] = receipt.to_dict()
+        self.repo.save_supplier_sku_selections(run_id, selections)
         return job
 
     def attach_locked_subject_master(self, run_id: str, seed_id: str) -> dict:
@@ -258,9 +266,9 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             supplier_sku_id=f"locked-{seed_id}",
             combination_key=f"locked>{seed_id}",
             raw_label=f"locked {seed_id}",
-            selected_options={"颜色": "黑色"},
+            selected_options={"颜色": "Черный", "数量": "1"},
             set_quantity=1,
-            set_composition=["1 件"],
+            set_composition=["Черный", "1 шт."],
             price={"currency": "CNY", "amount": "12.80"},
             stock={"status": "in_stock", "quantity": 10},
             image_urls=[f"https://cbu01.alicdn.com/img/ibank/{seed_id}.jpg"],
@@ -300,6 +308,14 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             run_id,
             {"run_id": run_id, "items": subject_items},
         )
+        selection_path = self.repo.run_dir(run_id) / "supplier_sku_selections.json"
+        selections = (
+            self.repo.load_supplier_sku_selections(run_id)
+            if selection_path.exists()
+            else {"run_id": run_id, "selections": {}}
+        )
+        selections.setdefault("selections", {})[seed_id] = receipt.to_dict()
+        self.repo.save_supplier_sku_selections(run_id, selections)
         return subject.to_dict()
 
     def prepare_pricing_sources(self, run_id: str, seed_id: str) -> None:
@@ -311,22 +327,24 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
                 "supplier_products": [supplier_product],
             },
         )
-        self.repo.save_supplier_sku_selections(
-            run_id,
+        selection_path = self.repo.run_dir(run_id) / "supplier_sku_selections.json"
+        selections = (
+            self.repo.load_supplier_sku_selections(run_id)
+            if selection_path.exists()
+            else {"run_id": run_id, "selections": {}}
+        )
+        selections.setdefault("selections", {}).setdefault(
+            seed_id,
             {
-                "run_id": run_id,
-                "selections": {
-                    seed_id: {
-                        "supplier_offer_id": supplier_product["offer_id"],
-                        "supplier_sku": supplier_product["sku_options"][0],
-                        "ozon_target_sku": {
-                            "sku_id": "ozon-sku-1",
-                            "selected_options": {"single_sku": "visible"},
-                        },
-                    }
+                "supplier_offer_id": supplier_product["offer_id"],
+                "supplier_sku": supplier_product["sku_options"][0],
+                "ozon_target_sku": {
+                    "sku_id": "ozon-sku-1",
+                    "selected_options": {"single_sku": "visible"},
                 },
             },
         )
+        self.repo.save_supplier_sku_selections(run_id, selections)
 
     def pricing_input_payload(self, seed_id: str) -> dict:
         return {
@@ -3055,6 +3073,15 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             },
             ok=False,
         )
+        rejected_gallery_subject = self.post_json(
+            f"/api/batches/{run_id}/subject-master",
+            {
+                "seed_id": seed.seed_id,
+                "source_image_urls": [subject_url, gallery_url],
+                "visible_subject_quantity": 4,
+            },
+            ok=False,
+        )
         reopened = self.post_json(
             f"/api/batches/{run_id}/supplier-sku/reopen",
             {"seed_id": seed.seed_id},
@@ -3097,6 +3124,10 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertIn('checkbox.type = "checkbox"', page)
         self.assertIn("SKU 绑定图", page)
         self.assertIn("供应商商品图", page)
+        self.assertIn(
+            "const candidates = skuImages.length ? skuImages : supplierImages.slice(0, 1);",
+            page,
+        )
         self.assertIn("source_image_urls:selectedUrls", page)
         self.assertNotIn('id="whiteBackgroundConfirmed"', page)
         self.assertNotIn("White Background Confirmed", page)
@@ -3108,11 +3139,148 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual("supplier-sku-set-x4", selected["data"]["receipt"]["supplier_sku_id"])
         self.assertFalse(rejected_subject["ok"])
         self.assertEqual("subject_master.image_not_in_supplier", rejected_subject["code"])
+        self.assertFalse(rejected_gallery_subject["ok"])
+        self.assertEqual(
+            "subject_master.image_not_in_locked_sku",
+            rejected_gallery_subject["code"],
+        )
         self.assertTrue(reopened["ok"])
         self.assertNotIn(
             seed.seed_id,
             self.repo.load_supplier_sku_selections(run_id)["selections"],
         )
+
+    def test_upload_workspace_repairs_legacy_subject_and_pending_package_to_locked_sku_images(
+        self,
+    ) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+        supplier_product = self.supplier_product_payload(seed.seed_id)
+        selected_url = supplier_product["sku_options"][0]["image_urls"][0]
+        wrong_variant_url = "https://cbu01.alicdn.com/img/ibank/wrong-variant.webp"
+        supplier_product["images"] = [selected_url, wrong_variant_url]
+        self.repo.save_supplier_collection_result(
+            run_id,
+            {"run_id": run_id, "supplier_products": [supplier_product]},
+        )
+        run = self.repo.load_run(run_id)
+        run["status"] = WorkbenchState.SUPPLIER_COLLECTED.value
+        self.repo.save_run(run)
+
+        service = WorkbenchService(
+            self.repo,
+            seller_api_adapter=FakeSellerApiAdapter(),
+        )
+        sku = SupplierSkuOption.from_dict(supplier_product["sku_options"][0])
+        ozon_product_id = str(
+            self.repo.load_ozon_collection_result(run_id)["ozon_candidates"][0][
+                "ozon_product_id"
+            ]
+        )
+        receipt = SupplierSkuSelectionReceipt.confirmed(
+            run_id=run_id,
+            product_id=ozon_product_id,
+            supplier_offer_id=supplier_product["offer_id"],
+            supplier_sku=sku,
+            ozon_target_sku={
+                "sku_id": "ozon-sku-1",
+                "selected_options": {"single_sku": "visible"},
+            },
+            differences=[],
+            confirmed_at="2026-08-02T00:00:00+00:00",
+        )
+        self.repo.save_supplier_sku_selections(
+            run_id,
+            {
+                "run_id": run_id,
+                "selections": {seed.seed_id: receipt.to_dict()},
+            },
+        )
+        selected_path = self.tmpdir / "selected-sku.jpg"
+        selected_path.write_bytes(b"selected-sku")
+        wrong_path = self.tmpdir / "wrong-variant.webp"
+        wrong_path.write_bytes(b"wrong-variant")
+        legacy_subject = SubjectMasterSelection.create(
+            receipt=receipt,
+            source_paths=[selected_path, wrong_path],
+            source_image_urls=[selected_url, wrong_variant_url],
+            visible_subject_quantity=1,
+            confirmed_at="2026-08-02T00:00:00+00:00",
+        )
+        self.repo.save_subject_masters(
+            run_id,
+            {
+                "run_id": run_id,
+                "items": {
+                    seed.seed_id: {
+                        "subject_master": legacy_subject.to_dict(),
+                        "image_task_mode": "post_upload_package",
+                    }
+                },
+            },
+        )
+        self.assertTrue(
+            service.confirm_pricing_evidence(
+                run_id,
+                self.pricing_input_payload(seed.seed_id),
+            ).ok
+        )
+        preview = service.preview_product_upload(run_id, seed.seed_id)
+        self.assertTrue(preview.ok, preview.to_dict())
+        submitted = service.submit_product_upload(
+            run_id,
+            seed.seed_id,
+            confirmation_token=preview.data["confirmation_token"],
+        )
+        self.assertTrue(submitted.ok, submitted.to_dict())
+        package_id = submitted.data["image_task_package_id"]
+        package_path = (
+            self.context.runtime_root
+            / "image_tasks"
+            / "pending"
+            / f"{package_id}.json"
+        )
+        package = json.loads(package_path.read_text(encoding="utf-8"))
+        package["evidence"]["subject_master"] = legacy_subject.to_dict()
+        package["failure"] = {"reason": "legacy mixed-variant evidence"}
+        package["failed_at"] = "2026-08-02T00:01:00+00:00"
+        package["assignment"] = {"worker_id": "stale-worker"}
+        package_path.write_text(
+            json.dumps(package, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        self.repo.save_subject_masters(
+            run_id,
+            {
+                "run_id": run_id,
+                "items": {
+                    seed.seed_id: {
+                        "subject_master": legacy_subject.to_dict(),
+                        "image_task_mode": "post_upload_package",
+                    }
+                },
+            },
+        )
+
+        workspace = service.upload_workspace(run_id)
+
+        self.assertTrue(workspace.ok, workspace.to_dict())
+        repaired_subject = self.repo.load_subject_masters(run_id)["items"][
+            seed.seed_id
+        ]["subject_master"]
+        repaired_package = json.loads(package_path.read_text(encoding="utf-8"))
+        self.assertEqual([selected_url], repaired_subject["source_image_urls"])
+        self.assertEqual(
+            [selected_url],
+            repaired_package["evidence"]["subject_master"]["source_image_urls"],
+        )
+        self.assertEqual(
+            selected_url,
+            repaired_package["bootstrap_image"]["url"],
+        )
+        self.assertNotIn("failure", repaired_package)
+        self.assertNotIn("failed_at", repaired_package)
+        self.assertNotIn("assignment", repaired_package)
 
     def test_image_workspace_page_and_api_show_real_source_assets(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()

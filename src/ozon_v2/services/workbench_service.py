@@ -1741,11 +1741,14 @@ class WorkbenchService:
                     if isinstance(content, dict)
                 }
         subject_path = self.repo.run_dir(run_id) / "subject_masters.json"
-        subject_items = (
-            self.repo.load_subject_masters(run_id).get("items", {})
+        subject_store = (
+            self.repo.load_subject_masters(run_id)
             if subject_path.exists()
-            else {}
+            else {"schema_version": 1, "run_id": run_id, "items": {}}
         )
+        subject_items = subject_store.get("items", {})
+        subject_items_changed = False
+        repaired_subject_seed_ids: set[str] = set()
         pricing_policy = PricingPolicy.from_mapping(
             self.repo.load_pricing_settings()
         ).to_dict()
@@ -1894,6 +1897,24 @@ class WorkbenchService:
                 and isinstance(subject_entry.get("subject_master"), dict)
                 else {}
             )
+            subject_master, subject_repaired = (
+                self._normalize_subject_master_to_locked_sku(
+                    subject_master,
+                    supplier_selection,
+                )
+            )
+            if subject_repaired and isinstance(subject_entry, dict):
+                subject_entry["subject_master"] = subject_master
+                subject_items_changed = True
+                repaired_subject_seed_ids.add(seed_id)
+                preview = upload_previews.get(seed_id)
+                if isinstance(preview, dict):
+                    preview.setdefault("image_task_context", {})[
+                        "subject_master"
+                    ] = subject_master
+                    preview.setdefault("bootstrap_image", {})["url"] = (
+                        subject_master.get("source_image_url")
+                    )
             subject_image_urls = [
                 str(value).strip()
                 for value in (
@@ -2152,6 +2173,46 @@ class WorkbenchService:
                     "upload_submission": upload_submissions.get(seed_id),
                 }
             )
+
+        if subject_items_changed:
+            self.repo.save_subject_masters(
+                run_id,
+                {
+                    **subject_store,
+                    "items": subject_items,
+                    "updated_at": utc_now_iso(),
+                },
+            )
+            if upload_previews:
+                self.repo.save_upload_previews(
+                    run_id,
+                    {
+                        "schema_version": 1,
+                        "run_id": run_id,
+                        "items": upload_previews,
+                    },
+                )
+            for repaired_seed_id in repaired_subject_seed_ids:
+                submission = upload_submissions.get(repaired_seed_id)
+                subject_entry = subject_items.get(repaired_seed_id)
+                subject_master = (
+                    subject_entry.get("subject_master")
+                    if isinstance(subject_entry, dict)
+                    else None
+                )
+                supplier_selection = supplier_selections.get(repaired_seed_id) or {}
+                if isinstance(submission, dict) and isinstance(subject_master, dict):
+                    self._refresh_pending_image_task_subject(
+                        package_id=str(
+                            submission.get("image_task_package_id") or ""
+                        ),
+                        run_id=run_id,
+                        seed_id=repaired_seed_id,
+                        subject_master=subject_master,
+                        locked_supplier_sku=(
+                            supplier_selection.get("supplier_sku") or {}
+                        ),
+                    )
 
         template_ready = bool(items) and all(item["template_ready"] for item in items)
         required_attributes_ready = bool(items) and all(
@@ -5760,10 +5821,29 @@ class WorkbenchService:
                 "The verified supplier product is missing.",
                 data={"run_id": run_id, "seed_id": seed_id},
             )
-        allowed_urls = set(receipt.supplier_sku.image_urls)
-        allowed_urls.update(self._supplier_product_images(supplier_product))
+        locked_sku_urls = {
+            str(value or "").strip()
+            for value in receipt.supplier_sku.image_urls
+            if str(value or "").strip()
+        }
+        supplier_urls = self._supplier_product_images(supplier_product)
+        allowed_urls = locked_sku_urls or set(supplier_urls[:1])
         foreign_urls = [url for url in selected_urls if url not in allowed_urls]
         if foreign_urls:
+            supplier_url_set = set(supplier_urls)
+            wrong_variant_urls = [
+                url for url in foreign_urls if url in supplier_url_set
+            ]
+            if locked_sku_urls and wrong_variant_urls:
+                return Result.failure(
+                    "subject_master.image_not_in_locked_sku",
+                    "Subject evidence may only use images attached to the locked supplier SKU.",
+                    data={
+                        "run_id": run_id,
+                        "seed_id": seed_id,
+                        "rejected_urls": wrong_variant_urls,
+                    },
+                )
             return Result.failure(
                 "subject_master.image_not_in_supplier",
                 "Every subject evidence image must belong to the verified supplier product.",
@@ -7487,6 +7567,102 @@ class WorkbenchService:
             return filtered
         primary_owner = max(owner_groups, key=lambda key: len(owner_groups[key]))
         return owner_groups[primary_owner]
+
+    def _normalize_subject_master_to_locked_sku(
+        self,
+        subject_master: dict[str, Any],
+        supplier_selection: dict[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        if not isinstance(subject_master, dict) or not subject_master:
+            return subject_master, False
+        supplier_sku = supplier_selection.get("supplier_sku") or {}
+        locked_urls = {
+            str(value or "").strip()
+            for value in supplier_sku.get("image_urls") or []
+            if str(value or "").strip()
+        }
+        if not locked_urls:
+            return subject_master, False
+        source_urls = [
+            str(value or "").strip()
+            for value in (
+                subject_master.get("source_image_urls")
+                or [subject_master.get("source_image_url")]
+            )
+            if str(value or "").strip()
+        ]
+        if source_urls and all(url in locked_urls for url in source_urls):
+            return subject_master, False
+        source_paths = list(
+            subject_master.get("source_paths")
+            or [subject_master.get("source_path")]
+        )
+        selected_pairs = [
+            (path, url)
+            for path, url in zip(source_paths, source_urls)
+            if url in locked_urls and str(path or "").strip()
+        ]
+        if not selected_pairs:
+            return {}, False
+        try:
+            receipt = SupplierSkuSelectionReceipt.from_dict(supplier_selection)
+            repaired = SubjectMasterSelection.create(
+                receipt=receipt,
+                source_paths=[pair[0] for pair in selected_pairs],
+                source_image_urls=[pair[1] for pair in selected_pairs],
+                visible_subject_quantity=int(
+                    subject_master.get("visible_subject_quantity") or 0
+                ),
+                white_background_confirmed=bool(
+                    subject_master.get("white_background_confirmed")
+                ),
+                confirmed_at=str(
+                    subject_master.get("confirmed_at") or utc_now_iso()
+                ),
+            ).to_dict()
+        except (KeyError, OSError, TypeError, ValueError):
+            return {}, False
+        return repaired, True
+
+    def _refresh_pending_image_task_subject(
+        self,
+        *,
+        package_id: str,
+        run_id: str,
+        seed_id: str,
+        subject_master: dict[str, Any],
+        locked_supplier_sku: dict[str, Any],
+    ) -> bool:
+        if not package_id:
+            return False
+        located = self.repo.find_image_task_package(package_id)
+        if located is None:
+            return False
+        path, package = located
+        if (
+            path.parent.name != "pending"
+            or str(package.get("status") or "") != "pending"
+            or str(package.get("resume_mode") or "") == "upload_only"
+            or str(package.get("run_id") or "") != run_id
+            or str(package.get("seed_id") or "") != seed_id
+        ):
+            return False
+        source_url = str(subject_master.get("source_image_url") or "").strip()
+        if not source_url:
+            return False
+        package.setdefault("evidence", {})["subject_master"] = subject_master
+        package.setdefault("evidence", {})[
+            "locked_supplier_sku"
+        ] = locked_supplier_sku
+        package.setdefault("bootstrap_image", {})["url"] = source_url
+        package.setdefault("bootstrap_image", {})[
+            "subject_master_sha256"
+        ] = subject_master.get("subject_master_sha256")
+        for stale_key in ("failure", "failed_at", "assignment"):
+            package.pop(stale_key, None)
+        package["evidence_refreshed_at"] = utc_now_iso()
+        self.repo.save_image_task_package(package_id, package)
+        return True
 
     @staticmethod
     def _sku_measurement_tokens(value: Any) -> list[str]:
