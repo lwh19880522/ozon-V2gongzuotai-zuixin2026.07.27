@@ -6204,19 +6204,23 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         )
         claimed = inbox.claim_next()
         self.assertEqual("grid_crop", claimed["assignment"]["phase"])
+        generated_media = {
+            "images": [
+                {
+                    "slot_id": f"slot-{index}",
+                    "path": f"C:/generated/{index}.jpg",
+                }
+                for index in range(8)
+            ],
+            "video": "C:/generated/slideshow.mp4",
+            "video_cover": "C:/generated/video_cover.jpg",
+        }
+        inbox.stage_media(deferred_package_id, generated_media)
+        upload = inbox.claim_next()
+        self.assertEqual("upload_only", upload["assignment"]["phase"])
         waiting = inbox.await_product(
             deferred_package_id,
-            {
-                "images": [
-                    {
-                        "slot_id": f"slot-{index}",
-                        "path": f"C:/generated/{index}.jpg",
-                    }
-                    for index in range(8)
-                ],
-                "video": "C:/generated/slideshow.mp4",
-                "video_cover": "C:/generated/video_cover.jpg",
-            },
+            generated_media,
         )
         self.assertEqual("awaiting_product", waiting["status"])
 

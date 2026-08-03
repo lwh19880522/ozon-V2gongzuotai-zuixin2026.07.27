@@ -107,10 +107,9 @@ def test_product_media_generates_one_four_by_two_grid_then_crops_eight_slots() -
     assert "exactly two image-generation calls" in files["skill"]
     assert "one 4x2 grid" in files["skill"]
     assert "stage-grid" in files["skill"]
-    assert "Do not crop any grid until every eligible product" in files["skill"]
-    assert "all raw 4x2 grids first" in files["agent"]
-    assert "immediately crop" not in files["skill"]
-    assert "Never generate grids for several products first" not in files["skill"]
+    assert "immediately crop" in files["skill"]
+    assert "Never generate grids for several products first" in files["skill"]
+    assert "all raw 4x2 grids first" not in files["agent"]
     assert "complete canvas aspect ratio of exactly 3:2" in gallery
     assert "four columns and two rows" in gallery
     for slot in (
@@ -126,6 +125,20 @@ def test_product_media_generates_one_four_by_two_grid_then_crops_eight_slots() -
         assert slot in gallery
     assert "crop-grid --layout 4x2" in files["skill"]
     assert "exactly 3:4 portrait" in files["repair"]
+
+
+def test_product_media_stages_each_complete_product_then_uploads_the_batch() -> None:
+    files = _worker_contract_files()
+    inbox_script = (ROOT / "scripts" / "ozon_image_task_inbox.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "stage-media" in files["skill"]
+    assert "stage-media" in inbox_script
+    assert "all products" in files["skill"]
+    assert "upload_only" in files["skill"]
+    assert "slideshow.mp4" in files["skill"]
+    assert "video_cover.jpg" in files["skill"]
 
 
 def test_workbench_package_contract_declares_single_grid_and_auto_gateway() -> None:

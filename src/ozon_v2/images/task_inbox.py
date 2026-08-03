@@ -99,12 +99,12 @@ class ImageTaskInbox:
                 if item[0].parent.name == "pending"
                 and str(item[1].get("resume_mode") or "") == "upload_only"
             ]
-            if generation_candidates:
-                phase = "grid_generation"
-                phase_candidates = generation_candidates
-            elif crop_candidates:
+            if crop_candidates:
                 phase = "grid_crop"
                 phase_candidates = crop_candidates
+            elif generation_candidates:
+                phase = "grid_generation"
+                phase_candidates = generation_candidates
             else:
                 phase = "upload_only"
                 phase_candidates = upload_candidates
@@ -174,13 +174,60 @@ class ImageTaskInbox:
         source.unlink()
         return {**payload, "package_path": str(target.resolve())}
 
+    def stage_media(
+        self,
+        package_id: str,
+        generated_media: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload, source = self._claimed_package(package_id)
+        self._require_phase(payload, package_id, "grid_crop")
+        images = generated_media.get("images")
+        if not isinstance(images, list) or len(images) != 8:
+            raise ImageTaskInboxError(
+                "Product media staging requires exactly eight validated images."
+            )
+        slot_ids: set[str] = set()
+        normalized_images: list[dict[str, str]] = []
+        for item in images:
+            if not isinstance(item, dict):
+                raise ImageTaskInboxError(
+                    "Each staged product image must be a slot/path object."
+                )
+            slot_id = str(item.get("slot_id") or "").strip()
+            path = str(item.get("path") or "").strip()
+            if not slot_id or not path or slot_id in slot_ids:
+                raise ImageTaskInboxError(
+                    "Staged product images require eight unique slot IDs and paths."
+                )
+            slot_ids.add(slot_id)
+            normalized_images.append({"slot_id": slot_id, "path": path})
+        video = str(generated_media.get("video") or "").strip()
+        video_cover = str(generated_media.get("video_cover") or "").strip()
+        if not video or not video_cover:
+            raise ImageTaskInboxError(
+                "Product media staging requires a slideshow video and video cover."
+            )
+        payload["status"] = "pending"
+        payload["resume_mode"] = "upload_only"
+        payload["media_ready_at"] = _utc_now()
+        payload["generated_media"] = {
+            "images": normalized_images,
+            "video": video,
+            "video_cover": video_cover,
+        }
+        payload.pop("assignment", None)
+        target = self.directory("pending") / source.name
+        _write_json(target, payload)
+        source.unlink()
+        return {**payload, "package_path": str(target.resolve())}
+
     def complete(
         self,
         package_id: str,
         receipt: dict[str, Any],
     ) -> dict[str, Any]:
         payload, source = self._claimed_package(package_id)
-        self._require_phase(payload, package_id, "grid_crop", "upload_only")
+        self._require_phase(payload, package_id, "upload_only")
         payload["status"] = "completed"
         payload["completed_at"] = _utc_now()
         payload["result"] = dict(receipt)
@@ -195,7 +242,7 @@ class ImageTaskInbox:
         generated_media: dict[str, Any],
     ) -> dict[str, Any]:
         payload, source = self._claimed_package(package_id)
-        self._require_phase(payload, package_id, "grid_crop", "upload_only")
+        self._require_phase(payload, package_id, "upload_only")
         target_info = payload.get("store_target") or {}
         if int(target_info.get("product_id") or 0) > 0:
             raise ImageTaskInboxError(

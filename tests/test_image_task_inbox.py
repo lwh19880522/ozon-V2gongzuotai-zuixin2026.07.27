@@ -68,6 +68,20 @@ def grid_checkpoint(package_id: str) -> dict:
     }
 
 
+def generated_media(package_id: str) -> dict:
+    return {
+        "images": [
+            {
+                "slot_id": f"slot-{index}",
+                "path": f"C:/generated/{package_id}/{index}.jpg",
+            }
+            for index in range(8)
+        ],
+        "video": f"C:/generated/{package_id}/slideshow.mp4",
+        "video_cover": f"C:/generated/{package_id}/video_cover.jpg",
+    }
+
+
 def test_image_task_inbox_claims_oldest_package_and_moves_it_atomically(
     tmp_path: Path,
 ) -> None:
@@ -117,6 +131,9 @@ def test_image_task_inbox_completion_is_owned_and_never_returns_to_workbench(
     inbox.stage_grid(generated["package_id"], grid_checkpoint(generated["package_id"]))
     cropped = inbox.claim_next()
     assert cropped["assignment"]["phase"] == "grid_crop"
+    inbox.stage_media(cropped["package_id"], generated_media(cropped["package_id"]))
+    upload = inbox.claim_next()
+    assert upload["assignment"]["phase"] == "upload_only"
 
     completed = inbox.complete(
         "ozon-image-001",
@@ -172,7 +189,7 @@ def test_image_task_inbox_never_claims_a_second_active_package(
     assert (tmp_path / "image_tasks" / "pending" / "ozon-image-002.json").is_file()
 
 
-def test_image_task_inbox_generates_every_grid_before_any_crop(
+def test_image_task_inbox_finishes_each_product_media_before_generating_next_grid(
     tmp_path: Path,
 ) -> None:
     write_package(tmp_path, "ozon-image-002")
@@ -183,14 +200,51 @@ def test_image_task_inbox_generates_every_grid_before_any_crop(
     assert first["assignment"]["phase"] == "grid_generation"
     inbox.stage_grid(first["package_id"], grid_checkpoint(first["package_id"]))
 
+    first_crop = inbox.claim_next()
+    assert first_crop["package_id"] == "ozon-image-001"
+    assert first_crop["assignment"]["phase"] == "grid_crop"
+    inbox.stage_media(
+        first_crop["package_id"],
+        generated_media(first_crop["package_id"]),
+    )
+
+    second = inbox.claim_next()
+    assert second["package_id"] == "ozon-image-002"
+    assert second["assignment"]["phase"] == "grid_generation"
+
+
+def test_image_task_inbox_uploads_only_after_every_product_media_is_ready(
+    tmp_path: Path,
+) -> None:
+    write_package(tmp_path, "ozon-image-002")
+    write_package(tmp_path, "ozon-image-001")
+    inbox = ImageTaskInbox(tmp_path)
+
+    first = inbox.claim_next()
+    inbox.stage_grid(first["package_id"], grid_checkpoint(first["package_id"]))
+    first_crop = inbox.claim_next()
+    inbox.stage_media(
+        first_crop["package_id"],
+        generated_media(first_crop["package_id"]),
+    )
+
     second = inbox.claim_next()
     assert second["package_id"] == "ozon-image-002"
     assert second["assignment"]["phase"] == "grid_generation"
     inbox.stage_grid(second["package_id"], grid_checkpoint(second["package_id"]))
+    second_crop = inbox.claim_next()
+    inbox.stage_media(
+        second_crop["package_id"],
+        generated_media(second_crop["package_id"]),
+    )
 
-    first_crop = inbox.claim_next()
-    assert first_crop["package_id"] == "ozon-image-001"
-    assert first_crop["assignment"]["phase"] == "grid_crop"
+    first_upload = inbox.claim_next()
+    assert first_upload["package_id"] == "ozon-image-001"
+    assert first_upload["assignment"]["phase"] == "upload_only"
+    inbox.complete(first_upload["package_id"], {"ozon_picture_import": "accepted"})
+    second_upload = inbox.claim_next()
+    assert second_upload["package_id"] == "ozon-image-002"
+    assert second_upload["assignment"]["phase"] == "upload_only"
 
 
 def test_image_task_inbox_releases_crop_back_to_grid_ready(
@@ -233,11 +287,19 @@ def test_image_task_inbox_finishes_the_oldest_batch_before_the_next_batch(
 
     first = inbox.claim_next()
     inbox.stage_grid(first["package_id"], grid_checkpoint(first["package_id"]))
+    first_crop = inbox.claim_next()
+    inbox.stage_media(
+        first_crop["package_id"],
+        generated_media(first_crop["package_id"]),
+    )
     second = inbox.claim_next()
     inbox.stage_grid(second["package_id"], grid_checkpoint(second["package_id"]))
-    first_crop = inbox.claim_next()
-    inbox.complete(first_crop["package_id"], {"ozon_picture_import": "accepted"})
     second_crop = inbox.claim_next()
+    inbox.stage_media(
+        second_crop["package_id"],
+        generated_media(second_crop["package_id"]),
+    )
+    first_upload = inbox.claim_next()
 
     assert first["run_id"] == "wb-old"
     assert second["run_id"] == "wb-old"
@@ -245,6 +307,8 @@ def test_image_task_inbox_finishes_the_oldest_batch_before_the_next_batch(
     assert first_crop["assignment"]["phase"] == "grid_crop"
     assert second_crop["run_id"] == "wb-old"
     assert second_crop["assignment"]["phase"] == "grid_crop"
+    assert first_upload["run_id"] == "wb-old"
+    assert first_upload["assignment"]["phase"] == "upload_only"
     assert (tmp_path / "image_tasks" / "pending" / "ozon-image-001.json").is_file()
 
 
@@ -313,16 +377,15 @@ def test_schema3_deferred_package_can_generate_then_wait_for_product_binding(
     )
     claimed = inbox.claim_next()
     assert claimed["assignment"]["phase"] == "grid_crop"
+    inbox.stage_media(
+        claimed["package_id"],
+        generated_media(claimed["package_id"]),
+    )
+    claimed = inbox.claim_next()
+    assert claimed["assignment"]["phase"] == "upload_only"
     waiting = inbox.await_product(
         claimed["package_id"],
-        {
-            "images": [
-                {"slot_id": f"slot-{index}", "path": f"C:/generated/{index}.jpg"}
-                for index in range(8)
-            ],
-            "video": "C:/generated/slideshow.mp4",
-            "video_cover": "C:/generated/video_cover.jpg",
-        },
+        generated_media(claimed["package_id"]),
     )
 
     assert waiting["status"] == "awaiting_product"

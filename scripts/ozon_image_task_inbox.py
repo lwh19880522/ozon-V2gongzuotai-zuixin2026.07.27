@@ -61,6 +61,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Ordered slot_id=absolute_path entry; provide exactly eight.",
     )
 
+    stage_media = commands.add_parser("stage-media")
+    stage_media.add_argument("--package", required=True)
+    stage_media.add_argument(
+        "--image",
+        action="append",
+        required=True,
+        help="Ordered slot_id=absolute_path entry; provide exactly eight.",
+    )
+    stage_media.add_argument("--video", required=True)
+    stage_media.add_argument("--video-cover", required=True)
+
     upload = commands.add_parser("upload-gallery")
     upload.add_argument("--package", required=True)
     upload.add_argument("--product-id", type=int)
@@ -139,6 +150,15 @@ def main() -> int:
         return 0
 
     package = inbox.load_in_progress(args.package)
+    phase = str((package.get("assignment") or {}).get("phase") or "")
+    if args.command in {"build-slideshow", "stage-media"} and phase != "grid_crop":
+        raise ImageTaskInboxError(
+            f"Package {args.package} is not assigned for product media completion."
+        )
+    if args.command == "upload-gallery" and phase != "upload_only":
+        raise ImageTaskInboxError(
+            f"Package {args.package} cannot upload before the batch media barrier."
+        )
     if args.command == "upload-gallery" and not args.image:
         generated_media = package.get("generated_media") or {}
         args.image = [
@@ -167,6 +187,17 @@ def main() -> int:
         raise ImageTaskInboxError(
             f"Slideshow video cover is not exact 3:4: {cover_path}"
         )
+    if args.command == "stage-media":
+        staged = inbox.stage_media(
+            args.package,
+            {
+                "images": source_files,
+                "video": str(video_path),
+                "video_cover": str(cover_path),
+            },
+        )
+        _print(staged)
+        return 0
     seller_api = SellerApiAdapter(repo)
     try:
         product_id = int(args.product_id or _resolve_product_id(package, seller_api))

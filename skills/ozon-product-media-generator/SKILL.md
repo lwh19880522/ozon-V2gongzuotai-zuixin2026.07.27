@@ -1,6 +1,6 @@
 ---
 name: ozon-product-media-generator
-description: Use when the Ozon V2 workbench has emitted image task packages that must be processed in a single-thread two-phase batch with a frozen white-background identity anchor, all raw 4x2 grids generated before deterministic 3:4 cropping begins, deferred product binding when necessary, an automatically managed free public media gateway, and direct Ozon gallery and video upload after binding.
+description: Use when Ozon V2 image task packages must run single-threaded as one-product media closures: frozen white-background identity anchor, one 4x2 grid, immediate 3:4 crop and validation, failed-slot-only repair, per-product video and cover completion, then one batch-wide upload phase after every product is media-ready.
 ---
 
 # Ozon Product Media Generator
@@ -8,11 +8,13 @@ description: Use when the Ozon V2 workbench has emitted image task packages that
 ## Core contract
 
 This is the only Ozon workbench image-generation skill. Run the complete flow
-single-threaded in the current task with a hard batch barrier: generate and
-checkpoint every raw 4x2 grid in the oldest batch first, then crop and finish
-those staged grids one at a time. Never create parallel or delegated generation
-tasks. Claim one package at a time, and never crop a grid while that batch still
-has a product awaiting raw-grid generation.
+single-threaded in the current task as a one-product closure: generate and
+checkpoint one raw 4x2 grid, immediately crop and validate its eight panels,
+repair only failed slots, then build and validate that product's video and
+cover before starting the next product. Never create parallel or delegated
+generation tasks. Claim one package at a time. Never generate grids for several products first,
+and never upload any product until all products in the oldest
+batch have completed their local image, video and cover media.
 
 Read generation packages from `image_tasks/pending`; staged raw grids live in
 `image_tasks/grid_ready`; claimed packages live in `image_tasks/in_progress`.
@@ -45,7 +47,8 @@ unselected variants, prior scenes, or conversation images. Do not use
    claim nothing; report the local gateway error.
 2. Read status and run `claim-next`. Process only the returned package and obey
    `assignment.phase`. One active package at a time remains a hard single-thread
-   rule, while the inbox enforces the batch-wide generation/crop barrier.
+   rule. The inbox enforces immediate per-product crop completion and the final
+   batch-wide upload barrier.
 3. Require `schema_version=3`, `status=in_progress`, `slot_count=8`,
    `aspect_ratio=3:4`, `generation_mode=single_thread_8_grid`,
    `grid_layout=4x2`, `public_media=auto_quick_tunnel`,
@@ -79,19 +82,18 @@ unselected variants, prior scenes, or conversation images. Do not use
 8. Build one prompt-only blueprint for each of `main_01`, `main_02`,
    `detail_01` through `detail_06`. Keep the existing storyboard, evidence-safe
    Russian copy and visual-diversity rules from the prompt contract.
-9. Phase A, raw-grid generation: when `assignment.phase=grid_generation`,
+9. Raw-grid generation: when `assignment.phase=grid_generation`,
    heartbeat, generate or reuse the frozen white anchor, then make one blocking
    gallery call for that product at a 3:2 whole-canvas ratio using only
    `referenced_image_paths=[<frozen anchor>]`. Save the untouched raw grid and
    run `scripts/ozon_image_task_inbox.py --runtime-root <runtime> stage-grid
    --package <id> --grid <absolute-grid-path> --white-anchor <absolute-anchor-path>`.
    This records both absolute paths and SHA-256 values and moves the package to
-   `image_tasks/grid_ready`. Do not crop it. Claim the next package and continue
-   Phase A until no product in the current oldest batch remains in raw-grid generation.
-10. Phase B, batch crop: only after Phase A has staged every eligible product,
-    `claim-next` may return `assignment.phase=grid_crop`. Do not crop any grid until every eligible product
-    in the current batch has a staged raw 4x2 grid.
-    Re-verify the package ID, run ID, seed ID, frozen-anchor path and hash, and
+   `image_tasks/grid_ready`. Immediately run `claim-next` again; it must return
+   the same package with `assignment.phase=grid_crop`. Do not generate another
+   product's grid first.
+10. Product crop and validation: re-verify the package ID, run ID, seed ID,
+    frozen-anchor path and hash, and
     raw-grid path and hash before running
     `scripts/ozon_image_worker.py crop-grid --layout 4x2`. Map row-major crops
     to the eight fixed slots. Cropping must not stretch a panel; each output
@@ -109,25 +111,32 @@ unselected variants, prior scenes, or conversation images. Do not use
     `additional_image_references_attached=false`,
     `locked_subject_preserved=true`, and
     `product_identity_source=white_anchor_only`.
-13. A copy-only defect uses deterministic local typography. For a selected
-    scene or product-truth repair, regenerate only that failed 3:4 slot with
-    the same sole frozen white anchor. Never change the anchor, attach another
-    image, or modify an unselected accepted slot. Allow at most two scene
-    repairs per slot.
-14. Inspect all eight accepted files with `view_image`. Build `slideshow.mp4`
-    and `video_cover.jpg` locally. Run `upload-gallery`. For a bound package it
-    publishes through the active automatic gateway, replaces the exact Ozon
-    product gallery and submits video fields. For an unbound package the same
-    command records all generated media and moves the package to
-    `image_tasks/awaiting_product` without treating it as failed.
-15. Claim the next staged grid from the same oldest batch and repeat Phase B.
-    A package
-    rebound by the workbench returns to `pending` with `resume_mode=upload_only`;
-    reuse its recorded media and call `upload-gallery` without regenerating or
-    recropping. The inbox may return `assignment.phase=upload_only` for it.
-    End the pass only when `pending` = 0, `grid_ready` = 0 and `in_progress` = 0,
-    then run `media-stop`. `awaiting_product` packages may resume later after
-    exact Ozon binding.
+13. A copy-only defect uses deterministic local typography. For scene or
+    product-truth defects, collect the exact failed slot IDs and regenerate
+    those slots one at a time with the same sole frozen white anchor. If three
+    slots fail, make exactly three single-slot repairs; never regenerate the
+    grid or an accepted slot. Revalidate each replacement immediately and
+    continue until all eight slots are accepted or that slot reaches its limit
+    of two scene repairs.
+14. Only after all eight slots are accepted, inspect all accepted files with
+    `view_image`, then build and validate `slideshow.mp4` and
+    `video_cover.jpg` for this product. Run `stage-media` with the eight ordered
+    accepted images, video and cover. This records the complete local media and
+    returns the package to `pending` with `resume_mode=upload_only`; it does not
+    upload anything.
+15. Run `claim-next`. While another normal product exists in the same oldest
+    batch, the inbox must return its `grid_generation` work before any
+    `upload_only` package. Repeat steps 7-14 one product at a time. Do not start
+    a newer batch.
+16. Only after all products in the oldest batch have passed image validation
+    and staged their own video and cover may `claim-next` return
+    `assignment.phase=upload_only`. Upload the media-ready products one at a
+    time with `upload-gallery`. A bound package publishes through the automatic
+    gateway, replaces the exact Ozon gallery and submits video fields. An
+    unbound package moves to `image_tasks/awaiting_product` with its generated
+    media intact; after exact binding it returns as `upload_only` and must reuse
+    those files without regeneration or recropping. End only when `pending` =
+    0, `grid_ready` = 0 and `in_progress` = 0, then run `media-stop`.
 
 ## Repair and stop gates
 
