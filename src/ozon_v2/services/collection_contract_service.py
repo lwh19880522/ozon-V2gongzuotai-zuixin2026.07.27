@@ -113,13 +113,42 @@ class CollectionContractService:
                 "Attribute template collection requires generated Russian-first query terms.",
                 data={"missing_seed_ids": missing_query},
             )
+        try:
+            ozon_result = self.repo.load_ozon_collection_result(run_id)
+        except (FileNotFoundError, json.JSONDecodeError):
+            ozon_result = {}
+        candidates = {
+            str(item.get("seed_id") or ""): item
+            for item in ozon_result.get("ozon_candidates", [])
+            if isinstance(item, dict) and item.get("seed_id")
+        }
+        missing_locked = [
+            seed.seed_id
+            for seed in seeds
+            if not str((candidates.get(seed.seed_id) or {}).get("ozon_product_id") or "").strip()
+            or not str((candidates.get(seed.seed_id) or {}).get("ozon_url") or "").strip()
+        ]
+        if missing_locked:
+            return Result.failure(
+                "contract.final_ozon_product_required",
+                "Attribute template collection requires one final locked Ozon product per candidate slot.",
+                data={"missing_seed_ids": missing_locked},
+            )
+        identities = self._candidate_identities(run_id)
+        excluded_product_ids = set(self.repo.load_blacklisted_ozon_product_ids())
+        excluded_product_ids.update(
+            self.repo.load_used_ozon_product_ids(exclude_run_id=run_id)
+        )
         payload = {
             "run_id": run_id,
-            "purpose": "fetch Ozon category and attribute templates immediately after seed selection",
+            "purpose": "resolve the Seller API category template for each final locked Ozon product",
             "rules": {
-                "after_seed_selection_required": True,
-                "before_ozon_product_collection_required": True,
-                "do_not_search_raw_chinese_seed_text": True,
+                "after_seed_selection_required": False,
+                "after_final_ozon_product_lock_required": True,
+                "before_ozon_product_collection_required": False,
+                "exact_locked_ozon_product_required": True,
+                "direct_locked_ozon_url_only": True,
+                "do_not_search_for_another_ozon_product": True,
                 "collect_category_candidates": True,
                 "collect_public_attribute_evidence": True,
                 "seller_api_upload_attribute_schema_required": True,
@@ -174,12 +203,17 @@ class CollectionContractService:
                 "title_description_rich_content_must_not_match_ozon": True,
                 "supplier_truth_overrides_conflicting_ozon_attributes": True,
             },
+            "excluded_ozon_product_ids": sorted(excluded_product_ids),
             "seeds": [
                 {
                     "seed_id": seed.seed_id,
+                    "slot_id": identities[seed.seed_id]["slot_id"],
+                    "candidate_revision": identities[seed.seed_id]["candidate_revision"],
+                    "source_ozon_product_id": str(candidates[seed.seed_id]["ozon_product_id"]),
                     "source_text_zh": seed.title_or_keyword,
                     "ozon_query_terms_ru": seed.ozon_query_terms_ru,
                     "auxiliary_query_terms_en": seed.auxiliary_query_terms_en,
+                    "locked_ozon_product": dict(candidates[seed.seed_id]),
                 }
                 for seed in seeds
             ],
@@ -199,20 +233,10 @@ class CollectionContractService:
                 "Ozon collection contract requires generated Russian-first query terms.",
                 data={"missing_seed_ids": missing_query},
             )
-        reusable_evidence: dict[str, dict] = {}
-        try:
-            template_result = self.repo.load_attribute_template_result(run_id)
-        except (FileNotFoundError, json.JSONDecodeError):
-            template_result = {}
-        for item in template_result.get("seed_templates", []):
-            if not isinstance(item, dict):
-                continue
-            seed_id = str(item.get("seed_id") or "").strip()
-            evidence = item.get("evidence")
-            if seed_id and isinstance(evidence, dict):
-                reusable_evidence[seed_id] = evidence
-
         excluded_product_ids = set(self.repo.load_blacklisted_ozon_product_ids())
+        excluded_product_ids.update(
+            self.repo.load_used_ozon_product_ids(exclude_run_id=run_id)
+        )
         try:
             previous_ozon_result = self.repo.load_ozon_collection_result(run_id)
         except (FileNotFoundError, json.JSONDecodeError):
@@ -223,6 +247,7 @@ class CollectionContractService:
             if isinstance(item, dict) and item.get("ozon_product_id")
         )
 
+        identities = self._candidate_identities(run_id)
         payload = {
             "run_id": run_id,
             "rules": {
@@ -238,13 +263,8 @@ class CollectionContractService:
                 ],
                 "content_score_evidence_required": True,
                 "record_unavailable_content_score_fields": True,
-                "attribute_template_prerequisite_required": True,
-            },
-            "attribute_template_prerequisite": {
-                "must_run_after_seed_selection": True,
-                "must_complete_before_ozon_collection": True,
-                "objective_attributes_may_be_prefilled": OBJECTIVE_ATTRIBUTE_PREFILL_FIELDS,
-                "creative_fields_must_be_rewritten": CREATIVE_FIELDS_REQUIRING_REWRITE,
+                "attribute_template_prerequisite_required": False,
+                "lock_final_ozon_product_before_template": True,
             },
             "content_score_evidence": {
                 "purpose": "collect detailed Ozon evidence for later content score optimization",
@@ -258,17 +278,11 @@ class CollectionContractService:
             "seeds": [
                 {
                     "seed_id": seed.seed_id,
+                    "slot_id": identities[seed.seed_id]["slot_id"],
+                    "candidate_revision": identities[seed.seed_id]["candidate_revision"],
                     "source_text_zh": seed.title_or_keyword,
                     "ozon_query_terms_ru": seed.ozon_query_terms_ru,
                     "auxiliary_query_terms_en": seed.auxiliary_query_terms_en,
-                    **(
-                        {
-                            "public_product_snapshot": reusable_evidence[seed.seed_id]["public_product_snapshot"],
-                            "domestic_seller_decision": reusable_evidence[seed.seed_id].get("domestic_seller_decision", {}),
-                        }
-                        if isinstance(reusable_evidence.get(seed.seed_id, {}).get("public_product_snapshot"), dict)
-                        else {}
-                    ),
                 }
                 for seed in seeds
             ],
@@ -278,6 +292,27 @@ class CollectionContractService:
             "Ozon collection task contract generated.",
             self.adapter.ozon_collection_contract(payload),
         )
+
+    def _candidate_identities(self, run_id: str) -> dict[str, dict[str, object]]:
+        seeds = self.repo.load_sampled_seeds(run_id)
+        try:
+            run = self.repo.load_run(run_id)
+        except FileNotFoundError:
+            run = {}
+        saved = {
+            str(item.get("seed_id") or ""): item
+            for item in run.get("candidate_slots", [])
+            if isinstance(item, dict) and item.get("seed_id")
+        }
+        return {
+            seed.seed_id: {
+                "slot_id": str((saved.get(seed.seed_id) or {}).get("slot_id") or f"slot-{index:04d}"),
+                "candidate_revision": int(
+                    (saved.get(seed.seed_id) or {}).get("candidate_revision") or 1
+                ),
+            }
+            for index, seed in enumerate(seeds, start=1)
+        }
 
     def _contract_seeds(self, run_id: str, *, result_kind: str) -> list:
         seeds = self.repo.load_sampled_seeds(run_id)

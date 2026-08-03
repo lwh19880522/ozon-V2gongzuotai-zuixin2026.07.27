@@ -271,6 +271,8 @@ class OzonCandidate:
     title: str
     seller_name: str
     target_sku: TargetSku
+    slot_id: str | None = None
+    candidate_revision: int = 1
     selected_sku_media: SelectedSkuMedia = field(default_factory=SelectedSkuMedia)
     brand: str | None = None
     seller_url: str | None = None

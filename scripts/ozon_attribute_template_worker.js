@@ -180,6 +180,9 @@ function buildTemplate(runId, seed, query, search, detail) {
   const schema = labels.slice(0, 12).map(attrFromLabel);
   return {
     seed_id: seed.seed_id,
+    slot_id: seed.slot_id,
+    candidate_revision: seed.candidate_revision,
+    source_ozon_product_id: String(seed.source_ozon_product_id || ""),
     source_query: query,
     category_candidates: [
       {
@@ -254,14 +257,27 @@ async function main() {
         : seed.title_or_keyword;
       const seedDir = path.join(artifactsDir, slug(seed.seed_id));
       fs.mkdirSync(seedDir, { recursive: true });
-      const search = await collectSearch(page, query, seedDir);
-      fs.writeFileSync(path.join(seedDir, "search.json"), JSON.stringify(search, null, 2), "utf8");
-      let detail = null;
-      const firstProduct = search.links.map((item) => normalizeUrl(item.href)).find(Boolean);
-      if (firstProduct) {
-        detail = await collectDetail(page, firstProduct, seedDir);
-        fs.writeFileSync(path.join(seedDir, "detail.json"), JSON.stringify(detail, null, 2), "utf8");
+      const locked = seed.locked_ozon_product || {};
+      const lockedProductId = String(seed.source_ozon_product_id || locked.ozon_product_id || "");
+      const lockedProductUrl = normalizeUrl(locked.ozon_url || locked.url);
+      if (!lockedProductId || !lockedProductUrl) {
+        throw new Error(`Seed ${seed.seed_id} has no final locked Ozon product.`);
       }
+      const detail = await collectDetail(page, lockedProductUrl, seedDir);
+      const urlProductId = String(detail.url || "").match(/(?:-|\/)(\d+)\/?$/);
+      if (!urlProductId || urlProductId[1] !== lockedProductId) {
+        throw new Error(
+          `Locked Ozon product mismatch for ${seed.seed_id}: expected ${lockedProductId}, received ${urlProductId ? urlProductId[1] : "unknown"}.`
+        );
+      }
+      fs.writeFileSync(path.join(seedDir, "detail.json"), JSON.stringify(detail, null, 2), "utf8");
+      const search = {
+        url: lockedProductUrl,
+        title: locked.title || detail.title,
+        links: [],
+        categoryLinks: [],
+        hasCaptcha: false,
+      };
       seedTemplates.push(buildTemplate(input.run_id, seed, query, search, detail));
     }
   } catch (error) {

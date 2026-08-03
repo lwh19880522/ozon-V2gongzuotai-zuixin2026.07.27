@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import threading
 import time
 from typing import Any
@@ -99,34 +100,33 @@ class WorkbenchRuntimeController:
         }
 
     def _spawn_restart_helper(self, pid: int, *, open_edge_after_restart: bool) -> None:
-        helper = self.project_root / "scripts" / "workbench_restart_helper.ps1"
+        helper = self.project_root / "scripts" / "workbench_restart_helper.py"
         command = [
-            "powershell.exe",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-WindowStyle",
-            "Hidden",
-            "-File",
+            sys.executable,
             str(helper),
-            "-WaitForPid",
+            "--wait-for-pid",
             str(pid),
-            "-Port",
+            "--port",
             str(self.port),
-            "-RuntimeState",
+            "--runtime-state",
             str(self.runtime_dir),
-            "-ProjectRoot",
+            "--project-root",
             str(self.project_root),
         ]
         if open_edge_after_restart:
-            command.append("-OpenEdgeAfterRestart")
+            command.append("--open-edge-after-restart")
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = (
+                getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            )
         subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            creationflags=creationflags,
             close_fds=True,
         )
 
@@ -154,4 +154,3 @@ class WorkbenchRuntimeController:
     @staticmethod
     def _utc_now() -> str:
         return datetime.now(timezone.utc).isoformat()
-

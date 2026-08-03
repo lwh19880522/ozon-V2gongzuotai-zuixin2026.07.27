@@ -29,7 +29,12 @@ class AttributeTemplateBrowserWorker:
         self.timeout_seconds = timeout_seconds
 
     def collect(self, run_id: str) -> Result:
-        seeds = self.repo.load_sampled_seeds(run_id)
+        try:
+            contract = self.repo.load_attribute_template_contract(run_id)
+        except FileNotFoundError:
+            contract = {}
+        payload = contract.get("payload") if isinstance(contract, dict) else None
+        seeds = payload.get("seeds", []) if isinstance(payload, dict) else []
         if not seeds:
             return Result.failure(
                 "attribute_template_worker.no_seeds",
@@ -45,7 +50,7 @@ class AttributeTemplateBrowserWorker:
             "run_id": run_id,
             "artifacts_dir": str(worker_dir),
             "visitor_profile_dir": str(visitor_profile_dir),
-            "seeds": [seed.to_dict() for seed in seeds],
+            "seeds": seeds,
         }
         input_path.write_text(json.dumps(input_payload, ensure_ascii=False, indent=2), encoding="utf-8")
         script_path = self.repo.context.project_root / "scripts" / "ozon_attribute_template_worker.js"

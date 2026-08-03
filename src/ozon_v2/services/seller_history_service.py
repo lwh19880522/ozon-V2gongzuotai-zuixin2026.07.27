@@ -21,13 +21,16 @@ class SellerHistoryService:
                 "Existing store dedupe refresh failed.",
                 errors=[str(exc)],
             )
-        self.repo.replace_existing_products(products)
+        local_products = self.repo.load_local_uploaded_products()
+        counts = self.repo.merge_existing_products(local_products + products)
+        counts["fetched_product_count"] = len(products)
+        counts["local_uploaded_product_count"] = len(local_products)
         status = self.repo.existing_store_dedupe_status()
         return Result.success(
             "dedupe.refreshed",
             "Existing store dedupe list refreshed.",
             {
-                "existing_product_count": len(products),
+                **counts,
                 "refreshed_at": status["refreshed_at"],
                 "meta_path": status["meta_path"],
             },

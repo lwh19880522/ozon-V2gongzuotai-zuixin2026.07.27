@@ -18,8 +18,9 @@ from urllib.request import Request, urlopen
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONTROL_SCRIPT = PROJECT_ROOT / "scripts" / "workbench_control.ps1"
 START_SCRIPT = PROJECT_ROOT / "scripts" / "start_workbench.py"
+PYTHON_LAUNCHER_SCRIPT = PROJECT_ROOT / "scripts" / "workbench_launcher.py"
 LAUNCHER_SCRIPT = PROJECT_ROOT / "scripts" / "launch_workbench.ps1"
-RESTART_HELPER_SCRIPT = PROJECT_ROOT / "scripts" / "workbench_restart_helper.ps1"
+RESTART_HELPER_SCRIPT = PROJECT_ROOT / "scripts" / "workbench_restart_helper.py"
 SHORTCUT_SCRIPT = PROJECT_ROOT / "scripts" / "create_workbench_shortcut.ps1"
 
 
@@ -193,33 +194,35 @@ class WorkbenchControlScriptTests(unittest.TestCase):
         shortcut = SHORTCUT_SCRIPT.read_text(encoding="utf-8-sig")
         restart_helper = RESTART_HELPER_SCRIPT.read_text(encoding="utf-8-sig")
 
-        self.assertIn("workbench_control.ps1", launcher)
+        self.assertTrue(PYTHON_LAUNCHER_SCRIPT.is_file())
+        self.assertIn("workbench_launcher.py", launcher)
         self.assertIn("NoOpen", launcher)
         self.assertNotIn("--user-data-dir", launcher)
         self.assertNotIn("--load-extension", launcher)
+        self.assertNotIn("ExecutionPolicy Bypass", launcher)
+        self.assertNotIn("WindowStyle Hidden", launcher)
         self.assertIn("Ozon V2 工具台.lnk", shortcut)
-        self.assertIn("launch_workbench.ps1", shortcut)
+        self.assertIn("workbench_launcher.py", shortcut)
+        self.assertIn("pythonw.exe", shortcut)
+        self.assertNotIn("ExecutionPolicy Bypass", shortcut)
+        self.assertNotIn("WindowStyle Hidden", shortcut)
         self.assertNotIn("startup", shortcut.lower())
-        self.assertIn("OpenEdgeAfterRestart", restart_helper)
-        self.assertIn("msedge.exe", restart_helper)
-        self.assertIn("http://127.0.0.1:$Port/", restart_helper)
+        self.assertIn("--open-edge-after-restart", restart_helper)
+        self.assertIn("webbrowser.open", restart_helper)
+        self.assertIn("http://127.0.0.1:{args.port}/", restart_helper)
 
     def test_launcher_no_open_starts_healthy_service(self) -> None:
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         stdout_path = self.runtime_dir / "launcher-test.stdout.log"
         stderr_path = self.runtime_dir / "launcher-test.stderr.log"
         command = [
-            "powershell.exe",
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(LAUNCHER_SCRIPT),
-            "-Port",
+            sys.executable,
+            str(PYTHON_LAUNCHER_SCRIPT),
+            "--port",
             str(self.port),
-            "-RuntimeState",
+            "--runtime-state",
             str(self.runtime_dir),
-            "-NoOpen",
+            "--no-open",
         ]
         with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
             completed = subprocess.run(
@@ -412,7 +415,4 @@ class WorkbenchControlScriptTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-
 

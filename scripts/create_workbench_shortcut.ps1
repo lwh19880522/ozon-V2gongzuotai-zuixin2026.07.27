@@ -4,17 +4,20 @@
 
 $ErrorActionPreference = 'Stop'
 $ProjectRoot = (Resolve-Path -LiteralPath (Split-Path -Parent $PSScriptRoot)).Path
-$LauncherScript = Join-Path $ProjectRoot 'scripts\launch_workbench.ps1'
+$LauncherScript = Join-Path $ProjectRoot 'scripts\workbench_launcher.py'
 if ([string]::IsNullOrWhiteSpace($ShortcutPath)) {
     $desktop = [Environment]::GetFolderPath('Desktop')
     $ShortcutPath = Join-Path $desktop 'Ozon V2 工具台.lnk'
 }
 
-$powerShellPath = Join-Path $PSHOME 'powershell.exe'
-$arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$LauncherScript`""
+$pythonwPath = Join-Path $ProjectRoot '.venv\Scripts\pythonw.exe'
+if (-not (Test-Path -LiteralPath $pythonwPath)) {
+    $pythonwPath = (Get-Command pythonw.exe -ErrorAction Stop).Source
+}
+$arguments = "`"$LauncherScript`""
 $shell = New-Object -ComObject WScript.Shell
 $shortcut = $shell.CreateShortcut($ShortcutPath)
-$shortcut.TargetPath = $powerShellPath
+$shortcut.TargetPath = $pythonwPath
 $shortcut.Arguments = $arguments
 $shortcut.WorkingDirectory = $ProjectRoot
 $shortcut.Description = 'Ozon V2 工具台一键启动 (One-click Workbench)'
@@ -23,7 +26,7 @@ if (Test-Path -LiteralPath $edgePath) {
     $shortcut.IconLocation = "$edgePath,0"
 }
 else {
-    $shortcut.IconLocation = "$powerShellPath,0"
+    $shortcut.IconLocation = "$pythonwPath,0"
 }
 $shortcut.Save()
 Write-Output "SHORTCUT_CREATED PATH=$ShortcutPath"

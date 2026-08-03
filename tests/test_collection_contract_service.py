@@ -17,6 +17,26 @@ from tests.helpers import RuntimeTestCase
 
 
 class CollectionContractServiceTests(RuntimeTestCase):
+    def save_locked_ozon_candidates(self, repo: FsRepo, run_id: str, seeds: list[SeedProduct]) -> None:
+        repo.save_ozon_collection_result(
+            run_id,
+            {
+                "ozon_candidates": [
+                    {
+                        "seed_id": seed.seed_id,
+                        "ozon_product_id": f"ozon-{index}",
+                        "ozon_url": f"https://www.ozon.ru/product/ozon-{index}/",
+                        "title": f"Product {index}",
+                        "category_path": "Home / Storage",
+                        "leaf_category": "Storage",
+                        "category_url": "https://www.ozon.ru/category/storage-456/",
+                        "category_id": "456",
+                    }
+                    for index, seed in enumerate(seeds, start=1)
+                ]
+            },
+        )
+
     def test_ozon_contract_requires_generated_queries(self) -> None:
         repo = FsRepo(self.context)
         self.save_test_credentials(repo)
@@ -62,13 +82,11 @@ class CollectionContractServiceTests(RuntimeTestCase):
         self.assertIn("review_count", content_score["recommended_market_signals"])
         self.assertIn("monthly_sales", content_score["optional_external_analytics_fields"])
         self.assertEqual("record unavailable fields with reason; do not invent metrics", content_score["missing_field_policy"])
-        self.assertTrue(result.data["payload"]["rules"]["attribute_template_prerequisite_required"])
-        prerequisite = result.data["payload"]["attribute_template_prerequisite"]
-        self.assertTrue(prerequisite["must_complete_before_ozon_collection"])
-        self.assertIn("dimensions", prerequisite["objective_attributes_may_be_prefilled"])
-        self.assertIn("title", prerequisite["creative_fields_must_be_rewritten"])
+        self.assertFalse(result.data["payload"]["rules"]["attribute_template_prerequisite_required"])
+        self.assertTrue(result.data["payload"]["rules"]["lock_final_ozon_product_before_template"])
+        self.assertNotIn("attribute_template_prerequisite", result.data["payload"])
 
-    def test_ozon_contract_reuses_verified_public_snapshot_from_template_stage(self) -> None:
+    def test_ozon_contract_does_not_reuse_a_pre_lock_template_snapshot(self) -> None:
         repo = FsRepo(self.context)
         self.save_test_credentials(repo)
         service = RunService(repo)
@@ -96,8 +114,8 @@ class CollectionContractServiceTests(RuntimeTestCase):
 
         self.assertTrue(result.ok)
         seed_payload = result.data["payload"]["seeds"][0]
-        self.assertEqual(snapshot, seed_payload["public_product_snapshot"])
-        self.assertEqual(decision, seed_payload["domestic_seller_decision"])
+        self.assertNotIn("public_product_snapshot", seed_payload)
+        self.assertNotIn("domestic_seller_decision", seed_payload)
 
     def test_attribute_template_contract_defines_prefill_and_rewrite_policy(self) -> None:
         repo = FsRepo(self.context)
@@ -107,6 +125,28 @@ class CollectionContractServiceTests(RuntimeTestCase):
         sampled_seed_id = repo.load_sampled_seeds(run_id)[0].seed_id
         service.attach_seed_queries(run_id, {sampled_seed_id: ["органайзер для хранения"]})
 
+        repo.save_ozon_collection_result(
+            run_id,
+            {
+                "ozon_candidates": [
+                    {
+                        "seed_id": sampled_seed_id,
+                        "ozon_product_id": "locked-123",
+                        "ozon_url": "https://www.ozon.ru/product/locked-123/",
+                        "title": "Locked product",
+                        "category_path": "Home / Storage",
+                        "leaf_category": "Storage",
+                        "category_url": "https://www.ozon.ru/category/storage-456/",
+                        "category_id": "456",
+                        "attributes": {"Type": "Storage box"},
+                        "selected_sku_media": {
+                            "main_gallery_images": ["https://img.example/locked.jpg"]
+                        },
+                    }
+                ]
+            },
+        )
+
         result = CollectionContractService(repo).build_attribute_template_contract(run_id)
 
         self.assertTrue(result.ok)
@@ -114,8 +154,9 @@ class CollectionContractServiceTests(RuntimeTestCase):
         self.assertIn("codex_in_app_browser", result.data["approved_browser_executors"])
         self.assertIn("workbench_browser_bridge", result.data["approved_browser_executors"])
         rules = result.data["payload"]["rules"]
-        self.assertTrue(rules["after_seed_selection_required"])
-        self.assertTrue(rules["before_ozon_product_collection_required"])
+        self.assertTrue(rules["after_final_ozon_product_lock_required"])
+        self.assertFalse(rules["before_ozon_product_collection_required"])
+        self.assertTrue(rules["exact_locked_ozon_product_required"])
         self.assertTrue(rules["prefill_objective_attributes_only"])
         self.assertTrue(rules["collect_public_attribute_evidence"])
         self.assertTrue(rules["seller_api_upload_attribute_schema_required"])
@@ -131,6 +172,11 @@ class CollectionContractServiceTests(RuntimeTestCase):
         self.assertIn("dimensions", policy["objective_copy_allowed_fields"])
         self.assertIn("description", policy["creative_rewrite_required_fields"])
         self.assertTrue(policy["title_description_rich_content_must_not_match_ozon"])
+        locked = result.data["payload"]["seeds"][0]
+        self.assertEqual("locked-123", locked["source_ozon_product_id"])
+        self.assertEqual("locked-123", locked["locked_ozon_product"]["ozon_product_id"])
+        self.assertEqual("slot-0001", locked["slot_id"])
+        self.assertEqual(1, locked["candidate_revision"])
 
     def test_replacement_attribute_contract_recollects_full_batch_without_retained_result(self) -> None:
         repo = FsRepo(self.context)
@@ -142,6 +188,7 @@ class CollectionContractServiceTests(RuntimeTestCase):
             run_id,
             {seed.seed_id: [f"query {index}"] for index, seed in enumerate(seeds, start=1)},
         )
+        self.save_locked_ozon_candidates(repo, run_id, seeds)
         run = repo.load_run(run_id)
         run["replacement_pending_seed_ids"] = [seeds[-1].seed_id]
         repo.save_run(run)
@@ -164,6 +211,7 @@ class CollectionContractServiceTests(RuntimeTestCase):
             run_id,
             {seed.seed_id: [f"query {index}"] for index, seed in enumerate(seeds, start=1)},
         )
+        self.save_locked_ozon_candidates(repo, run_id, seeds)
         pending_seed = seeds[-1]
         retained_seed = seeds[0]
         repo.save_attribute_template_result(

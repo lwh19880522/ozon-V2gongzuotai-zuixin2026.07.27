@@ -15,6 +15,11 @@ from ozon_v2.domain.models import (
 
 _CJK_RE = re.compile(r"[\u3400-\u9fff]")
 _NON_WORD_RE = re.compile(r"[\W_]+", re.UNICODE)
+_IDENTITY_STOPWORDS = {
+    "buy",
+    "купить",
+    "заказать",
+}
 
 
 def contains_cjk(value: str) -> bool:
@@ -42,10 +47,34 @@ def existing_product_keys(products: Iterable[ExistingStoreProduct]) -> dict[str,
     return keys
 
 
+def _generated_query_identity_keys(seed: SeedProduct) -> list[str]:
+    keys: list[str] = []
+    for query in seed.ozon_query_terms_ru:
+        words = [
+            word
+            for word in re.findall(r"[0-9a-zа-яё]+", query.casefold(), flags=re.UNICODE)
+            if word not in _IDENTITY_STOPWORDS
+        ]
+        key = normalize_identity_text(" ".join(words))
+        if len(key) >= 8 and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def _strict_identity_match(left: str, right: str) -> bool:
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    shorter, longer = sorted((left, right), key=len)
+    return len(shorter) >= 12 and shorter in longer
+
+
 def decide_seed_existing_product_dedupe(
     seed: SeedProduct,
     existing_products: Iterable[ExistingStoreProduct],
 ) -> DedupeDecision:
+    existing_products = list(existing_products)
     seed_key = seed_identity_key(seed)
     if not seed_key:
         return DedupeDecision.possible_duplicate("seed has no usable identity key")
@@ -57,6 +86,23 @@ def decide_seed_existing_product_dedupe(
             matched_product_id=product.store_product_id,
             evidence={"seed_id": seed.seed_id, "identity_key": seed_key},
         )
+    query_keys = _generated_query_identity_keys(seed)
+    for product in existing_products:
+        product_keys = {
+            normalize_identity_text(product.normalized_identity_key),
+            normalize_identity_text(product.title),
+        }
+        for query_key in query_keys:
+            if any(_strict_identity_match(query_key, product_key) for product_key in product_keys):
+                return DedupeDecision.duplicate(
+                    reason="generated Ozon query maps to existing store product",
+                    matched_product_id=product.store_product_id,
+                    evidence={
+                        "seed_id": seed.seed_id,
+                        "identity_key": query_key,
+                        "matched_by": "generated_query",
+                    },
+                )
     return DedupeDecision.clear("seed not found in existing store products")
 
 
@@ -64,6 +110,19 @@ def decide_ozon_candidate_dedupe(
     candidate: OzonCandidate,
     existing_products: Iterable[ExistingStoreProduct],
 ) -> DedupeDecision:
+    existing_products = list(existing_products)
+    candidate_product_id = str(candidate.ozon_product_id or "").strip().casefold()
+    for product in existing_products:
+        store_product_id = str(product.store_product_id or "").strip().casefold()
+        if candidate_product_id and candidate_product_id == store_product_id:
+            return DedupeDecision.duplicate(
+                reason="Ozon candidate product id matches existing store product",
+                matched_product_id=product.store_product_id,
+                evidence={
+                    "ozon_product_id": candidate.ozon_product_id,
+                    "matched_by": "ozon_product_id",
+                },
+            )
     title_key = normalize_identity_text(candidate.title)
     product_map = existing_product_keys(existing_products)
     if title_key and title_key in product_map:
@@ -73,6 +132,21 @@ def decide_ozon_candidate_dedupe(
             matched_product_id=product.store_product_id,
             evidence={"ozon_product_id": candidate.ozon_product_id, "identity_key": title_key},
         )
+    if title_key:
+        for product in existing_products:
+            product_key = normalize_identity_text(
+                product.normalized_identity_key or product.title
+            )
+            if _strict_identity_match(title_key, product_key):
+                return DedupeDecision.duplicate(
+                    reason="Ozon candidate title maps to existing store product",
+                    matched_product_id=product.store_product_id,
+                    evidence={
+                        "ozon_product_id": candidate.ozon_product_id,
+                        "identity_key": title_key,
+                        "matched_by": "strict_title_containment",
+                    },
+                )
     return DedupeDecision.clear("Ozon candidate not found in existing store products")
 
 

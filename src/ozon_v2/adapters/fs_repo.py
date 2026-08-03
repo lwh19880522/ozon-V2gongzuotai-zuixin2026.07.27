@@ -67,6 +67,10 @@ class FsRepo:
         return self.state_dir / "existing_store_dedupe.meta.json"
 
     @property
+    def product_identity_ledger_path(self) -> Path:
+        return self.state_dir / "used_product_identities.jsonl"
+
+    @property
     def config_initial_seed_path(self) -> Path:
         return self.config_dir / "seed_pool.initial.json"
 
@@ -94,7 +98,12 @@ class FsRepo:
         self.config_dir.mkdir(parents=True, exist_ok=True)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.runs_dir.mkdir(parents=True, exist_ok=True)
-        for ledger_path in (self.used_seed_path, self.seed_blacklist_path, self.existing_store_dedupe_path):
+        for ledger_path in (
+            self.used_seed_path,
+            self.seed_blacklist_path,
+            self.existing_store_dedupe_path,
+            self.product_identity_ledger_path,
+        ):
             if not ledger_path.exists():
                 ledger_path.touch()
 
@@ -317,9 +326,294 @@ class FsRepo:
             if item.get("ozon_product_id")
         }
 
+    @staticmethod
+    def _normalize_product_identity(identity_type: str, value: Any) -> str:
+        normalized = str(value or "").strip().casefold()
+        if identity_type not in {"ozon_product_id", "supplier_offer_id"}:
+            raise ValueError(f"Unsupported product identity type: {identity_type}")
+        return normalized
+
+    @staticmethod
+    def _supplier_offer_id_from_product(product: dict[str, Any]) -> str:
+        offer_id = str(
+            product.get("offer_id") or product.get("supplier_product_id") or ""
+        ).strip()
+        if offer_id:
+            return offer_id
+        supplier_url = str(
+            product.get("final_url") or product.get("supplier_url") or ""
+        )
+        match = re.search(r"/offer/(\d+)\.html", supplier_url)
+        return match.group(1) if match else ""
+
+    def _historical_product_identity_rows(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for item in self._read_jsonl(self.seed_blacklist_path):
+            product_id = self._normalize_product_identity(
+                "ozon_product_id", item.get("ozon_product_id")
+            )
+            if product_id:
+                rows.append(
+                    {
+                        "identity_type": "ozon_product_id",
+                        "identity_value": product_id,
+                        "run_id": str(item.get("run_id") or "seed_blacklist"),
+                        "seed_id": str(item.get("seed_id") or ""),
+                        "source": "seed_blacklist",
+                        "archived_at": str(item.get("blacklisted_at") or utc_now_iso()),
+                    }
+                )
+        if not self.runs_dir.exists():
+            return rows
+        for run_dir in sorted(self.runs_dir.iterdir(), key=lambda path: path.name):
+            if not run_dir.is_dir():
+                continue
+            run_id = run_dir.name
+            ozon_path = run_dir / "ozon_collection_result.json"
+            if ozon_path.is_file():
+                try:
+                    ozon_payload = self._read_json(ozon_path)
+                except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                    ozon_payload = {}
+                for item in ozon_payload.get("ozon_candidates", []):
+                    if not isinstance(item, dict):
+                        continue
+                    product_id = self._normalize_product_identity(
+                        "ozon_product_id", item.get("ozon_product_id")
+                    )
+                    if product_id:
+                        rows.append(
+                            {
+                                "identity_type": "ozon_product_id",
+                                "identity_value": product_id,
+                                "run_id": run_id,
+                                "seed_id": str(item.get("seed_id") or ""),
+                                "source": "historical_ozon_collection",
+                                "archived_at": utc_now_iso(),
+                            }
+                        )
+            for filename in (
+                "supplier_selection_draft.json",
+                "supplier_collection_result.json",
+            ):
+                supplier_path = run_dir / filename
+                if not supplier_path.is_file():
+                    continue
+                try:
+                    supplier_payload = self._read_json(supplier_path)
+                except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                    continue
+                for item in supplier_payload.get("supplier_products", []):
+                    if not isinstance(item, dict):
+                        continue
+                    offer_id = self._normalize_product_identity(
+                        "supplier_offer_id",
+                        self._supplier_offer_id_from_product(item),
+                    )
+                    if offer_id:
+                        rows.append(
+                            {
+                                "identity_type": "supplier_offer_id",
+                                "identity_value": offer_id,
+                                "run_id": run_id,
+                                "seed_id": str(item.get("seed_id") or ""),
+                                "source": f"historical_{filename[:-5]}",
+                                "archived_at": utc_now_iso(),
+                            }
+                        )
+        return rows
+
+    def _reconcile_product_identity_ledger_locked(self) -> list[dict[str, Any]]:
+        existing = self._read_jsonl(self.product_identity_ledger_path)
+        existing_keys = {
+            (
+                str(item.get("identity_type") or ""),
+                str(item.get("identity_value") or "").casefold(),
+            )
+            for item in existing
+            if item.get("identity_type") and item.get("identity_value")
+        }
+        additions: list[dict[str, Any]] = []
+        for item in self._historical_product_identity_rows():
+            key = (item["identity_type"], item["identity_value"])
+            if key in existing_keys:
+                continue
+            additions.append(item)
+            existing_keys.add(key)
+        if additions:
+            self._append_jsonl(self.product_identity_ledger_path, additions)
+        return existing + additions
+
+    def load_used_product_identity_values(
+        self,
+        identity_type: str,
+        *,
+        exclude_run_id: str | None = None,
+    ) -> set[str]:
+        self.initialize_runtime()
+        with _JSON_WRITE_LOCK:
+            rows = self._reconcile_product_identity_ledger_locked()
+        return {
+            str(item.get("identity_value") or "")
+            for item in rows
+            if str(item.get("identity_type") or "") == identity_type
+            and str(item.get("identity_value") or "")
+            and (
+                exclude_run_id is None
+                or str(item.get("run_id") or "") != exclude_run_id
+            )
+        }
+
+    def load_used_ozon_product_ids(self, *, exclude_run_id: str | None = None) -> set[str]:
+        return self.load_used_product_identity_values(
+            "ozon_product_id", exclude_run_id=exclude_run_id
+        )
+
+    def load_used_supplier_offer_ids(self, *, exclude_run_id: str | None = None) -> set[str]:
+        return self.load_used_product_identity_values(
+            "supplier_offer_id", exclude_run_id=exclude_run_id
+        )
+
+    def claim_product_identities(
+        self,
+        run_id: str,
+        claims: Iterable[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        normalized_claims: list[dict[str, Any]] = []
+        for raw_claim in claims:
+            identity_type = str(raw_claim.get("identity_type") or "")
+            identity_value = self._normalize_product_identity(
+                identity_type, raw_claim.get("identity_value")
+            )
+            if not identity_value:
+                continue
+            normalized_claims.append(
+                {
+                    "identity_type": identity_type,
+                    "identity_value": identity_value,
+                    "run_id": run_id,
+                    "seed_id": str(raw_claim.get("seed_id") or ""),
+                    "source": str(raw_claim.get("source") or "workbench"),
+                    "archived_at": utc_now_iso(),
+                }
+            )
+        if not normalized_claims:
+            return []
+        self.initialize_runtime()
+        with _JSON_WRITE_LOCK:
+            existing = self._reconcile_product_identity_ledger_locked()
+            by_identity = {
+                (
+                    str(item.get("identity_type") or ""),
+                    str(item.get("identity_value") or "").casefold(),
+                ): item
+                for item in existing
+                if item.get("identity_type") and item.get("identity_value")
+            }
+            conflicts: list[dict[str, Any]] = []
+            pending: list[dict[str, Any]] = []
+            for claim in normalized_claims:
+                key = (claim["identity_type"], claim["identity_value"])
+                previous = by_identity.get(key)
+                if previous is not None:
+                    same_owner = (
+                        str(previous.get("run_id") or "") == run_id
+                        and str(previous.get("seed_id") or "") == claim["seed_id"]
+                    )
+                    if not same_owner:
+                        conflicts.append(
+                            {
+                                "identity_type": claim["identity_type"],
+                                "identity_value": claim["identity_value"],
+                                "requested_run_id": run_id,
+                                "requested_seed_id": claim["seed_id"],
+                                "previous_run_id": previous.get("run_id"),
+                                "previous_seed_id": previous.get("seed_id"),
+                                "previous_source": previous.get("source"),
+                            }
+                        )
+                    continue
+                pending.append(claim)
+                by_identity[key] = claim
+            if conflicts:
+                return conflicts
+            if pending:
+                self._append_jsonl(self.product_identity_ledger_path, pending)
+        return []
+
     def load_existing_products(self) -> list[ExistingStoreProduct]:
         self.initialize_runtime()
         return [ExistingStoreProduct.from_dict(item) for item in self._read_jsonl(self.existing_store_dedupe_path)]
+
+    def load_local_uploaded_products(self) -> list[ExistingStoreProduct]:
+        """Recover accepted uploads that may not be visible in Seller API yet."""
+        self.initialize_runtime()
+        products: list[ExistingStoreProduct] = []
+        if not self.runs_dir.exists():
+            return products
+        for run_dir in sorted(self.runs_dir.iterdir(), key=lambda path: path.name):
+            if not run_dir.is_dir():
+                continue
+            submissions_path = run_dir / "upload_submissions.json"
+            previews_path = run_dir / "upload_previews.json"
+            if not submissions_path.is_file() or not previews_path.is_file():
+                continue
+            try:
+                submissions = self._read_json(submissions_path)
+                previews = self._read_json(previews_path)
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                continue
+            submission_items = submissions.get("items") if isinstance(submissions, dict) else None
+            preview_items = previews.get("items") if isinstance(previews, dict) else None
+            if not isinstance(submission_items, dict) or not isinstance(preview_items, dict):
+                continue
+            for seed_id, submission in submission_items.items():
+                if not isinstance(submission, dict):
+                    continue
+                status = str(submission.get("status") or "").strip().casefold()
+                if status not in {"accepted_by_ozon", "submitted", "imported"}:
+                    continue
+                preview = preview_items.get(seed_id)
+                seller_item = preview.get("seller_api_item") if isinstance(preview, dict) else None
+                seller_item = seller_item if isinstance(seller_item, dict) else {}
+                offer_id = str(
+                    submission.get("offer_id") or seller_item.get("offer_id") or ""
+                ).strip()
+                if not offer_id:
+                    continue
+                product_id = ""
+                for status_key in ("seller_api_status", "seller_api_import_status"):
+                    status_payload = submission.get(status_key)
+                    status_items = status_payload.get("items") if isinstance(status_payload, dict) else None
+                    if not isinstance(status_items, list):
+                        continue
+                    matching = next(
+                        (
+                            item
+                            for item in status_items
+                            if isinstance(item, dict)
+                            and str(item.get("offer_id") or "").strip() == offer_id
+                            and item.get("product_id") not in (None, "")
+                        ),
+                        None,
+                    )
+                    if matching is not None:
+                        product_id = str(matching["product_id"])
+                        break
+                title = str(seller_item.get("name") or offer_id).strip()
+                products.append(
+                    ExistingStoreProduct(
+                        store_product_id=product_id or f"offer:{offer_id}",
+                        offer_id_when_available=offer_id,
+                        title=title,
+                        normalized_identity_key=re.sub(r"[\W_]+", "", title.casefold()),
+                        source_captured_at=str(
+                            submission.get("submitted_at") or utc_now_iso()
+                        ),
+                        notes=f"recovered from local accepted upload {run_dir.name}:{seed_id}",
+                    )
+                )
+        return products
 
     def replace_existing_products(self, products: list[ExistingStoreProduct]) -> None:
         self.initialize_runtime()
@@ -332,6 +626,50 @@ class FsRepo:
                 "product_count": len(products),
             },
         )
+
+    def merge_existing_products(self, products: list[ExistingStoreProduct]) -> dict[str, int]:
+        """Merge the latest Seller API view into the durable store denylist.
+
+        Products absent from a later API response remain protected. Ozon may hide
+        archived or temporarily unavailable cards from a later listing response;
+        disappearance from that snapshot is not permission to publish a duplicate.
+        """
+        self.initialize_runtime()
+        existing = self.load_existing_products()
+        merged: list[ExistingStoreProduct] = []
+        index_by_key: dict[str, int] = {}
+
+        def identities(product: ExistingStoreProduct) -> list[str]:
+            keys: list[str] = []
+            product_id = str(product.store_product_id or "").strip()
+            if product_id:
+                keys.append(f"product:{product_id}")
+            offer_id = str(product.offer_id_when_available or "").strip().casefold()
+            if offer_id:
+                keys.append(f"offer:{offer_id}")
+            if not keys:
+                keys.append(f"title:{product.normalized_identity_key}")
+            return keys
+
+        for product in existing + list(products):
+            keys = identities(product)
+            matched_index = next(
+                (index_by_key[key] for key in keys if key in index_by_key),
+                None,
+            )
+            if matched_index is None:
+                matched_index = len(merged)
+                merged.append(product)
+            else:
+                merged[matched_index] = product
+            for key in keys:
+                index_by_key[key] = matched_index
+        self.replace_existing_products(merged)
+        return {
+            "fetched_product_count": len(products),
+            "existing_product_count": len(merged),
+            "preserved_history_count": max(0, len(merged) - len(products)),
+        }
 
     def existing_store_dedupe_status(self) -> dict[str, Any]:
         self.initialize_runtime()
@@ -498,6 +836,7 @@ class FsRepo:
         deleted_run_ids: list[str] = []
         skipped_entries: list[str] = []
         with _JSON_WRITE_LOCK:
+            self._reconcile_product_identity_ledger_locked()
             for candidate in list(self.runs_dir.iterdir()):
                 if not candidate.is_dir() or not self._is_recognized_batch_directory_name(candidate.name):
                     continue

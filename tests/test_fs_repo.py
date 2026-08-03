@@ -54,6 +54,38 @@ class FsRepoTests(RuntimeTestCase):
         self.assertEqual(seeds_before, repo.active_seed_path.read_bytes())
         self.assertEqual(dedupe_before, repo.existing_store_dedupe_path.read_bytes())
 
+    def test_clear_workbench_batches_archives_product_identities_before_deletion(self) -> None:
+        repo = FsRepo(self.context)
+        run = repo.create_workbench_batch_record(target_count=1)
+        run_id = run["run_id"]
+        repo.save_ozon_collection_result(
+            run_id,
+            {
+                "run_id": run_id,
+                "ozon_candidates": [
+                    {"seed_id": "seed-history", "ozon_product_id": "1189584062"}
+                ],
+            },
+        )
+        repo.save_supplier_collection_result(
+            run_id,
+            {
+                "run_id": run_id,
+                "supplier_products": [
+                    {
+                        "seed_id": "seed-history",
+                        "offer_id": "898078910803",
+                        "supplier_url": "https://detail.1688.com/offer/898078910803.html",
+                    }
+                ],
+            },
+        )
+
+        repo.clear_workbench_batches()
+
+        self.assertIn("1189584062", repo.load_used_ozon_product_ids())
+        self.assertIn("898078910803", repo.load_used_supplier_offer_ids())
+
     def test_seed_identity_is_stable_across_legacy_and_current_pool_ids(self) -> None:
         repo = FsRepo(self.context)
         legacy = SeedProduct(

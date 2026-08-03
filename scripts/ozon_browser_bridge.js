@@ -91,6 +91,9 @@
     const schema = labels.slice(0, 12).map(attributeFromLabel);
     return {
       seed_id: seed.seed_id,
+      slot_id: seed.slot_id,
+      candidate_revision: seed.candidate_revision,
+      source_ozon_product_id: String(seed.source_ozon_product_id || ""),
       source_query: query,
       category_candidates: [
         {
@@ -150,37 +153,22 @@
     const runId = task.data.run_id;
     const payload = task.data.contract.payload;
     const seeds = payload.seeds || [];
-    let state = loadState(runId) || { runId, seedIndex: 0, stage: "search", templates: [], searchEvidence: null };
+    let state = loadState(runId) || { runId, seedIndex: 0, stage: "detail", templates: [], searchEvidence: null };
     const seed = seeds[state.seedIndex];
     if (!seed) {
       return submit(runId, task.data.ingest_url, state.templates);
     }
     const query = (seed.ozon_query_terms_ru || [])[0] || seed.source_text_zh || "";
-    if (state.stage === "search") {
-      if (!location.href.includes("/search/")) {
-        saveState(state);
-        location.href = searchUrl(query);
-        return { ok: true, code: "bridge.navigating_search", query };
-      }
-      const productLinks = collectLinks('a[href*="/product/"]', 12);
-      const categoryLinks = collectLinks('a[href*="/category/"]', 12);
-      state.searchEvidence = {
-        url: location.href,
-        title: document.title,
-        productLinks,
-        categoryLinks,
-        hasChallenge: pageHasChallenge(),
-      };
-      const productUrl = productLinks.length ? productLinks[0].href : "";
-      if (!productUrl || state.searchEvidence.hasChallenge) {
-        saveState(state);
-        return { ok: false, code: "bridge.search_blocked", message: "Ozon search evidence is not ready.", state };
-      }
-      state.stage = "detail";
-      state.productUrl = productUrl;
+    const locked = seed.locked_ozon_product || {};
+    const lockedProductId = String(seed.source_ozon_product_id || locked.ozon_product_id || "");
+    const productUrl = String(locked.ozon_url || locked.url || "");
+    if (!lockedProductId || !productUrl) {
+      return { ok: false, code: "bridge.locked_product_missing", state };
+    }
+    if (!location.href.includes(lockedProductId)) {
       saveState(state);
       location.href = productUrl;
-      return { ok: true, code: "bridge.navigating_detail", productUrl };
+      return { ok: true, code: "bridge.navigating_locked_product", productUrl };
     }
     const detailEvidence = {
       url: location.href,
@@ -195,12 +183,13 @@
     }
     state.templates.push(buildTemplate(seed, query, state.searchEvidence || {}, detailEvidence));
     state.seedIndex += 1;
-    state.stage = "search";
+    state.stage = "detail";
     state.searchEvidence = null;
     state.productUrl = null;
     saveState(state);
     if (state.seedIndex < seeds.length) {
-      location.href = searchUrl((seeds[state.seedIndex].ozon_query_terms_ru || [])[0] || seeds[state.seedIndex].source_text_zh || "");
+      const nextLocked = seeds[state.seedIndex].locked_ozon_product || {};
+      location.href = nextLocked.ozon_url || nextLocked.url;
       return { ok: true, code: "bridge.next_seed", seedIndex: state.seedIndex };
     }
     return submit(runId, task.data.ingest_url, state.templates);

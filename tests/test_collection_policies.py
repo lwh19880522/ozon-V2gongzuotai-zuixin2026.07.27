@@ -5,6 +5,7 @@ from unittest import TestCase
 from ozon_v2.domain.models import ExistingStoreProduct, OzonCandidate, SeedProduct, SelectedSkuMedia, TargetSku
 from ozon_v2.domain.policies import (
     contains_cjk,
+    decide_ozon_candidate_dedupe,
     decide_seed_existing_product_dedupe,
     generated_query_terms_are_safe,
     pair_status_for_dedupe_decision,
@@ -229,6 +230,44 @@ class CollectionPolicyTests(TestCase):
 
         self.assertEqual("duplicate", decision.kind.value)
         self.assertEqual("store-1", decision.matched_product_id)
+
+    def test_existing_store_russian_title_blocks_seed_by_generated_query(self) -> None:
+        seed = SeedProduct(
+            seed_id="seed-0002",
+            title_or_keyword="电子桌面时钟",
+            product_clue="电子桌面时钟",
+            ozon_query_terms_ru=[
+                "электронные настольные часы с календарем",
+                "купить электронные настольные часы с календарем",
+            ],
+            query_generation_status="generated",
+        )
+        existing = ExistingStoreProduct(
+            store_product_id="store-2",
+            title="Электронные настольные часы с календарем, белый корпус",
+            normalized_identity_key="электронныенастольныечасыскалендарембелыйкорпус",
+        )
+
+        decision = decide_seed_existing_product_dedupe(seed, [existing])
+
+        self.assertEqual("duplicate", decision.kind.value)
+        self.assertEqual("store-2", decision.matched_product_id)
+        self.assertEqual("generated_query", decision.evidence["matched_by"])
+
+    def test_existing_store_exact_ozon_product_id_blocks_renamed_candidate(self) -> None:
+        candidate = self.ozon_candidate(self.verified_seller_decision())
+        candidate.title = "Completely renamed public title"
+        existing = ExistingStoreProduct(
+            store_product_id="ozon-1",
+            title="An older unrelated title",
+            normalized_identity_key="anolderunrelatedtitle",
+        )
+
+        decision = decide_ozon_candidate_dedupe(candidate, [existing])
+
+        self.assertEqual("duplicate", decision.kind.value)
+        self.assertEqual("ozon-1", decision.matched_product_id)
+        self.assertEqual("ozon_product_id", decision.evidence["matched_by"])
 
     def test_chinese_query_terms_are_not_safe_for_ozon(self) -> None:
         self.assertTrue(contains_cjk("收纳盒"))

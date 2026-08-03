@@ -696,6 +696,9 @@ function buildTemplate(seed, query, searchEvidence, detailEvidence, sellerDecisi
     .map(attributeFromLabel);
   return {
     seed_id: seed.seed_id,
+    slot_id: seed.slot_id,
+    candidate_revision: seed.candidate_revision,
+    source_ozon_product_id: String(seed.source_ozon_product_id || ""),
     source_query: query,
     category_candidates: [
       {
@@ -1183,7 +1186,7 @@ async function run() {
     taskType: "ozon_attribute_template",
     dispatchToken: task.data.dispatch_token,
     seedIndex: 0,
-    stage: "search",
+    stage: "detail",
     templates: [],
     searchEvidence: null,
     productLinkIndex: 0,
@@ -1205,42 +1208,28 @@ async function run() {
     code: "bridge.running",
     message: `Collecting seed ${state.seedIndex + 1} of ${seeds.length}.`,
   });
-  if (state.stage === "search") {
-    if (!isSearchEvidencePage()) {
-      saveState(state);
-      await heartbeat({
-        run_id: runId,
-        stage: "navigating_search",
-        code: "bridge.navigating_search",
-        message: "Navigating to Ozon search page.",
-      });
-      location.href = searchUrl(query);
-      return { ok: true, code: "bridge.navigating_search" };
-    }
-    state.searchEvidence = await waitForSearchEvidence(runId);
-    if (!state.searchEvidence.productLinks.length || state.searchEvidence.hasChallenge) {
-      await heartbeat({
-        run_id: runId,
-        stage: "search_blocked",
-        code: "bridge.search_blocked",
-        message: state.searchEvidence.hasChallenge
-          ? "Ozon search page is blocked by challenge."
-          : `Ozon search exposed ${state.searchEvidence.allProductLinkCount || 0} products but none had China cross-border card evidence.`,
-      });
-      saveState(state);
-      return { ok: false, code: "bridge.search_blocked" };
-    }
-    state.stage = "detail";
-    state.productLinkIndex = 0;
+  const lockedProduct = seed.locked_ozon_product || {};
+  const lockedProductId = String(seed.source_ozon_product_id || lockedProduct.ozon_product_id || "");
+  const lockedProductUrl = String(lockedProduct.ozon_url || lockedProduct.url || "");
+  if (!lockedProductId || !lockedProductUrl) {
+    await heartbeat({
+      run_id: runId,
+      stage: "locked_product_missing",
+      code: "bridge.attribute_template_locked_product_missing",
+      message: "The attribute-template contract has no final locked Ozon product.",
+    });
+    return { ok: false, code: "bridge.attribute_template_locked_product_missing" };
+  }
+  if (String(productIdFromPage(location.href) || "") !== lockedProductId) {
     saveState(state);
     await heartbeat({
       run_id: runId,
-      stage: "navigating_detail",
-      code: "bridge.navigating_detail",
-      message: "Navigating to first Ozon product detail page.",
+      stage: "navigating_locked_product",
+      code: "bridge.attribute_template_navigating_locked_product",
+      message: `Navigating directly to locked Ozon product ${lockedProductId}.`,
     });
-    location.href = state.searchEvidence.productLinks[0].href;
-    return { ok: true, code: "bridge.navigating_detail" };
+    location.href = lockedProductUrl;
+    return { ok: true, code: "bridge.attribute_template_navigating_locked_product" };
   }
   const detailEvidence = await waitForDetailEvidence(runId);
   if (detailEvidence.hasChallenge) {
@@ -1253,50 +1242,33 @@ async function run() {
     saveState(state);
     return { ok: false, code: "bridge.detail_blocked" };
   }
-  const evidence = globalThis.OzonV2ProductEvidence;
-  if (evidence && !evidence.matchesQueryIntent([query], detailEvidence.snapshot || {})) {
-    const relevanceCheck = await requireChineseCrossBorderDetail(
-      state,
-      runId,
-      "ozon_attribute_template",
-      "bridge.attribute_template",
-      { ...detailEvidence, missingFields: ["query_intent_mismatch"] },
-      seed.seed_id,
-    );
-    return {
-      ok: relevanceCheck.navigating,
-      code: relevanceCheck.navigating
-        ? "bridge.attribute_template_irrelevant_candidate"
-        : "bridge.attribute_template_no_relevant_candidate",
-    };
-  }
-  const sellerCheck = await requireChineseCrossBorderDetail(
-    state,
-    runId,
-    "ozon_attribute_template",
-    "bridge.attribute_template",
-    detailEvidence,
-    seed.seed_id,
+  const collectedProductId = String(
+    (detailEvidence.snapshot && detailEvidence.snapshot.product_id) || "",
   );
-  if (!sellerCheck.accepted) {
-    return {
-      ok: sellerCheck.navigating,
-      code: sellerCheck.navigating
-        ? "bridge.attribute_template_next_candidate"
-        : "bridge.attribute_template_no_cross_border_candidate",
-    };
+  if (collectedProductId !== lockedProductId) {
+    await heartbeat({
+      run_id: runId,
+      stage: "locked_product_mismatch",
+      code: "bridge.attribute_template_locked_product_mismatch",
+      message: `Expected locked Ozon product ${lockedProductId}, received ${collectedProductId || "unknown"}.`,
+    });
+    saveState(state);
+    return { ok: false, code: "bridge.attribute_template_locked_product_mismatch" };
   }
+  const sellerDecision = lockedProduct.domestic_seller_decision
+    || sellerDecisionForSnapshot(detailEvidence.snapshot || {});
   state.templates.push(
-    buildTemplate(seed, query, state.searchEvidence || {}, detailEvidence, sellerCheck.decision),
+    buildTemplate(seed, query, { url: lockedProductUrl, title: lockedProduct.title, productLinks: [] }, detailEvidence, sellerDecision),
   );
   state.seedIndex += 1;
-  state.stage = "search";
+  state.stage = "detail";
   state.searchEvidence = null;
   state.productLinkIndex = 0;
   saveState(state);
   if (state.seedIndex < seeds.length) {
     const next = seeds[state.seedIndex];
-    location.href = searchUrl((next.ozon_query_terms_ru || [])[0] || next.source_text_zh || "");
+    const nextLocked = next.locked_ozon_product || {};
+    location.href = nextLocked.ozon_url || nextLocked.url;
     return { ok: true, code: "bridge.next_seed" };
   }
   return await submit(

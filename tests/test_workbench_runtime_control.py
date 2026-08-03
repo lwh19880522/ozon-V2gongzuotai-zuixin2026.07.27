@@ -23,7 +23,7 @@ class WorkbenchRuntimeControllerTests(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.project_root = Path(self.temp_dir.name) / "project"
         (self.project_root / "scripts").mkdir(parents=True)
-        (self.project_root / "scripts" / "workbench_restart_helper.ps1").write_text("# helper", encoding="utf-8")
+        (self.project_root / "scripts" / "workbench_restart_helper.py").write_text("# helper", encoding="utf-8")
         self.runtime_dir = self.project_root / "runtime" / "workbench"
 
     def tearDown(self) -> None:
@@ -58,10 +58,10 @@ class WorkbenchRuntimeControllerTests(unittest.TestCase):
         self.assertEqual("runtime.action_in_progress", second["code"])
         popen.assert_called_once()
         command = popen.call_args.args[0]
-        self.assertIn(str(self.project_root / "scripts" / "workbench_restart_helper.ps1"), command)
+        self.assertIn(str(self.project_root / "scripts" / "workbench_restart_helper.py"), command)
         self.assertIn("4321", command)
         self.assertIn("8765", command)
-        self.assertNotIn("-OpenEdgeAfterRestart", command)
+        self.assertNotIn("--open-edge-after-restart", command)
         state = json.loads((self.runtime_dir / "workbench.json").read_text(encoding="utf-8"))
         self.assertEqual("restarting", state["status"])
 
@@ -77,7 +77,7 @@ class WorkbenchRuntimeControllerTests(unittest.TestCase):
             )
 
         command = popen.call_args.args[0]
-        self.assertIn("-OpenEdgeAfterRestart", command)
+        self.assertIn("--open-edge-after-restart", command)
 
     def test_stop_schedules_shutdown_without_spawning_helper(self) -> None:
         controller = WorkbenchRuntimeController(self.project_root, self.runtime_dir, port=8765)
@@ -94,16 +94,16 @@ class WorkbenchRuntimeControllerTests(unittest.TestCase):
         self.assertEqual("stopping", state["status"])
 
     def test_restart_helper_is_bounded_and_opens_edge_only_when_explicitly_requested(self) -> None:
-        helper_path = Path(__file__).resolve().parents[1] / "scripts" / "workbench_restart_helper.ps1"
+        helper_path = Path(__file__).resolve().parents[1] / "scripts" / "workbench_restart_helper.py"
 
         helper = helper_path.read_text(encoding="utf-8-sig")
 
-        self.assertIn("$attempt -le 2", helper)
-        self.assertIn("workbench_control.ps1", helper)
+        self.assertIn("range(1, 3)", helper)
+        self.assertIn("workbench_launcher.py", helper)
         self.assertIn("restart-status.json", helper)
-        self.assertIn("[switch]$OpenEdgeAfterRestart", helper)
-        self.assertIn("if ($OpenEdgeAfterRestart)", helper)
-        self.assertIn("msedge.exe", helper.lower())
+        self.assertIn("--open-edge-after-restart", helper)
+        self.assertIn("if args.open_edge_after_restart", helper)
+        self.assertIn("webbrowser.open", helper.lower())
         self.assertNotIn("--user-data-dir", helper.lower())
         self.assertNotIn("--load-extension", helper.lower())
 
@@ -116,6 +116,5 @@ class WorkbenchRuntimeControllerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
 
 
