@@ -302,6 +302,40 @@ class FsRepo:
                 )
         self.remove_active_seed_identities({identity_key})
 
+    def append_ozon_product_blacklist(
+        self,
+        run_id: str,
+        ozon_product_id: str,
+        reason: str,
+        *,
+        source_seed_id: str = "",
+        reason_code: str = "category_subject_mismatch",
+    ) -> None:
+        normalized_product_id = str(ozon_product_id or "").strip()
+        if not normalized_product_id:
+            raise ValueError("ozon_product_id is required")
+        with _JSON_WRITE_LOCK:
+            existing = self._read_jsonl(self.seed_blacklist_path)
+            if any(
+                str(item.get("ozon_product_id") or "").strip()
+                == normalized_product_id
+                for item in existing
+            ):
+                return
+            self._append_jsonl(
+                self.seed_blacklist_path,
+                [
+                    {
+                        "run_id": run_id,
+                        "source_seed_id": str(source_seed_id or "").strip(),
+                        "ozon_product_id": normalized_product_id,
+                        "reason_code": reason_code,
+                        "reason": str(reason or "").strip(),
+                        "blacklisted_at": utc_now_iso(),
+                    }
+                ],
+            )
+
     def load_blacklisted_seed_ids(self) -> set[str]:
         self.initialize_runtime()
         return {

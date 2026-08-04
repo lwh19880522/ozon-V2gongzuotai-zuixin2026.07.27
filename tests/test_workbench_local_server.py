@@ -36,7 +36,11 @@ from ozon_v2.services.workbench_service import (
     _valid_ozon_hashtags,
     _video_template_fields,
 )
-from ozon_v2.workbench.local_server import build_upload_workspace_html, create_handler
+from ozon_v2.workbench.local_server import (
+    build_home_html,
+    build_upload_workspace_html,
+    create_handler,
+)
 
 from tests.helpers import FakeSellerApiAdapter, RuntimeTestCase
 
@@ -122,6 +126,13 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.server.server_close()
         self.thread.join(timeout=5)
         super().tearDown()
+
+    def test_batch_progress_distinguishes_template_validation_and_recollection(self) -> None:
+        html = build_home_html()
+
+        self.assertIn("Ozon 类目模板校验", html)
+        self.assertIn("冲突商品会自动淘汰并补采", html)
+        self.assertIn("Ozon 补采", html)
 
     def prepare_reviewable_image_job(self) -> tuple[str, str, ImageGenerationQueue]:
         run = self.repo.create_workbench_batch_record(target_count=1)
@@ -1193,7 +1204,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         )
         self.assertTrue((self.repo.run_dir(run_id) / "supplier_review.json").exists())
 
-    def test_locked_ozon_page_with_title_type_contradiction_is_rejected(self) -> None:
+    def test_locked_ozon_page_with_title_type_contradiction_is_retired_and_recollected(self) -> None:
         seed = SeedProduct(
             seed_id="seed-subject-conflict",
             title_or_keyword="women shorts",
@@ -1240,12 +1251,190 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         template = self.seller_attribute_template_payload(run_id, seed.seed_id)
         result = service.ingest_attribute_template_result(run_id, template)
 
-        self.assertFalse(result.ok)
-        self.assertEqual("workbench.category_subject_mismatch", result.code)
+        self.assertTrue(result.ok, result.to_dict())
         self.assertEqual(
-            WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTING.value,
-            self.repo.load_run(run_id)["status"],
+            "workbench.category_subject_candidates_retired",
+            result.code,
         )
+        loaded = self.repo.load_run(run_id)
+        self.assertEqual(
+            WorkbenchState.SEED_SELECTED.value,
+            loaded["status"],
+        )
+        self.assertEqual([seed.seed_id], loaded["replacement_pending_seed_ids"])
+        self.assertFalse(loaded["ozon_collected"])
+        self.assertFalse(loaded["attribute_template_collected"])
+        self.assertFalse(loaded["ozon_collection_contract_ready"])
+        self.assertFalse(loaded["attribute_template_contract_ready"])
+        self.assertEqual(
+            [],
+            self.repo.load_ozon_collection_result(run_id)["ozon_candidates"],
+        )
+        self.assertIn("ozon-1", self.repo.load_blacklisted_ozon_product_ids())
+        self.assertNotIn(seed.seed_id, self.repo.load_blacklisted_seed_ids())
+        slot = loaded["candidate_slots"][0]
+        self.assertEqual(seed.seed_id, slot["seed_id"])
+        self.assertEqual(2, slot["candidate_revision"])
+        self.assertIsNone(slot["ozon_product_id"])
+        self.assertFalse(
+            (self.repo.run_dir(run_id) / "attribute_template_contract.json").exists()
+        )
+
+        resumed = service.run_until_blocked(run_id)
+
+        self.assertTrue(resumed.ok, resumed.to_dict())
+        self.assertEqual("collection_worker_required", resumed.data["blocked_reason"])
+        recollect_contract = self.repo.load_ozon_collection_contract(run_id)["payload"]
+        self.assertEqual(
+            [seed.seed_id],
+            [item["seed_id"] for item in recollect_contract["seeds"]],
+        )
+        self.assertIn("ozon-1", recollect_contract["excluded_ozon_product_ids"])
+
+    def test_repeated_subject_mismatch_preserves_other_slots_template_evidence(self) -> None:
+        retained_seed = SeedProduct(
+            seed_id="seed-retained-template",
+            title_or_keyword="paper tray",
+            product_clue="paper tray",
+            ozon_query_terms_ru=["лоток для бумаги"],
+            query_generation_status="generated",
+        )
+        rejected_seed = SeedProduct(
+            seed_id="seed-repeated-subject-conflict",
+            title_or_keyword="women shorts",
+            product_clue="women shorts",
+            ozon_query_terms_ru=["женские шорты"],
+            query_generation_status="generated",
+        )
+        run = self.repo.create_workbench_batch_record(target_count=2)
+        run_id = run["run_id"]
+        self.repo.save_sampled_seeds(run_id, [retained_seed, rejected_seed])
+        run["status"] = WorkbenchState.OZON_COLLECTING.value
+        self.repo.save_run(run)
+
+        retained_candidate = self.ozon_candidate_for_seed(
+            retained_seed,
+            "ozon-retained-template",
+        )
+        rejected_candidate = self.ozon_candidate_for_seed(
+            rejected_seed,
+            "ozon-subject-conflict-1",
+        )
+        rejected_candidate.update(
+            {
+                "title": "Женские шорты летние",
+                "category_path": "Конный спорт / Попоны",
+                "leaf_category": "Попоны для лошадей",
+                "category_url": "https://www.ozon.ru/category/popony-777/",
+                "category_id": "777",
+                "attributes": {"Тип": "Попона для лошади"},
+            }
+        )
+        service = WorkbenchService(
+            self.repo,
+            seller_api_adapter=FakeSellerApiAdapter(),
+        )
+        collected = service.ingest_ozon_collection_result(
+            run_id,
+            {
+                "run_id": run_id,
+                "worker": "workbench_browser_bridge",
+                "source": "test",
+                "ozon_candidates": [retained_candidate, rejected_candidate],
+            },
+        )
+        self.assertTrue(collected.ok, collected.to_dict())
+        started = service.dispatch(
+            run_id,
+            WorkbenchAction.START_ATTRIBUTE_TEMPLATE_COLLECTION.value,
+        )
+        self.assertTrue(started.ok, started.to_dict())
+        first_payload = self.seller_attribute_template_payload(
+            run_id,
+            retained_seed.seed_id,
+        )
+        rejected_template = self.seller_attribute_template_payload(
+            run_id,
+            rejected_seed.seed_id,
+        )["seed_templates"][0]
+        first_payload["seed_templates"].append(rejected_template)
+
+        first_retirement = service.ingest_attribute_template_result(
+            run_id,
+            first_payload,
+        )
+
+        self.assertTrue(first_retirement.ok, first_retirement.to_dict())
+        self.assertEqual(
+            [retained_seed.seed_id],
+            [
+                item["seed_id"]
+                for item in self.repo.load_attribute_template_result(run_id)[
+                    "seed_templates"
+                ]
+            ],
+        )
+        resumed = service.run_until_blocked(run_id)
+        self.assertTrue(resumed.ok, resumed.to_dict())
+        replacement_candidate = self.ozon_candidate_for_seed(
+            rejected_seed,
+            "ozon-subject-conflict-2",
+        )
+        replacement_candidate.update(
+            {
+                "title": "Женские шорты летние",
+                "category_path": "Конный спорт / Попоны",
+                "leaf_category": "Попоны для лошадей",
+                "category_url": "https://www.ozon.ru/category/popony-777/",
+                "category_id": "777",
+                "attributes": {"Тип": "Попона для лошади"},
+            }
+        )
+        replacement_collected = service.ingest_ozon_collection_result(
+            run_id,
+            {
+                "run_id": run_id,
+                "worker": "workbench_browser_bridge",
+                "source": "test",
+                "ozon_candidates": [replacement_candidate],
+            },
+        )
+        self.assertTrue(replacement_collected.ok, replacement_collected.to_dict())
+        template_resumed = service.run_until_blocked(run_id)
+        self.assertTrue(template_resumed.ok, template_resumed.to_dict())
+        second_payload = self.seller_attribute_template_payload(
+            run_id,
+            rejected_seed.seed_id,
+        )
+
+        second_retirement = service.ingest_attribute_template_result(
+            run_id,
+            second_payload,
+        )
+
+        self.assertTrue(second_retirement.ok, second_retirement.to_dict())
+        self.assertEqual(
+            [retained_seed.seed_id],
+            [
+                item["seed_id"]
+                for item in self.repo.load_attribute_template_result(run_id)[
+                    "seed_templates"
+                ]
+            ],
+        )
+        self.assertEqual(
+            {
+                "ozon-subject-conflict-1",
+                "ozon-subject-conflict-2",
+            },
+            self.repo.load_blacklisted_ozon_product_ids(),
+        )
+        rejected_slot = next(
+            item
+            for item in self.repo.load_run(run_id)["candidate_slots"]
+            if item["seed_id"] == rejected_seed.seed_id
+        )
+        self.assertEqual(3, rejected_slot["candidate_revision"])
 
     def test_browser_task_endpoint_returns_attribute_template_contract(self) -> None:
         seed = SeedProduct(

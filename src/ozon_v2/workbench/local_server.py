@@ -651,7 +651,7 @@ def build_home_html() -> str:
         <div class="progress-list">
           <div id="progressOzon" class="progress-row">
             <span class="progress-number">1</span>
-            <div class="progress-copy"><strong>Ozon 采集</strong><span>标题、类目、属性、图片、价格、评价和配送证据</span></div>
+            <div class="progress-copy"><strong id="progressOzonTitle">Ozon 采集</strong><span id="progressOzonCopy">标题、类目、属性、图片、价格、评价和配送证据</span></div>
             <span class="progress-state">未开始</span>
           </div>
           <div id="progressSupplier" class="progress-row">
@@ -828,10 +828,23 @@ def build_home_html() -> str:
       $("toggleDiagnostics").textContent = open ? "收起 (Collapse)" : "展开 (Expand)";
     }
 
-    function renderStageProgress(status) {
+    function renderStageProgress(status, run = {}) {
       const orderedStages = ["progressOzon", "progressSupplier", "progressUpload"];
       const supplierStatuses = new Set(["supplier_review", "supplier_collecting", "supplier_collected", "same_product_review"]);
       const uploadStatuses = new Set(["ai_filling", "image_processing", "image_processed", "draft_building", "draft_ready", "publish_submitted", "done"]);
+      const replacementPending =
+        Array.isArray(run.replacement_pending_seed_ids) &&
+        run.replacement_pending_seed_ids.length > 0;
+      if (status === "attribute_template_collecting") {
+        $("progressOzonTitle").textContent = "Ozon 类目模板校验";
+        $("progressOzonCopy").textContent = "商品采集已完成，正在校验精确类目；冲突商品会自动淘汰并补采";
+      } else if (replacementPending) {
+        $("progressOzonTitle").textContent = "Ozon 补采";
+        $("progressOzonCopy").textContent = "仅重新采集被淘汰的商品槽位，已完成商品保持不变";
+      } else {
+        $("progressOzonTitle").textContent = "Ozon 采集";
+        $("progressOzonCopy").textContent = "标题、类目、属性、图片、价格、评价和配送证据";
+      }
       let currentIndex = 0;
       if (supplierStatuses.has(status)) currentIndex = 1;
       if (uploadStatuses.has(status)) currentIndex = 2;
@@ -905,6 +918,7 @@ def build_home_html() -> str:
       "browser_candidate.exhausted": ["当前种子已耗尽", "当前种子没有找到合格候选，正在尝试补位。"],
       "browser_candidate.replaced": ["种子已替换", "失败种子已完成补位，批次继续运行。"],
       "browser_candidate.failed": ["种子最终失败", "失败种子无法补位，需要人工处理。"],
+      "attribute_template.category_subject_candidates_retired": ["错类商品已淘汰", "主体或类目冲突的 Ozon 商品已加入排除名单，系统正在按原槽位补采。"],
       "supplier_review.replacement_recovery_started": ["替补商品恢复补采", "已返回替补商品尚未完成的采集阶段，其他成功商品保持不变。"],
       "ozon_collection.replacement_checkpoint_reconciled": ["替补采集断点已清理", "已移除被拒商品遗留的采集断点，只继续采集当前替补商品。"],
     };
@@ -935,7 +949,7 @@ def build_home_html() -> str:
       $("runId").textContent = runId || "-";
       $("status").textContent = run.status || data.status || "-";
       updateStageNavigation(runId);
-      renderStageProgress(run.status || data.status || "created");
+      renderStageProgress(run.status || data.status || "created", run);
       const status = run.status || data.status || "";
       const replacementPending =
         Array.isArray(run.replacement_pending_seed_ids) &&

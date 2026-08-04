@@ -461,17 +461,22 @@ class WorkbenchService:
             expected_seed_ids,
         )
         if subject_errors:
-            event = self.repo.append_run_event(
+            mismatch_seed_ids = [
+                seed_id
+                for seed_id in expected_seed_ids
+                if any(
+                    error.startswith(f"seed {seed_id} ")
+                    for error in subject_errors
+                )
+            ]
+            return self._retire_category_subject_mismatches(
                 run_id,
-                "attribute_template.category_subject_mismatch",
-                "The locked Ozon page contradicts its own title, product type, or category subject.",
-                {"errors": subject_errors},
-            )
-            return Result.failure(
-                "workbench.category_subject_mismatch",
-                "The locked Ozon product has contradictory subject evidence and must be replaced before supplier search.",
-                errors=subject_errors,
-                data=self._response_payload(run, event),
+                payload,
+                subject_errors=subject_errors,
+                mismatch_seed_ids=mismatch_seed_ids,
+                all_seed_ids=all_seed_ids,
+                dispatch_token=dispatch_token,
+                payload_dispatch_token=payload_dispatch_token,
             )
         with self._run_mutation_lock(run_id):
             current_run = self.repo.load_run(run_id)
@@ -556,6 +561,225 @@ class WorkbenchService:
                 "workbench.attribute_template_ingested",
                 "Final-product category templates are complete and supplier review is open.",
                 self._response_payload(run, event),
+            )
+
+    def _retire_category_subject_mismatches(
+        self,
+        run_id: str,
+        payload: dict[str, Any],
+        *,
+        subject_errors: list[str],
+        mismatch_seed_ids: list[str],
+        all_seed_ids: list[str],
+        dispatch_token: str,
+        payload_dispatch_token: str,
+    ) -> Result:
+        if not mismatch_seed_ids:
+            run = self.repo.load_run(run_id)
+            event = self.repo.append_run_event(
+                run_id,
+                "attribute_template.category_subject_mismatch_unbound",
+                "Category-subject mismatch could not be bound to an active candidate slot.",
+                {"errors": subject_errors},
+            )
+            return Result.failure(
+                "workbench.category_subject_mismatch_unbound",
+                "The contradictory category evidence could not be retired safely.",
+                errors=subject_errors,
+                data=self._response_payload(run, event),
+            )
+
+        with self._run_mutation_lock(run_id):
+            run = self.repo.load_run(run_id)
+            current_seed_ids = [
+                seed.seed_id for seed in self._safe_load_sampled_seeds(run_id)
+            ]
+            stale_errors = self._stage_snapshot_errors(
+                run=run,
+                expected_state=WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTING,
+                expected_seed_ids=all_seed_ids,
+                current_seed_ids=current_seed_ids,
+                expected_dispatch_token=dispatch_token,
+                payload_dispatch_token=payload_dispatch_token,
+            )
+            if stale_errors:
+                return self._reject_stale_stage_result(
+                    run_id,
+                    "attribute_template",
+                    run,
+                    stale_errors,
+                )
+
+            ozon_payload = self.repo.load_ozon_collection_result(run_id)
+            candidates = {
+                str(item.get("seed_id") or ""): item
+                for item in ozon_payload.get("ozon_candidates", [])
+                if isinstance(item, dict) and item.get("seed_id")
+            }
+            missing_candidates = [
+                seed_id
+                for seed_id in mismatch_seed_ids
+                if not str(
+                    (candidates.get(seed_id) or {}).get("ozon_product_id") or ""
+                ).strip()
+            ]
+            if missing_candidates:
+                event = self.repo.append_run_event(
+                    run_id,
+                    "attribute_template.category_subject_mismatch_unbound",
+                    "Category-subject mismatch referenced a slot without a locked Ozon product.",
+                    {
+                        "errors": subject_errors,
+                        "missing_seed_ids": missing_candidates,
+                    },
+                )
+                return Result.failure(
+                    "workbench.category_subject_mismatch_unbound",
+                    "The contradictory category evidence could not be retired safely.",
+                    errors=subject_errors,
+                    data=self._response_payload(run, event),
+                )
+
+            reason_by_seed = {
+                seed_id: next(
+                    (
+                        error
+                        for error in subject_errors
+                        if error.startswith(f"seed {seed_id} ")
+                    ),
+                    "The locked Ozon product contradicts its category subject.",
+                )
+                for seed_id in mismatch_seed_ids
+            }
+            retired: list[dict[str, Any]] = []
+            for seed_id in mismatch_seed_ids:
+                candidate = candidates[seed_id]
+                product_id = str(candidate.get("ozon_product_id") or "").strip()
+                reason = reason_by_seed[seed_id]
+                self.repo.append_ozon_product_blacklist(
+                    run_id,
+                    product_id,
+                    reason,
+                    source_seed_id=seed_id,
+                    reason_code="category_subject_mismatch",
+                )
+                slot = self._replace_candidate_slot(
+                    run,
+                    rejected_seed_id=seed_id,
+                    replacement_seed_id=seed_id,
+                    rejected_ozon_product_id=product_id,
+                    reason=reason,
+                )
+                retired.append(
+                    {
+                        "seed_id": seed_id,
+                        "ozon_product_id": product_id,
+                        "slot_id": slot["slot_id"],
+                        "candidate_revision": slot["candidate_revision"],
+                        "reason": reason,
+                    }
+                )
+
+            mismatch_ids = set(mismatch_seed_ids)
+            ozon_payload["ozon_candidates"] = [
+                item
+                for item in ozon_payload.get("ozon_candidates", [])
+                if isinstance(item, dict)
+                and str(item.get("seed_id") or "") not in mismatch_ids
+            ]
+            ozon_payload["updated_at"] = utc_now_iso()
+            self.repo.save_ozon_collection_result(run_id, ozon_payload)
+
+            try:
+                existing_template_payload = self.repo.load_attribute_template_result(
+                    run_id
+                )
+            except (FileNotFoundError, json.JSONDecodeError):
+                existing_template_payload = {}
+            existing_templates = {
+                str(item.get("seed_id") or ""): item
+                for item in existing_template_payload.get("seed_templates", [])
+                if isinstance(item, dict) and item.get("seed_id")
+            }
+            submitted_templates = {
+                str(item.get("seed_id") or ""): item
+                for item in payload.get("seed_templates", [])
+                if isinstance(item, dict) and item.get("seed_id")
+            }
+            retained_template_payload = {
+                **existing_template_payload,
+                **payload,
+                "seed_templates": [
+                    submitted_templates.get(seed_id)
+                    or existing_templates[seed_id]
+                    for seed_id in all_seed_ids
+                    if seed_id not in mismatch_ids
+                    and (
+                        seed_id in submitted_templates
+                        or seed_id in existing_templates
+                    )
+                ],
+                "updated_at": utc_now_iso(),
+            }
+            self.repo.save_attribute_template_result(
+                run_id,
+                retained_template_payload,
+            )
+
+            for seed_id in mismatch_seed_ids:
+                self._prune_excluded_product_artifacts(run_id, seed_id)
+            for filename in (
+                "attribute_template_contract.json",
+                "ozon_collection_contract.json",
+                "ozon_collection_draft.json",
+                "supplier_review.json",
+            ):
+                (self.repo.run_dir(run_id) / filename).unlink(missing_ok=True)
+
+            pending_ids = {
+                str(seed_id).strip()
+                for seed_id in run.get("replacement_pending_seed_ids") or []
+                if str(seed_id).strip()
+            }
+            pending_ids.update(mismatch_seed_ids)
+            run["replacement_pending_seed_ids"] = sorted(pending_ids)
+            run["status"] = WorkbenchState.SEED_SELECTED.value
+            run["ozon_collected"] = False
+            run["attribute_template_collected"] = False
+            run["ozon_collection_contract_ready"] = False
+            run["attribute_template_contract_ready"] = False
+            run["browser_task_cancelled"] = False
+            run["browser_task_resumed_at"] = utc_now_iso()
+            for key in (
+                "attribute_template_contract_path",
+                "ozon_collection_contract_path",
+                "supplier_review_path",
+            ):
+                run.pop(key, None)
+            self.repo.save_run(run)
+            event = self.repo.append_run_event(
+                run_id,
+                "attribute_template.category_subject_candidates_retired",
+                "Contradictory Ozon products were blacklisted and queued for exact-slot recollection.",
+                {
+                    "retired_candidates": retired,
+                    "replacement_pending_seed_ids": sorted(pending_ids),
+                    "retained_candidate_count": len(
+                        ozon_payload.get("ozon_candidates", [])
+                    ),
+                },
+            )
+            return Result.success(
+                "workbench.category_subject_candidates_retired",
+                "Contradictory Ozon products were retired and replacement collection was queued.",
+                self._response_payload(
+                    run,
+                    event,
+                    {
+                        "retired_candidates": retired,
+                        "replacement_pending_seed_ids": sorted(pending_ids),
+                    },
+                ),
             )
 
     def _attach_seller_attribute_templates(self, payload: dict[str, Any]) -> dict[str, Any]:
