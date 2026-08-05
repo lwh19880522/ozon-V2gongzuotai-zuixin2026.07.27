@@ -48,8 +48,30 @@ class WorkbenchBackgroundRunnerTests(RuntimeTestCase):
         run = repo.load_run(run_id)
         run["status"] = WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTING.value
         run["attribute_template_contract_ready"] = True
+        run["candidate_slots"] = [
+            {
+                "slot_id": "slot-0001",
+                "seed_id": seed.seed_id,
+                "candidate_revision": 1,
+                "ozon_product_id": "ozon-runner-1",
+            }
+        ]
         repo.save_run(run)
         repo.save_sampled_seeds(run_id, [seed])
+        repo.save_ozon_collection_result(
+            run_id,
+            {
+                "run_id": run_id,
+                "ozon_candidates": [
+                    {
+                        "seed_id": seed.seed_id,
+                        "ozon_product_id": "ozon-runner-1",
+                        "slot_id": "slot-0001",
+                        "candidate_revision": 1,
+                    }
+                ],
+            },
+        )
         worker = FakeAttributeTemplateWorker(run_id, seed.seed_id)
         runner = WorkbenchBackgroundRunner(service, attribute_template_worker=worker)
 
@@ -61,7 +83,7 @@ class WorkbenchBackgroundRunnerTests(RuntimeTestCase):
         self.assertEqual(1, worker.collect_count)
         self.assertFalse(status["running"])
         self.assertEqual("blocked", status["state"])
-        self.assertEqual("collection_worker_required", status["blocked_reason"])
+        self.assertEqual("supplier_review_required", status["blocked_reason"])
         self.assertTrue((repo.run_dir(run_id) / "attribute_template_result.json").exists())
         self.assertIn("attribute_template.ingested", events)
 
@@ -205,6 +227,9 @@ class FakeAttributeTemplateWorker:
                     "seed_templates": [
                         {
                             "seed_id": self.seed_id,
+                            "source_ozon_product_id": "ozon-runner-1",
+                            "slot_id": "slot-0001",
+                            "candidate_revision": 1,
                             "category_candidates": [
                                 {
                                     "category_path": "Красота / Зеркала",

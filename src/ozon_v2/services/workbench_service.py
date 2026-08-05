@@ -285,34 +285,7 @@ class WorkbenchService:
                 data={"run_id": run_id, "rejected_seed_id": rejected_seed_id},
             )
 
-        used_ids = self.repo.load_used_seed_ids()
-        blacklisted_ids = self.repo.load_blacklisted_seed_ids()
-        used_identity_keys = self.repo.load_used_seed_identity_keys()
-        blacklisted_identity_keys = self.repo.load_blacklisted_seed_identity_keys()
-        rejected_attempts = self.repo.load_rejected_seed_attempts(run_id)
-        rejected_ids = {item.get("seed_id") for item in rejected_attempts}
-        sampled_ids = {seed.seed_id for seed in sampled}
-        excluded_ids = used_ids | blacklisted_ids | rejected_ids | sampled_ids
-        excluded_identity_keys = (
-            used_identity_keys
-            | blacklisted_identity_keys
-            | {self.repo.seed_identity_key(seed) for seed in sampled}
-            | {
-                self.repo.seed_identity_key(item.get("seed") or str(item.get("seed_id") or ""))
-                for item in rejected_attempts
-                if item.get("seed") or item.get("seed_id")
-            }
-        )
-        existing_products = self.repo.load_existing_products()
-        eligible: list[SeedProduct] = []
-        for seed in self.repo.load_active_seeds():
-            if seed.seed_id in excluded_ids:
-                continue
-            if self.repo.seed_identity_key(seed) in excluded_identity_keys:
-                continue
-            decision = decide_seed_existing_product_dedupe(seed, existing_products)
-            if decision.kind.value == "clear":
-                eligible.append(seed)
+        eligible = self._eligible_replacement_seeds(run_id, sampled)
         if not eligible:
             return Result.failure(
                 "workbench.exhausted_seed_no_replacement",
@@ -364,6 +337,42 @@ class WorkbenchService:
             ),
         )
 
+    def _eligible_replacement_seeds(
+        self,
+        run_id: str,
+        sampled: list[SeedProduct],
+    ) -> list[SeedProduct]:
+        rejected_attempts = self.repo.load_rejected_seed_attempts(run_id)
+        excluded_ids = (
+            self.repo.load_used_seed_ids()
+            | self.repo.load_blacklisted_seed_ids()
+            | {str(item.get("seed_id") or "") for item in rejected_attempts}
+            | {seed.seed_id for seed in sampled}
+        )
+        excluded_identity_keys = (
+            self.repo.load_used_seed_identity_keys()
+            | self.repo.load_blacklisted_seed_identity_keys()
+            | {self.repo.seed_identity_key(seed) for seed in sampled}
+            | {
+                self.repo.seed_identity_key(
+                    item.get("seed") or str(item.get("seed_id") or "")
+                )
+                for item in rejected_attempts
+                if item.get("seed") or item.get("seed_id")
+            }
+        )
+        existing_products = self.repo.load_existing_products()
+        eligible: list[SeedProduct] = []
+        for seed in self.repo.load_active_seeds():
+            if seed.seed_id in excluded_ids:
+                continue
+            if self.repo.seed_identity_key(seed) in excluded_identity_keys:
+                continue
+            decision = decide_seed_existing_product_dedupe(seed, existing_products)
+            if decision.kind.value == "clear":
+                eligible.append(seed)
+        return eligible
+
     def ingest_attribute_template_result(self, run_id: str, payload: dict[str, Any]) -> Result:
         run = self.repo.load_run(run_id)
         if WorkbenchState(run["status"]) != WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTING:
@@ -394,6 +403,17 @@ class WorkbenchService:
             all_seed_ids,
             result_kind="attribute_template",
         )
+        template_items = [
+            item
+            for item in payload.get("seed_templates", [])
+            if isinstance(item, dict)
+        ]
+        full_current_snapshot = self._is_full_current_seed_snapshot(
+            template_items,
+            all_seed_ids,
+        )
+        if full_current_snapshot:
+            expected_seed_ids = all_seed_ids
         errors = validate_attribute_template_result(payload, expected_seed_ids)
         if errors:
             event = self.repo.append_run_event(
@@ -499,7 +519,7 @@ class WorkbenchService:
                     stale_errors,
                 )
             run = current_run
-            if run.get("replacement_pending_seed_ids"):
+            if run.get("replacement_pending_seed_ids") and not full_current_snapshot:
                 try:
                     existing_payload = self.repo.load_attribute_template_result(run_id)
                 except FileNotFoundError:
@@ -651,11 +671,56 @@ class WorkbenchService:
                 )
                 for seed_id in mismatch_seed_ids
             }
+            sampled = self._safe_load_sampled_seeds(run_id)
+            sampled_by_seed = {seed.seed_id: seed for seed in sampled}
+            slots_by_seed = self._ensure_candidate_slots(run, sampled)
+            seed_ids_requiring_replacement = [
+                seed_id
+                for seed_id in mismatch_seed_ids
+                if int((slots_by_seed.get(seed_id) or {}).get("candidate_revision") or 1)
+                >= 2
+            ]
+            replacement_by_seed: dict[str, SeedProduct] = {}
+            replacement_random_seed: int | None = None
+            if seed_ids_requiring_replacement:
+                eligible = self._eligible_replacement_seeds(run_id, sampled)
+                if len(eligible) < len(seed_ids_requiring_replacement):
+                    event = self.repo.append_run_event(
+                        run_id,
+                        "attribute_template.category_subject_replacement_unavailable",
+                        "Repeated category conflicts exhausted their seed slots, but no safe replacement seed remains.",
+                        {
+                            "mismatch_seed_ids": mismatch_seed_ids,
+                            "replacement_required_seed_ids": seed_ids_requiring_replacement,
+                            "eligible_replacement_count": len(eligible),
+                        },
+                    )
+                    return Result.failure(
+                        "workbench.category_subject_replacement_unavailable",
+                        "Repeated category conflicts require fresh seeds, but the eligible seed pool is exhausted.",
+                        errors=subject_errors,
+                        data=self._response_payload(run, event),
+                    )
+                replacement_random_seed = random.SystemRandom().randint(
+                    1,
+                    2**31 - 1,
+                )
+                replacements = self.repo.sample_seeds(
+                    eligible,
+                    len(seed_ids_requiring_replacement),
+                    replacement_random_seed,
+                )
+                replacement_by_seed = dict(
+                    zip(seed_ids_requiring_replacement, replacements)
+                )
+
             retired: list[dict[str, Any]] = []
             for seed_id in mismatch_seed_ids:
                 candidate = candidates[seed_id]
                 product_id = str(candidate.get("ozon_product_id") or "").strip()
                 reason = reason_by_seed[seed_id]
+                replacement = replacement_by_seed.get(seed_id)
+                replacement_seed_id = replacement.seed_id if replacement else seed_id
                 self.repo.append_ozon_product_blacklist(
                     run_id,
                     product_id,
@@ -666,19 +731,47 @@ class WorkbenchService:
                 slot = self._replace_candidate_slot(
                     run,
                     rejected_seed_id=seed_id,
-                    replacement_seed_id=seed_id,
+                    replacement_seed_id=replacement_seed_id,
                     rejected_ozon_product_id=product_id,
                     reason=reason,
                 )
+                if replacement is not None:
+                    rejected_seed = sampled_by_seed[seed_id]
+                    self.repo.append_rejected_seed_attempt(
+                        run_id,
+                        rejected_seed,
+                        reason,
+                        replacement.seed_id,
+                    )
                 retired.append(
                     {
                         "seed_id": seed_id,
+                        "replacement_seed_id": replacement_seed_id,
                         "ozon_product_id": product_id,
                         "slot_id": slot["slot_id"],
                         "candidate_revision": slot["candidate_revision"],
                         "reason": reason,
                     }
                 )
+
+            if replacement_by_seed:
+                sampled = [
+                    replacement_by_seed.get(seed.seed_id, seed)
+                    for seed in sampled
+                ]
+                replacements = list(replacement_by_seed.values())
+                self.repo.save_sampled_seeds(run_id, sampled)
+                self.repo.append_used_seeds(
+                    run_id,
+                    replacements,
+                    "workbench_category_subject_replacement_sampled",
+                )
+                run["sampled_seed_ids"] = [seed.seed_id for seed in sampled]
+                run["rejected_seed_ids"] = [
+                    item.get("seed_id")
+                    for item in self.repo.load_rejected_seed_attempts(run_id)
+                ]
+                self._update_query_summary(run, sampled)
 
             mismatch_ids = set(mismatch_seed_ids)
             ozon_payload["ozon_candidates"] = [
@@ -737,11 +830,9 @@ class WorkbenchService:
                 (self.repo.run_dir(run_id) / filename).unlink(missing_ok=True)
 
             pending_ids = {
-                str(seed_id).strip()
-                for seed_id in run.get("replacement_pending_seed_ids") or []
-                if str(seed_id).strip()
+                replacement_by_seed.get(seed_id, sampled_by_seed[seed_id]).seed_id
+                for seed_id in mismatch_seed_ids
             }
-            pending_ids.update(mismatch_seed_ids)
             run["replacement_pending_seed_ids"] = sorted(pending_ids)
             run["status"] = WorkbenchState.SEED_SELECTED.value
             run["ozon_collected"] = False
@@ -764,6 +855,7 @@ class WorkbenchService:
                 {
                     "retired_candidates": retired,
                     "replacement_pending_seed_ids": sorted(pending_ids),
+                    "replacement_random_seed": replacement_random_seed,
                     "retained_candidate_count": len(
                         ozon_payload.get("ozon_candidates", [])
                     ),
@@ -1634,6 +1726,12 @@ class WorkbenchService:
             for item in payload.get("ozon_candidates", [])
             if isinstance(item, dict)
         ]
+        full_current_snapshot = self._is_full_current_seed_snapshot(
+            candidate_items,
+            all_seed_ids,
+        )
+        if full_current_snapshot:
+            expected_seed_ids = all_seed_ids
         frozen_excluded_ids = self._frozen_contract_excluded_ozon_ids(run_id)
         frozen_conflicts = [
             {
@@ -1713,7 +1811,7 @@ class WorkbenchService:
                     stale_errors,
                 )
             run = current_run
-            if run.get("replacement_pending_seed_ids"):
+            if run.get("replacement_pending_seed_ids") and not full_current_snapshot:
                 try:
                     existing_payload = self.repo.load_ozon_collection_result(run_id)
                 except FileNotFoundError:
@@ -7833,8 +7931,9 @@ class WorkbenchService:
             "existing_store_dedupe": self.repo.existing_store_dedupe_status(),
         }
 
-    def _ozon_collection_progress(self, run: dict, seeds: list[SeedProduct]) -> dict[str, int]:
+    def _ozon_collection_progress(self, run: dict, seeds: list[SeedProduct]) -> dict[str, Any]:
         total = len(seeds)
+        expected_seed_ids = {seed.seed_id for seed in seeds}
         bridge = self.repo.load_browser_bridge_status()
         live: dict[str, Any] = {}
         if (
@@ -7864,23 +7963,40 @@ class WorkbenchService:
             )
         } - {""}) - replaced
 
+        durable_candidates: list[dict[str, Any]] = []
         final_path = self.repo.run_dir(run["run_id"]) / "ozon_collection_result.json"
         if final_path.exists():
-            success = len(self.repo.load_ozon_collection_result(run["run_id"]).get("ozon_candidates", []))
+            final_candidates = [
+                candidate
+                for candidate in self.repo.load_ozon_collection_result(
+                    run["run_id"]
+                ).get("ozon_candidates", [])
+                if isinstance(candidate, dict)
+            ]
+            durable_candidates = [
+                candidate
+                for candidate in final_candidates
+                if str(candidate.get("seed_id") or "") in expected_seed_ids
+            ]
+            success = len(final_candidates)
         else:
             draft_path = self.repo.run_dir(run["run_id"]) / "ozon_collection_draft.json"
             durable_seed_ids: set[str] = set()
             if draft_path.exists():
                 try:
                     draft = self.repo.load_ozon_collection_draft(run["run_id"])
-                    expected_seed_ids = {seed.seed_id for seed in seeds}
-                    durable_seed_ids = {
-                        str(candidate.get("seed_id") or "")
+                    durable_candidates = [
+                        candidate
                         for candidate in draft.get("ozon_candidates", [])
                         if isinstance(candidate, dict)
                         and str(candidate.get("seed_id") or "") in expected_seed_ids
+                    ]
+                    durable_seed_ids = {
+                        str(candidate.get("seed_id") or "")
+                        for candidate in durable_candidates
                     }
                 except (json.JSONDecodeError, OSError, TypeError, ValueError):
+                    durable_candidates = []
                     durable_seed_ids = set()
             if durable_seed_ids:
                 success = len(durable_seed_ids)
@@ -7892,6 +8008,48 @@ class WorkbenchService:
         success = min(total, max(0, success))
         failure = min(len(failed), max(total - success, 0))
         processed = min(total, success + failure)
+        template_validated_count = 0
+        if durable_candidates:
+            try:
+                template_payload = self.repo.load_attribute_template_result(
+                    run["run_id"]
+                )
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                template_payload = {}
+            templates_by_seed = {
+                str(item.get("seed_id") or ""): item
+                for item in template_payload.get("seed_templates", [])
+                if isinstance(item, dict) and item.get("seed_id")
+            }
+            for candidate in durable_candidates:
+                seed_id = str(candidate.get("seed_id") or "")
+                template = templates_by_seed.get(seed_id) or {}
+                try:
+                    candidate_revision = int(
+                        candidate.get("candidate_revision") or 0
+                    )
+                    template_revision = int(
+                        template.get("candidate_revision") or 0
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    str(template.get("source_ozon_product_id") or "")
+                    == str(candidate.get("ozon_product_id") or "")
+                    and str(template.get("slot_id") or "")
+                    == str(candidate.get("slot_id") or "")
+                    and candidate_revision > 0
+                    and template_revision == candidate_revision
+                ):
+                    template_validated_count += 1
+        collection_complete = total > 0 and success == total and failure == 0
+        template_pending_count = max(total - template_validated_count, 0)
+        stage_complete = bool(
+            collection_complete
+            and template_validated_count == total
+            and run.get("attribute_template_collected")
+            and not run.get("replacement_pending_seed_ids")
+        )
         return {
             "total_count": total,
             "processed_count": processed,
@@ -7899,6 +8057,10 @@ class WorkbenchService:
             "failure_count": failure,
             "replacement_count": len(replaced),
             "pending_count": max(total - processed, 0),
+            "collection_complete": collection_complete,
+            "template_validated_count": template_validated_count,
+            "template_pending_count": template_pending_count,
+            "stage_complete": stage_complete,
         }
 
     def _run_progress(self, run: dict) -> dict:
@@ -8091,6 +8253,21 @@ class WorkbenchService:
         if not required_retained_ids.issubset(retained_seed_ids):
             return all_seed_ids
         return pending_ids
+
+    @staticmethod
+    def _is_full_current_seed_snapshot(
+        items: list[dict[str, Any]],
+        all_seed_ids: list[str],
+    ) -> bool:
+        submitted_seed_ids = [
+            str(item.get("seed_id") or "").strip()
+            for item in items
+        ]
+        return bool(
+            all_seed_ids
+            and len(submitted_seed_ids) == len(all_seed_ids)
+            and set(submitted_seed_ids) == set(all_seed_ids)
+        )
 
     def _build_supplier_review(
         self,

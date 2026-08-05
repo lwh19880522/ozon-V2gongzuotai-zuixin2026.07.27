@@ -71,7 +71,7 @@ class ImageWorkflowServiceTests(RuntimeTestCase):
                                 "set_composition": ["set x4"],
                                 "price": {"currency": "CNY", "amount": "18.80"},
                                 "stock": {"status": "in_stock", "quantity": 100},
-                                "image_urls": [self.subject_url],
+                                "image_urls": [self.subject_url, self.gallery_url],
                                 "evidence_source": "trusted_sku_map",
                                 "complete": True,
                                 "evidence": {"source": "trusted_sku_map"},

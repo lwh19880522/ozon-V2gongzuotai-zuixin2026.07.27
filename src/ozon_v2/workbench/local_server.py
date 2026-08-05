@@ -884,6 +884,12 @@ def build_home_html() -> str:
       const pending = Math.max(0, Number(value.pending_count ?? (total - processed)) || 0);
       const successPercent = total ? success / total * 100 : 0;
       const failurePercent = total ? failure / total * 100 : 0;
+      const collectionComplete = Boolean(value.collection_complete);
+      const stageComplete = Boolean(value.stage_complete);
+      const templateValidated = Math.min(
+        total,
+        Math.max(0, Number(value.template_validated_count) || 0)
+      );
       $("ozonProcessed").textContent = !hasProgress
         ? "当前没有正在采集的批次"
         : !total
@@ -891,6 +897,13 @@ def build_home_html() -> str:
           : pending === 0
             ? `采集完成 ${processed} / ${total}`
             : `实时已保存 ${success} / ${total} · 已处理 ${processed}`;
+      if (hasProgress && total && collectionComplete) {
+        $("ozonProcessed").textContent = stageComplete
+          ? `采集与类目校验完成 ${success} / ${total}`
+          : `Ozon 页面采集完成 ${success} / ${total} · 类目校验 ${templateValidated} / ${total}`;
+      } else if (hasProgress && total && pending === 0 && failure > 0) {
+        $("ozonProcessed").textContent = `Ozon 页面处理完成 ${processed} / ${total} · 失败 ${failure}`;
+      }
       $("ozonSucceeded").textContent = String(success);
       $("ozonFailed").textContent = String(failure);
       $("ozonReplaced").textContent = String(Math.max(0, Number(value.replacement_count) || 0));

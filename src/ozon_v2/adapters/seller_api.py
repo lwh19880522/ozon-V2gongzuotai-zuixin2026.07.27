@@ -528,18 +528,42 @@ def _token_keys(value: str) -> set[str]:
     return {token for token in value.split() if len(token) >= 3}
 
 
+_CATEGORY_COMPOUND_PREFIXES = (
+    "авто",
+    "вело",
+    "макси",
+    "мини",
+    "мото",
+    "термо",
+    "фото",
+    "электро",
+)
+
+
+def _category_token_variants(value: str) -> set[str]:
+    variants = {value}
+    for prefix in _CATEGORY_COMPOUND_PREFIXES:
+        if value.startswith(prefix) and len(value) - len(prefix) >= 4:
+            variants.add(value[len(prefix) :])
+    return variants
+
+
 def _category_tokens_match(left: str, right: str) -> bool:
-    if left == right:
-        return True
-    shorter = min(len(left), len(right))
-    if shorter < 5:
-        return False
-    common_prefix = 0
-    for left_char, right_char in zip(left, right):
-        if left_char != right_char:
-            break
-        common_prefix += 1
-    return common_prefix >= shorter - 1
+    for left_variant in _category_token_variants(left):
+        for right_variant in _category_token_variants(right):
+            if left_variant == right_variant:
+                return True
+            shorter = min(len(left_variant), len(right_variant))
+            if shorter < 5:
+                continue
+            common_prefix = 0
+            for left_char, right_char in zip(left_variant, right_variant):
+                if left_char != right_char:
+                    break
+                common_prefix += 1
+            if common_prefix >= shorter - 1:
+                return True
+    return False
 
 
 def _category_title_match_score(title_key: str, node_leaf_key: str) -> int:

@@ -135,8 +135,8 @@ unselected variants, prior scenes, or conversation images. Do not use
     gateway, replaces the exact Ozon gallery and submits video fields. An
     unbound package moves to `image_tasks/awaiting_product` with its generated
     media intact; after exact binding it returns as `upload_only` and must reuse
-    those files without regeneration or recropping. End only when `pending` =
-    0, `grid_ready` = 0 and `in_progress` = 0, then run `media-stop`.
+    those files without regeneration or recropping. End only when `pending` = 0,
+    `grid_ready` = 0 and `in_progress` = 0, then run `media-stop`.
 
 ## Repair and stop gates
 
