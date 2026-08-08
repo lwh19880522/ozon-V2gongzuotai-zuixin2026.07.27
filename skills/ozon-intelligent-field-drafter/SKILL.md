@@ -1,15 +1,16 @@
 ---
 name: ozon-intelligent-field-drafter
-description: Build auditable Russian Ozon V2 Seller API field drafts from collected Ozon evidence, confirmed 1688 product facts, and the complete user-locked supplier SKU. Use for required-field-first completion, batch field drafting, objective attribute completion, Russian title/description/Rich Content creation, classified evidence gaps, and retrying rejected field decisions before upload; manual required-field handoff is allowed only after evidence-exhausted unresolved decisions.
+description: Build auditable Russian Ozon V2 Seller API field drafts from official Seller API templates and locked 1688 supplier truth, using Ozon only as a Russian market-writing reference. Use for required-field-first completion, batch field drafting, objective attribute completion, Russian title/description/Rich Content creation, classified evidence gaps, and retrying rejected field decisions before upload; manual required-field handoff is allowed only after evidence-exhausted unresolved decisions.
 ---
 
 # Ozon Intelligent Field Drafter
 
 ## Core contract
 
-Complete one Ozon V2 batch through the workbench field-task API. Use Ozon as a
-Russian structure and terminology reference. Use the confirmed 1688 product and
-the complete locked supplier SKU as product truth. Translate or normalize a
+Complete one Ozon V2 batch through the workbench field-task API. Treat the
+Seller API template as the field contract, Ozon only as a Russian structure and
+terminology reference, and the confirmed 1688 product plus complete locked SKU
+as the sole product truth. Translate or normalize a
 verified fact without changing its meaning; never copy Chinese customer-facing
 text into a Russian Ozon field.
 
@@ -28,18 +29,15 @@ fields.
    deterministic mappings. Do not spend model decisions recreating fixed
    country, approved no-brand, seller-code, pricing/package, or locked-SKU
    quantity values. It also fixes
-   `workflow.defaults.disable_product_grouping=Нет` and may use
-   `ozon.category_path.leaf` as a low-priority type fallback when no more
-   specific verified type exists.
+   `workflow.defaults.disable_product_grouping=Нет`.
    Ozon marking-code and similar compliance decisions are not Skill inference.
    The workbench exposes them as a dedicated boolean confirmation and omits
    them from `field_tasks`; never invent or submit a compliance value.
 4. For every pending entry in `field_tasks`, inspect its
    `candidate_evidence_refs`, then
    verify the referenced values in `evidence_index`. Read the full evidence when
-   candidates are incomplete. The collected structured Ozon attributes remain
-   active evidence for terminology and objective non-identity facts whenever
-   the locked 1688 SKU or supplier attributes do not contradict them.
+   candidates are incomplete. Ozon title, attributes, category, SKU, and prose
+   are reference-only and must not fill any identity or objective field.
 5. When any pending field has `visual_inference_supported=true`, run:
 
    ```powershell
@@ -81,8 +79,8 @@ fields.
      advertising must never enter the Ozon customer-facing value.
    - Before returning `unresolved` for a required field, exhaust this checklist:
      inspect all `candidate_evidence_refs`; search the full `evidence_index`;
-     inspect `confirmed_supplier_sku`, supplier attributes, structured Ozon
-     attributes, allowed dictionary values, and every permitted locked visual
+     inspect `confirmed_supplier_sku`, supplier attributes, allowed dictionary
+     values, and every permitted locked visual
      reference. Translate and normalize verified facts instead of treating them
      as absent. Do not infer prohibited regulatory, certification, warranty,
      customs, or measurement facts.
@@ -166,7 +164,7 @@ Visual fact after actual image inspection:
 Unavailable source fact:
 
 ```json
-{"decision":"unresolved","resolution_class":"source_fact_missing","reason":"Neither collected Ozon evidence nor confirmed 1688 evidence states the warranty.","evidence_refs":[]}
+{"decision":"unresolved","resolution_class":"source_fact_missing","reason":"The locked 1688 supplier truth does not state the warranty.","evidence_refs":[]}
 ```
 
 Creative fields may be strings, but prefer structured `decision=filled` values
@@ -212,6 +210,8 @@ Use exactly one for every unresolved field:
 - A filled visual decision requires `visual_analysis.result=observed`. An
   unresolved visual decision requires `not_visible`, `ambiguous`, or `conflict`.
 - For `supplier_truth_required`, cite `supplier.*` or `supplier_selection.*`.
+- Never cite `ozon.*` as proof for an identity or objective field. Ozon evidence
+  may be cited only for creative Russian structure or terminology reference.
 - Translate verified Chinese descriptive values into natural Russian for
   customer-facing model, type, color, material, package, and similar fields.
 - Supplier fulfillment and sales promises are not product attributes. Remove

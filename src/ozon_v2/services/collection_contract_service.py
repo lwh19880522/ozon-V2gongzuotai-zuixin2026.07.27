@@ -7,6 +7,7 @@ from ozon_v2.adapters.playwright_mcp_contract import PlaywrightMcpContractAdapte
 from ozon_v2.app.result import Result
 from ozon_v2.domain.models import CollectionPair
 from ozon_v2.domain.policies import seed_has_generated_ozon_query
+from ozon_v2.domain.seed_subject import build_seed_subject_contract
 
 
 REQUIRED_PUBLIC_CONTENT_SCORE_FIELDS = [
@@ -250,6 +251,7 @@ class CollectionContractService:
         identities = self._candidate_identities(run_id)
         payload = {
             "run_id": run_id,
+            "ozon_evidence_role": "market_reference",
             "rules": {
                 "single_sku_only": True,
                 "do_not_search_raw_chinese_seed_text": True,
@@ -283,6 +285,11 @@ class CollectionContractService:
                     "source_text_zh": seed.title_or_keyword,
                     "ozon_query_terms_ru": seed.ozon_query_terms_ru,
                     "auxiliary_query_terms_en": seed.auxiliary_query_terms_en,
+                    "seed_subject_contract": build_seed_subject_contract(
+                        seed_id=seed.seed_id,
+                        source_text_zh=seed.title_or_keyword,
+                        queries_ru=seed.ozon_query_terms_ru,
+                    ),
                 }
                 for seed in seeds
             ],

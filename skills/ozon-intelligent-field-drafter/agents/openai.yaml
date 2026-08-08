@@ -1,4 +1,4 @@
 interface:
   display_name: "Ozon Intelligent Field Drafter"
   short_description: "Complete required Ozon fields before upload"
-  default_prompt: "Use $ozon-intelligent-field-drafter to complete required fields first from locked evidence, inspect permitted visual evidence, and hand only evidence-exhausted manual_required_fields to the user before upload."
+  default_prompt: "Use $ozon-intelligent-field-drafter to complete the official Seller API template from locked 1688 supplier truth, use Ozon only as a Russian writing reference, inspect permitted visual evidence, and hand only evidence-exhausted manual_required_fields to the user before upload."

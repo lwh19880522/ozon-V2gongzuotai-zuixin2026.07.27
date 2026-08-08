@@ -1,11 +1,11 @@
 "use strict";
 
-const BASE_URL = "http://127.0.0.1:8765";
-const STATE_KEY = "ozon_v2_browser_bridge_state";
-const STATE_SCHEMA_VERSION = 6;
-const EXTENSION_VERSION = chrome.runtime.getManifest().version;
-const API_TIMEOUT_MS = Number(globalThis.OZON_V2_API_TIMEOUT_MS) || 15000;
-let activeRunPromise = null;
+var BASE_URL = "http://127.0.0.1:8765";
+var STATE_KEY = "ozon_v2_browser_bridge_state";
+var STATE_SCHEMA_VERSION = 6;
+var EXTENSION_VERSION = chrome.runtime.getManifest().version;
+var API_TIMEOUT_MS = Number(globalThis.OZON_V2_API_TIMEOUT_MS) || 15000;
+var activeRunPromise = null;
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message && message.type === "ozon_v2_content_ping") {
@@ -87,7 +87,7 @@ async function heartbeat(payload = {}) {
         extension_version: EXTENSION_VERSION,
         url: location.href,
         run_id: payload.run_id || null,
-        task_type: payload.task_type || "ozon_attribute_template",
+        task_type: payload.task_type || "ozon_collection",
         stage: payload.stage || null,
         code: payload.code || null,
         message: payload.message || null,
@@ -270,21 +270,6 @@ async function requireChineseCrossBorderDetail(
   return { accepted: false, navigating: false, decision };
 }
 
-function attributeFromLabel(label, index) {
-  const normalized = String(label || "").trim();
-  const key = normalized.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "_").replace(/^_+|_+$/g, "");
-  return {
-    attribute_id: key || `visible_attribute_${index + 1}`,
-    attribute_label: normalized || `Visible attribute ${index + 1}`,
-    attribute_type: "text",
-    is_required: false,
-    allowed_values: [],
-    unit: null,
-    group: "visible_attributes",
-    example_value_when_visible: null,
-  };
-}
-
 function searchUrl(query) {
   const evidence = globalThis.OzonV2ProductEvidence;
   const scopedQuery = evidence && typeof evidence.crossBorderSearchQuery === "function"
@@ -326,7 +311,7 @@ async function waitForSearchEvidence(runId, timeoutMs = 120000) {
     if (searchLinks.all.length >= 8 || (firstResultsAt !== null && Date.now() - firstResultsAt >= 5000)) {
       const productLinks = globalThis.OzonV2ProductEvidence
         && typeof globalThis.OzonV2ProductEvidence.selectSearchCandidates === "function"
-        ? globalThis.OzonV2ProductEvidence.selectSearchCandidates(searchLinks.all, 8)
+        ? globalThis.OzonV2ProductEvidence.selectSearchCandidates(searchLinks.all, 3)
         : searchLinks.all.slice(0, 8);
       return {
         url: location.href,
@@ -351,7 +336,7 @@ async function waitForSearchEvidence(runId, timeoutMs = 120000) {
     title: document.title,
     productLinks: globalThis.OzonV2ProductEvidence
       && typeof globalThis.OzonV2ProductEvidence.selectSearchCandidates === "function"
-      ? globalThis.OzonV2ProductEvidence.selectSearchCandidates(searchProductLinks(24).all, 8)
+      ? globalThis.OzonV2ProductEvidence.selectSearchCandidates(searchProductLinks(24).all, 3)
       : searchProductLinks(24).all.slice(0, 8),
     allProductLinkCount: searchProductLinks(24).all.length,
     categoryLinks: links('a[href*="/category/"]', 12),
@@ -669,14 +654,6 @@ function loadState(runId, taskType, dispatchToken, seeds = []) {
       && (!taskType || state.taskType === taskType);
     if (!matchesTask) return null;
     if (state.dispatchToken === dispatchToken) return state;
-    const evidence = globalThis.OzonV2ProductEvidence;
-    if (
-      taskType === "ozon_attribute_template"
-      && evidence
-      && typeof evidence.reconcileTemplateProgress === "function"
-    ) {
-      return evidence.reconcileTemplateProgress(state, seeds, dispatchToken);
-    }
     return null;
   } catch (_) {
     return null;
@@ -685,49 +662,6 @@ function loadState(runId, taskType, dispatchToken, seeds = []) {
 
 function saveState(state) {
   sessionStorage.setItem(STATE_KEY, JSON.stringify({ ...state, schemaVersion: STATE_SCHEMA_VERSION }));
-}
-
-function buildTemplate(seed, query, searchEvidence, detailEvidence, sellerDecision) {
-  const snapshot = detailEvidence.snapshot;
-  const categoryLinks = snapshot.category_links || [];
-  const productLinks = searchEvidence.productLinks || [];
-  const visibleSchemaGuess = Object.keys(snapshot.attributes || {})
-    .slice(0, 12)
-    .map(attributeFromLabel);
-  return {
-    seed_id: seed.seed_id,
-    slot_id: seed.slot_id,
-    candidate_revision: seed.candidate_revision,
-    source_ozon_product_id: String(seed.source_ozon_product_id || ""),
-    source_query: query,
-    category_candidates: [
-      {
-        category_path: snapshot.category_path,
-        leaf_category: snapshot.leaf_category,
-        category_url: snapshot.category_url,
-        category_id: snapshot.category_id,
-        confidence: "high",
-        source_evidence: "Ozon product breadcrumb evidence",
-      },
-    ],
-    public_attribute_evidence: {
-      attribute_labels: Object.keys(snapshot.attributes || {}),
-      attribute_table: snapshot.attributes,
-      visible_public_schema_guess: visibleSchemaGuess,
-      note: "Public Ozon page evidence only. Server must replace upload_attribute_schema with Seller API category template.",
-    },
-    evidence: {
-      search_url: searchEvidence.url,
-      search_title: searchEvidence.title,
-      product_url: detailEvidence.url,
-      product_title: detailEvidence.title,
-      public_product_snapshot: snapshot,
-      product_links_seen: productLinks.map((item) => item.href).slice(0, 8),
-      bridge_url: location.href,
-      has_challenge: hasChallenge(),
-      domestic_seller_decision: sellerDecision,
-    },
-  };
 }
 
 function productIdFromPage(url) {
@@ -764,8 +698,14 @@ function ratingText() {
 
 function buildOzonCandidate(seed, query, searchEvidence, detailEvidence, sellerDecision) {
   const snapshot = detailEvidence.snapshot;
+  const subjectMatchEvidence = globalThis.OzonV2ProductEvidence.evaluateSeedSubject(
+    seed.seed_subject_contract || {},
+    snapshot,
+  );
   return {
     seed_id: seed.seed_id,
+    slot_id: seed.slot_id,
+    candidate_revision: seed.candidate_revision,
     seed_title_or_keyword: seed.source_text_zh || seed.title_or_keyword || "",
     seed_source_language: "zh-CN",
     ozon_query_terms_ru: seed.ozon_query_terms_ru || [query],
@@ -809,6 +749,7 @@ function buildOzonCandidate(seed, query, searchEvidence, detailEvidence, sellerD
     fulfillment_label: snapshot.fulfillment_label,
     attributes: snapshot.attributes,
     domestic_seller_decision: sellerDecision,
+    subject_match_evidence: subjectMatchEvidence,
     hot_product_evidence: {
       rating: snapshot.rating,
       review_count: snapshot.review_count,
@@ -851,33 +792,6 @@ function buildOzonCandidate(seed, query, searchEvidence, detailEvidence, sellerD
   };
 }
 
-async function submit(runId, ingestUrl, templates, dispatchToken) {
-  await heartbeat({
-    run_id: runId,
-    stage: "submitting",
-    code: "bridge.submitting",
-    message: "Submitting Ozon attribute template evidence to workbench.",
-  });
-  const result = await api(ingestUrl, {
-    method: "POST",
-    body: JSON.stringify({
-      run_id: runId,
-      worker: "workbench_browser_bridge",
-      source: "ozon_browser_extension_content_script",
-      dispatch_token: dispatchToken,
-      seed_templates: templates,
-    }),
-  });
-  sessionStorage.removeItem(STATE_KEY);
-  await heartbeat({
-    run_id: runId,
-    stage: "submitted",
-    code: "bridge.submitted",
-    message: "Ozon attribute template evidence submitted to workbench.",
-  });
-  return result;
-}
-
 async function submitOzonCollection(runId, ingestUrl, state, totalCount) {
   await heartbeat({
     run_id: runId,
@@ -893,6 +807,7 @@ async function submitOzonCollection(runId, ingestUrl, state, totalCount) {
       run_id: runId,
       worker: "workbench_browser_bridge",
       source: "ozon_browser_extension_content_script",
+      task_type: "ozon_collection",
       dispatch_token: state.dispatchToken,
       ozon_candidates: state.candidates,
     }),
@@ -966,6 +881,8 @@ async function checkpointOzonCandidate(task, candidate) {
       run_id: task.data.run_id,
       worker: "workbench_browser_bridge",
       source: "ozon_browser_extension_content_script",
+      task_type: "ozon_collection",
+      dispatch_token: task.data.dispatch_token,
       ozon_candidate: candidate,
     }),
   });
@@ -992,13 +909,14 @@ async function runOzonCollection(task) {
   const runId = task.data.run_id;
   const seeds = task.data.contract.payload.seeds || [];
   const excludedProductIds = task.data.contract.payload.excluded_ozon_product_ids || [];
+  const productEvidence = globalThis.OzonV2ProductEvidence;
   const sessionState = loadState(runId, "ozon_collection", task.data.dispatch_token);
   let state = reconcileOzonCollectionState(task, sessionState);
   while (state.stage === "search" && state.seedIndex < seeds.length) {
     const reusableSeed = seeds[state.seedIndex];
     const snapshot = reusableSeed.public_product_snapshot;
     const decision = reusableSeed.domestic_seller_decision || {};
-    const evidence = globalThis.OzonV2ProductEvidence;
+    const evidence = productEvidence;
     const reusableQuery = (reusableSeed.ozon_query_terms_ru || [])[0] || reusableSeed.source_text_zh || "";
     if (
       !snapshot
@@ -1007,7 +925,7 @@ async function runOzonCollection(task) {
       || decision.confidence !== "high"
       || (evidence && evidence.hasUsedProductId(state.candidates, snapshot.product_id))
       || (evidence && evidence.isExcludedProductId(excludedProductIds, snapshot.product_id))
-      || (evidence && !evidence.matchesQueryIntent([reusableQuery], snapshot))
+      || (evidence && !evidence.evaluateSeedSubject(reusableSeed.seed_subject_contract || {}, snapshot).accepted)
     ) break;
     const candidate = buildOzonCandidate(
       reusableSeed,
@@ -1050,6 +968,14 @@ async function runOzonCollection(task) {
       return { ok: true, code: "bridge.ozon_collection_navigating_search" };
     }
     state.searchEvidence = await waitForSearchEvidence(runId);
+    if (productEvidence && typeof productEvidence.evaluateSeedSubject === "function") {
+      state.searchEvidence.productLinks = state.searchEvidence.productLinks
+        .filter((item) => productEvidence.evaluateSeedSubject(seed.seed_subject_contract || {}, {
+          title: item.text,
+          card_text: item.card_text,
+        }).accepted)
+        .slice(0, 3);
+    }
     if (!state.searchEvidence.productLinks.length || state.searchEvidence.hasChallenge) {
       await heartbeat({
         run_id: runId,
@@ -1081,9 +1007,13 @@ async function runOzonCollection(task) {
     saveState(state);
     return { ok: false, code: "bridge.ozon_collection_detail_blocked" };
   }
-  const evidence = globalThis.OzonV2ProductEvidence;
+  const evidence = productEvidence;
   const detailProductId = detailEvidence.snapshot && detailEvidence.snapshot.product_id;
-  if (evidence && !evidence.matchesQueryIntent([query], detailEvidence.snapshot || {})) {
+  const subjectMatch = evidence && evidence.evaluateSeedSubject(
+    seed.seed_subject_contract || {},
+    detailEvidence.snapshot || {},
+  );
+  if (subjectMatch && !subjectMatch.accepted) {
     const relevanceCheck = await requireChineseCrossBorderDetail(
       state,
       runId,
@@ -1175,108 +1105,8 @@ async function run() {
   if (task.code === "browser_task.ozon_collection_ready") {
     return await runOzonCollection(task);
   }
-  if (task.code !== "browser_task.attribute_template_ready") {
-    await heartbeat({ stage: "idle", code: task.code, message: task.message });
-    return { ok: true, code: task.code };
-  }
-  const runId = task.data.run_id;
-  const seeds = task.data.contract.payload.seeds || [];
-  let state = loadState(runId, "ozon_attribute_template", task.data.dispatch_token, seeds) || {
-    runId,
-    taskType: "ozon_attribute_template",
-    dispatchToken: task.data.dispatch_token,
-    seedIndex: 0,
-    stage: "detail",
-    templates: [],
-    searchEvidence: null,
-    productLinkIndex: 0,
-    rejectedCandidates: [],
-  };
-  const seed = seeds[state.seedIndex];
-  if (!seed) {
-    return await submit(
-      runId,
-      task.data.ingest_url,
-      state.templates,
-      state.dispatchToken,
-    );
-  }
-  const query = (seed.ozon_query_terms_ru || [])[0] || seed.source_text_zh || "";
-  await heartbeat({
-    run_id: runId,
-    stage: state.stage,
-    code: "bridge.running",
-    message: `Collecting seed ${state.seedIndex + 1} of ${seeds.length}.`,
-  });
-  const lockedProduct = seed.locked_ozon_product || {};
-  const lockedProductId = String(seed.source_ozon_product_id || lockedProduct.ozon_product_id || "");
-  const lockedProductUrl = String(lockedProduct.ozon_url || lockedProduct.url || "");
-  if (!lockedProductId || !lockedProductUrl) {
-    await heartbeat({
-      run_id: runId,
-      stage: "locked_product_missing",
-      code: "bridge.attribute_template_locked_product_missing",
-      message: "The attribute-template contract has no final locked Ozon product.",
-    });
-    return { ok: false, code: "bridge.attribute_template_locked_product_missing" };
-  }
-  if (String(productIdFromPage(location.href) || "") !== lockedProductId) {
-    saveState(state);
-    await heartbeat({
-      run_id: runId,
-      stage: "navigating_locked_product",
-      code: "bridge.attribute_template_navigating_locked_product",
-      message: `Navigating directly to locked Ozon product ${lockedProductId}.`,
-    });
-    location.href = lockedProductUrl;
-    return { ok: true, code: "bridge.attribute_template_navigating_locked_product" };
-  }
-  const detailEvidence = await waitForDetailEvidence(runId);
-  if (detailEvidence.hasChallenge) {
-    await heartbeat({
-      run_id: runId,
-      stage: "detail_blocked",
-      code: "bridge.detail_blocked",
-      message: "Ozon product detail page is blocked by challenge.",
-    });
-    saveState(state);
-    return { ok: false, code: "bridge.detail_blocked" };
-  }
-  const collectedProductId = String(
-    (detailEvidence.snapshot && detailEvidence.snapshot.product_id) || "",
-  );
-  if (collectedProductId !== lockedProductId) {
-    await heartbeat({
-      run_id: runId,
-      stage: "locked_product_mismatch",
-      code: "bridge.attribute_template_locked_product_mismatch",
-      message: `Expected locked Ozon product ${lockedProductId}, received ${collectedProductId || "unknown"}.`,
-    });
-    saveState(state);
-    return { ok: false, code: "bridge.attribute_template_locked_product_mismatch" };
-  }
-  const sellerDecision = lockedProduct.domestic_seller_decision
-    || sellerDecisionForSnapshot(detailEvidence.snapshot || {});
-  state.templates.push(
-    buildTemplate(seed, query, { url: lockedProductUrl, title: lockedProduct.title, productLinks: [] }, detailEvidence, sellerDecision),
-  );
-  state.seedIndex += 1;
-  state.stage = "detail";
-  state.searchEvidence = null;
-  state.productLinkIndex = 0;
-  saveState(state);
-  if (state.seedIndex < seeds.length) {
-    const next = seeds[state.seedIndex];
-    const nextLocked = next.locked_ozon_product || {};
-    location.href = nextLocked.ozon_url || nextLocked.url;
-    return { ok: true, code: "bridge.next_seed" };
-  }
-  return await submit(
-    runId,
-    task.data.ingest_url,
-    state.templates,
-    state.dispatchToken,
-  );
+  await heartbeat({ stage: "idle", code: task.code, message: task.message });
+  return { ok: true, code: task.code };
 }
 
 function triggerRun() {

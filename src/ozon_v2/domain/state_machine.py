@@ -62,7 +62,7 @@ WORKBENCH_TRANSITIONS: dict[WorkbenchState, dict[WorkbenchAction, WorkbenchState
         WorkbenchAction.MARK_FAILED_RETRYABLE: WorkbenchState.FAILED_RETRYABLE,
     },
     WorkbenchState.OZON_COLLECTED: {
-        WorkbenchAction.START_ATTRIBUTE_TEMPLATE_COLLECTION: WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTING,
+        WorkbenchAction.OPEN_SUPPLIER_REVIEW: WorkbenchState.SUPPLIER_REVIEW,
         WorkbenchAction.MARK_NEEDS_MANUAL_REVIEW: WorkbenchState.NEEDS_MANUAL_REVIEW,
     },
     WorkbenchState.SUPPLIER_REVIEW: {

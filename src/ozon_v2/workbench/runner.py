@@ -207,40 +207,7 @@ class WorkbenchBackgroundRunner:
                     )
                 remaining_steps -= 1
                 continue
-            if blocked_reason != "attribute_template_worker_required":
-                return result
-            if self.attribute_template_worker is None:
-                return result
-            if self._stop_requested(run_id):
-                return Result.success("runner.stopped", "Background runner was stopped by the user.", {"blocked_reason": "user_stopped"})
-            worker_result = self.attribute_template_worker.collect(run_id)
-            if not worker_result.ok:
-                return Result.success(
-                    "autopilot.blocked",
-                    worker_result.message,
-                    {
-                        "blocked_reason": worker_result.code,
-                        "worker_result": worker_result.to_dict(),
-                    },
-                )
-            payload = worker_result.data.get("payload") if isinstance(worker_result.data, dict) else None
-            if not isinstance(payload, dict):
-                return Result.success(
-                    "autopilot.blocked",
-                    "Attribute template browser worker did not return an ingest payload.",
-                    {"blocked_reason": "attribute_template_worker.invalid_payload"},
-                )
-            ingest_result = self.service.ingest_attribute_template_result(run_id, payload)
-            if not ingest_result.ok:
-                return Result.success(
-                    "autopilot.blocked",
-                    ingest_result.message,
-                    {
-                        "blocked_reason": ingest_result.code,
-                        "ingest_result": ingest_result.to_dict(),
-                    },
-                )
-            remaining_steps -= 1
+            return result
         return Result.success(
             "autopilot.blocked",
             "Autopilot stopped because the worker loop step limit was reached.",

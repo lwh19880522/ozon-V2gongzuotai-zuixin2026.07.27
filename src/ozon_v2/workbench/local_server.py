@@ -886,9 +886,9 @@ def build_home_html() -> str:
       const failurePercent = total ? failure / total * 100 : 0;
       const collectionComplete = Boolean(value.collection_complete);
       const stageComplete = Boolean(value.stage_complete);
-      const templateValidated = Math.min(
+      const subjectValidated = Math.min(
         total,
-        Math.max(0, Number(value.template_validated_count) || 0)
+        Math.max(0, Number(value.market_reference_validated_count ?? value.template_validated_count) || 0)
       );
       $("ozonProcessed").textContent = !hasProgress
         ? "当前没有正在采集的批次"
@@ -899,8 +899,8 @@ def build_home_html() -> str:
             : `实时已保存 ${success} / ${total} · 已处理 ${processed}`;
       if (hasProgress && total && collectionComplete) {
         $("ozonProcessed").textContent = stageComplete
-          ? `采集与类目校验完成 ${success} / ${total}`
-          : `Ozon 页面采集完成 ${success} / ${total} · 类目校验 ${templateValidated} / ${total}`;
+          ? `Ozon 主体采集完成 ${success} / ${total}`
+          : `Ozon 页面采集完成 ${success} / ${total} · 主体验收 ${subjectValidated} / ${total}`;
       } else if (hasProgress && total && pending === 0 && failure > 0) {
         $("ozonProcessed").textContent = `Ozon 页面处理完成 ${processed} / ${total} · 失败 ${failure}`;
       }
@@ -3617,6 +3617,25 @@ api(`/api/operations/${{pageKey}}`).then(result=>{{const data=result.data||{{}};
 </script></body></html>"""
 
 
+def build_category_confirmation_html(run_id: str) -> str:
+    run_json = json.dumps(run_id, ensure_ascii=False)
+    return f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>确认商品类目 - Ozon V2</title>
+<style>
+body{{margin:0;background:#f3f5f8;color:#182235;font:14px/1.5 "Segoe UI","Microsoft YaHei",sans-serif}}main{{max-width:1180px;margin:0 auto;padding:24px}}header,.card{{background:#fff;border:1px solid #dce2ea;border-radius:8px}}header{{padding:18px 20px;margin-bottom:14px}}h1{{margin:0 0 6px;font-size:20px}}p{{margin:0;color:#68758a}}.card{{display:grid;grid-template-columns:120px minmax(0,1fr);gap:16px;padding:16px;margin-bottom:12px}}img{{width:120px;height:120px;object-fit:contain;border:1px solid #dce2ea;border-radius:6px}}h2{{margin:0 0 4px;font-size:15px}}.meta{{margin-bottom:12px;color:#68758a;font-size:12px}}label{{display:block;padding:10px;margin:7px 0;border:1px solid #dce2ea;border-radius:6px;cursor:pointer}}label:hover{{border-color:#2457d6;background:#f7f9ff}}button{{height:36px;padding:0 16px;border:0;border-radius:5px;color:#fff;background:#2457d6;cursor:pointer}}button:disabled{{opacity:.55;cursor:wait}}.empty,.message{{padding:28px;text-align:center;color:#68758a}}.error{{color:#b4232c}}@media(max-width:640px){{.card{{grid-template-columns:1fr}}}}
+</style></head><body><main><header><h1>确认无法自动判定的商品类目</h1><p>这里只显示工作台无法唯一确认的单件商品。确认后直接下载 Seller API 官方字段模板，不会重新采集 Ozon 或 1688。</p></header><div id="message" class="message">正在加载...</div><section id="items"></section></main>
+<script>
+const runId={run_json};
+async function api(path,options={{}}){{const response=await fetch(path,{{headers:{{"Content-Type":"application/json"}},...options}});const body=await response.json();if(!response.ok||body.ok===false)throw new Error(body.message||"请求失败");return body;}}
+function el(tag,text,className){{const node=document.createElement(tag);if(text!==undefined)node.textContent=text;if(className)node.className=className;return node;}}
+async function confirmItem(item,button){{const selected=document.querySelector(`input[name="category-${{CSS.escape(item.slot_id)}}"]:checked`);if(!selected)return;const option=JSON.parse(selected.value);button.disabled=true;button.textContent="正在确认...";try{{await api(`/api/runs/${{encodeURIComponent(runId)}}/category-confirmations/${{encodeURIComponent(item.slot_id)}}`,{{method:"POST",body:JSON.stringify({{description_category_id:option.description_category_id,type_id:option.type_id}})}});await load();}}catch(error){{button.disabled=false;button.textContent="确认此类目";alert(error.message);}}}}
+function render(items){{const root=document.getElementById("items");root.replaceChildren();const message=document.getElementById("message");if(!items.length){{message.textContent="没有需要人工确认的商品。";return;}}message.textContent=`待确认 ${{items.length}} 件`;items.forEach(item=>{{const truth=item.supplier_truth||{{}};const title=truth.subject?.value||truth.supplier_title||item.slot_id;const images=truth.selected_sku_images||[];const card=el("article",undefined,"card");const image=document.createElement("img");image.src=images[0]||truth.primary_image_url||"";image.alt=title||"商品图片";image.referrerPolicy="no-referrer";const body=el("div");body.append(el("h2",title),el("div",`1688 Offer：${{truth.supplier_offer_id||"-"}}　SKU：${{truth.supplier_sku_id||"-"}}`,"meta"));(item.candidates||[]).forEach((option,index)=>{{const label=el("label");const radio=document.createElement("input");radio.type="radio";radio.name=`category-${{item.slot_id}}`;radio.value=JSON.stringify(option);radio.checked=index===0;label.append(radio,document.createTextNode(` ${{option.matched_category_path||option.category_path||option.category_name||"官方类目"}}（${{option.description_category_id}} / ${{option.type_id}}）`));body.append(label);}});const button=el("button","确认此类目");button.type="button";button.onclick=()=>confirmItem(item,button);body.append(button);card.append(image,body);root.append(card);}});}}
+async function load(){{try{{const result=await api(`/api/runs/${{encodeURIComponent(runId)}}/category-confirmations`);render(result.data?.items||[]);}}catch(error){{const message=document.getElementById("message");message.textContent=error.message;message.className="message error";}}}}
+load();
+</script></body></html>"""
+
+
 def create_handler(
     repo: FsRepo | None = None,
     background_runner: WorkbenchBackgroundRunner | None = None,
@@ -3713,6 +3732,9 @@ def create_handler(
             if len(parts) == 3 and parts[0] == "batches" and parts[2] == "supplier-review":
                 self._send_html(build_supplier_review_html(parts[1]))
                 return
+            if len(parts) == 3 and parts[0] == "batches" and parts[2] == "category-confirmations":
+                self._send_html(build_category_confirmation_html(parts[1]))
+                return
             if len(parts) == 3 and parts[0] == "batches" and parts[2] == "images":
                 self._send_redirect(f"/batches/{parts[1]}/upload")
                 return
@@ -3724,6 +3746,9 @@ def create_handler(
                 return
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "supplier-review":
                 self._send_result(service.supplier_review(parts[2]), run_id=parts[2])
+                return
+            if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "category-confirmations":
+                self._send_result(service.category_confirmations(parts[2]), run_id=parts[2])
                 return
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "images":
                 self._send_result(service.image_workspace(parts[2]), run_id=parts[2])
@@ -3904,7 +3929,11 @@ def create_handler(
                             "details": payload.get("details") if isinstance(payload.get("details"), dict) else {},
                         },
                     )
-                elif run_id and code.endswith(".no_cross_border_candidate"):
+                elif (
+                    run_id
+                    and payload.get("task_type") == "ozon_collection"
+                    and code.endswith(".no_cross_border_candidate")
+                ):
                     details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
                     selected_repo.append_run_event(
                         run_id,
@@ -3917,7 +3946,7 @@ def create_handler(
                         },
                     )
                     rejected_seed_id = str(details.get("seed_id") or "").strip()
-                    if payload.get("task_type") in {"ozon_attribute_template", "ozon_collection"} and rejected_seed_id:
+                    if rejected_seed_id:
                         task_type = str(payload.get("task_type") or "")
                         existing_outcome = next(
                             (
@@ -4193,6 +4222,17 @@ def create_handler(
                     run_id=parts[2],
                 )
                 return
+            if len(parts) == 5 and parts[:2] == ["api", "runs"] and parts[3] == "category-confirmations":
+                self._send_result(
+                    service.confirm_category_resolution(
+                        parts[2],
+                        slot_id=parts[4],
+                        description_category_id=payload.get("description_category_id"),
+                        type_id=payload.get("type_id"),
+                    ),
+                    run_id=parts[2],
+                )
+                return
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "subject-master":
                 source_image_urls = payload.get("source_image_urls")
                 if not isinstance(source_image_urls, list):
@@ -4300,34 +4340,16 @@ def create_handler(
                     "errors": [],
                 }
             if run.get("status") == "attribute_template_collecting" and run.get("attribute_template_contract_ready"):
-                contract_path = selected_repo.run_dir(run_id) / "attribute_template_contract.json"
-                if not contract_path.exists():
-                    contract_result = service.collection_contract_service.build_attribute_template_contract(run_id)
-                    if not contract_result.ok:
-                        return contract_result.to_dict()
-                    selected_repo.save_attribute_template_contract(run_id, contract_result.data)
-                    run["attribute_template_contract_path"] = str(contract_path)
-                    selected_repo.save_run(run)
-                    selected_repo.append_run_event(
-                        run_id,
-                        "browser_task.contract_restored",
-                        "Attribute template contract was restored for browser task pickup.",
-                        {"contract_path": str(contract_path)},
-                    )
                 return {
-                    "ok": True,
-                    "code": "browser_task.attribute_template_ready",
-                    "message": "Attribute template browser task is ready for a real browser bridge.",
+                    "ok": False,
+                    "code": "browser_task.legacy_restart_required",
+                    "message": "This batch uses the retired Ozon attribute-template browser stage and must be restarted.",
                     "data": {
                         "run_id": run_id,
                         "created_at": run.get("created_at"),
-                        "task_type": "ozon_attribute_template",
-                        "dispatch_token": run.get("browser_task_resumed_at") or run.get("created_at"),
-                        "contract": selected_repo.load_attribute_template_contract(run_id),
-                        "result_worker": "workbench_browser_bridge",
-                        "ingest_url": f"/api/batches/{run_id}/attribute-template",
+                        "status": run.get("status"),
                     },
-                    "errors": [],
+                    "errors": ["Restart the batch to enter the supplier-truth pipeline."],
                 }
             if run.get("status") == "ozon_collecting" and run.get("ozon_collection_contract_ready"):
                 contract_path = selected_repo.run_dir(run_id) / "ozon_collection_contract.json"

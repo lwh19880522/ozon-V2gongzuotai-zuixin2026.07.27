@@ -258,6 +258,161 @@ class SellerCategoryTreeTests(TestCase):
 
         self.assertEqual(301, match["type_id"])
 
+    def test_category_match_accepts_public_root_nested_under_seller_root(self) -> None:
+        adapter = SellerApiAdapter()
+        adapter._fetch_description_category_tree = lambda: [
+            {
+                "category_name": "Одежда",
+                "description_category_id": 400,
+                "children": [
+                    {
+                        "category_name": "Аксессуары",
+                        "children": [
+                            {
+                                "type_name": "Повязка на голову",
+                                "type_id": 401,
+                                "children": [],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+
+        match = adapter._match_description_category(
+            {
+                "category_path": "Аксессуары / Женские аксессуары / Головные уборы / Банданы и косынки",
+                "leaf_category": "Банданы и косынки",
+                "product_title": "Повязка на голову 1 шт.",
+            }
+        )
+
+        self.assertEqual(400, match["description_category_id"])
+        self.assertEqual(401, match["type_id"])
+
+    def test_category_match_rejects_cross_domain_type_with_only_stopword_overlap(self) -> None:
+        adapter = SellerApiAdapter()
+        adapter._fetch_description_category_tree = lambda: [
+            {
+                "category_name": "Товары для курения",
+                "description_category_id": 500,
+                "children": [
+                    {
+                        "type_name": "Аксессуар для курения",
+                        "type_id": 501,
+                        "children": [],
+                    }
+                ],
+            }
+        ]
+
+        with self.assertRaises(SellerApiError):
+            adapter._match_description_category(
+                {
+                    "category_path": "Товары для животных / Для собак / Амуниция / Аксессуары",
+                    "leaf_category": "Аксессуары",
+                    "product_title": "Салфетка в виде щенка из шенила, серая",
+                    "product_type": "Украшение для животных",
+                }
+            )
+
+    def test_category_match_rejects_parent_only_match_with_wrong_seller_type(self) -> None:
+        adapter = SellerApiAdapter()
+        adapter._fetch_description_category_tree = lambda: [
+            {
+                "category_name": "Детские товары",
+                "description_category_id": 600,
+                "children": [
+                    {
+                        "category_name": "Обучающие игры",
+                        "children": [
+                            {
+                                "type_name": "Диапроектор",
+                                "type_id": 601,
+                                "children": [],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+
+        with self.assertRaises(SellerApiError):
+            adapter._match_description_category(
+                {
+                    "category_path": "Детские товары / Игрушки и игры / Развивающие игры / Обучающие игры",
+                    "leaf_category": "Обучающие игры",
+                    "product_title": "Образовательные бумажные карточки для тренировки по вычитанию",
+                }
+            )
+
+    def test_category_match_accepts_strong_hierarchy_with_partial_leaf_alias(self) -> None:
+        adapter = SellerApiAdapter()
+        adapter._fetch_description_category_tree = lambda: [
+            {
+                "category_name": "Animals",
+                "description_category_id": 650,
+                "children": [
+                    {
+                        "category_name": "Domestic animals",
+                        "children": [
+                            {
+                                "category_name": "Bird supplies",
+                                "children": [
+                                    {
+                                        "type_name": "Parrot accessories",
+                                        "type_id": 651,
+                                        "children": [],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+
+        match = adapter._match_description_category(
+            {
+                "category_path": "Animals / Domestic animals / Bird supplies / Parrot toys",
+                "leaf_category": "Parrot toys",
+                "product_title": "Set of eleven hanging items for parrots",
+            }
+        )
+
+        self.assertEqual(650, match["description_category_id"])
+        self.assertEqual(651, match["type_id"])
+
+    def test_category_match_rejects_cross_domain_generic_tool_overlap(self) -> None:
+        adapter = SellerApiAdapter()
+        adapter._fetch_description_category_tree = lambda: [
+            {
+                "category_name": "Строительство и ремонт",
+                "description_category_id": 700,
+                "children": [
+                    {
+                        "category_name": "Оснастка для инструмента",
+                        "children": [
+                            {
+                                "type_name": "Принадлежности для инструментов",
+                                "type_id": 701,
+                                "children": [],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+
+        with self.assertRaises(SellerApiError):
+            adapter._match_description_category(
+                {
+                    "category_path": "Хобби и творчество / Рукоделие / Инструменты и инвентарь / Портновские принадлежности",
+                    "leaf_category": "Портновские принадлежности",
+                    "product_title": "Инструмент для вышивки крестом, фиксированная клипса для вышивания",
+                }
+            )
+
     def test_product_title_selects_price_tag_instead_of_luggage_tag(self) -> None:
         adapter = SellerApiAdapter()
         adapter._fetch_description_category_tree = lambda: [

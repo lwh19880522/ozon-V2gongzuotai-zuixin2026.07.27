@@ -102,7 +102,7 @@ class AttributeMappingServiceTests(unittest.TestCase):
                 fields[field_key]["evidence_ref"],
             )
 
-    def test_category_leaf_is_a_deterministic_type_fact(self) -> None:
+    def test_ozon_category_leaf_is_not_product_truth_for_type(self) -> None:
         result = map_template_attributes(
             [
                 {
@@ -120,10 +120,34 @@ class AttributeMappingServiceTests(unittest.TestCase):
         )
 
         field = result["fields"][0]
+        self.assertEqual("missing_fact", field["status"])
+        self.assertIsNone(field["value"])
+        self.assertIsNone(field["source"])
+        self.assertIsNone(field["evidence_ref"])
+
+    def test_locked_supplier_truth_is_a_deterministic_type_fact(self) -> None:
+        result = map_template_attributes(
+            [
+                {
+                    "attribute_id": "8229",
+                    "attribute_label": "Тип",
+                    "is_required": True,
+                }
+            ],
+            {"category_path": "Ozon market reference", "attributes": {}},
+            supplier_truth_profile={
+                "objective_fields": {"attributes": {"Тип": "Полусапоги"}}
+            },
+        )
+
+        field = result["fields"][0]
         self.assertEqual("mapped", field["status"])
         self.assertEqual("Полусапоги", field["value"])
-        self.assertEqual("workflow_category", field["source"])
-        self.assertEqual("ozon.category_path.leaf", field["evidence_ref"])
+        self.assertEqual("locked_supplier_truth", field["source"])
+        self.assertEqual(
+            "supplier_truth.objective_fields.attributes.Тип",
+            field["evidence_ref"],
+        )
 
     def test_common_supplier_footwear_labels_map_to_russian_template_semantics(
         self,
@@ -331,7 +355,7 @@ class AttributeMappingServiceTests(unittest.TestCase):
         self.assertEqual(5, progress["fields_to_70_percent"])
         self.assertEqual(15, progress["next_band_points"])
 
-    def test_uses_complete_ozon_content_evidence_and_marks_creative_fields_for_rewrite(self) -> None:
+    def test_ignores_ozon_product_facts_and_marks_creative_fields_for_rewrite(self) -> None:
         schema = [
             {"attribute_id": "85", "attribute_label": "Бренд", "is_required": True},
             {"attribute_id": "7194", "attribute_label": "Материал", "is_required": False},
@@ -354,17 +378,12 @@ class AttributeMappingServiceTests(unittest.TestCase):
         fields = {field["field_key"]: field for field in result["fields"]}
 
         self.assertEqual("mapped", fields["85"]["status"])
-        self.assertEqual("mapped", fields["7194"]["status"])
-        self.assertEqual("mapped", fields["9799"]["status"])
-        self.assertEqual("45", fields["9799"]["value"])
-        self.assertEqual(
-            "ozon.content_score_evidence.attribute_table.Ширина, мм",
-            fields["9799"]["evidence_ref"],
-        )
+        self.assertEqual("missing_fact", fields["7194"]["status"])
+        self.assertEqual("missing_fact", fields["9799"]["status"])
         self.assertEqual("rewrite_required", fields["4180"]["status"])
         self.assertEqual("rewrite_required", fields["4191"]["status"])
         self.assertEqual("rewrite_required", fields["11254"]["status"])
-        self.assertEqual(3, result["mapped_attribute_count"])
+        self.assertEqual(1, result["mapped_attribute_count"])
         self.assertEqual(3, result["rewrite_required_count"])
         self.assertEqual(0, result["excluded_attribute_count"])
 

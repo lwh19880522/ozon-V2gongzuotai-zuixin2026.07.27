@@ -293,6 +293,7 @@ class OzonCandidate:
     fulfillment_label: str | None = None
     attributes: dict[str, Any] = field(default_factory=dict)
     domestic_seller_decision: dict[str, Any] = field(default_factory=dict)
+    subject_match_evidence: dict[str, Any] = field(default_factory=dict)
     hot_product_evidence: dict[str, Any] = field(default_factory=dict)
     content_score_evidence: dict[str, Any] = field(default_factory=dict)
     source_captured_at: str = field(default_factory=utc_now_iso)

@@ -148,7 +148,11 @@ _VISUAL_INFERENCE_FIELDS = {
     "set_item_count",
 }
 _SUPPLIER_IDENTITY_FIELDS = {"brand", "model", "article", "color"}
-_SUPPLIER_TRUTH_SOURCES = {"confirmed_supplier_sku", "supplier_attributes"}
+_SUPPLIER_TRUTH_SOURCES = {
+    "confirmed_supplier_sku",
+    "supplier_attributes",
+    "locked_supplier_truth",
+}
 _STORE_FIXED_FIELDS: dict[str, dict[str, str]] = {
     "country": {
         "value": "Китай",
@@ -237,6 +241,7 @@ def map_template_attributes(
     *,
     supplier_product: dict[str, Any] | None = None,
     supplier_selection: dict[str, Any] | None = None,
+    supplier_truth_profile: dict[str, Any] | None = None,
     rewritten_content: dict[str, Any] | None = None,
     pricing_evidence: dict[str, Any] | None = None,
     user_confirmed_required_fields: dict[str, Any] | None = None,
@@ -245,6 +250,7 @@ def map_template_attributes(
         ozon_candidate,
         supplier_product=supplier_product,
         supplier_selection=supplier_selection,
+        supplier_truth_profile=supplier_truth_profile,
         pricing_evidence=pricing_evidence,
     )
     mapped_fields: list[dict[str, Any]] = []
@@ -641,6 +647,7 @@ def _collect_evidence(
     *,
     supplier_product: dict[str, Any] | None,
     supplier_selection: dict[str, Any] | None,
+    supplier_truth_profile: dict[str, Any] | None,
     pricing_evidence: dict[str, Any] | None,
 ) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
@@ -663,17 +670,9 @@ def _collect_evidence(
             }
         )
 
-    add("Бренд", ozon_candidate.get("brand"), "ozon_structured", "ozon.brand", 50)
-    category_leaf = str(ozon_candidate.get("category_path") or "").rsplit(
-        "/", 1
-    )[-1].strip()
-    add(
-        "Тип",
-        category_leaf,
-        "workflow_category",
-        "ozon.category_path.leaf",
-        90,
-    )
+    # Ozon is a market-language reference only. It must never supply identity,
+    # category, dimensions, material, quantity, or another objective value for
+    # the locked 1688 product.
     for key, label in (
         ("package_weight_g", "Вес с упаковкой, г"),
         ("package_length_cm", "Длина упаковки, см"),
@@ -687,21 +686,6 @@ def _collect_evidence(
             f"pricing_evidence.inputs.{key}",
             1,
         )
-    target_sku = ozon_candidate.get("target_sku") or {}
-    for label, value in _mapping_items(target_sku.get("selected_options")):
-        add(label, value, "ozon_selected_sku", f"ozon.target_sku.selected_options.{label}", 60)
-    for label, value in _mapping_items(ozon_candidate.get("attributes")):
-        add(label, value, "ozon_attributes", f"ozon.attributes.{label}", 70)
-    content_score_evidence = ozon_candidate.get("content_score_evidence") or {}
-    for label, value in _mapping_items(content_score_evidence.get("attribute_table")):
-        add(
-            label,
-            value,
-            "ozon_content_score_evidence",
-            f"ozon.content_score_evidence.attribute_table.{label}",
-            80,
-        )
-
     if supplier_selection:
         supplier_sku = supplier_selection.get("supplier_sku") or {}
         for label, value in _mapping_items(supplier_sku.get("selected_options")):
@@ -739,6 +723,17 @@ def _collect_evidence(
             if _is_supplier_specification_artifact(label, value):
                 continue
             add(label, value, "supplier_attributes", f"supplier.attributes.{label}", 20)
+    if supplier_truth_profile:
+        objective_fields = supplier_truth_profile.get("objective_fields") or {}
+        truth_attributes = objective_fields.get("attributes") or {}
+        for label, value in _mapping_items(truth_attributes):
+            add(
+                label,
+                value,
+                "locked_supplier_truth",
+                f"supplier_truth.objective_fields.attributes.{label}",
+                2,
+            )
     return items
 
 

@@ -19,6 +19,7 @@ from ozon_v2.adapters.fs_repo import FsRepo
 from ozon_v2.adapters.seller_api import (
     SellerApiAdapter,
     SellerApiError,
+    SellerCategoryMatchError,
     assess_category_template_match,
 )
 from ozon_v2.app.result import Result
@@ -36,6 +37,7 @@ from ozon_v2.domain.supplier_sku import (
     documented_composition_quantity,
     validate_supplier_sku_option,
 )
+from ozon_v2.domain.supplier_truth import build_supplier_truth_profile
 from ozon_v2.domain.state_machine import allowed_workbench_actions, transition_workbench_state
 from ozon_v2.domain.validators import validate_attribute_template_result, validate_ozon_collection_result, validate_seed_ready_for_ozon
 from ozon_v2.images.contracts import SubjectMasterSelection
@@ -55,6 +57,7 @@ from ozon_v2.services.collection_contract_service import (
 )
 from ozon_v2.services.credential_service import CredentialService
 from ozon_v2.services.seed_query_service import SeedQueryService
+from ozon_v2.services.seller_category_resolver import SellerCategoryResolver
 from ozon_v2.services.seller_history_service import SellerHistoryService
 
 
@@ -128,6 +131,66 @@ class WorkbenchService:
     @staticmethod
     def _browser_dispatch_token(run: dict[str, Any]) -> str:
         return str(run.get("browser_task_resumed_at") or run.get("created_at") or "").strip()
+
+    def _browser_result_identity_errors(
+        self,
+        run: dict[str, Any],
+        payload: dict[str, Any],
+        *,
+        task_type: str,
+    ) -> list[str]:
+        errors: list[str] = []
+        strict_browser_bridge = str(payload.get("source") or "").strip() == "ozon_browser_extension_content_script"
+        if str(payload.get("run_id") or "").strip() != str(run.get("run_id") or "").strip():
+            errors.append("browser result run_id is stale")
+        payload_task_type = str(payload.get("task_type") or "").strip()
+        if (strict_browser_bridge or payload_task_type) and payload_task_type != task_type:
+            errors.append("browser result task_type is missing or stale")
+        dispatch_token = str(payload.get("dispatch_token") or "").strip()
+        if (strict_browser_bridge or dispatch_token) and dispatch_token != self._browser_dispatch_token(run):
+            errors.append("browser result dispatch token is missing or stale")
+        return errors
+
+    @staticmethod
+    def _ozon_candidate_identity_errors(
+        run: dict[str, Any],
+        candidates: list[dict[str, Any]],
+        *,
+        required: bool = False,
+    ) -> list[str]:
+        slots = {
+            str(item.get("seed_id") or ""): item
+            for item in run.get("candidate_slots", [])
+            if isinstance(item, dict) and item.get("seed_id")
+        }
+        errors: list[str] = []
+        for candidate in candidates:
+            seed_id = str(candidate.get("seed_id") or "").strip()
+            slot = slots.get(seed_id)
+            if slot is None:
+                if required:
+                    errors.append(f"candidate {seed_id!r} has no active product slot")
+                continue
+            slot_id = str(candidate.get("slot_id") or "").strip()
+            expected_slot_id = str(slot.get("slot_id") or "").strip()
+            if (required or slot_id) and slot_id != expected_slot_id:
+                errors.append(
+                    f"candidate {seed_id} slot_id {slot_id!r} does not match {expected_slot_id!r}"
+                )
+            raw_revision = candidate.get("candidate_revision")
+            if raw_revision in (None, "") and not required:
+                continue
+            try:
+                candidate_revision = int(raw_revision)
+            except (TypeError, ValueError):
+                errors.append(f"candidate {seed_id} candidate_revision is required")
+                continue
+            expected_revision = int(slot.get("candidate_revision") or 1)
+            if candidate_revision != expected_revision:
+                errors.append(
+                    f"candidate {seed_id} revision {candidate_revision} does not match {expected_revision}"
+                )
+        return errors
 
     def _reject_stale_stage_result(
         self,
@@ -447,8 +510,15 @@ class WorkbenchService:
                 data=self._response_payload(run, event),
             )
         try:
-            payload = self._attach_seller_attribute_templates(payload)
+            payload, category_match_failures = self._attach_seller_attribute_templates(payload)
         except SellerApiError as exc:
+            with self._run_mutation_lock(run_id):
+                blocked_run = self.repo.load_run(run_id)
+                if WorkbenchState(blocked_run["status"]) == WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTING:
+                    blocked_run["browser_task_cancelled"] = True
+                    blocked_run["browser_task_cancelled_at"] = utc_now_iso()
+                    self.repo.save_run(blocked_run)
+                    run = blocked_run
             event = self.repo.append_run_event(
                 run_id,
                 "attribute_template.seller_schema_unavailable",
@@ -460,6 +530,24 @@ class WorkbenchService:
                 "Seller category attribute template is required before Ozon collection.",
                 errors=[str(exc)],
                 data=self._response_payload(run, event),
+            )
+        if category_match_failures:
+            mismatch_seed_ids = [
+                str(item["seed_id"])
+                for item in category_match_failures
+            ]
+            category_match_errors = [
+                f"seed {item['seed_id']} seller category schema match failed: {item['error']}"
+                for item in category_match_failures
+            ]
+            return self._retire_category_subject_mismatches(
+                run_id,
+                payload,
+                subject_errors=category_match_errors,
+                mismatch_seed_ids=mismatch_seed_ids,
+                all_seed_ids=all_seed_ids,
+                dispatch_token=dispatch_token,
+                payload_dispatch_token=payload_dispatch_token,
             )
         seller_schema_errors = validate_attribute_template_result(payload, expected_seed_ids, require_seller_schema=True)
         if seller_schema_errors:
@@ -874,9 +962,13 @@ class WorkbenchService:
                 ),
             )
 
-    def _attach_seller_attribute_templates(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _attach_seller_attribute_templates(
+        self,
+        payload: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[dict[str, str]]]:
         enriched = dict(payload)
         enriched_templates: list[dict[str, Any]] = []
+        category_match_failures: list[dict[str, str]] = []
         for item in payload.get("seed_templates", []):
             seed_template = dict(item)
             public_evidence = dict(seed_template.get("public_attribute_evidence") or {})
@@ -906,7 +998,19 @@ class WorkbenchService:
                 )
                 if product_type:
                     category_candidate["product_type"] = product_type
-            seller_template = self.seller_api_adapter.resolve_attribute_template(category_candidate)
+            try:
+                seller_template = self.seller_api_adapter.resolve_attribute_template(
+                    category_candidate
+                )
+            except SellerCategoryMatchError as exc:
+                category_match_failures.append(
+                    {
+                        "seed_id": str(seed_template.get("seed_id") or ""),
+                        "error": str(exc),
+                    }
+                )
+                enriched_templates.append(seed_template)
+                continue
             upload_schema = seller_template.get("upload_attribute_schema") or []
             seed_template["public_attribute_evidence"] = public_evidence
             seed_template["seller_attribute_template"] = {
@@ -920,7 +1024,7 @@ class WorkbenchService:
             "source": "ozon_seller_api_description_category_attribute",
             "public_page_schema_is_evidence_only": True,
         }
-        return enriched
+        return enriched, category_match_failures
 
     def _build_draft_prefill_plan(self, upload_schema: list[dict[str, Any]]) -> list[dict[str, Any]]:
         plan: list[dict[str, Any]] = []
@@ -933,19 +1037,63 @@ class WorkbenchService:
             plan.append(
                 {
                     "field_key": field_key,
-                    "source": "seller_api_template_plus_supplier_or_ozon_objective_fact",
+                    "source": "seller_api_template_plus_locked_1688_supplier_truth",
                     "prefill_allowed": not creative,
                     "rewrite_required": creative,
                     "reason": (
-                        "Seller API upload field. Fill only when supplier/Ozon objective fact is available."
+                        "Seller API upload field. Fill objective values only from locked 1688 supplier truth."
                         if objective_hint or not creative
-                        else "Creative field must be rewritten, not copied from Ozon."
+                        else "Creative field may use Ozon terminology as reference but must be rewritten from supplier truth."
                     ),
                 }
             )
         return plan
 
     def refresh_attribute_template(self, run_id: str, seed_id: str) -> Result:
+        truth_path = self.repo.run_dir(run_id) / "supplier_truth_profiles.json"
+        if truth_path.exists():
+            profile = (
+                self.repo.load_supplier_truth_profiles(run_id).get("profiles") or {}
+            ).get(seed_id)
+            if not isinstance(profile, dict):
+                return Result.failure(
+                    "supplier_truth.missing",
+                    "The locked 1688 supplier truth profile is missing for this product.",
+                    data={"run_id": run_id, "seed_id": seed_id},
+                )
+            resolution = self._resolve_supplier_truth_category(
+                run_id,
+                seed_id=seed_id,
+                profile=profile,
+            )
+            if resolution.get("status") == "category_confirmation_required":
+                return Result.failure(
+                    "category_confirmation.required",
+                    "The official Seller API category is ambiguous and requires one product-level confirmation.",
+                    data={
+                        "run_id": run_id,
+                        "seed_id": seed_id,
+                        "slot_id": resolution.get("slot_id"),
+                        "category_confirmation_url": f"/batches/{run_id}/category-confirmations",
+                        "candidates": resolution.get("candidates") or [],
+                    },
+                )
+            if resolution.get("status") != "resolved" or resolution.get("template_status") != "ready":
+                return Result.failure(
+                    "seller_api.template_unavailable",
+                    "The official Seller API category template is temporarily unavailable.",
+                    errors=[str(resolution.get("error") or "Seller API template unavailable")],
+                    data={"run_id": run_id, "seed_id": seed_id},
+                )
+            return Result.success(
+                "seller_api.template_refreshed",
+                "The official Seller API template was refreshed from locked 1688 supplier truth.",
+                {
+                    "run_id": run_id,
+                    "seed_id": seed_id,
+                    "resolution": resolution,
+                },
+            )
         try:
             payload = self.repo.load_attribute_template_result(run_id)
             ozon_result = self.repo.load_ozon_collection_result(run_id)
@@ -1096,6 +1244,48 @@ class WorkbenchService:
         payload: dict[str, Any],
         expected_seed_ids: list[str],
     ) -> list[str]:
+        templates = {
+            str(item.get("seed_id") or ""): item
+            for item in payload.get("seed_templates", [])
+            if isinstance(item, dict) and item.get("seed_id")
+        }
+        if templates and all(
+            item.get("template_source") == "seller_api_from_locked_1688_truth"
+            for item in templates.values()
+        ):
+            run = self.repo.load_run(run_id)
+            active_slots = {
+                str(item.get("seed_id") or ""): item
+                for item in run.get("candidate_slots", [])
+                if isinstance(item, dict) and item.get("seed_id")
+            }
+            truth_path = self.repo.run_dir(run_id) / "supplier_truth_profiles.json"
+            truths = (
+                (self.repo.load_supplier_truth_profiles(run_id).get("profiles") or {})
+                if truth_path.exists()
+                else {}
+            )
+            errors: list[str] = []
+            for seed_id in expected_seed_ids:
+                template = templates.get(seed_id)
+                slot = active_slots.get(seed_id)
+                truth = truths.get(seed_id) if isinstance(truths, dict) else None
+                if template is None:
+                    errors.append(f"seed {seed_id} official Seller API template is missing")
+                    continue
+                if not isinstance(slot, dict) or not isinstance(truth, dict):
+                    errors.append(f"seed {seed_id} active slot or locked supplier truth is missing")
+                    continue
+                if str(template.get("slot_id") or "") != str(slot.get("slot_id") or ""):
+                    errors.append(f"seed {seed_id} official template belongs to a different slot")
+                if int(template.get("candidate_revision") or 0) != int(slot.get("candidate_revision") or 0):
+                    errors.append(f"seed {seed_id} official template belongs to a stale candidate revision")
+                identity = template.get("supplier_truth_identity") or {}
+                if str(identity.get("supplier_offer_id") or "") != str(truth.get("supplier_offer_id") or ""):
+                    errors.append(f"seed {seed_id} official template supplier offer binding is stale")
+                if str(identity.get("supplier_sku_id") or "") != str(truth.get("supplier_sku_id") or ""):
+                    errors.append(f"seed {seed_id} official template supplier SKU binding is stale")
+            return errors
         try:
             ozon_payload = self.repo.load_ozon_collection_result(run_id)
         except (FileNotFoundError, json.JSONDecodeError):
@@ -1103,11 +1293,6 @@ class WorkbenchService:
         candidates = {
             str(item.get("seed_id") or ""): item
             for item in ozon_payload.get("ozon_candidates", [])
-            if isinstance(item, dict) and item.get("seed_id")
-        }
-        templates = {
-            str(item.get("seed_id") or ""): item
-            for item in payload.get("seed_templates", [])
             if isinstance(item, dict) and item.get("seed_id")
         }
         errors: list[str] = []
@@ -1260,6 +1445,23 @@ class WorkbenchService:
             if str(product_id).strip()
         }
 
+    def _frozen_subject_contracts(self, run_id: str) -> dict[str, dict[str, Any]]:
+        try:
+            contract = self.repo.load_ozon_collection_contract(run_id)
+        except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+            return {}
+        payload = contract.get("payload") if isinstance(contract, dict) else None
+        seeds = payload.get("seeds") if isinstance(payload, dict) else None
+        if not isinstance(seeds, list):
+            return {}
+        return {
+            str(seed.get("seed_id") or "").strip(): dict(seed["seed_subject_contract"])
+            for seed in seeds
+            if isinstance(seed, dict)
+            and str(seed.get("seed_id") or "").strip()
+            and isinstance(seed.get("seed_subject_contract"), dict)
+        }
+
     def _reject_used_ozon_identities(
         self,
         run: dict[str, Any],
@@ -1278,6 +1480,7 @@ class WorkbenchService:
         )
 
     def ozon_collection_checkpoint(self, run_id: str) -> Result:
+        subject_contracts = self._frozen_subject_contracts(run_id)
         try:
             contract = self.repo.load_ozon_collection_contract(run_id)
             contract_payload = contract.get("payload")
@@ -1354,6 +1557,7 @@ class WorkbenchService:
                     validate_ozon_collection_result(
                         {"worker": worker, "ozon_candidates": [candidate]},
                         [seed_id],
+                        subject_contracts=subject_contracts,
                     )
                 )
                 if product_id in excluded_product_ids:
@@ -1404,11 +1608,35 @@ class WorkbenchService:
                 "Ozon collection progress belongs to a different batch.",
                 data={"run_id": run_id, "payload_run_id": payload.get("run_id")},
             )
+        identity_errors = self._browser_result_identity_errors(
+            run,
+            payload,
+            task_type="ozon_collection",
+        )
+        if identity_errors:
+            return self._reject_stale_stage_result(
+                run_id,
+                "ozon_collection",
+                run,
+                identity_errors,
+            )
         candidate = payload.get("ozon_candidate")
         if not isinstance(candidate, dict):
             return Result.failure(
                 "ozon_collection.progress_invalid",
                 "Ozon collection progress must include one candidate object.",
+                data={"run_id": run_id},
+            )
+        candidate_identity_errors = self._ozon_candidate_identity_errors(
+            run,
+            [candidate],
+            required=str(payload.get("source") or "").strip() == "ozon_browser_extension_content_script",
+        )
+        if candidate_identity_errors:
+            return Result.failure(
+                "ozon_collection.progress_identity_invalid",
+                "The checkpoint candidate does not belong to the active product slot revision.",
+                errors=candidate_identity_errors,
                 data={"run_id": run_id},
             )
 
@@ -1431,6 +1659,7 @@ class WorkbenchService:
                 "ozon_candidates": [candidate],
             },
             [seed_id],
+            subject_contracts=self._frozen_subject_contracts(run_id),
         )
         product_id = str(candidate.get("ozon_product_id") or "").strip()
         if product_id in excluded_product_ids:
@@ -1528,15 +1757,11 @@ class WorkbenchService:
         }
         task_type_by_status = {
             WorkbenchState.OZON_COLLECTING: "ozon_collection",
-            WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTING: "ozon_attribute_template",
             WorkbenchState.SUPPLIER_REVIEW: "supplier_selection",
             WorkbenchState.SUPPLIER_COLLECTING: "supplier_collection",
         }
         if status == WorkbenchState.OZON_COLLECTED:
-            prepared = self.dispatch(
-                run_id,
-                WorkbenchAction.START_ATTRIBUTE_TEMPLATE_COLLECTION.value,
-            )
+            prepared = self._open_supplier_review_from_locked_ozon(run)
             if not prepared.ok:
                 return prepared
             run = self.repo.load_run(run_id)
@@ -1707,12 +1932,17 @@ class WorkbenchService:
             )
         dispatch_token = self._browser_dispatch_token(run)
         payload_dispatch_token = str(payload.get("dispatch_token") or "").strip()
-        if payload_dispatch_token and payload_dispatch_token != dispatch_token:
+        identity_errors = self._browser_result_identity_errors(
+            run,
+            payload,
+            task_type="ozon_collection",
+        )
+        if identity_errors:
             return self._reject_stale_stage_result(
                 run_id,
                 "ozon_collection",
                 run,
-                ["browser result dispatch token is stale"],
+                identity_errors,
             )
         seeds = self._safe_load_sampled_seeds(run_id)
         all_seed_ids = [seed.seed_id for seed in seeds]
@@ -1726,6 +1956,18 @@ class WorkbenchService:
             for item in payload.get("ozon_candidates", [])
             if isinstance(item, dict)
         ]
+        candidate_identity_errors = self._ozon_candidate_identity_errors(
+            run,
+            candidate_items,
+            required=str(payload.get("source") or "").strip() == "ozon_browser_extension_content_script",
+        )
+        if candidate_identity_errors:
+            return Result.failure(
+                "workbench.ozon_candidate_identity_invalid",
+                "Ozon collection result did not match the active product slot revision.",
+                errors=candidate_identity_errors,
+                data={"run_id": run_id, "status": run["status"]},
+            )
         full_current_snapshot = self._is_full_current_seed_snapshot(
             candidate_items,
             all_seed_ids,
@@ -1766,7 +2008,12 @@ class WorkbenchService:
                     {"duplicates": duplicate_matches},
                 ),
             )
-        errors = validate_ozon_collection_result(payload, expected_seed_ids)
+        subject_contracts = self._frozen_subject_contracts(run_id)
+        errors = validate_ozon_collection_result(
+            payload,
+            expected_seed_ids,
+            subject_contracts=subject_contracts,
+        )
         blacklisted_product_ids = self.repo.load_blacklisted_ozon_product_ids()
         collected_blacklisted_ids = sorted(
             {
@@ -1823,7 +2070,11 @@ class WorkbenchService:
                     if isinstance(item, dict) and str(item.get("seed_id") or "") not in pending_ids
                 ]
                 payload = {**payload, "ozon_candidates": retained_candidates + list(payload.get("ozon_candidates", []))}
-                merged_errors = validate_ozon_collection_result(payload, all_seed_ids)
+                merged_errors = validate_ozon_collection_result(
+                    payload,
+                    all_seed_ids,
+                    subject_contracts=subject_contracts,
+                )
                 if merged_errors:
                     event = self.repo.append_run_event(
                         run_id,
@@ -1878,19 +2129,28 @@ class WorkbenchService:
             run["status"] = transition_workbench_state(current, WorkbenchAction.MARK_OZON_COLLECTED).value
             run["ozon_collected"] = True
             run["ozon_collection_result_path"] = str(result_path)
-            run["attribute_template_collected"] = False
-            run["attribute_template_contract_ready"] = False
-            run.pop("attribute_template_contract_path", None)
+            review = self._build_supplier_review(run_id, payload)
+            review_path = self.repo.save_supplier_review(run_id, review)
+            run["supplier_review_path"] = str(review_path)
+            run["status"] = transition_workbench_state(
+                WorkbenchState(run["status"]),
+                WorkbenchAction.OPEN_SUPPLIER_REVIEW,
+            ).value
+            run.pop("replacement_pending_seed_ids", None)
             self.repo.save_run(run)
             event = self.repo.append_run_event(
                 run_id,
                 "ozon_collection.ingested",
-                "Ozon collection result was ingested; final products are locked for exact category template collection.",
-                {"result_path": str(result_path), "candidate_count": len(payload.get("ozon_candidates", []))},
+                "Ozon market-reference evidence was locked and supplier review was opened.",
+                {
+                    "result_path": str(result_path),
+                    "review_path": str(review_path),
+                    "candidate_count": len(payload.get("ozon_candidates", [])),
+                },
             )
             return Result.success(
                 "workbench.ozon_collection_ingested",
-                "Ozon products are locked. Exact category template collection is required next.",
+                "Ozon products are locked as market reference; supplier review is open.",
                 self._response_payload(run, event),
             )
 
@@ -2363,15 +2623,99 @@ class WorkbenchService:
             data,
         )
 
+    def _load_supplier_official_template_result(self, run_id: str) -> dict[str, Any]:
+        run_dir = self.repo.run_dir(run_id)
+        truth_path = run_dir / "supplier_truth_profiles.json"
+        resolution_path = run_dir / "category_resolutions.json"
+        cache_path = run_dir / "seller_template_cache.json"
+        if not truth_path.exists():
+            # Historical batches may still be inspected with their frozen legacy
+            # artifact. New batches create supplier truth before category work.
+            return self.repo.load_attribute_template_result(run_id)
+        truths = self.repo.load_supplier_truth_profiles(run_id).get("profiles") or {}
+        resolutions = (
+            self.repo.load_category_resolutions(run_id).get("items") or {}
+            if resolution_path.exists()
+            else {}
+        )
+        templates = (
+            self.repo.load_seller_template_cache(run_id).get("templates") or {}
+            if cache_path.exists()
+            else {}
+        )
+        seed_templates: list[dict[str, Any]] = []
+        for seed_id, truth in truths.items():
+            if not isinstance(truth, dict):
+                continue
+            resolution = resolutions.get(seed_id) if isinstance(resolutions, dict) else None
+            if not isinstance(resolution, dict) or resolution.get("status") not in {
+                "resolved",
+                "resolved_by_user",
+            }:
+                continue
+            chosen = resolution.get("chosen") or {}
+            cache_key = str(resolution.get("template_cache_key") or "").strip()
+            seller_template = templates.get(cache_key) if isinstance(templates, dict) else None
+            if not isinstance(seller_template, dict):
+                continue
+            schema = seller_template.get("upload_attribute_schema") or []
+            if not isinstance(schema, list) or not schema:
+                continue
+            matched_path = str(
+                chosen.get("matched_category_path")
+                or chosen.get("category_path")
+                or ""
+            ).strip()
+            normalized_seller_template = {
+                **seller_template,
+                "description_category_id": int(chosen.get("description_category_id") or 0),
+                "type_id": int(chosen.get("type_id") or 0),
+                "matched_category_path": matched_path,
+                "source": "ozon_seller_api_description_category_attribute",
+            }
+            seed_templates.append(
+                {
+                    "seed_id": seed_id,
+                    "slot_id": str(truth.get("slot_id") or ""),
+                    "candidate_revision": int(truth.get("candidate_revision") or 0),
+                    "template_source": "seller_api_from_locked_1688_truth",
+                    "seller_attribute_template": normalized_seller_template,
+                    "upload_attribute_schema": list(schema),
+                    "draft_prefill_plan": self._build_draft_prefill_plan(list(schema)),
+                    "category_candidates": [
+                        {
+                            **chosen,
+                            "category_path": matched_path,
+                            "source": "seller_api_official_category",
+                        }
+                    ],
+                    "supplier_truth_identity": {
+                        "supplier_offer_id": str(truth.get("supplier_offer_id") or ""),
+                        "supplier_sku_id": str(truth.get("supplier_sku_id") or ""),
+                    },
+                    "evidence": {
+                        "supplier_truth_profile": truth,
+                        "category_resolution": resolution,
+                        "ozon_role": "market_reference_only",
+                    },
+                }
+            )
+        return {
+            "schema_version": 2,
+            "run_id": run_id,
+            "template_source": "seller_api_from_locked_1688_truth",
+            "seed_templates": seed_templates,
+        }
+
     def upload_workspace(self, run_id: str) -> Result:
         run = self.repo.load_run(run_id)
         try:
-            template_result = self.repo.load_attribute_template_result(run_id)
+            template_result = self._load_supplier_official_template_result(run_id)
             ozon_result = self.repo.load_ozon_collection_result(run_id)
         except FileNotFoundError:
             return Result.failure(
                 "upload_workspace.source_missing",
-                "Category template and Ozon evidence are required before a draft can be prepared.",
+                "Locked 1688 supplier truth, an official Seller API template, and Ozon market-reference evidence are required before a draft can be prepared.",
                 data={"run_id": run_id, "status": run["status"]},
             )
 
@@ -2380,6 +2724,18 @@ class WorkbenchService:
             for item in template_result.get("seed_templates", [])
             if isinstance(item, dict)
         }
+        category_resolution_path = self.repo.run_dir(run_id) / "category_resolutions.json"
+        category_resolutions_by_seed = (
+            self.repo.load_category_resolutions(run_id).get("items") or {}
+            if category_resolution_path.exists()
+            else {}
+        )
+        supplier_truth_path = self.repo.run_dir(run_id) / "supplier_truth_profiles.json"
+        supplier_truth_by_seed = (
+            self.repo.load_supplier_truth_profiles(run_id).get("profiles") or {}
+            if supplier_truth_path.exists()
+            else {}
+        )
         suppliers_by_seed: dict[str, dict[str, Any]] = {}
         supplier_result_path = self.repo.run_dir(run_id) / "supplier_collection_result.json"
         if supplier_result_path.exists():
@@ -2646,26 +3002,33 @@ class WorkbenchService:
                 ),
                 "",
             )
-            category_assessment = assess_category_template_match(
-                category_path=str(
-                    candidate.get("category_path")
-                    or category_candidate.get("category_path")
-                    or ""
-                ),
-                leaf_category=str(
-                    candidate.get("leaf_category")
-                    or category_candidate.get("leaf_category")
-                    or ""
-                ),
-                matched_category_path=str(seller_template.get("matched_category_path") or ""),
-                product_title=str(candidate.get("title") or ""),
-                product_type=str(product_type or ""),
-                category_url=str(
-                    candidate.get("category_url")
-                    or category_candidate.get("category_url")
-                    or ""
-                ),
-            )
+            if template.get("template_source") == "seller_api_from_locked_1688_truth":
+                category_assessment = {
+                    "credible": bool(schema and seller_template),
+                    "reason": "seller_api_category_resolved_from_locked_1688_truth",
+                    "reference_ozon_category_ignored": True,
+                }
+            else:
+                category_assessment = assess_category_template_match(
+                    category_path=str(
+                        candidate.get("category_path")
+                        or category_candidate.get("category_path")
+                        or ""
+                    ),
+                    leaf_category=str(
+                        candidate.get("leaf_category")
+                        or category_candidate.get("leaf_category")
+                        or ""
+                    ),
+                    matched_category_path=str(seller_template.get("matched_category_path") or ""),
+                    product_title=str(candidate.get("title") or ""),
+                    product_type=str(product_type or ""),
+                    category_url=str(
+                        candidate.get("category_url")
+                        or category_candidate.get("category_url")
+                        or ""
+                    ),
+                )
             if template_binding_errors:
                 category_assessment = {
                     **category_assessment,
@@ -2704,6 +3067,7 @@ class WorkbenchService:
                     candidate,
                     supplier_product=suppliers_by_seed.get(seed_id),
                     supplier_selection=supplier_selections.get(seed_id),
+                    supplier_truth_profile=supplier_truth_by_seed.get(seed_id),
                     pricing_evidence=(
                         pricing_record.get("inputs")
                         if pricing_ready
@@ -2771,6 +3135,7 @@ class WorkbenchService:
                     "supplier_selected_sku": (
                         supplier_sku
                     ),
+                    "supplier_truth_profile": supplier_truth_by_seed.get(seed_id),
                     "supplier_source_images": supplier_source_images,
                     "subject_master": subject_master,
                     "bootstrap_image_url": bootstrap_image_url or None,
@@ -2803,6 +3168,17 @@ class WorkbenchService:
                     "prefill_plan": prefill_plan,
                     "video_template_fields": _video_template_fields(schema),
                     "template_ready": template_ready,
+                    "category_resolution": category_resolutions_by_seed.get(seed_id),
+                    "category_confirmation_required": (
+                        (category_resolutions_by_seed.get(seed_id) or {}).get("status")
+                        == "category_confirmation_required"
+                    ),
+                    "category_confirmation_url": (
+                        f"/batches/{run_id}/category-confirmations"
+                        if (category_resolutions_by_seed.get(seed_id) or {}).get("status")
+                        == "category_confirmation_required"
+                        else None
+                    ),
                     "category_template_assessment": category_assessment,
                     "attribute_mapping": mapping["fields"],
                     "mapped_attribute_count": mapping["mapped_attribute_count"],
@@ -3246,6 +3622,12 @@ class WorkbenchService:
             generated = generated_items.get(seed_id) or {}
             generated_field_results = _generated_field_results(generated)
             evidence = {
+                "field_contract": {
+                    "source": "ozon_seller_api_description_category_attribute",
+                    "description_category_id": item.get("description_category_id"),
+                    "type_id": item.get("type_id"),
+                },
+                "supplier_truth_profile": item.get("supplier_truth_profile") or {},
                 "ozon_title_style_reference": item.get("source_title"),
                 "ozon_attributes": item.get("source_attributes") or {},
                 "ozon_selected_sku": item.get("selected_options") or {},
@@ -3268,6 +3650,11 @@ class WorkbenchService:
                         )
                         == "single_sku_detail_page"
                     ),
+                },
+                "source_roles": {
+                    "seller_api_template": "field_contract_only",
+                    "supplier_truth_profile": "product_truth",
+                    "ozon": "russian_market_reference_only",
                 },
             }
             evidence_index = _content_evidence_index(evidence)
@@ -3625,7 +4012,11 @@ class WorkbenchService:
                         )
                     if field.get("supplier_truth_required") is True and not any(
                         reference.startswith(
-                            ("supplier.", "supplier_selection.")
+                            (
+                                "supplier.",
+                                "supplier_selection.",
+                                "supplier_truth.",
+                            )
                         )
                         for reference in evidence_refs
                     ):
@@ -6348,6 +6739,32 @@ class WorkbenchService:
         selections.setdefault("selections", {})[seed_id] = receipt.to_dict()
         selections["updated_at"] = utc_now_iso()
         saved_path = self.repo.save_supplier_sku_selections(run_id, selections)
+        slots = {
+            str(item.get("seed_id") or ""): item
+            for item in run.get("candidate_slots", [])
+            if isinstance(item, dict)
+        }
+        profile = build_supplier_truth_profile(
+            run_id=run_id,
+            seed_id=seed_id,
+            slot=slots.get(seed_id) or {"slot_id": f"slot-{seed_id}", "candidate_revision": 1},
+            supplier_product=supplier_product,
+            selection_receipt=receipt.to_dict(),
+        )
+        truth_path = self.repo.run_dir(run_id) / "supplier_truth_profiles.json"
+        truth_payload = self.repo.load_supplier_truth_profiles(run_id) if truth_path.exists() else {
+            "schema_version": 1,
+            "run_id": run_id,
+            "profiles": {},
+        }
+        truth_payload.setdefault("profiles", {})[seed_id] = profile
+        truth_payload["updated_at"] = utc_now_iso()
+        saved_truth_path = self.repo.save_supplier_truth_profiles(run_id, truth_payload)
+        category_resolution = self._resolve_supplier_truth_category(
+            run_id,
+            seed_id=seed_id,
+            profile=profile,
+        )
         selection_status = self._supplier_sku_selection_status(run_id)
         event = self.repo.append_run_event(
             run_id,
@@ -6358,6 +6775,8 @@ class WorkbenchService:
                 "supplier_sku_id": supplier_sku_id,
                 "selection_sha256": receipt.selection_sha256,
                 "selection_path": str(saved_path),
+                "supplier_truth_path": str(saved_truth_path),
+                "category_resolution_status": category_resolution.get("status"),
             },
         )
         return Result.success(
@@ -6368,6 +6787,239 @@ class WorkbenchService:
                 event,
                 {"receipt": receipt.to_dict(), "selection_status": selection_status},
             ),
+        )
+
+    def _resolve_supplier_truth_category(
+        self,
+        run_id: str,
+        *,
+        seed_id: str,
+        profile: dict[str, Any],
+    ) -> dict[str, Any]:
+        seed = next(
+            (item for item in self._safe_load_sampled_seeds(run_id) if item.seed_id == seed_id),
+            None,
+        )
+        try:
+            resolution = SellerCategoryResolver(self.seller_api_adapter).resolve(
+                profile,
+                seed_query_terms=list(seed.ozon_query_terms_ru if seed else []),
+            )
+        except (SellerApiError, AttributeError, OSError, TypeError, ValueError) as exc:
+            resolution = {
+                "status": "seller_api_unavailable",
+                "source": "locked_1688_supplier_truth",
+                "candidates": [],
+                "chosen": None,
+                "error": str(exc),
+            }
+
+        run = self.repo.load_run(run_id)
+        slot = next(
+            (
+                item
+                for item in run.get("candidate_slots", [])
+                if isinstance(item, dict) and str(item.get("seed_id") or "") == seed_id
+            ),
+            {},
+        )
+        resolution = {
+            **resolution,
+            "seed_id": seed_id,
+            "slot_id": str(profile.get("slot_id") or slot.get("slot_id") or ""),
+            "candidate_revision": int(
+                profile.get("candidate_revision") or slot.get("candidate_revision") or 1
+            ),
+            "updated_at": utc_now_iso(),
+        }
+        chosen = resolution.get("chosen") if isinstance(resolution.get("chosen"), dict) else None
+        if resolution.get("status") == "resolved" and chosen:
+            cache_key = f"{int(chosen['description_category_id'])}:{int(chosen['type_id'])}"
+            cache_path = self.repo.run_dir(run_id) / "seller_template_cache.json"
+            cache = self.repo.load_seller_template_cache(run_id) if cache_path.exists() else {
+                "schema_version": 1,
+                "run_id": run_id,
+                "templates": {},
+            }
+            template = (cache.get("templates") or {}).get(cache_key)
+            if not isinstance(template, dict):
+                try:
+                    template = self.seller_api_adapter.fetch_attribute_template(
+                        int(chosen["description_category_id"]),
+                        int(chosen["type_id"]),
+                    )
+                except (SellerApiError, AttributeError, OSError, TypeError, ValueError) as exc:
+                    resolution["status"] = "seller_api_unavailable"
+                    resolution["error"] = str(exc)
+                    template = None
+                if isinstance(template, dict):
+                    cache.setdefault("templates", {})[cache_key] = template
+                    cache["updated_at"] = utc_now_iso()
+                    self.repo.save_seller_template_cache(run_id, cache)
+            if isinstance(template, dict):
+                resolution["template_cache_key"] = cache_key
+                resolution["template_status"] = "ready"
+
+        path = self.repo.run_dir(run_id) / "category_resolutions.json"
+        payload = self.repo.load_category_resolutions(run_id) if path.exists() else {
+            "schema_version": 1,
+            "run_id": run_id,
+            "items": {},
+        }
+        payload.setdefault("items", {})[seed_id] = resolution
+        payload["updated_at"] = utc_now_iso()
+        self.repo.save_category_resolutions(run_id, payload)
+        return resolution
+
+    def category_confirmations(self, run_id: str) -> Result:
+        resolutions_path = self.repo.run_dir(run_id) / "category_resolutions.json"
+        truth_path = self.repo.run_dir(run_id) / "supplier_truth_profiles.json"
+        resolutions = self.repo.load_category_resolutions(run_id) if resolutions_path.exists() else {
+            "items": {}
+        }
+        truths = self.repo.load_supplier_truth_profiles(run_id) if truth_path.exists() else {
+            "profiles": {}
+        }
+        items = []
+        for seed_id, resolution in (resolutions.get("items") or {}).items():
+            if not isinstance(resolution, dict) or resolution.get("status") != "category_confirmation_required":
+                continue
+            items.append(
+                {
+                    **resolution,
+                    "seed_id": seed_id,
+                    "supplier_truth": (truths.get("profiles") or {}).get(seed_id, {}),
+                }
+            )
+        return Result.success(
+            "category_confirmations.ready",
+            "Ambiguous Seller API categories requiring confirmation were loaded.",
+            {"run_id": run_id, "items": items, "count": len(items)},
+        )
+
+    def confirm_category_resolution(
+        self,
+        run_id: str,
+        *,
+        slot_id: str,
+        description_category_id: int | str | None,
+        type_id: int | str | None,
+    ) -> Result:
+        try:
+            description_category_id = int(description_category_id or 0)
+            type_id = int(type_id or 0)
+        except (TypeError, ValueError):
+            return Result.failure(
+                "category_confirmation.invalid_choice",
+                "A valid Seller API category and type must be selected.",
+                data={"run_id": run_id, "slot_id": slot_id},
+            )
+        if description_category_id <= 0 or type_id <= 0:
+            return Result.failure(
+                "category_confirmation.invalid_choice",
+                "A valid Seller API category and type must be selected.",
+                data={"run_id": run_id, "slot_id": slot_id},
+            )
+        path = self.repo.run_dir(run_id) / "category_resolutions.json"
+        if not path.exists():
+            return Result.failure(
+                "category_confirmation.missing",
+                "No ambiguous Seller API category is waiting for confirmation.",
+                data={"run_id": run_id, "slot_id": slot_id},
+            )
+        payload = self.repo.load_category_resolutions(run_id)
+        entry = next(
+            (
+                item
+                for item in (payload.get("items") or {}).values()
+                if isinstance(item, dict) and str(item.get("slot_id") or "") == slot_id
+            ),
+            None,
+        )
+        if not isinstance(entry, dict) or entry.get("status") != "category_confirmation_required":
+            return Result.failure(
+                "category_confirmation.not_expected",
+                "This product slot does not require category confirmation.",
+                data={"run_id": run_id, "slot_id": slot_id},
+            )
+        run = self.repo.load_run(run_id)
+        active_slot = next(
+            (
+                item
+                for item in run.get("candidate_slots", [])
+                if isinstance(item, dict) and str(item.get("slot_id") or "") == slot_id
+            ),
+            None,
+        )
+        if not active_slot or int(active_slot.get("candidate_revision") or 0) != int(
+            entry.get("candidate_revision") or 0
+        ):
+            return Result.failure(
+                "category_confirmation.stale_revision",
+                "The category choice belongs to an old product revision and was not saved.",
+                data={"run_id": run_id, "slot_id": slot_id},
+            )
+        chosen = next(
+            (
+                dict(item)
+                for item in entry.get("candidates") or []
+                if int(item.get("description_category_id") or 0) == int(description_category_id)
+                and int(item.get("type_id") or 0) == int(type_id)
+            ),
+            None,
+        )
+        if chosen is None:
+            return Result.failure(
+                "category_confirmation.invalid_choice",
+                "The selected Seller API type is not one of this product's official candidates.",
+                data={"run_id": run_id, "slot_id": slot_id},
+            )
+        cache_key = f"{int(description_category_id)}:{int(type_id)}"
+        cache_path = self.repo.run_dir(run_id) / "seller_template_cache.json"
+        cache = self.repo.load_seller_template_cache(run_id) if cache_path.exists() else {
+            "schema_version": 1,
+            "run_id": run_id,
+            "templates": {},
+        }
+        template = (cache.get("templates") or {}).get(cache_key)
+        if not isinstance(template, dict):
+            try:
+                template = self.seller_api_adapter.fetch_attribute_template(
+                    int(description_category_id),
+                    int(type_id),
+                )
+            except (SellerApiError, AttributeError, OSError, TypeError, ValueError) as exc:
+                return Result.failure(
+                    "category_confirmation.template_unavailable",
+                    "The official Seller API field template could not be downloaded; the selection was not committed.",
+                    errors=[str(exc)],
+                    data={"run_id": run_id, "slot_id": slot_id},
+                )
+            cache.setdefault("templates", {})[cache_key] = template
+            cache["updated_at"] = utc_now_iso()
+            self.repo.save_seller_template_cache(run_id, cache)
+        entry.update(
+            {
+                "status": "resolved_by_user",
+                "confidence": "user_confirmed",
+                "chosen": chosen,
+                "template_cache_key": cache_key,
+                "template_status": "ready",
+                "confirmed_at": utc_now_iso(),
+            }
+        )
+        payload["updated_at"] = utc_now_iso()
+        self.repo.save_category_resolutions(run_id, payload)
+        event = self.repo.append_run_event(
+            run_id,
+            "category_confirmation.confirmed",
+            "One ambiguous Seller API category was confirmed without recollecting Ozon or 1688 evidence.",
+            {"slot_id": slot_id, "description_category_id": description_category_id, "type_id": type_id},
+        )
+        return Result.success(
+            "category_confirmation.confirmed",
+            "The official Seller API category and field template were locked.",
+            self._response_payload(run, event, {"resolution": entry}),
         )
 
     def reopen_supplier_sku_selection(self, run_id: str, *, seed_id: str) -> Result:
@@ -6447,6 +7099,20 @@ class WorkbenchService:
         selections.setdefault("selections", {}).pop(seed_id, None)
         selections["updated_at"] = reopened_at
         self.repo.save_supplier_sku_selections(run_id, selections)
+
+        truth_path = self.repo.run_dir(run_id) / "supplier_truth_profiles.json"
+        if truth_path.exists():
+            truth_payload = self.repo.load_supplier_truth_profiles(run_id)
+            truth_payload.setdefault("history", []).append(
+                {
+                    "seed_id": seed_id,
+                    "reopened_at": reopened_at,
+                    "profile": (truth_payload.get("profiles") or {}).get(seed_id),
+                }
+            )
+            truth_payload.setdefault("profiles", {}).pop(seed_id, None)
+            truth_payload["updated_at"] = reopened_at
+            self.repo.save_supplier_truth_profiles(run_id, truth_payload)
 
         if isinstance(subject_entry, dict):
             subjects.setdefault("history", []).append(
@@ -6942,17 +7608,18 @@ class WorkbenchService:
             if state == WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTING:
                 return self._autopilot_blocked(
                     run_id,
-                    "attribute_template_worker_required",
-                    "Ozon attribute template contract is ready; an approved browser worker must collect and ingest the template.",
+                    "legacy_batch_restart_required",
+                    "This batch belongs to the retired Ozon attribute-template browser pipeline and must be restarted.",
                     history,
                 )
 
             if state == WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTED:
-                result = self.dispatch(run_id, WorkbenchAction.OPEN_SUPPLIER_REVIEW.value)
-                history.append(self._history_item(result))
-                if not result.ok:
-                    return self._autopilot_blocked(run_id, result.code, result.message, history)
-                continue
+                return self._autopilot_blocked(
+                    run_id,
+                    "legacy_batch_restart_required",
+                    "This batch belongs to the retired Ozon attribute-template browser pipeline and must be restarted.",
+                    history,
+                )
 
             if state == WorkbenchState.OZON_COLLECTING:
                 return self._autopilot_blocked(
@@ -6963,10 +7630,7 @@ class WorkbenchService:
                 )
 
             if state == WorkbenchState.OZON_COLLECTED:
-                result = self.dispatch(
-                    run_id,
-                    WorkbenchAction.START_ATTRIBUTE_TEMPLATE_COLLECTION.value,
-                )
+                result = self._open_supplier_review_from_locked_ozon(run)
                 history.append(self._history_item(result))
                 if not result.ok:
                     return self._autopilot_blocked(
@@ -7096,7 +7760,7 @@ class WorkbenchService:
         if parsed_action == WorkbenchAction.GENERATE_OZON_QUERIES:
             return self._generate_ozon_queries(run)
         if parsed_action == WorkbenchAction.START_ATTRIBUTE_TEMPLATE_COLLECTION:
-            return self._prepare_attribute_template_contract(run)
+            return self._reject_invalid_action(run, parsed_action)
         if parsed_action == WorkbenchAction.MARK_ATTRIBUTE_TEMPLATE_COLLECTED:
             return self._mark_attribute_template_collected(run)
         if parsed_action == WorkbenchAction.START_OZON_COLLECTION:
@@ -7216,23 +7880,13 @@ class WorkbenchService:
         if not pending_seed_ids or current not in _REPLACEMENT_RECOVERY_STATES:
             return run
 
-        if run.get("attribute_template_collected"):
-            target = WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTED
-        elif run.get("attribute_template_contract_ready"):
-            target = WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTING
-        elif run.get("ozon_collected"):
-            target = WorkbenchState.OZON_COLLECTED
-        elif run.get("ozon_collection_contract_ready"):
+        if run.get("ozon_collection_contract_ready"):
             target = WorkbenchState.OZON_COLLECTING
         else:
             target = WorkbenchState.SEED_SELECTED
 
         run["status"] = target.value
-        run["ozon_collected"] = target in {
-            WorkbenchState.OZON_COLLECTED,
-            WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTING,
-            WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTED,
-        }
+        run["ozon_collected"] = False
         run["browser_task_cancelled"] = False
         run.pop("browser_task_cancelled_at", None)
         run.pop("browser_task_cancel_reason", None)
@@ -8008,46 +8662,9 @@ class WorkbenchService:
         success = min(total, max(0, success))
         failure = min(len(failed), max(total - success, 0))
         processed = min(total, success + failure)
-        template_validated_count = 0
-        if durable_candidates:
-            try:
-                template_payload = self.repo.load_attribute_template_result(
-                    run["run_id"]
-                )
-            except (FileNotFoundError, json.JSONDecodeError, OSError):
-                template_payload = {}
-            templates_by_seed = {
-                str(item.get("seed_id") or ""): item
-                for item in template_payload.get("seed_templates", [])
-                if isinstance(item, dict) and item.get("seed_id")
-            }
-            for candidate in durable_candidates:
-                seed_id = str(candidate.get("seed_id") or "")
-                template = templates_by_seed.get(seed_id) or {}
-                try:
-                    candidate_revision = int(
-                        candidate.get("candidate_revision") or 0
-                    )
-                    template_revision = int(
-                        template.get("candidate_revision") or 0
-                    )
-                except (TypeError, ValueError):
-                    continue
-                if (
-                    str(template.get("source_ozon_product_id") or "")
-                    == str(candidate.get("ozon_product_id") or "")
-                    and str(template.get("slot_id") or "")
-                    == str(candidate.get("slot_id") or "")
-                    and candidate_revision > 0
-                    and template_revision == candidate_revision
-                ):
-                    template_validated_count += 1
         collection_complete = total > 0 and success == total and failure == 0
-        template_pending_count = max(total - template_validated_count, 0)
         stage_complete = bool(
             collection_complete
-            and template_validated_count == total
-            and run.get("attribute_template_collected")
             and not run.get("replacement_pending_seed_ids")
         )
         return {
@@ -8058,8 +8675,9 @@ class WorkbenchService:
             "replacement_count": len(replaced),
             "pending_count": max(total - processed, 0),
             "collection_complete": collection_complete,
-            "template_validated_count": template_validated_count,
-            "template_pending_count": template_pending_count,
+            "market_reference_validated_count": success if collection_complete else 0,
+            "template_validated_count": success if collection_complete else 0,
+            "template_pending_count": 0 if collection_complete else max(total - success, 0),
             "stage_complete": stage_complete,
         }
 
@@ -8335,6 +8953,45 @@ class WorkbenchService:
             "updated_at": now,
         }
 
+    def _open_supplier_review_from_locked_ozon(self, run: dict[str, Any]) -> Result:
+        run_id = str(run["run_id"])
+        try:
+            payload = self.repo.load_ozon_collection_result(run_id)
+        except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+            return Result.failure(
+                "supplier_review.ozon_result_missing",
+                "Locked Ozon market-reference evidence is required before supplier review.",
+                errors=[str(exc)],
+                data={"run_id": run_id, "status": run.get("status")},
+            )
+        review = self._build_supplier_review(run_id, payload, preserve_created_at=True)
+        review_path = self.repo.save_supplier_review(run_id, review)
+        current = WorkbenchState(run["status"])
+        if current != WorkbenchState.OZON_COLLECTED:
+            return Result.failure(
+                "supplier_review.open_not_expected",
+                "Supplier review can be opened only after Ozon reference collection is locked.",
+                data={"run_id": run_id, "status": current.value},
+            )
+        run["status"] = transition_workbench_state(
+            current,
+            WorkbenchAction.OPEN_SUPPLIER_REVIEW,
+        ).value
+        run["supplier_review_path"] = str(review_path)
+        run.pop("replacement_pending_seed_ids", None)
+        self.repo.save_run(run)
+        event = self.repo.append_run_event(
+            run_id,
+            "supplier_review.opened",
+            "Supplier review was opened from locked Ozon market-reference evidence.",
+            {"review_path": str(review_path), "item_count": len(review.get("items", []))},
+        )
+        return Result.success(
+            "workbench.supplier_review_opened",
+            "Supplier review is open.",
+            self._response_payload(run, event),
+        )
+
     def recover_browser_task_state(self, run_id: str) -> dict[str, Any]:
         with self._run_mutation_lock(run_id):
             run = self.repo.load_run(run_id)
@@ -8346,8 +9003,6 @@ class WorkbenchService:
         current = WorkbenchState(run["status"])
         recoverable_states = {
             WorkbenchState.SEED_SELECTED,
-            WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTING,
-            WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTED,
             WorkbenchState.OZON_COLLECTING,
             WorkbenchState.OZON_COLLECTED,
             WorkbenchState.SUPPLIER_REVIEW,
@@ -8362,26 +9017,18 @@ class WorkbenchService:
             expected_seed_ids = [seed.seed_id for seed in self._safe_load_sampled_seeds(run["run_id"])]
         except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
             return run
-        if not expected_seed_ids or validate_ozon_collection_result(payload, expected_seed_ids):
+        if not expected_seed_ids or validate_ozon_collection_result(
+            payload,
+            expected_seed_ids,
+            subject_contracts=self._frozen_subject_contracts(run["run_id"]),
+        ):
             return run
 
-        template_ready = not self._seller_attribute_template_errors(
-            run["run_id"],
-            expected_seed_ids,
-        )
-        if template_ready:
-            target_state = WorkbenchState.SUPPLIER_REVIEW
-        elif (
-            current == WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTING
-            and run.get("attribute_template_contract_ready")
-        ):
-            target_state = WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTING
-        else:
-            target_state = WorkbenchState.OZON_COLLECTED
+        target_state = WorkbenchState.SUPPLIER_REVIEW
         changed = (
             current != target_state
             or run.get("ozon_collected") is not True
-            or (template_ready and bool(run.get("replacement_pending_seed_ids")))
+            or bool(run.get("replacement_pending_seed_ids"))
         )
         if not changed:
             return run
@@ -8390,20 +9037,14 @@ class WorkbenchService:
             self.repo.run_dir(run["run_id"]) / "ozon_collection_result.json"
         )
         run["status"] = target_state.value
-        if template_ready:
-            review = self._build_supplier_review(
-                run["run_id"],
-                payload,
-                preserve_created_at=True,
-            )
-            review_path = self.repo.save_supplier_review(run["run_id"], review)
-            run["supplier_review_path"] = str(review_path)
-            run.pop("replacement_pending_seed_ids", None)
-        else:
-            run["attribute_template_collected"] = False
-            run["attribute_template_contract_ready"] = False
-            run.pop("attribute_template_contract_path", None)
-            run.pop("supplier_review_path", None)
+        review = self._build_supplier_review(
+            run["run_id"],
+            payload,
+            preserve_created_at=True,
+        )
+        review_path = self.repo.save_supplier_review(run["run_id"], review)
+        run["supplier_review_path"] = str(review_path)
+        run.pop("replacement_pending_seed_ids", None)
         self.repo.save_run(run)
         if changed:
             self.repo.append_run_event(
@@ -8412,7 +9053,6 @@ class WorkbenchService:
                 "A complete Ozon result was restored to the correct post-lock lifecycle gate.",
                 {
                     "candidate_count": len(payload.get("ozon_candidates", [])),
-                    "template_ready": template_ready,
                     "target_status": target_state.value,
                 },
             )
@@ -9415,6 +10055,21 @@ def _content_evidence_index(evidence: dict[str, Any]) -> dict[str, Any]:
             if value not in (None, "", [], {}):
                 index[reference] = value
 
+    def add_tree(reference: str, value: Any) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                add_tree(f"{reference}.{key}", child)
+            return
+        if isinstance(value, list):
+            for position, child in enumerate(value):
+                add_tree(f"{reference}.{position}", child)
+            return
+        add(reference, value)
+
+    supplier_truth_profile = evidence.get("supplier_truth_profile")
+    if isinstance(supplier_truth_profile, dict):
+        add_tree("supplier_truth", supplier_truth_profile)
+
     add("ozon.title", evidence.get("ozon_title_style_reference"))
     ozon_selected_sku = evidence.get("ozon_selected_sku")
     if isinstance(ozon_selected_sku, dict):
@@ -9504,10 +10159,22 @@ def _field_candidate_evidence_refs(
     evidence_index: dict[str, Any],
 ) -> list[str]:
     canonical_label = canonical_attribute_label(field.get("label"))
+    creative_field = canonical_label in {"title", "description", "rich_content", "hashtags"}
+
+    def evidence_label(reference: str) -> str:
+        for marker in (".attributes.", ".selected_options."):
+            if marker in reference:
+                return reference.split(marker, 1)[1]
+        return reference.rsplit(".", 1)[-1]
+
+    def permitted(reference: str) -> bool:
+        return creative_field or not reference.startswith("ozon.")
+
     candidates: list[str] = []
     for reference in evidence_index:
-        evidence_label = reference.rsplit(".", 1)[-1]
-        if canonical_attribute_label(evidence_label) == canonical_label:
+        if not permitted(reference):
+            continue
+        if canonical_attribute_label(evidence_label(reference)) == canonical_label:
             candidates.append(reference)
     special_suffixes = {
         "quantity": (".set_quantity",),
@@ -9523,14 +10190,15 @@ def _field_candidate_evidence_refs(
     candidates.extend(
         reference
         for reference in evidence_index
-        if canonical_attribute_label(reference.rsplit(".", 1)[-1])
+        if permitted(reference)
+        and canonical_attribute_label(evidence_label(reference))
         in related_canonical_labels.get(canonical_label, set())
     )
     for suffix in special_suffixes.get(canonical_label, ()):
         candidates.extend(
             reference
             for reference in evidence_index
-            if reference.endswith(suffix)
+            if permitted(reference) and reference.endswith(suffix)
         )
     return list(dict.fromkeys(candidates))
 

@@ -998,6 +998,30 @@ class FsRepo:
     def load_supplier_sku_selections(self, run_id: str) -> dict[str, Any]:
         return self._read_json(self.run_dir(run_id) / "supplier_sku_selections.json")
 
+    def save_supplier_truth_profiles(self, run_id: str, payload: dict[str, Any]) -> Path:
+        path = self.run_dir(run_id) / "supplier_truth_profiles.json"
+        self._write_json(path, payload)
+        return path
+
+    def load_supplier_truth_profiles(self, run_id: str) -> dict[str, Any]:
+        return self._read_json(self.run_dir(run_id) / "supplier_truth_profiles.json")
+
+    def save_category_resolutions(self, run_id: str, payload: dict[str, Any]) -> Path:
+        path = self.run_dir(run_id) / "category_resolutions.json"
+        self._write_json(path, payload)
+        return path
+
+    def load_category_resolutions(self, run_id: str) -> dict[str, Any]:
+        return self._read_json(self.run_dir(run_id) / "category_resolutions.json")
+
+    def save_seller_template_cache(self, run_id: str, payload: dict[str, Any]) -> Path:
+        path = self.run_dir(run_id) / "seller_template_cache.json"
+        self._write_json(path, payload)
+        return path
+
+    def load_seller_template_cache(self, run_id: str) -> dict[str, Any]:
+        return self._read_json(self.run_dir(run_id) / "seller_template_cache.json")
+
     def save_pricing_settings(self, payload: dict[str, Any]) -> Path:
         self._write_json(self.pricing_settings_path, payload)
         return self.pricing_settings_path

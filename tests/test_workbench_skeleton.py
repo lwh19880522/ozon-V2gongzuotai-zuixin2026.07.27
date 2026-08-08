@@ -653,15 +653,12 @@ class WorkbenchSkeletonTests(RuntimeTestCase):
             {
                 "run_id": run_id,
                 "worker": "workbench_browser_bridge",
-                "ozon_candidates": [self.saved_ozon_candidate("seed-test", "sample-123")],
+                "ozon_candidates": [
+                    self.saved_ozon_candidate_for_contract(repo, run_id, "seed-test", "sample-123")
+                ],
             },
         )
         template_result = service.dispatch(run_id, WorkbenchAction.START_ATTRIBUTE_TEMPLATE_COLLECTION.value)
-        premature_ozon_result = service.dispatch(run_id, WorkbenchAction.START_OZON_COLLECTION.value)
-        ingest_template_result = service.ingest_attribute_template_result(
-            run_id,
-            self.attribute_template_payload(run_id, "seed-test"),
-        )
 
         self.assertTrue(query_result.ok)
         self.assertEqual("workbench.queries_generated", query_result.code)
@@ -669,17 +666,16 @@ class WorkbenchSkeletonTests(RuntimeTestCase):
         self.assertEqual("workbench.ozon_contract_ready", contract_result.code)
         self.assertTrue(ozon_result.ok)
         self.assertEqual("workbench.ozon_collection_ingested", ozon_result.code)
-        self.assertTrue(template_result.ok)
-        self.assertEqual("workbench.attribute_template_contract_ready", template_result.code)
-        self.assertFalse(premature_ozon_result.ok)
-        self.assertEqual("workbench.invalid_action", premature_ozon_result.code)
-        self.assertTrue(ingest_template_result.ok)
-        self.assertEqual("workbench.attribute_template_ingested", ingest_template_result.code)
+        self.assertFalse(template_result.ok)
+        self.assertEqual("workbench.invalid_action", template_result.code)
         self.assertEqual(WorkbenchState.SUPPLIER_REVIEW.value, repo.load_run(run_id)["status"])
         self.assertIn("contract", contract_result.data)
-        self.assertEqual("attribute_template.ingested", repo.load_run_events(run_id)[-1].event_type)
+        self.assertIn(
+            "ozon_collection.ingested",
+            [event.event_type for event in repo.load_run_events(run_id)],
+        )
 
-    def test_ingest_attribute_template_result_completes_template_gate(self) -> None:
+    def test_legacy_attribute_template_result_is_rejected_after_ozon_lock(self) -> None:
         repo = FsRepo(self.context)
         self.save_test_credentials(repo)
         seed = SeedProduct(seed_id="seed-test", title_or_keyword="夏凉被", product_clue="夏凉被")
@@ -698,27 +694,21 @@ class WorkbenchSkeletonTests(RuntimeTestCase):
             {
                 "run_id": run_id,
                 "worker": "workbench_browser_bridge",
-                "ozon_candidates": [self.saved_ozon_candidate("seed-test", "sample-123")],
+                "ozon_candidates": [
+                    self.saved_ozon_candidate_for_contract(repo, run_id, "seed-test", "sample-123")
+                ],
             },
         )
         self.assertTrue(ozon_result.ok, ozon_result.to_dict())
-        service.dispatch(run_id, WorkbenchAction.START_ATTRIBUTE_TEMPLATE_COLLECTION.value)
-
         result = service.ingest_attribute_template_result(run_id, self.attribute_template_payload(run_id, "seed-test"))
 
-        self.assertTrue(result.ok)
-        self.assertEqual("workbench.attribute_template_ingested", result.code)
-        self.assertEqual(1, seller_api.resolve_count)
-        self.assertEqual("sample-123", seller_api.last_category_candidate["product_title"])
+        self.assertFalse(result.ok)
+        self.assertEqual("workbench.attribute_template_not_expected", result.code)
+        self.assertEqual(0, seller_api.resolve_count)
         loaded = repo.load_run(run_id)
         self.assertEqual(WorkbenchState.SUPPLIER_REVIEW.value, loaded["status"])
-        self.assertTrue(loaded["attribute_template_collected"])
-        result_payload = repo.load_attribute_template_result(run_id)
-        template = result_payload["seed_templates"][0]
-        self.assertEqual("ozon_seller_api_description_category_attribute", template["seller_attribute_template"]["source"])
-        self.assertEqual("85", template["upload_attribute_schema"][0]["attribute_id"])
-        self.assertIn("visible_public_schema_guess", template["public_attribute_evidence"])
-        self.assertEqual("attribute_template.ingested", repo.load_run_events(run_id)[-1].event_type)
+        with self.assertRaises(FileNotFoundError):
+            repo.load_attribute_template_result(run_id)
 
     def test_ingest_attribute_template_result_rejects_invalid_payload(self) -> None:
         repo = FsRepo(self.context)
@@ -851,6 +841,54 @@ class WorkbenchSkeletonTests(RuntimeTestCase):
         self.assertFalse(result.ok)
         self.assertEqual("workbench.seller_attribute_template_unavailable", result.code)
         self.assertEqual(WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTING.value, repo.load_run(run_id)["status"])
+        self.assertTrue(repo.load_run(run_id)["browser_task_cancelled"])
+
+    def test_category_schema_no_match_retires_only_failing_candidate(self) -> None:
+        repo = FsRepo(self.context)
+        self.save_test_credentials(repo)
+        failing = self.ready_seed("seed-failing", "failing")
+        retained = self.ready_seed("seed-retained", "retained")
+        repo.save_active_seeds([failing, retained])
+        service = WorkbenchService(
+            repo,
+            seller_api_adapter=SelectiveCategoryNoMatchSellerApiAdapter(),
+        )
+        run_id = service.start_batch(target_count=2).data["run"]["run_id"]
+        self.save_locked_ozon_result(repo, run_id, [failing, retained])
+        run = repo.load_run(run_id)
+        run["status"] = WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTING.value
+        repo.save_run(run)
+        failing_payload = self.attribute_template_payload(run_id, failing.seed_id)
+        retained_payload = self.attribute_template_payload(run_id, retained.seed_id)
+        payload = {
+            **failing_payload,
+            "seed_templates": [
+                *failing_payload["seed_templates"],
+                *retained_payload["seed_templates"],
+            ],
+        }
+
+        result = service.ingest_attribute_template_result(run_id, payload)
+
+        self.assertTrue(result.ok, result.to_dict())
+        self.assertEqual("workbench.category_subject_candidates_retired", result.code)
+        self.assertEqual(WorkbenchState.SEED_SELECTED.value, repo.load_run(run_id)["status"])
+        self.assertEqual([failing.seed_id], repo.load_run(run_id)["replacement_pending_seed_ids"])
+        self.assertEqual(
+            [retained.seed_id],
+            [
+                item["seed_id"]
+                for item in repo.load_ozon_collection_result(run_id)["ozon_candidates"]
+            ],
+        )
+        self.assertEqual(
+            [retained.seed_id],
+            [
+                item["seed_id"]
+                for item in repo.load_attribute_template_result(run_id)["seed_templates"]
+            ],
+        )
+        self.assertIn("ozon-1", repo.load_blacklisted_ozon_product_ids())
 
     def test_autopilot_runs_until_attribute_template_worker_gate_when_queries_are_ready(self) -> None:
         repo = FsRepo(self.context)
@@ -1035,9 +1073,47 @@ class WorkbenchSkeletonTests(RuntimeTestCase):
             },
         }
 
+    def saved_ozon_candidate_for_contract(
+        self,
+        repo: FsRepo,
+        run_id: str,
+        seed_id: str,
+        product_id: str,
+    ) -> dict:
+        candidate = self.saved_ozon_candidate(seed_id, product_id)
+        contract = repo.load_ozon_collection_contract(run_id)
+        seed_contract = next(
+            seed["seed_subject_contract"]
+            for seed in contract["payload"]["seeds"]
+            if seed["seed_id"] == seed_id
+        )
+        subject_title = " ".join(seed_contract["required_stems"])
+        candidate["title"] = subject_title
+        candidate["content_score_evidence"]["title_raw"] = subject_title
+        candidate["subject_match_evidence"] = {
+            "seed_id": seed_id,
+            "accepted": True,
+            "required_stems": list(seed_contract["required_stems"]),
+            "matched_stems": list(seed_contract["required_stems"]),
+            "missing_stems": [],
+            "match_ratio": 1.0,
+            "minimum_matches": seed_contract["minimum_matches"],
+            "minimum_match_ratio": seed_contract["minimum_match_ratio"],
+        }
+        return candidate
+
 
 class FailingSellerApiAdapter:
     def resolve_attribute_template(self, category_candidate: dict) -> dict:
         from ozon_v2.adapters.seller_api import SellerApiError
 
         raise SellerApiError("category template not found")
+
+
+class SelectiveCategoryNoMatchSellerApiAdapter(FakeSellerApiAdapter):
+    def resolve_attribute_template(self, category_candidate: dict) -> dict:
+        from ozon_v2.adapters.seller_api import SellerCategoryMatchError
+
+        if category_candidate.get("product_title") == "ozon-1":
+            raise SellerCategoryMatchError("category template not found")
+        return super().resolve_attribute_template(category_candidate)

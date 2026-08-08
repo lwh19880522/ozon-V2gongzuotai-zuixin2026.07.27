@@ -127,7 +127,7 @@ const context = vm.createContext({
     }
     if (url.includes("/api/browser-task/active")) {
       activeFetchCount += 1;
-      return { json: async () => activeTaskResponse || task("ozon_attribute_template") };
+      return { json: async () => activeTaskResponse || task("ozon_collection") };
     }
     return { json: async () => ({ ok: true, code: "browser_task.none", data: {} }) };
   },
@@ -141,8 +141,8 @@ vm.runInContext(fs.readFileSync(backgroundPath, "utf8"), context, { filename: ba
 function task(taskType, runId = "wb-test", createdAt = "2026-07-10T04:30:00+00:00") {
   return {
     ok: true,
-    code: taskType === "ozon_attribute_template"
-      ? "browser_task.attribute_template_ready"
+    code: taskType === "ozon_collection"
+      ? "browser_task.ozon_collection_ready"
       : "browser_task.ozon_collection_ready",
     message: "ready",
     data: {
@@ -178,7 +178,7 @@ function sendMessageFromTab(message, tabId) {
 }
 
 (async () => {
-  const first = task("ozon_attribute_template");
+  const first = task("ozon_collection");
   stored.currentRunId = "";
   await Promise.all([
     sendMessage({ type: "ozon_v2_current_task", task: first }),
@@ -190,7 +190,7 @@ function sendMessageFromTab(message, tabId) {
   assert.equal(injectionCount, 1, "a mapped Ozon tab without a content-script receiver must be injected once");
   assert.equal(contentRunCount, 1, "one dispatch token must trigger one content-script run");
   assert.ok(tabs.get(1).url.startsWith("https://www.ozon.ru/search/"));
-  assert.ok(stored.openedTasks["wb-test:ozon_attribute_template"]);
+  assert.ok(stored.openedTasks["wb-test:ozon_collection"]);
   assert.ok(
     postedPayloads.some((payload) => payload.extension_version === manifestVersion),
     "heartbeats must report the version loaded from chrome.runtime.getManifest()",
@@ -219,11 +219,11 @@ function sendMessageFromTab(message, tabId) {
   assert.equal(updateCount, 0, "repeated polling must not bounce the mapped tab");
 
   contentTaskResponse = undefined;
-  const navigationTask = task("ozon_attribute_template", "wb-test", "2026-07-10T04:30:30+00:00");
+  const navigationTask = task("ozon_collection", "wb-test", "2026-07-10T04:30:30+00:00");
   const heartbeatsBeforeNavigation = postedPayloads.length;
   await sendMessage({ type: "ozon_v2_current_task", task: navigationTask });
   assert.equal(
-    stored.openedTasks["wb-test:ozon_attribute_template"].dispatchToken,
+    stored.openedTasks["wb-test:ozon_collection"].dispatchToken,
     navigationTask.data.dispatch_token,
     "a content task that navigates away before replying must still consume its dispatch token",
   );
@@ -233,7 +233,7 @@ function sendMessageFromTab(message, tabId) {
     "a navigation handoff must not be reported as a failed content task",
   );
 
-  const successfulDispatchToken = stored.openedTasks["wb-test:ozon_attribute_template"].dispatchToken;
+  const successfulDispatchToken = stored.openedTasks["wb-test:ozon_collection"].dispatchToken;
   contentTaskResponse = {
     ok: false,
     result: {
@@ -245,7 +245,7 @@ function sendMessageFromTab(message, tabId) {
   };
   await sendMessage({
     type: "ozon_v2_current_task",
-    task: task("ozon_attribute_template", "wb-test", "2026-07-10T04:31:00+00:00"),
+    task: task("ozon_collection", "wb-test", "2026-07-10T04:31:00+00:00"),
   });
   assert.ok(
     postedPayloads.some((payload) => (
@@ -254,7 +254,7 @@ function sendMessageFromTab(message, tabId) {
     "a failed content task must remain visible as a failed browser stage",
   );
   assert.equal(
-    stored.openedTasks["wb-test:ozon_attribute_template"].dispatchToken,
+    stored.openedTasks["wb-test:ozon_collection"].dispatchToken,
     successfulDispatchToken,
     "a failed content task must not consume the new dispatch token",
   );
@@ -270,8 +270,8 @@ function sendMessageFromTab(message, tabId) {
 
   const collectionTask = task("ozon_collection");
   await sendMessage({ type: "ozon_v2_current_task", task: collectionTask });
-  assert.equal(createCount, 1, "the next stage must reuse the existing Ozon tab");
-  assert.equal(updateCount, 1, "the next stage should navigate the reused tab once");
+  assert.equal(createCount, 1, "the collection task must reuse the existing Ozon tab");
+  assert.equal(updateCount, 0, "repeated collection polling must not navigate the tab again");
   await sendMessage({ type: "ozon_v2_current_task", task: collectionTask });
   const collectionKey = "wb-test:ozon_collection";
   const runsBeforeRecovery = contentRunCount;
@@ -298,7 +298,7 @@ function sendMessageFromTab(message, tabId) {
   );
 
   stored.currentRunId = "wb-complete";
-  activeTaskResponse = task("ozon_attribute_template", "wb-historical", "2026-07-10T03:00:00+00:00");
+  activeTaskResponse = task("ozon_collection", "wb-historical", "2026-07-10T03:00:00+00:00");
   const activeFetchesBeforeTerminalCheck = activeFetchCount;
   const terminal = await sendMessage({ type: "ozon_v2_get_current_task" });
   assert.equal(terminal.task.code, "browser_task.none", "a completed current run must remain terminal");
@@ -310,7 +310,7 @@ function sendMessageFromTab(message, tabId) {
   assert.equal(stored.currentRunId, "wb-complete", "an older historical task must not replace the current run");
 
   stored.currentRunId = "wb-stale";
-  activeTaskResponse = task("ozon_attribute_template", "wb-historical", "2026-07-10T03:00:00+00:00");
+  activeTaskResponse = task("ozon_collection", "wb-historical", "2026-07-10T03:00:00+00:00");
   const activeFetchesBeforeStoppedCheck = activeFetchCount;
   const stopped = await sendMessage({ type: "ozon_v2_get_current_task" });
   assert.equal(stopped.task.code, "browser_task.none", "a stopped current run must remain stopped");
@@ -322,7 +322,7 @@ function sendMessageFromTab(message, tabId) {
   assert.equal(stored.currentRunId, "wb-stale", "an older historical task must not replace a stopped run");
 
   stored.currentRunId = "wb-complete";
-  activeTaskResponse = task("ozon_attribute_template", "wb-new", "2026-07-10T05:00:00+00:00");
+  activeTaskResponse = task("ozon_collection", "wb-new", "2026-07-10T05:00:00+00:00");
   const next = await sendMessage({ type: "ozon_v2_get_current_task" });
   assert.equal(next.task.data.run_id, "wb-new", "a genuinely newer batch must be discoverable automatically");
 
@@ -331,7 +331,7 @@ function sendMessageFromTab(message, tabId) {
   assert.equal(stored.currentRunId, "wb-new", "background polling must adopt the genuinely newer batch");
   assert.equal(updateCount, updatesBeforeNewBatch + 1, "background polling must navigate the reused Ozon tab once");
 
-  stored.openedTasks["wb-new:ozon_attribute_template"] = {
+  stored.openedTasks["wb-new:ozon_collection"] = {
     tabId: 1,
     targetUrl: tabs.get(1).url,
     extensionVersion: "0.1.10",
@@ -340,14 +340,14 @@ function sendMessageFromTab(message, tabId) {
   const reloadsBeforeVersionRefresh = reloadCount;
   await sendMessage({
     type: "ozon_v2_current_task",
-    task: task("ozon_attribute_template", "wb-new", "2026-07-10T05:00:00+00:00"),
+    task: task("ozon_collection", "wb-new", "2026-07-10T05:00:00+00:00"),
   });
   assert.equal(updateCount, updatesBeforeVersionRefresh, "same-URL version refresh must not use a no-op URL update");
   assert.equal(reloadCount, reloadsBeforeVersionRefresh + 1, "same-URL version refresh must force one tab reload");
-  assert.equal(stored.openedTasks["wb-new:ozon_attribute_template"].extensionVersion, manifestVersion);
+  assert.equal(stored.openedTasks["wb-new:ozon_collection"].extensionVersion, manifestVersion);
 
   tabs.set(1, { id: 1, url: "edge://extensions/" });
-  stored.openedTasks["wb-remap:ozon_attribute_template"] = {
+  stored.openedTasks["wb-remap:ozon_collection"] = {
     tabId: 1,
     targetUrl: "https://www.ozon.ru/search/?text=old",
     extensionVersion: manifestVersion,
@@ -356,7 +356,7 @@ function sendMessageFromTab(message, tabId) {
   const createsBeforeInvalidMapping = createCount;
   await sendMessage({
     type: "ozon_v2_current_task",
-    task: task("ozon_attribute_template", "wb-remap", "2026-07-10T05:30:00+00:00"),
+    task: task("ozon_collection", "wb-remap", "2026-07-10T05:30:00+00:00"),
   });
   assert.equal(
     createCount,
@@ -365,10 +365,10 @@ function sendMessageFromTab(message, tabId) {
   );
   assert.ok(tabs.get(createCount).url.startsWith("https://www.ozon.ru/search/"));
 
-  const closeTask = task("ozon_attribute_template", "wb-close", "2026-07-10T05:40:00+00:00");
+  const closeTask = task("ozon_collection", "wb-close", "2026-07-10T05:40:00+00:00");
   closeTaskResponse = closeTask;
   await sendMessage({ type: "ozon_v2_current_task", task: closeTask });
-  const closeKey = "wb-close:ozon_attribute_template";
+  const closeKey = "wb-close:ozon_collection";
   const closedTabId = stored.openedTasks[closeKey].tabId;
   const createsBeforeUserClose = createCount;
   tabs.delete(closedTabId);
@@ -385,7 +385,7 @@ function sendMessageFromTab(message, tabId) {
   await context.pollTask("after_user_close");
   assert.equal(createCount, createsBeforeUserClose, "background polling must not reopen a user-closed task tab");
 
-  closeTaskResponse = task("ozon_attribute_template", "wb-close", "2026-07-10T05:41:00+00:00");
+  closeTaskResponse = task("ozon_collection", "wb-close", "2026-07-10T05:41:00+00:00");
   await context.pollTask("after_explicit_resume");
   assert.equal(createCount, createsBeforeUserClose + 1, "a new resume token may reopen the task tab once");
   const createsAfterExplicitResume = createCount;

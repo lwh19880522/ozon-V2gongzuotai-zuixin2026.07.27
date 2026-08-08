@@ -187,6 +187,30 @@ class CollectionPolicyTests(TestCase):
         self.assertIn("Ozon collection result must include exactly one candidate per expected seed", errors)
         self.assertIn("Ozon collection result has duplicate seed_ids: seed-test", errors)
 
+    def test_ozon_collection_rejects_candidate_without_matching_subject_evidence(self) -> None:
+        candidate = self.ozon_candidate(self.verified_seller_decision()).to_dict()
+
+        errors = validate_ozon_collection_result(
+            {
+                "worker": "workbench_browser_bridge",
+                "ozon_candidates": [candidate],
+            },
+            ["seed-test"],
+            subject_contracts={
+                "seed-test": {
+                    "seed_id": "seed-test",
+                    "required_stems": ["план", "запи", "счет", "ганд"],
+                    "minimum_matches": 3,
+                    "minimum_match_ratio": 0.70,
+                }
+            },
+        )
+
+        self.assertIn(
+            "Ozon candidate seed-test: subject_match_evidence is required",
+            errors,
+        )
+
     def test_ozon_collection_rejects_candidate_for_unexpected_seed(self) -> None:
         expected = self.ozon_candidate(self.verified_seller_decision()).to_dict()
         unexpected = dict(expected)

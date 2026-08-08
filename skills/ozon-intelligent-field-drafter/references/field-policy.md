@@ -16,12 +16,9 @@ Use the most product-specific verified source:
    price, stock, and image facts.
 3. `supplier_attributes` and `supplier.attributes.*`: 1688 product-level facts
    that do not conflict with the locked SKU.
-4. Facts consistent across supplier evidence and `ozon_attributes`.
-5. `ozon_attributes` and Ozon content evidence: Russian terminology, structure,
-   and non-identity reference facts when supplier truth does not contradict them.
-   The structured Ozon attributes remain active evidence; they are not display-only
-   data and must be checked before declaring a non-identity source fact missing.
-6. Ozon prose: creative reference unless a structured supplier fact confirms it.
+4. Ozon title, attributes, category, SKU, and prose: Russian terminology and
+   creative structure reference only. They are never product-fact evidence for
+   the locked 1688 product.
 
 Never let lower-priority evidence overwrite higher-priority evidence.
 
@@ -147,8 +144,8 @@ with `#`, and replace multi-word hashtag spaces with underscores, such as
 ## Required fields
 
 Process required fields before optional and creative fields. Exhaust exact
-locked-SKU evidence, supplier attributes, structured Ozon attributes, allowed
-dictionary values, permitted visual evidence, translation, and normalization
+locked-SKU evidence, supplier attributes, allowed dictionary values, permitted
+visual evidence, translation, and normalization
 before declaring a required fact missing.
 
 Required fields receive no permission to guess. If the fact remains

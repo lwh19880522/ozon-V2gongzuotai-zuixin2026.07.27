@@ -114,7 +114,12 @@ def validate_attribute_template_result(
     return errors
 
 
-def validate_ozon_collection_result(payload: dict, expected_seed_ids: list[str]) -> list[str]:
+def validate_ozon_collection_result(
+    payload: dict,
+    expected_seed_ids: list[str],
+    *,
+    subject_contracts: dict[str, dict] | None = None,
+) -> list[str]:
     errors: list[str] = []
     if payload.get("worker") not in ATTRIBUTE_TEMPLATE_WORKERS:
         errors.append("Ozon collection result must come from an approved browser worker")
@@ -166,6 +171,30 @@ def validate_ozon_collection_result(payload: dict, expected_seed_ids: list[str])
             errors.append(f"Ozon candidate {index} has invalid shape: {exc}")
             continue
         errors.extend([f"Ozon candidate {candidate.seed_id}: {error}" for error in validate_ozon_candidate(candidate)])
+        contract = (subject_contracts or {}).get(candidate.seed_id)
+        if contract:
+            evidence = candidate.subject_match_evidence or {}
+            if not evidence:
+                errors.append(f"Ozon candidate {candidate.seed_id}: subject_match_evidence is required")
+                continue
+            if str(evidence.get("seed_id") or "") != candidate.seed_id:
+                errors.append(f"Ozon candidate {candidate.seed_id}: subject_match_evidence seed_id mismatch")
+            subject_text = " ".join(
+                str(value or "")
+                for value in (
+                    candidate.title,
+                    candidate.category_path,
+                    candidate.leaf_category,
+                    " ".join(str(key) for key in candidate.attributes),
+                    " ".join(str(value) for value in candidate.attributes.values()),
+                    " ".join(str(value) for value in candidate.target_sku.selected_options.values()),
+                )
+            )
+            from ozon_v2.domain.seed_subject import evaluate_subject_text
+
+            server_evidence = evaluate_subject_text(contract, subject_text)
+            if evidence.get("accepted") is not True or server_evidence["accepted"] is not True:
+                errors.append(f"Ozon candidate {candidate.seed_id}: seed subject contract did not match")
     return errors
 
 

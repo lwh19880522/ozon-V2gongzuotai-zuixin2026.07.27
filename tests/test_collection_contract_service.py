@@ -85,6 +85,12 @@ class CollectionContractServiceTests(RuntimeTestCase):
         self.assertFalse(result.data["payload"]["rules"]["attribute_template_prerequisite_required"])
         self.assertTrue(result.data["payload"]["rules"]["lock_final_ozon_product_before_template"])
         self.assertNotIn("attribute_template_prerequisite", result.data["payload"])
+        subject_contract = seed_payload["seed_subject_contract"]
+        self.assertEqual(sampled_seed_id, subject_contract["seed_id"])
+        self.assertEqual("органайзер для хранения", subject_contract["primary_query_ru"])
+        self.assertGreaterEqual(subject_contract["minimum_match_ratio"], 0.70)
+        self.assertTrue(subject_contract["required_stems"])
+        self.assertEqual("market_reference", result.data["payload"]["ozon_evidence_role"])
 
     def test_ozon_contract_does_not_reuse_a_pre_lock_template_snapshot(self) -> None:
         repo = FsRepo(self.context)

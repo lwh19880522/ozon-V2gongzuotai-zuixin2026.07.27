@@ -6,33 +6,68 @@
   }
 
   function intentStems(value) {
-    const stopwords = new Set(["без", "для", "или", "из", "на", "от", "по", "под", "при", "со"]);
-    const genericRoots = new Set([
-      "аксе", "комп", "мешо", "набо", "орга", "паке", "сумк", "това", "унив", "хран", "чехо",
-    ]);
+    const stopwords = new Set(["без", "для", "или", "из", "на", "над", "от", "по", "под", "при", "со"]);
+    const noiseRoots = new Set(["дост", "зака", "кита", "купи", "озон", "прод", "това", "цена"]);
     const tokens = normalized(value)
       .toLowerCase()
+      .replace(/ё/g, "е")
       .replace(/[-_/]+/g, " ")
       .match(/[\p{L}\p{N}]+/gu) || [];
     return tokens
       .filter((token) => token.length >= 4 && !stopwords.has(token))
       .map((token) => token.slice(0, 4))
-      .filter((stem) => !genericRoots.has(stem));
+      .filter((stem) => !noiseRoots.has(stem));
   }
 
-  function matchesQueryIntent(queryTerms, snapshot = {}) {
-    const queryStems = Array.from(new Set(intentStems((queryTerms || []).join(" "))));
-    if (!queryStems.length) return false;
-    const productStems = new Set(intentStems([
+  const stemAliasGroups = [
+    new Set(["мешк", "паке"]),
+  ];
+
+  function stemMatches(requiredStem, productStems) {
+    if (productStems.has(requiredStem)) return true;
+    const group = stemAliasGroups.find((values) => values.has(requiredStem));
+    return Boolean(group && Array.from(group).some((stem) => productStems.has(stem)));
+  }
+
+  function subjectSnapshotText(snapshot = {}) {
+    return [
       snapshot.title,
       snapshot.category_path,
       snapshot.leaf_category,
       ...Object.keys(snapshot.attributes || {}),
       ...Object.values(snapshot.attributes || {}),
       ...Object.values(snapshot.selected_options || {}),
-    ].filter(Boolean).join(" ")));
-    const matched = queryStems.filter((stem) => productStems.has(stem));
-    return matched.length >= Math.min(2, queryStems.length);
+      snapshot.card_text,
+    ].filter(Boolean).join(" ");
+  }
+
+  function evaluateSeedSubject(contract = {}, snapshot = {}) {
+    const required = Array.from(new Set((contract.required_stems || []).map(normalized).filter(Boolean)));
+    const productStems = new Set(intentStems(subjectSnapshotText(snapshot)));
+    const matched = required.filter((stem) => stemMatches(stem, productStems));
+    const missing = required.filter((stem) => !stemMatches(stem, productStems));
+    const matchRatio = required.length ? matched.length / required.length : 0;
+    const minimumMatches = Math.max(1, Number(contract.minimum_matches || 1));
+    const minimumRatio = Number(contract.minimum_match_ratio || 0.70);
+    return {
+      seed_id: normalized(contract.seed_id) || null,
+      accepted: required.length > 0 && matched.length >= minimumMatches && matchRatio >= minimumRatio,
+      required_stems: required,
+      matched_stems: matched,
+      missing_stems: missing,
+      match_ratio: Number(matchRatio.toFixed(4)),
+      minimum_matches: minimumMatches,
+      minimum_match_ratio: minimumRatio,
+    };
+  }
+
+  function matchesQueryIntent(queryTerms, snapshot = {}) {
+    const queryStems = Array.from(new Set(intentStems((queryTerms || []).join(" "))));
+    return evaluateSeedSubject({
+      required_stems: queryStems,
+      minimum_matches: Math.max(1, Math.ceil(queryStems.length * 0.70)),
+      minimum_match_ratio: 0.70,
+    }, snapshot).accepted;
   }
 
   function normalizeMedia(values, limit = 24) {
@@ -124,7 +159,7 @@
     });
   }
 
-  function selectSearchCandidates(items, fallbackLimit = 8) {
+  function selectSearchCandidates(items, fallbackLimit = 3) {
     const source = Array.isArray(items) ? items : [];
     const qualified = prioritizeCrossBorderSearchLinks(source);
     const ordered = [...qualified, ...source.filter((item) => !qualified.includes(item))];
@@ -260,6 +295,7 @@
 
   const api = {
     crossBorderSearchQuery,
+    evaluateSeedSubject,
     blockingCandidateFields,
     hasRealAttributes,
     hasUsedProductId,

@@ -11,6 +11,29 @@ const evidence = require(path.join(
   "product_evidence.js",
 ));
 
+const handballContract = {
+  seed_id: "seed-5000-0001",
+  required_stems: ["план", "запи", "счет", "ганд"],
+  minimum_matches: 3,
+  minimum_match_ratio: 0.70,
+};
+assert.equal(
+  evidence.evaluateSeedSubject(handballContract, {
+    title: "Обычная доска для письма и заметок",
+    leaf_category: "Доски",
+  }).accepted,
+  false,
+  "generic wording must not satisfy a structured seed subject contract",
+);
+assert.equal(
+  evidence.evaluateSeedSubject(handballContract, {
+    title: "Гандбольный планшет для ведения счёта",
+    leaf_category: "Спортивные аксессуары",
+  }).accepted,
+  true,
+  "Russian morphology may vary while the locked product identity remains present",
+);
+
 assert.equal(evidence.crossBorderSearchQuery("цветочный горшок"), "цветочный горшок из Китая");
 assert.equal(evidence.crossBorderSearchQuery("цветочный горшок из Китая"), "цветочный горшок из Китая");
 
@@ -93,6 +116,11 @@ assert.deepEqual(
   evidence.selectSearchCandidates(mixedCandidates, 8).map((item) => item.href),
   mixedCandidates.slice(0, 8).map((item) => item.href),
   "a qualified first card must not prevent checking the other visible candidates up to the fixed limit",
+);
+assert.equal(
+  evidence.selectSearchCandidates(mixedCandidates).length,
+  3,
+  "one seed must inspect at most three detail candidates by default",
 );
 
 assert.deepEqual(

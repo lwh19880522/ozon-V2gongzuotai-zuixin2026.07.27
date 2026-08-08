@@ -16,6 +16,10 @@ class SellerApiError(RuntimeError):
     pass
 
 
+class SellerCategoryMatchError(SellerApiError):
+    pass
+
+
 class SellerApiAdapter:
     def __init__(self, repo: FsRepo | None = None, base_url: str = "https://api-seller.ozon.ru") -> None:
         self.repo = repo or FsRepo()
@@ -105,7 +109,9 @@ class SellerApiAdapter:
                 item["match_evidence"] = assessment
                 matches.append(item)
         if not matches:
-            raise SellerApiError("Could not match public Ozon category to Seller description category template.")
+            raise SellerCategoryMatchError(
+                "Could not match public Ozon category to Seller description category template."
+            )
         matches.sort(key=lambda item: item["match_score"], reverse=True)
         return matches[0]
 
@@ -115,6 +121,29 @@ class SellerApiAdapter:
         if not isinstance(result, list):
             raise SellerApiError("Seller category tree response has invalid shape.")
         return result
+
+    def fetch_description_category_tree(self) -> list[dict[str, Any]]:
+        return [dict(item) for item in _iter_description_category_nodes(self._fetch_description_category_tree())]
+
+    def fetch_attribute_template(
+        self,
+        description_category_id: int,
+        type_id: int,
+    ) -> dict[str, Any]:
+        attributes = self._fetch_description_category_attributes(
+            int(description_category_id),
+            int(type_id),
+        )
+        schema = [_normalize_upload_attribute(item) for item in attributes]
+        schema = [item for item in schema if item["attribute_id"]]
+        if not schema:
+            raise SellerApiError("Seller category attribute template did not return upload attributes.")
+        return {
+            "source": "ozon_seller_api_description_category_attribute",
+            "description_category_id": int(description_category_id),
+            "type_id": int(type_id),
+            "upload_attribute_schema": schema,
+        }
 
     def _fetch_description_category_attributes(
         self,
@@ -569,12 +598,12 @@ def _category_tokens_match(left: str, right: str) -> bool:
 def _category_title_match_score(title_key: str, node_leaf_key: str) -> int:
     if not title_key or not node_leaf_key:
         return 0
-    if f" {node_leaf_key} " in f" {title_key} ":
-        return 100
-    title_tokens = _token_keys(title_key)
-    leaf_tokens = _token_keys(node_leaf_key)
+    title_tokens = _context_tokens(title_key)
+    leaf_tokens = _context_tokens(node_leaf_key)
     if not title_tokens or not leaf_tokens:
         return 0
+    if f" {node_leaf_key} " in f" {title_key} ":
+        return 100
     matched = sum(
         1 for leaf_token in leaf_tokens if any(_category_tokens_match(leaf_token, title) for title in title_tokens)
     )
@@ -608,6 +637,7 @@ def assess_category_template_match(
     category_score = _category_match_score(target_key, target_leaf_key, node_key)
     title_score = _category_title_match_score(_normalize_category_text(product_title), node_leaf_key)
     type_score = _category_title_match_score(_normalize_category_text(product_type), node_leaf_key)
+    leaf_score = _category_title_match_score(target_leaf_key, node_leaf_key)
 
     target_parts = [part.strip() for part in category_path.split("/") if part.strip()]
     node_parts = [part.strip() for part in matched_category_path.split("/") if part.strip()]
@@ -615,13 +645,31 @@ def assess_category_template_match(
         target_parts[0] if target_parts else "",
         node_parts[0] if node_parts else "",
     )
+    target_root_key = _normalize_category_text(target_parts[0] if target_parts else "")
+    root_nested_under_seller_parent = bool(
+        target_root_key
+        and any(
+            _normalize_category_text(part) == target_root_key
+            for part in node_parts[:-1]
+        )
+    )
     context_overlap = _category_context_overlap(
         " ".join(target_parts[:-1] or target_parts),
         " ".join(node_parts[:-1]),
     )
     has_hierarchy = len(target_parts) > 1 and len(node_parts) > 1
     cross_domain = has_hierarchy and not root_compatible
-    credible = not cross_domain or type_score > 0 or (title_score > 0 and context_overlap > 0)
+    strong_subject_score = max(title_score, type_score)
+    hierarchy_subject_aligned = category_score >= 60 and leaf_score >= 40
+    credible = (
+        (
+            not cross_domain
+            and (max(leaf_score, strong_subject_score) >= 60 or hierarchy_subject_aligned)
+        )
+        or (root_nested_under_seller_parent and strong_subject_score >= 60)
+        or type_score >= 80
+        or (cross_domain and title_score == 100 and context_overlap > 0)
+    )
     reason = "category_evidence_aligned" if credible else "cross_domain_category_mismatch"
     return {
         "credible": credible,
@@ -630,7 +678,10 @@ def assess_category_template_match(
         "category_score": category_score,
         "title_score": title_score,
         "product_type_score": type_score,
+        "leaf_score": leaf_score,
         "root_compatible": root_compatible,
+        "root_nested_under_seller_parent": root_nested_under_seller_parent,
+        "hierarchy_subject_aligned": hierarchy_subject_aligned,
         "context_overlap": context_overlap,
     }
 

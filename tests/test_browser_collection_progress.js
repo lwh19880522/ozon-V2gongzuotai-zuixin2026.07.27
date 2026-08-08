@@ -32,6 +32,9 @@ const productEvidence = {
   hasUsedProductId() { return false; },
   isExcludedProductId() { return false; },
   matchesQueryIntent() { return true; },
+  evaluateSeedSubject(contract) {
+    return { seed_id: String((contract || {}).seed_id || ""), accepted: true };
+  },
 };
 
 const document = {

@@ -128,7 +128,6 @@ function taskTargetUrl(task) {
 
 function isRunnableTask(task) {
   return !!task && (
-    task.code === "browser_task.attribute_template_ready" ||
     task.code === "browser_task.ozon_collection_ready" ||
     task.code === "browser_task.supplier_collection_ready" ||
     task.code === "browser_task.supplier_selection_ready"
