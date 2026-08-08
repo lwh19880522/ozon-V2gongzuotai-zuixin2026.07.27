@@ -3932,7 +3932,10 @@ def create_handler(
                 elif (
                     run_id
                     and payload.get("task_type") == "ozon_collection"
-                    and code.endswith(".no_cross_border_candidate")
+                    and (
+                        code.endswith(".no_cross_border_candidate")
+                        or code.endswith(".no_relevant_search_candidate")
+                    )
                 ):
                     details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
                     selected_repo.append_run_event(
@@ -3983,7 +3986,11 @@ def create_handler(
                                 response_message = "The exhausted Ozon seed was replaced and the batch resumed."
                             elif (
                                 task_type == "ozon_collection"
-                                and replacement.code == "workbench.exhausted_seed_no_replacement"
+                                and replacement.code
+                                in {
+                                    "workbench.exhausted_seed_no_replacement",
+                                    "workbench.exhausted_seed_budget_exceeded",
+                                }
                             ):
                                 selected_repo.append_run_event(
                                     run_id,
@@ -3995,8 +4002,8 @@ def create_handler(
                                         "result_code": replacement.code,
                                     },
                                 )
-                                response_code = "browser_bridge.exhausted_seed_no_replacement"
-                                response_message = "No eligible replacement seed remains; manual review is required."
+                                response_code = f"browser_bridge.{replacement.code.removeprefix('workbench.')}"
+                                response_message = replacement.message
                 self._send_json(
                     {
                         "ok": True,

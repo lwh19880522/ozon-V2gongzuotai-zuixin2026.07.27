@@ -88,7 +88,7 @@ class CollectionContractServiceTests(RuntimeTestCase):
         subject_contract = seed_payload["seed_subject_contract"]
         self.assertEqual(sampled_seed_id, subject_contract["seed_id"])
         self.assertEqual("органайзер для хранения", subject_contract["primary_query_ru"])
-        self.assertGreaterEqual(subject_contract["minimum_match_ratio"], 0.70)
+        self.assertEqual(0.60, subject_contract["minimum_match_ratio"])
         self.assertTrue(subject_contract["required_stems"])
         self.assertEqual("market_reference", result.data["payload"]["ozon_evidence_role"])
 

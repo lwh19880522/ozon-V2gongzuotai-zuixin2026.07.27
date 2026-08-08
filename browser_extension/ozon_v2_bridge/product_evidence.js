@@ -266,9 +266,19 @@
   }
 
   function blockingCandidateFields(missingFields, decision) {
-    const optionalMarketSignals = new Set(["rating", "review_count"]);
+    const selectionCriticalFields = new Set([
+      "product_id",
+      "title",
+      "sku_id",
+      "main_gallery_images",
+      "selected_sku_images",
+      "query_intent_mismatch",
+      "excluded_ozon_product_id",
+      "public_product_snapshot",
+      "product_evidence_module",
+    ]);
     const fields = Array.from(new Set(Array.isArray(missingFields) ? missingFields : []))
-      .filter((field) => !optionalMarketSignals.has(field));
+      .filter((field) => selectionCriticalFields.has(field));
     const signals = decision && Array.isArray(decision.signals) ? decision.signals : [];
     const hasChinaProductOrigin = Boolean(
       decision

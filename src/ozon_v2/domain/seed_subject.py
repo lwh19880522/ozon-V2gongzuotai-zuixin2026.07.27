@@ -72,7 +72,7 @@ def build_seed_subject_contract(
     required_stems = normalized_content_stems(primary_query)
     if not required_stems:
         raise ValueError("Russian seed query contains no usable subject terms")
-    minimum_ratio = 0.70
+    minimum_ratio = 0.60
     return {
         "contract_version": 1,
         "seed_id": str(seed_id),

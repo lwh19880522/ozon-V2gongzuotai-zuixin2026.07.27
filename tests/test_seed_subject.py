@@ -39,6 +39,22 @@ def test_subject_contract_accepts_russian_morphology_when_identity_is_preserved(
     assert set(result["matched_stems"]) >= {"ганд", "план", "счет"}
 
 
+def test_subject_contract_accepts_close_market_title_with_two_of_three_core_terms() -> None:
+    contract = build_seed_subject_contract(
+        seed_id="seed-5000-0003",
+        source_text_zh="汽车遮阳帘",
+        queries_ru=["автомобильный солнцезащитный козырек"],
+    )
+
+    result = evaluate_subject_text(
+        contract,
+        "Солнцезащитная шторка на лобовое стекло автомобиля",
+    )
+
+    assert result["accepted"] is True
+    assert set(result["matched_stems"]) >= {"авто", "солн"}
+
+
 def test_subject_contract_removes_only_real_search_noise() -> None:
     contract = build_seed_subject_contract(
         seed_id="seed-5000-0002",

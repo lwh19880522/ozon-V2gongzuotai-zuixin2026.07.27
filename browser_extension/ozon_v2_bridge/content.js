@@ -290,6 +290,24 @@ function isSearchEvidencePage() {
   return false;
 }
 
+function normalizedSearchText(value) {
+  return String(value || "")
+    .trim()
+    .toLocaleLowerCase("ru-RU")
+    .replace(/\s+/g, " ");
+}
+
+function searchPageMatchesQuery(query) {
+  if (!isSearchEvidencePage()) return false;
+  try {
+    const currentQuery = new URL(location.href).searchParams.get("text") || "";
+    const expectedQuery = new URL(searchUrl(query)).searchParams.get("text") || "";
+    return normalizedSearchText(currentQuery) === normalizedSearchText(expectedQuery);
+  } catch (_) {
+    return false;
+  }
+}
+
 async function waitForSearchEvidence(runId, timeoutMs = 120000) {
   const deadline = Date.now() + timeoutMs;
   let firstResultsAt = null;
@@ -962,32 +980,39 @@ async function runOzonCollection(task) {
     details: collectionProgressDetails(state, seeds.length),
   });
   if (state.stage === "search") {
-    if (!isSearchEvidencePage()) {
+    if (!searchPageMatchesQuery(query)) {
       saveState(state);
       location.href = searchUrl(query);
       return { ok: true, code: "bridge.ozon_collection_navigating_search" };
     }
     state.searchEvidence = await waitForSearchEvidence(runId);
-    if (productEvidence && typeof productEvidence.evaluateSeedSubject === "function") {
-      state.searchEvidence.productLinks = state.searchEvidence.productLinks
-        .filter((item) => productEvidence.evaluateSeedSubject(seed.seed_subject_contract || {}, {
-          title: item.text,
-          card_text: item.card_text,
-        }).accepted)
-        .slice(0, 3);
-    }
-    if (!state.searchEvidence.productLinks.length || state.searchEvidence.hasChallenge) {
+    if (state.searchEvidence.hasChallenge) {
       await heartbeat({
         run_id: runId,
         task_type: "ozon_collection",
         stage: "search_blocked",
         code: "bridge.ozon_collection_search_blocked",
-        message: state.searchEvidence.hasChallenge
-          ? "Ozon search page is blocked by challenge."
-          : `Ozon search exposed ${state.searchEvidence.allProductLinkCount || 0} products but none had China cross-border card evidence.`,
+        message: "Ozon search page is blocked by challenge.",
       });
       saveState(state);
       return { ok: false, code: "bridge.ozon_collection_search_blocked" };
+    }
+    if (!state.searchEvidence.productLinks.length) {
+      await heartbeat({
+        run_id: runId,
+        task_type: "ozon_collection",
+        stage: "search_no_relevant_candidate",
+        code: "bridge.ozon_collection.no_relevant_search_candidate",
+        message: `Ozon search exposed ${state.searchEvidence.allProductLinkCount || 0} products, but none matched the locked seed subject.`,
+        details: {
+          seed_id: seed.seed_id,
+          query,
+          search_result_count: state.searchEvidence.allProductLinkCount || 0,
+          collection_progress: collectionProgress(state, seeds.length),
+        },
+      });
+      saveState(state);
+      return { ok: false, code: "bridge.ozon_collection.no_relevant_search_candidate" };
     }
     state.stage = "detail";
     state.productLinkIndex = 0;

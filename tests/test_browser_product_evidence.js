@@ -34,7 +34,11 @@ assert.equal(
   "Russian morphology may vary while the locked product identity remains present",
 );
 
-assert.equal(evidence.crossBorderSearchQuery("цветочный горшок"), "цветочный горшок из Китая");
+assert.equal(
+  evidence.crossBorderSearchQuery("цветочный горшок"),
+  "цветочный горшок из Китая",
+  "Ozon collection must prequalify China candidates before opening detail pages",
+);
 assert.equal(evidence.crossBorderSearchQuery("цветочный горшок из Китая"), "цветочный горшок из Китая");
 
 assert.deepEqual(
@@ -251,15 +255,29 @@ assert.deepEqual(
 );
 assert.deepEqual(
   evidence.blockingCandidateFields(
-    ["attributes", "delivery_origin", "delivery_time", "fulfillment_label"],
+    [
+      "attributes",
+      "selected_options",
+      "category_path",
+      "leaf_category",
+      "category_url",
+      "category_id",
+      "price",
+      "currency",
+      "seller_name",
+      "seller_url",
+      "delivery_origin",
+      "delivery_time",
+      "fulfillment_label",
+    ],
     {
       is_chinese_domestic_seller: true,
       confidence: "high",
       signals: [{ kind: "product_origin_china", raw_text: "Страна-изготовитель: Китай" }],
     },
   ),
-  ["attributes"],
-  "China origin must not waive core product evidence",
+  [],
+  "market-reference fields must be recorded when available but must not block a China-origin candidate",
 );
 assert.deepEqual(
   evidence.blockingCandidateFields(

@@ -3535,7 +3535,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
     def test_extension_manifest_registers_1688_supplier_content_script(self) -> None:
         manifest_path = self.project_root / "browser_extension" / "ozon_v2_bridge" / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self.assertEqual("0.1.69", manifest["version"])
+        self.assertEqual("0.1.73", manifest["version"])
 
         supplier_scripts = [
             item
@@ -8212,6 +8212,96 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual(1, len(outcomes))
         self.assertEqual("browser_candidate.replaced", outcomes[0].event_type)
         self.assertEqual("ozon_collection", outcomes[0].data["task_type"])
+
+    def test_search_without_relevant_result_replaces_seed_and_continues(self) -> None:
+        self.repo.initialize_runtime()
+        rejected_seed = self.repo.load_active_seeds()[0]
+        run = self.repo.create_workbench_batch_record(target_count=1)
+        run_id = run["run_id"]
+        self.repo.save_sampled_seeds(run_id, [rejected_seed])
+        run = self.repo.load_run(run_id)
+        run["status"] = WorkbenchState.OZON_COLLECTING.value
+        run["sampled_seed_ids"] = [rejected_seed.seed_id]
+        run["ozon_collection_contract_ready"] = True
+        self.repo.save_run(run)
+
+        self.post_json(
+            "/api/browser-bridge/heartbeat",
+            {
+                "source": "ozon_content_script",
+                "run_id": run_id,
+                "task_type": "ozon_collection",
+                "stage": "search_no_relevant_candidate",
+                "code": "bridge.ozon_collection.no_relevant_search_candidate",
+                "message": "Ozon search returned products, but none matched the seed subject.",
+                "details": {
+                    "seed_id": rejected_seed.seed_id,
+                    "search_result_count": 12,
+                },
+                "extension_version": self.required_extension_version(),
+            },
+        )
+
+        deadline = time.time() + 3
+        while (
+            time.time() < deadline
+            and self.repo.load_sampled_seeds(run_id)[0].seed_id == rejected_seed.seed_id
+        ):
+            time.sleep(0.05)
+        replacement = self.repo.load_sampled_seeds(run_id)[0]
+        event_types = [event.event_type for event in self.repo.load_run_events(run_id)]
+        self.assertNotEqual(rejected_seed.seed_id, replacement.seed_id)
+        self.assertIn("browser_candidate.exhausted", event_types)
+        self.assertIn("seed_sampling.replaced_after_exhaustion", event_types)
+        self.assertEqual(1, event_types.count("browser_candidate.replaced"))
+
+    def test_ozon_collection_stops_replacing_after_batch_budget_is_exhausted(self) -> None:
+        self.repo.initialize_runtime()
+        active = self.repo.load_active_seeds()
+        rejected_seed = active[10]
+        run = self.repo.create_workbench_batch_record(target_count=1)
+        run_id = run["run_id"]
+        self.repo.save_sampled_seeds(run_id, [rejected_seed])
+        for index in range(6):
+            self.repo.append_rejected_seed_attempt(
+                run_id,
+                active[index],
+                "No relevant Ozon candidate.",
+                active[index + 1].seed_id,
+            )
+        run = self.repo.load_run(run_id)
+        run["status"] = WorkbenchState.OZON_COLLECTING.value
+        run["sampled_seed_ids"] = [rejected_seed.seed_id]
+        run["ozon_collection_contract_ready"] = True
+        self.repo.save_run(run)
+
+        self.post_json(
+            "/api/browser-bridge/heartbeat",
+            {
+                "source": "ozon_content_script",
+                "run_id": run_id,
+                "task_type": "ozon_collection",
+                "stage": "search_no_relevant_candidate",
+                "code": "bridge.ozon_collection.no_relevant_search_candidate",
+                "message": "Ozon search returned no relevant candidate.",
+                "details": {"seed_id": rejected_seed.seed_id, "search_result_count": 24},
+                "extension_version": self.required_extension_version(),
+            },
+        )
+
+        sampled_after = self.repo.load_sampled_seeds(run_id)
+        events = self.repo.load_run_events(run_id)
+        outcomes = [
+            event
+            for event in events
+            if event.event_type in {"browser_candidate.replaced", "browser_candidate.failed"}
+        ]
+        progress = self.get_json(f"/api/batches/{run_id}")["data"]["progress"]["ozon_collection_progress"]
+        self.assertEqual(rejected_seed.seed_id, sampled_after[0].seed_id)
+        self.assertEqual(["browser_candidate.failed"], [event.event_type for event in outcomes])
+        self.assertEqual("workbench.exhausted_seed_budget_exceeded", outcomes[0].data["result_code"])
+        self.assertEqual(1, progress["failure_count"])
+        self.assertEqual(0, progress["pending_count"])
 
     def test_exhausted_ozon_seed_without_replacement_is_one_final_failure(self) -> None:
         self.repo.initialize_runtime()

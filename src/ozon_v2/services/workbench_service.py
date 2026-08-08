@@ -348,6 +348,21 @@ class WorkbenchService:
                 data={"run_id": run_id, "rejected_seed_id": rejected_seed_id},
             )
 
+        if current_state == WorkbenchState.OZON_COLLECTING:
+            replacement_attempt_count = len(self.repo.load_rejected_seed_attempts(run_id))
+            max_replacement_attempts = max(6, int(run.get("target_count") or 1) * 6)
+            if replacement_attempt_count >= max_replacement_attempts:
+                return Result.failure(
+                    "workbench.exhausted_seed_budget_exceeded",
+                    "The Ozon collection replacement budget was exhausted; manual review is required.",
+                    data={
+                        "run_id": run_id,
+                        "rejected_seed_id": rejected_seed_id,
+                        "replacement_attempt_count": replacement_attempt_count,
+                        "max_replacement_attempts": max_replacement_attempts,
+                    },
+                )
+
         eligible = self._eligible_replacement_seeds(run_id, sampled)
         if not eligible:
             return Result.failure(

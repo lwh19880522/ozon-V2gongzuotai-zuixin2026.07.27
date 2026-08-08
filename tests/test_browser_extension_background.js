@@ -190,6 +190,11 @@ function sendMessageFromTab(message, tabId) {
   assert.equal(injectionCount, 1, "a mapped Ozon tab without a content-script receiver must be injected once");
   assert.equal(contentRunCount, 1, "one dispatch token must trigger one content-script run");
   assert.ok(tabs.get(1).url.startsWith("https://www.ozon.ru/search/"));
+  assert.equal(
+    new URL(tabs.get(1).url).searchParams.get("text"),
+    `${first.data.contract.payload.seeds[0].ozon_query_terms_ru[0]} из Китая`,
+    "the background must prequalify China candidates before opening detail pages",
+  );
   assert.ok(stored.openedTasks["wb-test:ozon_collection"]);
   assert.ok(
     postedPayloads.some((payload) => payload.extension_version === manifestVersion),

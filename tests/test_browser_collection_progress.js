@@ -299,6 +299,63 @@ function assertProgress(value, expected) {
   heartbeats.length = 0;
   sessionStorage.setItem("ozon_v2_browser_bridge_state", JSON.stringify({
     schemaVersion: 6,
+    runId: "wb-early-subject-reject",
+    taskType: "ozon_collection",
+    dispatchToken: "dispatch-early-subject-reject",
+    seedIndex: 0,
+    stage: "detail",
+    candidates: [],
+    searchEvidence: {
+      url: "https://www.ozon.ru/search/",
+      title: "search",
+      productLinks: [{ href: "https://www.ozon.ru/product/wrong-1/", card_text: "Wrong product" }],
+    },
+    productLinkIndex: 0,
+    rejectedCandidates: [],
+  }));
+  location.href = "https://www.ozon.ru/product/wrong-1/";
+  const originalEvaluateSeedSubject = productEvidence.evaluateSeedSubject;
+  productEvidence.evaluateSeedSubject = (_contract, candidate) => ({
+    accepted: Boolean(candidate && candidate.product_id),
+    matched_stems: [],
+    missing_stems: ["core"],
+  });
+  let detailEvidenceCalls = 0;
+  context.waitForDetailEvidence = async () => {
+    detailEvidenceCalls += 1;
+    return {
+      snapshot: snapshot("101"),
+      url: "https://www.ozon.ru/product/test-101/",
+      title: "Product 101",
+      sellerDecision: { is_chinese_domestic_seller: true, confidence: "high", signals: [] },
+      missingFields: [],
+      hasChallenge: false,
+    };
+  };
+  await context.runOzonCollection({
+    data: {
+      run_id: "wb-early-subject-reject",
+      dispatch_token: "dispatch-early-subject-reject",
+      ingest_url: "/api/batches/wb-early-subject-reject/ozon-collection",
+      progress_url: "/api/batches/wb-early-subject-reject/ozon-collection-progress",
+      contract: { payload: { excluded_ozon_product_ids: [], seeds: [{
+        seed_id: "seed-early-subject-reject",
+        source_text_zh: "wrong",
+        ozon_query_terms_ru: ["expected product"],
+        seed_subject_contract: { seed_id: "seed-early-subject-reject", required_stems: ["core"] },
+      }] } },
+    },
+  });
+  productEvidence.evaluateSeedSubject = originalEvaluateSeedSubject;
+  assert.equal(
+    detailEvidenceCalls,
+    1,
+    "an incomplete heading or search card must not reject a candidate before the full detail snapshot is collected",
+  );
+
+  heartbeats.length = 0;
+  sessionStorage.setItem("ozon_v2_browser_bridge_state", JSON.stringify({
+    schemaVersion: 6,
     runId: "wb-normal",
     taskType: "ozon_collection",
     dispatchToken: "dispatch-normal",
@@ -436,6 +493,99 @@ function assertProgress(value, expected) {
   assert.equal(safeState.seedIndex, 0, "a failed checkpoint must not advance the seed cursor");
   assert.deepEqual(safeState.candidates, [], "a failed checkpoint must not count the candidate as durable");
   assert.equal(finalRequests.length, finalCountBeforeFailure, "a failed checkpoint must block final submission");
+
+  sessionStorage.removeItem("ozon_v2_browser_bridge_state");
+  location.href = "https://www.ozon.ru/search/?from_global=true&text=old-seed-query";
+  context.isSearchEvidencePage = () => true;
+  context.waitForSearchEvidence = async () => {
+    throw new Error("a stale search page must not be scanned for a replacement seed");
+  };
+  const staleSearchResult = await context.runOzonCollection({
+    data: {
+      run_id: "wb-stale-search",
+      dispatch_token: "dispatch-stale-search",
+      ingest_url: "/api/batches/wb-stale-search/ozon-collection",
+      progress_url: "/api/batches/wb-stale-search/ozon-collection-progress",
+      contract: { payload: { excluded_ozon_product_ids: [], seeds: [{
+        seed_id: "seed-stale-search",
+        source_text_zh: "replacement seed",
+        ozon_query_terms_ru: ["new seed query"],
+        seed_subject_contract: { seed_id: "seed-stale-search" },
+      }] } },
+    },
+  });
+  assert.equal(staleSearchResult.ok, true);
+  assert.equal(staleSearchResult.code, "bridge.ozon_collection_navigating_search");
+  assert.equal(location.href, context.searchUrl("new seed query"));
+
+  heartbeats.length = 0;
+  sessionStorage.removeItem("ozon_v2_browser_bridge_state");
+  location.href = context.searchUrl("card inference");
+  context.isSearchEvidencePage = () => true;
+  context.waitForSearchEvidence = async () => ({
+    productLinks: [{
+      href: "https://www.ozon.ru/product/card-inference-1/",
+      text: "Incomplete card title",
+      card_text: "Incomplete search card",
+    }],
+    allProductLinkCount: 1,
+    hasChallenge: false,
+  });
+  productEvidence.evaluateSeedSubject = (_contract, candidate) => ({
+    accepted: Boolean(candidate && candidate.product_id),
+    matched_stems: [],
+    missing_stems: ["core"],
+  });
+  const cardInferenceResult = await context.runOzonCollection({
+    data: {
+      run_id: "wb-card-inference",
+      dispatch_token: "dispatch-card-inference",
+      ingest_url: "/api/batches/wb-card-inference/ozon-collection",
+      progress_url: "/api/batches/wb-card-inference/ozon-collection-progress",
+      contract: { payload: { excluded_ozon_product_ids: [], seeds: [{
+        seed_id: "seed-card-inference",
+        source_text_zh: "card inference",
+        ozon_query_terms_ru: ["card inference"],
+        seed_subject_contract: { seed_id: "seed-card-inference", required_stems: ["core"] },
+      }] } },
+    },
+  });
+  productEvidence.evaluateSeedSubject = originalEvaluateSeedSubject;
+  assert.equal(cardInferenceResult.ok, true);
+  assert.equal(cardInferenceResult.code, "bridge.ozon_collection_navigating_detail");
+  assert.equal(location.href, "https://www.ozon.ru/product/card-inference-1/");
+
+  heartbeats.length = 0;
+  sessionStorage.removeItem("ozon_v2_browser_bridge_state");
+  location.href = context.searchUrl("no match");
+  context.isSearchEvidencePage = () => true;
+  context.waitForSearchEvidence = async () => ({
+    productLinks: [],
+    allProductLinkCount: 12,
+    hasChallenge: false,
+  });
+  const noMatchResult = await context.runOzonCollection({
+    data: {
+      run_id: "wb-search-no-match",
+      dispatch_token: "dispatch-search-no-match",
+      ingest_url: "/api/batches/wb-search-no-match/ozon-collection",
+      progress_url: "/api/batches/wb-search-no-match/ozon-collection-progress",
+      contract: { payload: { excluded_ozon_product_ids: [], seeds: [{
+        seed_id: "seed-search-no-match",
+        source_text_zh: "no match",
+        ozon_query_terms_ru: ["no match"],
+        seed_subject_contract: { seed_id: "seed-search-no-match" },
+      }] } },
+    },
+  });
+  assert.equal(noMatchResult.ok, false);
+  assert.equal(noMatchResult.code, "bridge.ozon_collection.no_relevant_search_candidate");
+  const noMatchHeartbeat = heartbeats.find(
+    (item) => item.code === "bridge.ozon_collection.no_relevant_search_candidate",
+  );
+  assert.ok(noMatchHeartbeat, "a terminal no-match search must be reported to the workbench");
+  assert.equal(noMatchHeartbeat.details.seed_id, "seed-search-no-match");
+  assert.equal(noMatchHeartbeat.details.search_result_count, 12);
 
   process.stdout.write("browser Ozon collection progress: OK\n");
 })().catch((error) => {
