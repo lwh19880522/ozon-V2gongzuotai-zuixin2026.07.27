@@ -1,4 +1,4 @@
 interface:
   display_name: "Ozon Store Content Risk Optimizer"
   short_description: "Optimize listing content and stop unsafe offers"
-  default_prompt: "Use $ozon-store-content-risk-optimizer to automatically audit and optimize eligible Ozon store products, preserve media, verify every write, and resume from its incremental ledger."
+  default_prompt: "Use $ozon-store-content-risk-optimizer to audit the store, resume only problem or changed products, optimize evidence-supported non-media fields, preserve unresolved risks, leave media untouched, verify every write, and claim completion only when run_complete is true."

@@ -24,6 +24,7 @@ class SellerApiAdapter:
     def __init__(self, repo: FsRepo | None = None, base_url: str = "https://api-seller.ozon.ru") -> None:
         self.repo = repo or FsRepo()
         self.base_url = base_url.rstrip("/")
+        self._description_category_tree_cache: dict[str, list[dict[str, Any]]] = {}
 
     def fetch_existing_products(self, page_limit: int | None = None) -> list[ExistingStoreProduct]:
         credentials = self.repo.load_credentials()
@@ -115,15 +116,34 @@ class SellerApiAdapter:
         matches.sort(key=lambda item: item["match_score"], reverse=True)
         return matches[0]
 
-    def _fetch_description_category_tree(self) -> list[dict[str, Any]]:
-        payload = self._post_json("/v1/description-category/tree", {"language": "DEFAULT"})
+    def _fetch_description_category_tree(
+        self,
+        language: str = "DEFAULT",
+    ) -> list[dict[str, Any]]:
+        normalized_language = str(language or "DEFAULT").strip().upper() or "DEFAULT"
+        cached = self._description_category_tree_cache.get(normalized_language)
+        if cached is not None:
+            return cached
+        payload = self._post_json(
+            "/v1/description-category/tree",
+            {"language": normalized_language},
+        )
         result = payload.get("result", [])
         if not isinstance(result, list):
             raise SellerApiError("Seller category tree response has invalid shape.")
+        self._description_category_tree_cache[normalized_language] = result
         return result
 
-    def fetch_description_category_tree(self) -> list[dict[str, Any]]:
-        return [dict(item) for item in _iter_description_category_nodes(self._fetch_description_category_tree())]
+    def fetch_description_category_tree(
+        self,
+        language: str = "DEFAULT",
+    ) -> list[dict[str, Any]]:
+        return [
+            dict(item)
+            for item in _iter_description_category_nodes(
+                self._fetch_description_category_tree(language)
+            )
+        ]
 
     def fetch_attribute_template(
         self,

@@ -52,6 +52,7 @@ class AttributeMappingServiceTests(unittest.TestCase):
                 },
                 "warranty": {
                     "decision": "unresolved",
+                    "candidate_policy_version": 2,
                     "resolution_class": "source_fact_missing",
                     "evidence_refs": [],
                     "reason": "Гарантия отсутствует в собранных данных.",
@@ -71,6 +72,105 @@ class AttributeMappingServiceTests(unittest.TestCase):
         self.assertEqual(
             "unresolved",
             completed["manual_required_fields"][0]["intelligence_decision"],
+        )
+
+    def test_legacy_unresolved_required_result_reopens_for_current_policy(
+        self,
+    ) -> None:
+        result = map_template_attributes(
+            [
+                {
+                    "attribute_id": "type",
+                    "attribute_label": "Тип",
+                    "is_required": True,
+                }
+            ],
+            {"attributes": {"Тип": "Аксессуар для камеры"}},
+            rewritten_content={
+                "type": {
+                    "decision": "unresolved",
+                    "resolution_class": "source_fact_missing",
+                    "evidence_refs": ["ozon.attributes.Тип"],
+                    "reason": (
+                        "The legacy task did not expose the exact field candidate."
+                    ),
+                }
+            },
+        )
+
+        self.assertEqual([], result["manual_required_fields"])
+        self.assertEqual(
+            ["type"],
+            [
+                field["field_key"]
+                for field in result["skill_pending_required_fields"]
+            ],
+        )
+
+    def test_ozon_reference_difference_reopens_for_locked_supplier_truth(self) -> None:
+        result = map_template_attributes(
+            [
+                {
+                    "attribute_id": "type",
+                    "attribute_label": "Тип",
+                    "is_required": True,
+                }
+            ],
+            {"attributes": {"Тип": "Бусины"}},
+            supplier_product={"title": "Деревянные кольца для поделок"},
+            rewritten_content={
+                "type": {
+                    "decision": "unresolved",
+                    "resolution_class": "evidence_conflict",
+                    "evidence_refs": [
+                        "ozon.attributes.Тип",
+                        "supplier.title",
+                    ],
+                    "reason": (
+                        "The Ozon type conflicts with the locked supplier subject."
+                    ),
+                }
+            },
+        )
+
+        self.assertEqual(
+            ["type"],
+            [
+                field["field_key"]
+                for field in result["skill_pending_required_fields"]
+            ],
+        )
+        self.assertEqual([], result["manual_required_fields"])
+
+    def test_locked_sku_explicit_gram_weight_overrides_ozon_reference_weight(
+        self,
+    ) -> None:
+        result = map_template_attributes(
+            [
+                {
+                    "attribute_id": "4383",
+                    "attribute_label": "Вес товара, г",
+                    "is_required": True,
+                }
+            ],
+            {"attributes": {"Вес товара, г": "480"}},
+            supplier_selection={
+                "supplier_offer_id": "1031021254753",
+                "supplier_sku": {
+                    "supplier_sku_id": "6228675806089",
+                    "raw_label": "雪饼438g大袋装",
+                    "selected_options": {"包装规格": "雪饼438g大袋装"},
+                },
+            },
+        )
+
+        weight = result["fields"][0]
+        self.assertEqual("mapped", weight["status"])
+        self.assertEqual("438", weight["value"])
+        self.assertEqual("confirmed_supplier_sku", weight["source"])
+        self.assertEqual(
+            "supplier_selection.supplier_sku.raw_label",
+            weight["evidence_ref"],
         )
 
     def test_store_fixed_grouping_flags_are_mapped_before_field_skill(self) -> None:
@@ -411,6 +511,29 @@ class AttributeMappingServiceTests(unittest.TestCase):
             [field["status"] for field in result["fields"]],
         )
 
+    def test_missing_fact_counts_separate_required_blockers_from_optional_gaps(
+        self,
+    ) -> None:
+        result = map_template_attributes(
+            [
+                {
+                    "attribute_id": "required-type",
+                    "attribute_label": "Тип",
+                    "is_required": True,
+                },
+                {
+                    "attribute_id": "optional-warranty",
+                    "attribute_label": "Гарантия",
+                    "is_required": False,
+                },
+            ],
+            {"attributes": {}},
+        )
+
+        self.assertEqual(2, result["missing_fact_count"])
+        self.assertEqual(1, result["missing_required_fact_count"])
+        self.assertEqual(1, result["missing_optional_fact_count"])
+
     def test_uses_validated_original_content_for_creative_template_fields(self) -> None:
         schema = [
             {"attribute_id": "4180", "attribute_label": "Название", "is_required": False},
@@ -526,6 +649,7 @@ class AttributeMappingServiceTests(unittest.TestCase):
                 },
                 "warranty": {
                     "decision": "unresolved",
+                    "candidate_policy_version": 2,
                     "reason": "В собранных данных Ozon и 1688 гарантия не указана.",
                     "evidence_refs": [],
                 },

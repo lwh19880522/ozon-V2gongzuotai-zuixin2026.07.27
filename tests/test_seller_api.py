@@ -38,6 +38,45 @@ class FakeHttpResponse:
 
 
 class SellerCategoryTreeTests(TestCase):
+    def test_description_category_tree_forwards_requested_language(self) -> None:
+        adapter = SellerApiAdapter(repo=FakeCredentialsRepo())
+        calls: list[tuple[str, dict]] = []
+
+        def fake_post(path: str, payload: dict) -> dict:
+            calls.append((path, payload))
+            return {"result": []}
+
+        adapter._post_json = fake_post
+
+        self.assertEqual([], adapter.fetch_description_category_tree(language="ZH_HANS"))
+        self.assertEqual(
+            [("/v1/description-category/tree", {"language": "ZH_HANS"})],
+            calls,
+        )
+
+    def test_description_category_tree_is_downloaded_once_per_language(self) -> None:
+        adapter = SellerApiAdapter(repo=FakeCredentialsRepo())
+        calls: list[tuple[str, dict]] = []
+
+        def fake_post(path: str, payload: dict) -> dict:
+            calls.append((path, payload))
+            return {"result": []}
+
+        adapter._post_json = fake_post
+
+        adapter.fetch_description_category_tree(language="ZH_HANS")
+        adapter.fetch_description_category_tree(language="ZH_HANS")
+        adapter.fetch_description_category_tree(language="DEFAULT")
+        adapter.fetch_description_category_tree(language="DEFAULT")
+
+        self.assertEqual(
+            [
+                ("/v1/description-category/tree", {"language": "ZH_HANS"}),
+                ("/v1/description-category/tree", {"language": "DEFAULT"}),
+            ],
+            calls,
+        )
+
     def test_product_state_lookup_uses_exact_offer_and_returns_final_errors(
         self,
     ) -> None:

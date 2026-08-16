@@ -28,15 +28,18 @@ from ozon_v2.services.attribute_mapping_service import map_template_attributes
 from ozon_v2.services.workbench_service import (
     WorkbenchService,
     _dictionary_upload_value,
+    _content_result_is_accepted,
     _normalize_ozon_rich_content_value,
     _pricing_upload_core_fields,
     _product_import_status,
     _seller_api_attribute,
     _seller_api_import_item,
+    _supplier_identity_conflict_assessment,
     _valid_ozon_hashtags,
     _video_template_fields,
 )
 from ozon_v2.workbench.local_server import (
+    build_category_confirmation_html,
     build_home_html,
     build_upload_workspace_html,
     create_handler,
@@ -102,6 +105,112 @@ def test_video_template_fields_classify_video_and_cover_inputs() -> None:
         "12": "video_title",
         "13": "video_cover_image_url",
     }
+
+
+def test_required_identity_conflict_requests_supplier_recapture() -> None:
+    assessment = _supplier_identity_conflict_assessment(
+        {
+            "8229": {
+                "decision": "unresolved",
+                "resolution_class": "evidence_conflict",
+                "evidence_refs": [
+                    "supplier.title",
+                    "supplier_selection.supplier_sku.raw_label",
+                ],
+                "reason": "The required product type conflicts across locked sources.",
+            }
+        },
+        {"8229"},
+    )
+
+    assert assessment["recapture_required"] is True
+    assert assessment["required_conflict_field_keys"] == ["8229"]
+
+
+def test_two_independent_identity_conflicts_request_supplier_recapture() -> None:
+    assessment = _supplier_identity_conflict_assessment(
+        {
+            "4382": {
+                "decision": "unresolved",
+                "resolution_class": "evidence_conflict",
+                "evidence_refs": [
+                    "supplier.attributes.尺寸",
+                    "supplier_selection.supplier_sku.raw_label",
+                ],
+                "reason": "Locked dimensions conflict across sources.",
+            },
+            "4383": {
+                "decision": "unresolved",
+                "resolution_class": "evidence_conflict",
+                "evidence_refs": [
+                    "supplier.attributes.重量",
+                    "supplier_selection.supplier_sku.raw_label",
+                ],
+                "reason": "Locked weight conflicts across sources.",
+            },
+        },
+        set(),
+    )
+
+    assert assessment["recapture_required"] is True
+    assert assessment["conflict_field_keys"] == ["4382", "4383"]
+
+
+def test_ozon_reference_difference_does_not_request_supplier_recapture() -> None:
+    assessment = _supplier_identity_conflict_assessment(
+        {
+            "4383": {
+                "decision": "unresolved",
+                "resolution_class": "evidence_conflict",
+                "evidence_refs": [
+                    "supplier_selection.supplier_sku.raw_label",
+                    "ozon.attributes.Вес товара, г",
+                ],
+                "reason": "Locked SKU says 438 g while Ozon reference says 480 g.",
+            }
+        },
+        {"4383"},
+    )
+
+    assert assessment["recapture_required"] is False
+    assert assessment["conflict_field_keys"] == []
+
+
+def test_ozon_reference_difference_is_reopened_for_content_drafting() -> None:
+    accepted = _content_result_is_accepted(
+        {
+            "field_key": "4383",
+            "label": "Вес товара, г",
+            "required": True,
+        },
+        {
+            "decision": "unresolved",
+            "resolution_class": "evidence_conflict",
+            "evidence_refs": [
+                "supplier_selection.supplier_sku.raw_label",
+                "ozon.attributes.Вес товара, г",
+            ],
+            "reason": "Locked SKU says 438 g while Ozon reference says 480 g.",
+        },
+    )
+
+    assert accepted is False
+
+
+def test_missing_source_fact_does_not_invalidate_supplier_binding() -> None:
+    assessment = _supplier_identity_conflict_assessment(
+        {
+            "9163": {
+                "decision": "unresolved",
+                "resolution_class": "source_fact_missing",
+                "reason": "Gender is not stated in the collected evidence.",
+            }
+        },
+        {"9163"},
+    )
+
+    assert assessment["recapture_required"] is False
+    assert assessment["conflict_field_keys"] == []
 
 
 class WorkbenchLocalServerTests(RuntimeTestCase):
@@ -206,6 +315,54 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         resolution = self.repo.load_category_resolutions(run_id)["items"]["seed-ambiguous"]
         self.assertEqual("resolved_by_user", resolution["status"])
         self.assertEqual("101:202", resolution["template_cache_key"])
+
+    def test_upload_workspace_links_ambiguous_product_to_category_confirmation(self) -> None:
+        html = build_upload_workspace_html("wb-category-confirmation")
+
+        self.assertIn("category_confirmation_required", html)
+        self.assertIn("category_confirmation_url", html)
+        self.assertIn("确认正确类目", html)
+        self.assertIn('confirmCategory.target = "_blank"', html)
+
+    def test_category_confirmation_page_returns_to_upload_workspace_when_empty(self) -> None:
+        html = build_category_confirmation_html("wb-category-confirmation")
+
+        self.assertIn("返回上传工作台", html)
+        self.assertIn("option.display_category_path_zh", html)
+        self.assertIn(
+            'window.location.replace(`/batches/${encodeURIComponent(runId)}/upload`)',
+            html,
+        )
+
+    def test_category_reference_type_comes_from_the_same_candidate_version(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        run = self.repo.load_run(run_id)
+        slot = run["candidate_slots"][0]
+        ozon_payload = self.repo.load_ozon_collection_result(run_id)
+        candidate = ozon_payload["ozon_candidates"][0]
+        candidate["slot_id"] = slot["slot_id"]
+        candidate["candidate_revision"] = slot["candidate_revision"]
+        candidate["attributes"] = {"Тип": "Аксессуар для камеры"}
+        self.repo.save_ozon_collection_result(run_id, ozon_payload)
+        service = WorkbenchService(self.repo)
+
+        self.assertEqual(
+            "Аксессуар для камеры",
+            service._ozon_reference_product_type(
+                run_id,
+                seed_id=seed.seed_id,
+                slot_id=slot["slot_id"],
+                candidate_revision=slot["candidate_revision"],
+            ),
+        )
+        self.assertIsNone(
+            service._ozon_reference_product_type(
+                run_id,
+                seed_id=seed.seed_id,
+                slot_id=slot["slot_id"],
+                candidate_revision=slot["candidate_revision"] + 1,
+            )
+        )
 
     def test_official_template_is_bound_to_supplier_truth_not_reference_ozon_category(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
@@ -603,6 +760,82 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             blacklist_rows[-1]["reason_code"],
         )
 
+    def test_user_can_exclude_new_pipeline_product_without_legacy_template_file(
+        self,
+    ) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        legacy_template = self.repo.load_attribute_template_result(run_id)
+        schema = legacy_template["seed_templates"][0]["upload_attribute_schema"]
+        (self.repo.run_dir(run_id) / "attribute_template_result.json").unlink()
+        self.repo.save_supplier_truth_profiles(
+            run_id,
+            {
+                "run_id": run_id,
+                "profiles": {
+                    seed.seed_id: {
+                        "seed_id": seed.seed_id,
+                        "slot_id": "slot-0001",
+                        "candidate_revision": 1,
+                        "supplier_offer_id": "123456789012",
+                        "supplier_sku_id": "sku-black-1",
+                    }
+                },
+            },
+        )
+        self.repo.save_category_resolutions(
+            run_id,
+            {
+                "run_id": run_id,
+                "items": {
+                    seed.seed_id: {
+                        "status": "resolved",
+                        "template_cache_key": "17000001:970001",
+                        "chosen": {
+                            "description_category_id": 17000001,
+                            "type_id": 970001,
+                            "matched_category_path": "Красота / Зеркала",
+                        },
+                    }
+                },
+            },
+        )
+        self.repo.save_seller_template_cache(
+            run_id,
+            {
+                "run_id": run_id,
+                "templates": {
+                    "17000001:970001": {
+                        "upload_attribute_schema": schema,
+                    }
+                },
+            },
+        )
+        run = self.repo.load_run(run_id)
+        run["status"] = WorkbenchState.IMAGE_PROCESSING.value
+        self.repo.save_run(run)
+
+        try:
+            excluded = WorkbenchService(self.repo).exclude_product_without_replacement(
+                run_id,
+                seed.seed_id,
+                "1688 缺少 Ozon 必填商品事实",
+                confirmed=True,
+            )
+        except FileNotFoundError as exc:
+            self.fail(f"new-pipeline exclusion required a removed legacy file: {exc}")
+
+        self.assertTrue(excluded.ok, excluded.to_dict())
+        self.assertEqual(0, excluded.data["remaining_product_count"])
+        self.assertEqual([], self.repo.load_sampled_seeds(run_id))
+        self.assertNotIn(
+            seed.seed_id,
+            self.repo.load_supplier_truth_profiles(run_id)["profiles"],
+        )
+        self.assertNotIn(
+            seed.seed_id,
+            self.repo.load_category_resolutions(run_id)["items"],
+        )
+
     def test_upload_pricing_editor_exposes_permanent_exclusion_without_refill(self) -> None:
         html = build_upload_workspace_html("wb-exclusion-button")
 
@@ -946,6 +1179,10 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             query_generation_status="generated",
         )
         self.repo.save_active_seeds([seed, replacement])
+        run = self.repo.load_run(run_id)
+        run["browser_task_resumed_at"] = "2026-08-09T00:00:00+00:00"
+        self.repo.save_run(run)
+        original_dispatch_token = run["browser_task_resumed_at"]
 
         page = self.get_text(f"/batches/{run_id}/supplier-review")
         result = self.post_json(
@@ -962,7 +1199,13 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertNotIn('state.status !== "supplier_review" || !!item.supplier_url', page)
         self.assertTrue(result["ok"])
         self.assertEqual("supplier_review.candidate_replaced", result["code"])
-        self.assertEqual([replacement.seed_id], self.repo.load_run(run_id)["replacement_pending_seed_ids"])
+        replaced_run = self.repo.load_run(run_id)
+        self.assertEqual([replacement.seed_id], replaced_run["replacement_pending_seed_ids"])
+        self.assertNotEqual(
+            original_dispatch_token,
+            replaced_run["browser_task_resumed_at"],
+            "replacing a supplier candidate must create a new browser-task generation",
+        )
 
     def test_replacement_collection_merges_with_retained_evidence_and_links(self) -> None:
         rejected = SeedProduct(
@@ -2679,6 +2922,35 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual("supplier_selection.offer_identity_mismatch", result["code"])
         self.assertFalse((self.repo.run_dir(run_id) / "supplier_selection_draft.json").exists())
 
+    def test_supplier_selection_capture_rejects_offer_already_present_in_store_history(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        task = self.get_json(f"/api/batches/{run_id}/browser-task")
+        self.repo.merge_existing_products(
+            [
+                ExistingStoreProduct(
+                    store_product_id="store-existing",
+                    title="Already uploaded product",
+                    normalized_identity_key="alreadyuploadedproduct",
+                    supplier_offer_id="123456789012",
+                )
+            ]
+        )
+
+        result = self.post_json(
+            f"/api/batches/{run_id}/supplier-selection/capture",
+            {
+                "channel_index": 0,
+                "seed_id": seed.seed_id,
+                "ozon_product_id": "ozon-1",
+                "dispatch_token": task["data"]["dispatch_token"],
+                "supplier_product": self.supplier_product_payload(seed.seed_id),
+            },
+            ok=False,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("supplier_selection.offer_exists_in_store", result["code"])
+
     def test_supplier_selection_capture_rejects_offer_already_assigned_to_another_product(
         self,
     ) -> None:
@@ -2974,9 +3246,12 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         review = self.get_json(f"/api/batches/{run_id}/supplier-review")
 
         self.assertTrue(recaptured["ok"])
-        self.assertEqual("supplier_selection.recapture_complete", recaptured["code"])
+        self.assertEqual("supplier_selection.recapture_product_captured", recaptured["code"])
         self.assertEqual(WorkbenchState.IMAGE_PROCESSING.value, self.repo.load_run(run_id)["status"])
-        self.assertEqual([], self.repo.load_run(run_id).get("supplier_recapture_seed_ids"))
+        self.assertEqual(
+            [seed.seed_id],
+            self.repo.load_run(run_id).get("supplier_recapture_seed_ids"),
+        )
         self.assertEqual(
             {seed.seed_id, "seed-retained"},
             {
@@ -2985,6 +3260,359 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             },
         )
         self.assertEqual(1, len(review["data"]["items"][0]["supplier_sku_options"]))
+
+        waiting_task = self.get_json(f"/api/batches/{run_id}/browser-task")
+        self.assertEqual("browser_task.none", waiting_task["code"])
+        self.assertEqual(
+            "supplier_sku_confirmation_required",
+            waiting_task["data"]["recovery_status"],
+        )
+
+        restart_waiting = self.post_json(
+            f"/api/batches/{run_id}/browser-task/restart",
+            {},
+            ok=False,
+        )
+        self.assertFalse(restart_waiting["ok"])
+        self.assertEqual(
+            "browser_task.supplier_sku_confirmation_required",
+            restart_waiting["code"],
+        )
+
+        confirmed = WorkbenchService(
+            self.repo,
+            seller_api_adapter=FakeSellerApiAdapter(),
+        ).confirm_supplier_sku(
+            run_id,
+            seed_id=seed.seed_id,
+            supplier_sku_id="sku-black-1",
+        )
+
+        self.assertTrue(confirmed.ok, confirmed.to_dict())
+        self.assertEqual([], self.repo.load_run(run_id).get("supplier_recapture_seed_ids"))
+        self.assertIn(
+            seed.seed_id,
+            self.repo.load_supplier_truth_profiles(run_id)["profiles"],
+        )
+
+    def test_field_conflict_audit_clears_wrong_supplier_chain_and_schedules_targeted_recapture(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        captured = self.post_json(
+            f"/api/batches/{run_id}/supplier-selection/capture",
+            {
+                "channel_index": 0,
+                "seed_id": seed.seed_id,
+                "ozon_product_id": "ozon-1",
+                "supplier_product": self.supplier_product_payload(seed.seed_id),
+            },
+        )
+        self.assertTrue(captured["ok"], captured)
+
+        template = self.repo.load_attribute_template_result(run_id)
+        template["seed_templates"][0]["upload_attribute_schema"] = [
+            {
+                "attribute_id": "8229",
+                "attribute_label": "Тип",
+                "required": False,
+                "type": "string",
+            }
+        ]
+        self.repo.save_attribute_template_result(run_id, template)
+        self.repo.save_supplier_sku_selections(
+            run_id,
+            {"run_id": run_id, "selections": {seed.seed_id: {"supplier_sku_id": "sku-1"}}},
+        )
+        self.repo.save_supplier_truth_profiles(
+            run_id,
+            {"run_id": run_id, "profiles": {seed.seed_id: {"supplier_offer_id": "123456789012"}}},
+        )
+        self.repo.save_category_resolutions(
+            run_id,
+            {"run_id": run_id, "items": {seed.seed_id: {"type_id": 1}}},
+        )
+        self.repo.save_subject_masters(
+            run_id,
+            {"run_id": run_id, "items": {seed.seed_id: {"supplier_sku_id": "sku-1"}}},
+        )
+        self.repo.save_generated_content_result(
+            run_id,
+            {
+                "run_id": run_id,
+                "items": {
+                    seed.seed_id: {
+                        "status": "blocked",
+                        "field_results": {
+                            "8229": {
+                                "decision": "unresolved",
+                                "resolution_class": "evidence_conflict",
+                                "evidence_refs": [
+                                    "supplier.title",
+                                    "supplier_selection.supplier_sku.raw_label",
+                                ],
+                                "reason": "Required type conflicts across locked supplier evidence.",
+                            }
+                        },
+                    }
+                },
+            },
+        )
+        run = self.repo.load_run(run_id)
+        run["status"] = WorkbenchState.IMAGE_PROCESSING.value
+        self.repo.save_run(run)
+
+        audited = WorkbenchService(self.repo).audit_supplier_identity_conflicts(run_id)
+
+        self.assertTrue(audited.ok, audited.to_dict())
+        self.assertEqual([seed.seed_id], audited.data["recapture_seed_ids"])
+        reloaded_run = self.repo.load_run(run_id)
+        self.assertEqual(WorkbenchState.IMAGE_PROCESSING.value, reloaded_run["status"])
+        self.assertEqual([seed.seed_id], reloaded_run["supplier_recapture_seed_ids"])
+        review_item = self.repo.load_supplier_review(run_id)["items"][0]
+        self.assertIsNone(review_item["supplier_url"])
+        self.assertFalse(review_item["user_verified_exact_match"])
+        self.assertEqual(
+            [],
+            self.repo.load_supplier_collection_result(run_id)["supplier_products"],
+        )
+        self.assertNotIn(
+            seed.seed_id,
+            self.repo.load_supplier_sku_selections(run_id)["selections"],
+        )
+        self.assertNotIn(
+            seed.seed_id,
+            self.repo.load_supplier_truth_profiles(run_id)["profiles"],
+        )
+        self.assertNotIn(
+            seed.seed_id,
+            self.repo.load_category_resolutions(run_id)["items"],
+        )
+        self.assertNotIn(
+            seed.seed_id,
+            self.repo.load_subject_masters(run_id)["items"],
+        )
+        self.assertEqual(
+            [],
+            self.repo.load_attribute_template_result(run_id)["seed_templates"],
+        )
+        self.assertNotIn(
+            seed.seed_id,
+            self.repo.load_generated_content_result(run_id)["items"],
+        )
+
+    def test_field_conflict_audit_keeps_supplier_for_ozon_reference_difference(
+        self,
+    ) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        self.repo.save_supplier_sku_selections(
+            run_id,
+            {
+                "run_id": run_id,
+                "selections": {
+                    seed.seed_id: {
+                        "supplier_offer_id": "1031021254753",
+                        "supplier_sku": {
+                            "supplier_sku_id": "6228675806089",
+                            "raw_label": "雪饼438g大袋装",
+                        },
+                    }
+                },
+            },
+        )
+        self.repo.save_supplier_truth_profiles(
+            run_id,
+            {
+                "run_id": run_id,
+                "profiles": {
+                    seed.seed_id: {"supplier_offer_id": "1031021254753"}
+                },
+            },
+        )
+        self.repo.save_generated_content_result(
+            run_id,
+            {
+                "run_id": run_id,
+                "items": {
+                    seed.seed_id: {
+                        "status": "blocked",
+                        "field_results": {
+                            "4383": {
+                                "decision": "unresolved",
+                                "resolution_class": "evidence_conflict",
+                                "evidence_refs": [
+                                    "supplier_selection.supplier_sku.raw_label",
+                                    "ozon.attributes.Вес товара, г",
+                                ],
+                                "reason": (
+                                    "Locked SKU says 438 g while Ozon reference "
+                                    "says 480 g."
+                                ),
+                            }
+                        },
+                    }
+                },
+            },
+        )
+
+        audited = WorkbenchService(self.repo).audit_supplier_identity_conflicts(
+            run_id
+        )
+
+        self.assertTrue(audited.ok, audited.to_dict())
+        self.assertEqual([], audited.data["recapture_seed_ids"])
+        self.assertIn(
+            seed.seed_id,
+            self.repo.load_supplier_sku_selections(run_id)["selections"],
+        )
+        self.assertIn(
+            seed.seed_id,
+            self.repo.load_supplier_truth_profiles(run_id)["profiles"],
+        )
+        self.assertIn(
+            seed.seed_id,
+            self.repo.load_generated_content_result(run_id)["items"],
+        )
+
+    def test_field_conflict_audit_keeps_supplier_for_genuine_missing_fact(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        template = self.repo.load_attribute_template_result(run_id)
+        template["seed_templates"][0]["upload_attribute_schema"] = [
+            {
+                "attribute_id": "9163",
+                "attribute_label": "Пол",
+                "required": True,
+                "type": "string",
+            }
+        ]
+        self.repo.save_attribute_template_result(run_id, template)
+        self.repo.save_generated_content_result(
+            run_id,
+            {
+                "run_id": run_id,
+                "items": {
+                    seed.seed_id: {
+                        "status": "blocked",
+                        "field_results": {
+                            "9163": {
+                                "decision": "unresolved",
+                                "resolution_class": "source_fact_missing",
+                                "reason": "Gender is not stated in the collected evidence.",
+                            }
+                        },
+                    }
+                },
+            },
+        )
+
+        audited = WorkbenchService(self.repo).audit_supplier_identity_conflicts(run_id)
+
+        self.assertTrue(audited.ok, audited.to_dict())
+        self.assertEqual([], audited.data["recapture_seed_ids"])
+        self.assertIn(
+            seed.seed_id,
+            self.repo.load_generated_content_result(run_id)["items"],
+        )
+
+    def test_upload_workspace_restores_lost_supplier_recapture_state(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        review = self.repo.load_supplier_review(run_id)
+        review["items"][0]["supplier_identity_conflict"] = {
+            "detected_at": "2026-08-12T00:00:00+00:00",
+            "conflict_field_keys": ["8229"],
+        }
+        review["items"][0]["supplier_url"] = (
+            "https://detail.1688.com/offer/123456789012.html"
+        )
+        review["items"][0]["user_verified_exact_match"] = True
+        self.repo.save_supplier_review(run_id, review)
+        self.repo.save_supplier_collection_result(
+            run_id,
+            {
+                "run_id": run_id,
+                "supplier_products": [self.supplier_product_payload(seed.seed_id)],
+            },
+        )
+        run = self.repo.load_run(run_id)
+        run["status"] = WorkbenchState.IMAGE_PROCESSING.value
+        run["supplier_recapture_seed_ids"] = []
+        self.repo.save_run(run)
+        truth_path = self.repo.run_dir(run_id) / "supplier_truth_profiles.json"
+        if truth_path.exists():
+            truth_path.unlink()
+
+        workspace = WorkbenchService(
+            self.repo,
+            seller_api_adapter=FakeSellerApiAdapter(),
+        ).upload_workspace(run_id)
+
+        self.assertTrue(workspace.ok, workspace.to_dict())
+        self.assertEqual(
+            [seed.seed_id],
+            self.repo.load_run(run_id)["supplier_recapture_seed_ids"],
+        )
+        item = workspace.data["items"][0]
+        self.assertEqual("supplier_sku_confirmation_required", item["supplier_recovery_status"])
+        self.assertIn("supplier_identity", item["blocking_gates"])
+        self.assertNotEqual(
+            "candidate_revision_or_product_binding_mismatch",
+            item["category_template_assessment"]["reason"],
+        )
+
+    def test_reconcile_restores_reopened_sku_queue_from_audit_history(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        self.repo.save_supplier_collection_result(
+            run_id,
+            {
+                "run_id": run_id,
+                "supplier_products": [self.supplier_product_payload(seed.seed_id)],
+            },
+        )
+        self.repo.save_supplier_sku_selections(
+            run_id,
+            {
+                "schema_version": 1,
+                "run_id": run_id,
+                "selections": {},
+                "history": [
+                    {
+                        "seed_id": seed.seed_id,
+                        "reopened_at": "2026-08-16T00:00:00+00:00",
+                        "receipt": {"supplier_sku_id": "old-sku"},
+                    }
+                ],
+            },
+        )
+        truth_path = self.repo.run_dir(run_id) / "supplier_truth_profiles.json"
+        if truth_path.exists():
+            truth_path.unlink()
+        run = self.repo.load_run(run_id)
+        run["status"] = WorkbenchState.IMAGE_PROCESSING.value
+        run["supplier_recapture_seed_ids"] = []
+        self.repo.save_run(run)
+
+        reconciled = WorkbenchService(self.repo).reconcile_supplier_recovery_state(
+            run_id
+        )
+
+        self.assertTrue(reconciled.ok, reconciled.to_dict())
+        self.assertEqual(
+            [seed.seed_id],
+            reconciled.data["sku_confirmation_seed_ids"],
+        )
+        self.assertEqual(
+            [seed.seed_id],
+            self.repo.load_run(run_id)["supplier_recapture_seed_ids"],
+        )
+
+    def test_upload_page_routes_supplier_recovery_back_to_supplier_review(self) -> None:
+        page = build_upload_workspace_html("wb-supplier-recovery")
+
+        self.assertIn('supplier_identity:"1688 商品身份恢复"', page)
+        self.assertIn("item.supplier_recovery_status", page)
+        self.assertIn("返回供应商审核并锁定 SKU", page)
+        self.assertIn(
+            "/batches/${encodeURIComponent(runId)}/supplier-review",
+            page,
+        )
 
     def test_supplier_review_page_enables_targeted_recapture_for_incomplete_late_stage_product(self) -> None:
         run_id, _seed = self.prepare_supplier_review_run()
@@ -3535,7 +4163,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
     def test_extension_manifest_registers_1688_supplier_content_script(self) -> None:
         manifest_path = self.project_root / "browser_extension" / "ozon_v2_bridge" / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self.assertEqual("0.1.73", manifest["version"])
+        self.assertEqual("0.1.75", manifest["version"])
 
         supplier_scripts = [
             item
@@ -3941,9 +4569,28 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             },
             ok=False,
         )
+        self.repo.save_category_resolutions(
+            run_id,
+            {
+                "schema_version": 1,
+                "run_id": run_id,
+                "items": {seed.seed_id: {"status": "resolved", "type_id": 101}},
+            },
+        )
+        self.repo.save_generated_content_result(
+            run_id,
+            {
+                "schema_version": 1,
+                "run_id": run_id,
+                "items": {seed.seed_id: {"title": "Stale content for old SKU"}},
+            },
+        )
         reopened = self.post_json(
             f"/api/batches/{run_id}/supplier-sku/reopen",
             {"seed_id": seed.seed_id},
+        )
+        pending_after_reopen = self.repo.load_run(run_id).get(
+            "supplier_recapture_seed_ids", []
         )
 
         self.assertIn('id="skuDecisionPanel"', page)
@@ -4004,9 +4651,18 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             rejected_gallery_subject["code"],
         )
         self.assertTrue(reopened["ok"])
+        self.assertIn(seed.seed_id, pending_after_reopen)
         self.assertNotIn(
             seed.seed_id,
             self.repo.load_supplier_sku_selections(run_id)["selections"],
+        )
+        self.assertNotIn(
+            seed.seed_id,
+            self.repo.load_category_resolutions(run_id)["items"],
+        )
+        self.assertNotIn(
+            seed.seed_id,
+            self.repo.load_generated_content_result(run_id)["items"],
         )
 
     def test_upload_workspace_repairs_legacy_subject_and_pending_package_to_locked_sku_images(
@@ -5605,6 +6261,102 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             task["evidence_index"]["ozon.target_sku.selected_options.Цвет"],
         )
 
+    def test_content_tasks_expose_exact_ozon_attribute_as_reference_candidate(
+        self,
+    ) -> None:
+        run_id, _seed = self.prepare_supplier_review_run()
+        ozon_result = self.repo.load_ozon_collection_result(run_id)
+        ozon_result["ozon_candidates"][0]["attributes"] = {
+            "Тип": "Аксессуар для камеры",
+        }
+        self.repo.save_ozon_collection_result(run_id, ozon_result)
+        template_result = self.repo.load_attribute_template_result(run_id)
+        template_result["seed_templates"][0]["upload_attribute_schema"] = [
+            {
+                "attribute_id": "type",
+                "attribute_label": "Тип",
+                "attribute_type": "String",
+                "dictionary_id": 1001,
+                "is_required": True,
+            }
+        ]
+        self.repo.save_attribute_template_result(run_id, template_result)
+
+        task = self.get_json(f"/api/batches/{run_id}/content-tasks")["data"][
+            "items"
+        ][0]
+        field = task["field_tasks"][0]
+
+        self.assertEqual("type", field["field_key"])
+        self.assertIn(
+            "ozon.attributes.Тип",
+            field["candidate_evidence_refs"],
+        )
+        self.assertEqual(
+            "Аксессуар для камеры",
+            task["evidence_index"]["ozon.attributes.Тип"],
+        )
+
+    def test_content_tasks_reopen_source_missing_result_when_new_candidate_exists(
+        self,
+    ) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        ozon_result = self.repo.load_ozon_collection_result(run_id)
+        ozon_result["ozon_candidates"][0]["attributes"] = {
+            "Тип": "Аксессуар для камеры",
+        }
+        self.repo.save_ozon_collection_result(run_id, ozon_result)
+        template_result = self.repo.load_attribute_template_result(run_id)
+        template_result["seed_templates"][0]["upload_attribute_schema"] = [
+            {
+                "attribute_id": "type",
+                "attribute_label": "Тип",
+                "attribute_type": "String",
+                "is_required": True,
+            }
+        ]
+        self.repo.save_attribute_template_result(run_id, template_result)
+        self.repo.save_generated_content_result(
+            run_id,
+            {
+                "schema_version": 2,
+                "run_id": run_id,
+                "items": {
+                    seed.seed_id: {
+                        "status": "blocked",
+                        "field_results": {
+                            "type": {
+                                "decision": "unresolved",
+                                "resolution_class": "source_fact_missing",
+                                "evidence_refs": ["ozon.attributes.Тип"],
+                                "reason": (
+                                    "The previous task exposed no field-specific "
+                                    "candidate evidence for this required type."
+                                ),
+                            }
+                        },
+                    }
+                },
+            },
+        )
+
+        task = self.get_json(f"/api/batches/{run_id}/content-tasks")["data"][
+            "items"
+        ][0]
+        field = task["field_tasks"][0]
+
+        self.assertEqual("pending", field["status"])
+        self.assertIsNone(field["decision"])
+        self.assertEqual("pending", task["status"])
+
+    def test_upload_page_distinguishes_required_and_optional_missing_fields(
+        self,
+    ) -> None:
+        page = build_upload_workspace_html("wb-count-labels")
+
+        self.assertIn("缺少必填", page)
+        self.assertIn("可选缺失", page)
+
     def test_content_tasks_reopen_polluted_mapped_field_for_normalization(
         self,
     ) -> None:
@@ -6785,6 +7537,15 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
 
         self.assertTrue(accepted.ok, accepted.to_dict())
         self.assertEqual("accepted_by_ozon", accepted.data["status"])
+        stored_product = next(
+            item
+            for item in self.repo.load_existing_products()
+            if item.store_product_id == "900001"
+        )
+        self.assertEqual(self.repo.seed_identity_key(seed), stored_product.source_seed_identity_key)
+        self.assertEqual("makeupmirror", stored_product.seed_subject_identity_key)
+        self.assertEqual("ozon-1", stored_product.source_ozon_product_id)
+        self.assertEqual("123456789012", stored_product.supplier_offer_id)
         package_path = self.context.runtime_root / "image_tasks" / "pending" / (
             accepted.data["image_task_package_id"] + ".json"
         )
@@ -7288,6 +8049,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
                             },
                             "900": {
                                 "decision": "unresolved",
+                                "candidate_policy_version": 2,
                                 "resolution_class": "source_fact_missing",
                                 "evidence_refs": [],
                                 "reason": "Гарантия отсутствует в собранных данных.",

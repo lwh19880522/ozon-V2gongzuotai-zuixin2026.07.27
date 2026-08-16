@@ -23,8 +23,8 @@ from ozon_v2.adapters.seller_api import (
     assess_category_template_match,
 )
 from ozon_v2.app.result import Result
-from ozon_v2.domain.models import OzonCandidate, QueryGenerationStatus, SeedProduct, SeedSearchQuery, WorkbenchAction, WorkbenchState, utc_now_iso
-from ozon_v2.domain.policies import decide_ozon_candidate_dedupe, decide_seed_existing_product_dedupe, seed_has_generated_ozon_query
+from ozon_v2.domain.models import ExistingStoreProduct, OzonCandidate, QueryGenerationStatus, SeedProduct, SeedSearchQuery, WorkbenchAction, WorkbenchState, utc_now_iso
+from ozon_v2.domain.policies import decide_ozon_candidate_dedupe, decide_seed_existing_product_dedupe, normalize_identity_text, seed_has_generated_ozon_query
 from ozon_v2.domain.pricing import (
     PricingInput,
     PricingPolicy,
@@ -46,6 +46,7 @@ from ozon_v2.images.worker import is_exact_three_by_four_image
 from ozon_v2.services.attribute_mapping_service import (
     attribute_content_score_progress,
     canonical_attribute_label,
+    is_locked_supplier_internal_conflict,
     is_visual_inference_field,
     map_template_attributes,
     normalize_attribute_label,
@@ -68,6 +69,46 @@ _CONTENT_RESOLUTION_CLASSES = {
     "evidence_conflict",
     "not_applicable",
 }
+
+
+def _supplier_identity_conflict_assessment(
+    field_results: dict[str, dict[str, Any]],
+    required_field_keys: set[str],
+) -> dict[str, Any]:
+    """Return the strong-evidence supplier recapture decision for one product.
+
+    A single internal 1688 conflict on a required Seller API field is enough to
+    invalidate the supplier binding. Optional conflicts need at least two
+    independent fields. Ozon differences are market-reference differences, not
+    supplier identity evidence. Missing source facts remain eligible for the
+    normal manual-fill workflow.
+    """
+
+    normalized_required = {
+        str(field_key).strip()
+        for field_key in required_field_keys
+        if str(field_key).strip()
+    }
+    conflict_field_keys = sorted(
+        str(field_key).strip()
+        for field_key, result in field_results.items()
+        if str(field_key).strip()
+        and isinstance(result, dict)
+        and str(result.get("decision") or "").strip() == "unresolved"
+        and is_locked_supplier_internal_conflict(result)
+    )
+    required_conflict_field_keys = sorted(
+        field_key
+        for field_key in conflict_field_keys
+        if field_key in normalized_required
+    )
+    return {
+        "recapture_required": bool(required_conflict_field_keys)
+        or len(conflict_field_keys) >= 2,
+        "conflict_field_keys": conflict_field_keys,
+        "required_conflict_field_keys": required_conflict_field_keys,
+    }
+_FIELD_CANDIDATE_POLICY_VERSION = 2
 _RUSSIAN_OBJECTIVE_FIELDS = {
     "model",
     "type",
@@ -1764,12 +1805,31 @@ class WorkbenchService:
     def restart_browser_task(self, run_id: str) -> Result:
         run = self.recover_browser_task_state(run_id)
         run = self._recover_pending_supplier_replacement(run)
+        recovery = self.reconcile_supplier_recovery_state(run_id)
+        if not recovery.ok:
+            return recovery
+        run = self.repo.load_run(run_id)
         status = WorkbenchState(run["status"])
         recapture_seed_ids = {
             str(seed_id).strip()
-            for seed_id in run.get("supplier_recapture_seed_ids") or []
+            for seed_id in recovery.data.get("product_recapture_seed_ids") or []
             if str(seed_id).strip()
         }
+        sku_confirmation_seed_ids = {
+            str(seed_id).strip()
+            for seed_id in recovery.data.get("sku_confirmation_seed_ids") or []
+            if str(seed_id).strip()
+        }
+        if sku_confirmation_seed_ids and not recapture_seed_ids:
+            return Result.failure(
+                "browser_task.supplier_sku_confirmation_required",
+                "The re-collected supplier products must have their exact SKUs confirmed before processing can continue.",
+                data={
+                    "run_id": run_id,
+                    "status": run["status"],
+                    "seed_ids": sorted(sku_confirmation_seed_ids),
+                },
+            )
         task_type_by_status = {
             WorkbenchState.OZON_COLLECTING: "ozon_collection",
             WorkbenchState.SUPPLIER_REVIEW: "supplier_selection",
@@ -2723,6 +2783,15 @@ class WorkbenchService:
         }
 
     def upload_workspace(self, run_id: str) -> Result:
+        conflict_audit = self.audit_supplier_identity_conflicts(run_id)
+        if not conflict_audit.ok:
+            return conflict_audit
+        recovery = self.reconcile_supplier_recovery_state(run_id)
+        if not recovery.ok:
+            return recovery
+        supplier_recovery_status_by_seed = dict(
+            recovery.data.get("recovery_status_by_seed") or {}
+        )
         run = self.repo.load_run(run_id)
         try:
             template_result = self._load_supplier_official_template_result(run_id)
@@ -2874,6 +2943,7 @@ class WorkbenchService:
         items: list[dict[str, Any]] = []
         for candidate in candidates:
             seed_id = str(candidate.get("seed_id") or "")
+            supplier_recovery_status = supplier_recovery_status_by_seed.get(seed_id)
             template = templates_by_seed.get(seed_id, {})
             template_binding_errors = self._attribute_template_product_binding_errors(
                 run_id,
@@ -3051,6 +3121,12 @@ class WorkbenchService:
                     "reason": "candidate_revision_or_product_binding_mismatch",
                     "binding_errors": template_binding_errors,
                 }
+            if supplier_recovery_status:
+                category_assessment = {
+                    "credible": False,
+                    "reason": "supplier_identity_recovery_required",
+                    "supplier_recovery_status": supplier_recovery_status,
+                }
             generated_field_results = (
                 (generated_content_items.get(seed_id) or {}).get(
                     "field_results"
@@ -3105,6 +3181,8 @@ class WorkbenchService:
                     "mapped_attribute_count": 0,
                     "rewrite_required_count": 0,
                     "missing_fact_count": 0,
+                    "missing_required_fact_count": 0,
+                    "missing_optional_fact_count": 0,
                     "not_applicable_count": 0,
                     "excluded_attribute_count": 0,
                     "required_attribute_count": 0,
@@ -3123,6 +3201,8 @@ class WorkbenchService:
                 template_ready and mapping["rewrite_required_count"] == 0
             )
             blocking_gates: list[str] = []
+            if supplier_recovery_status:
+                blocking_gates.append("supplier_identity")
             if not template_ready:
                 blocking_gates.append("category_template")
             elif not required_attributes_ready:
@@ -3151,6 +3231,7 @@ class WorkbenchService:
                         supplier_sku
                     ),
                     "supplier_truth_profile": supplier_truth_by_seed.get(seed_id),
+                    "supplier_recovery_status": supplier_recovery_status,
                     "supplier_source_images": supplier_source_images,
                     "subject_master": subject_master,
                     "bootstrap_image_url": bootstrap_image_url or None,
@@ -3199,6 +3280,12 @@ class WorkbenchService:
                     "mapped_attribute_count": mapping["mapped_attribute_count"],
                     "rewrite_required_count": mapping["rewrite_required_count"],
                     "missing_fact_count": mapping["missing_fact_count"],
+                    "missing_required_fact_count": mapping[
+                        "missing_required_fact_count"
+                    ],
+                    "missing_optional_fact_count": mapping[
+                        "missing_optional_fact_count"
+                    ],
                     "not_applicable_count": mapping["not_applicable_count"],
                     "excluded_attribute_count": mapping["excluded_attribute_count"],
                     "required_mapped_count": mapping["required_mapped_count"],
@@ -3330,6 +3417,12 @@ class WorkbenchService:
         mapped_attribute_count = sum(item["mapped_attribute_count"] for item in items)
         rewrite_required_count = sum(item["rewrite_required_count"] for item in items)
         missing_fact_count = sum(item["missing_fact_count"] for item in items)
+        missing_required_fact_count = sum(
+            item["missing_required_fact_count"] for item in items
+        )
+        missing_optional_fact_count = sum(
+            item["missing_optional_fact_count"] for item in items
+        )
         not_applicable_count = sum(item["not_applicable_count"] for item in items)
         required_mapped_count = sum(item["required_mapped_count"] for item in items)
         valid_required_attribute_count = sum(
@@ -3417,6 +3510,8 @@ class WorkbenchService:
                     "mapped_attribute_count": mapped_attribute_count,
                     "rewrite_required_count": rewrite_required_count,
                     "missing_fact_count": missing_fact_count,
+                    "missing_required_fact_count": missing_required_fact_count,
+                    "missing_optional_fact_count": missing_optional_fact_count,
                     "not_applicable_count": not_applicable_count,
                     "required_mapped_count": required_mapped_count,
                     "valid_required_attribute_count": valid_required_attribute_count,
@@ -3692,12 +3787,17 @@ class WorkbenchService:
                     evidence_index,
                     evidence,
                 )
+                candidate_evidence_refs = _field_candidate_evidence_refs(
+                    field,
+                    evidence_index,
+                )
                 completed_result = (
                     stored_result
                     if _content_result_is_accepted(
                         field,
                         stored_result,
                         visual_evidence_refs=visual_evidence_refs,
+                        candidate_evidence_refs=candidate_evidence_refs,
                     )
                     else None
                 )
@@ -3739,9 +3839,9 @@ class WorkbenchService:
                         ),
                         "current_mapping_status": field.get("status"),
                         "reference_evidence": field.get("reference_evidence", []),
-                        "candidate_evidence_refs": _field_candidate_evidence_refs(
-                            field,
-                            evidence_index,
+                        "candidate_evidence_refs": candidate_evidence_refs,
+                        "candidate_policy_version": (
+                            _FIELD_CANDIDATE_POLICY_VERSION
                         ),
                         "supplier_truth_required": bool(
                             supplier_truth_available
@@ -3794,6 +3894,7 @@ class WorkbenchService:
                         "use_ozon_structure_as_reference": True,
                         "copy_ozon_text_verbatim": False,
                         "supplier_truth_overrides_ozon": True,
+                        "ozon_objective_reference_requires_supplier_consistency": True,
                         "unsupported_claims_forbidden": True,
                         "complete_all_pending_fields": True,
                         "required_fields_must_be_completed_first": True,
@@ -4058,6 +4159,10 @@ class WorkbenchService:
                     resolution_class if decision == "unresolved" else None
                 ),
                 "visual_analysis": visual_analysis,
+                "candidate_policy_version": field.get(
+                    "candidate_policy_version"
+                ),
+                "required": field.get("required") is True,
             }
 
         visual_signatures: dict[tuple[str, str], tuple[str, str]] = {}
@@ -4192,6 +4297,28 @@ class WorkbenchService:
             for field in task.get("field_tasks", [])
             if field.get("required") is True
         }
+        identity_assessment = _supplier_identity_conflict_assessment(
+            stored_field_results,
+            required_field_keys,
+        )
+        if identity_assessment["recapture_required"]:
+            with self._run_mutation_lock(run_id):
+                self._invalidate_supplier_identity_locked(
+                    run_id,
+                    seed_id,
+                    identity_assessment,
+                    field_results=stored_field_results,
+                )
+            return Result.success(
+                "content_task.supplier_identity_conflict_recollection",
+                "The conflicting 1688 supplier binding was invalidated and queued for targeted re-collection.",
+                {
+                    "run_id": run_id,
+                    "seed_id": seed_id,
+                    "status": "supplier_recapture_required",
+                    **identity_assessment,
+                },
+            )
         blocking_unresolved_field_count = sum(
             1
             for field_key, result in stored_field_results.items()
@@ -4235,6 +4362,434 @@ class WorkbenchService:
                     blocking_unresolved_field_count
                 ),
                 "target_score": 90,
+            },
+        )
+
+    def audit_supplier_identity_conflicts(self, run_id: str) -> Result:
+        """Invalidate already-saved supplier bindings proven internally inconsistent."""
+
+        with self._run_mutation_lock(run_id):
+            self.repo.load_run(run_id)
+            generated_path = self.repo.run_dir(run_id) / "generated_content_result.json"
+            if not generated_path.exists():
+                return Result.success(
+                    "supplier_identity.audit_complete",
+                    "No generated field evidence exists yet.",
+                    {"run_id": run_id, "recapture_seed_ids": []},
+                )
+            generated = self.repo.load_generated_content_result(run_id)
+            generated_items = generated.get("items") or {}
+            if not isinstance(generated_items, dict):
+                return Result.failure(
+                    "supplier_identity.audit_invalid",
+                    "Generated field evidence is malformed and was not changed.",
+                    data={"run_id": run_id},
+                )
+
+            required_by_seed = self._required_content_field_keys_by_seed(run_id)
+            submission_items: dict[str, Any] = {}
+            submission_path = self.repo.run_dir(run_id) / "upload_submissions.json"
+            if submission_path.exists():
+                raw_submission_items = self.repo.load_upload_submissions(run_id).get(
+                    "items", {}
+                )
+                if isinstance(raw_submission_items, dict):
+                    submission_items = raw_submission_items
+
+            recapture_seed_ids: list[str] = []
+            protected_seed_ids: list[str] = []
+            for seed_id, item in list(generated_items.items()):
+                if not isinstance(item, dict):
+                    continue
+                normalized_seed_id = str(seed_id or "").strip()
+                if not normalized_seed_id:
+                    continue
+                field_results = _generated_field_results(item)
+                required_field_keys = set(required_by_seed.get(normalized_seed_id) or set())
+                required_field_keys.update(
+                    field_key
+                    for field_key, result in field_results.items()
+                    if isinstance(result, dict)
+                    and (
+                        result.get("required") is True
+                        or canonical_attribute_label(result.get("label"))
+                        == "type"
+                        or re.search(
+                            r"\brequired\b|обязательн",
+                            str(result.get("reason") or ""),
+                            flags=re.IGNORECASE,
+                        )
+                    )
+                )
+                assessment = _supplier_identity_conflict_assessment(
+                    field_results,
+                    required_field_keys,
+                )
+                if not assessment["recapture_required"]:
+                    continue
+                submission_status = str(
+                    ((submission_items.get(normalized_seed_id) or {}).get("status"))
+                    or ""
+                ).strip().casefold()
+                if submission_status and submission_status not in {
+                    "failed",
+                    "error",
+                    "declined",
+                }:
+                    protected_seed_ids.append(normalized_seed_id)
+                    continue
+                self._invalidate_supplier_identity_locked(
+                    run_id,
+                    normalized_seed_id,
+                    assessment,
+                    field_results=field_results,
+                )
+                recapture_seed_ids.append(normalized_seed_id)
+
+            return Result.success(
+                "supplier_identity.audit_complete",
+                "Conflicting supplier bindings were isolated for targeted re-collection.",
+                {
+                    "run_id": run_id,
+                    "recapture_seed_ids": sorted(recapture_seed_ids),
+                    "protected_submitted_seed_ids": sorted(protected_seed_ids),
+                },
+            )
+
+    def reconcile_supplier_recovery_state(self, run_id: str) -> Result:
+        """Repair the durable per-product recovery queue from saved supplier artifacts."""
+
+        with self._run_mutation_lock(run_id):
+            run = self.repo.load_run(run_id)
+            review_path = self.repo.run_dir(run_id) / "supplier_review.json"
+            if not review_path.exists():
+                return Result.success(
+                    "supplier_recovery.reconciled",
+                    "No supplier review exists for this batch.",
+                    {
+                        "run_id": run_id,
+                        "recovery_status_by_seed": {},
+                        "product_recapture_seed_ids": [],
+                        "sku_confirmation_seed_ids": [],
+                    },
+                )
+
+            review = self.repo.load_supplier_review(run_id)
+            review_items = [
+                item for item in review.get("items", []) if isinstance(item, dict)
+            ]
+            active_seed_ids = {
+                str(item.get("seed_id") or "").strip()
+                for item in run.get("candidate_slots", [])
+                if isinstance(item, dict) and str(item.get("seed_id") or "").strip()
+            }
+            truth_path = self.repo.run_dir(run_id) / "supplier_truth_profiles.json"
+            truths = (
+                self.repo.load_supplier_truth_profiles(run_id).get("profiles") or {}
+                if truth_path.exists()
+                else {}
+            )
+            collection_path = self.repo.run_dir(run_id) / "supplier_collection_result.json"
+            supplier_products = (
+                self.repo.load_supplier_collection_result(run_id).get(
+                    "supplier_products", []
+                )
+                if collection_path.exists()
+                else []
+            )
+            collected_seed_ids = {
+                str(item.get("seed_id") or "").strip()
+                for item in supplier_products
+                if isinstance(item, dict) and str(item.get("seed_id") or "").strip()
+            }
+            selection_path = self.repo.run_dir(run_id) / "supplier_sku_selections.json"
+            reopened_seed_ids: set[str] = set()
+            if selection_path.exists():
+                selection_payload = self.repo.load_supplier_sku_selections(run_id)
+                selected_seed_ids = {
+                    str(value).strip()
+                    for value in (selection_payload.get("selections") or {}).keys()
+                    if str(value).strip()
+                }
+                reopened_seed_ids = {
+                    str(item.get("seed_id") or "").strip()
+                    for item in selection_payload.get("history") or []
+                    if isinstance(item, dict)
+                    and str(item.get("seed_id") or "").strip()
+                    and item.get("reopened_at")
+                } - selected_seed_ids
+            pending = {
+                str(value).strip()
+                for value in run.get("supplier_recapture_seed_ids") or []
+                if str(value).strip()
+            }
+            pending.update(
+                seed_id
+                for seed_id in reopened_seed_ids
+                if seed_id in active_seed_ids
+                and seed_id in collected_seed_ids
+                and not isinstance(truths.get(seed_id), dict)
+            )
+            for item in review_items:
+                seed_id = str(item.get("seed_id") or "").strip()
+                if not seed_id or (active_seed_ids and seed_id not in active_seed_ids):
+                    continue
+                if (
+                    isinstance(item.get("supplier_identity_conflict"), dict)
+                    and not isinstance(truths.get(seed_id), dict)
+                ):
+                    pending.add(seed_id)
+
+            recovery_status_by_seed: dict[str, str] = {}
+            review_changed = False
+            for item in review_items:
+                seed_id = str(item.get("seed_id") or "").strip()
+                if seed_id not in pending:
+                    continue
+                if isinstance(truths.get(seed_id), dict):
+                    pending.discard(seed_id)
+                    if item.pop("supplier_identity_conflict", None) is not None:
+                        item["supplier_identity_rebuilt_at"] = utc_now_iso()
+                        review_changed = True
+                    continue
+                recovery_status_by_seed[seed_id] = (
+                    "supplier_sku_confirmation_required"
+                    if seed_id in collected_seed_ids
+                    else "supplier_product_recapture_required"
+                )
+
+            normalized_pending = sorted(pending)
+            original_pending = sorted(
+                str(value).strip()
+                for value in run.get("supplier_recapture_seed_ids") or []
+                if str(value).strip()
+            )
+            run_changed = normalized_pending != original_pending
+            if run_changed:
+                run["supplier_recapture_seed_ids"] = normalized_pending
+                self.repo.save_run(run)
+            if review_changed:
+                review["items"] = review_items
+                review["updated_at"] = utc_now_iso()
+                self.repo.save_supplier_review(run_id, review)
+            if run_changed or review_changed:
+                self.repo.append_run_event(
+                    run_id,
+                    "supplier_recovery.state_reconciled",
+                    "The per-product supplier recovery queue was repaired from durable evidence.",
+                    {"recovery_status_by_seed": recovery_status_by_seed},
+                )
+
+            return Result.success(
+                "supplier_recovery.reconciled",
+                "The per-product supplier recovery state is consistent.",
+                {
+                    "run_id": run_id,
+                    "recovery_status_by_seed": recovery_status_by_seed,
+                    "product_recapture_seed_ids": sorted(
+                        seed_id
+                        for seed_id, status in recovery_status_by_seed.items()
+                        if status == "supplier_product_recapture_required"
+                    ),
+                    "sku_confirmation_seed_ids": sorted(
+                        seed_id
+                        for seed_id, status in recovery_status_by_seed.items()
+                        if status == "supplier_sku_confirmation_required"
+                    ),
+                },
+            )
+
+    def _required_content_field_keys_by_seed(
+        self,
+        run_id: str,
+    ) -> dict[str, set[str]]:
+        template_path = self.repo.run_dir(run_id) / "attribute_template_result.json"
+        if not template_path.exists():
+            return {}
+        template_payload = self.repo.load_attribute_template_result(run_id)
+        result: dict[str, set[str]] = {}
+        for template in template_payload.get("seed_templates", []):
+            if not isinstance(template, dict):
+                continue
+            seed_id = str(template.get("seed_id") or "").strip()
+            if not seed_id:
+                continue
+            schema = template.get("upload_attribute_schema") or []
+            result[seed_id] = {
+                str(field.get("attribute_id") or field.get("field_key") or "").strip()
+                for field in schema
+                if isinstance(field, dict)
+                and field.get("required") is True
+                and str(
+                    field.get("attribute_id") or field.get("field_key") or ""
+                ).strip()
+            }
+        return result
+
+    def _invalidate_supplier_identity_locked(
+        self,
+        run_id: str,
+        seed_id: str,
+        assessment: dict[str, Any],
+        *,
+        field_results: dict[str, dict[str, Any]],
+    ) -> None:
+        run = self.repo.load_run(run_id)
+        now = utc_now_iso()
+
+        review_path = self.repo.run_dir(run_id) / "supplier_review.json"
+        if review_path.exists():
+            review = self.repo.load_supplier_review(run_id)
+            for item in review.get("items", []):
+                if not isinstance(item, dict) or str(item.get("seed_id") or "") != seed_id:
+                    continue
+                item["supplier_url"] = None
+                item["user_verified_exact_match"] = False
+                item["verified_at"] = None
+                item["supplier_identity_conflict"] = {
+                    "detected_at": now,
+                    "conflict_field_keys": assessment.get("conflict_field_keys") or [],
+                    "required_conflict_field_keys": assessment.get(
+                        "required_conflict_field_keys"
+                    )
+                    or [],
+                }
+            review["updated_at"] = now
+            self.repo.save_supplier_review(run_id, review)
+
+        list_artifacts = (
+            (
+                "supplier_selection_draft.json",
+                self.repo.load_supplier_selection_draft,
+                self.repo.save_supplier_selection_draft,
+                "supplier_products",
+            ),
+            (
+                "supplier_collection_result.json",
+                self.repo.load_supplier_collection_result,
+                self.repo.save_supplier_collection_result,
+                "supplier_products",
+            ),
+        )
+        for filename, loader, saver, key in list_artifacts:
+            if not (self.repo.run_dir(run_id) / filename).exists():
+                continue
+            artifact = loader(run_id)
+            artifact[key] = [
+                item
+                for item in artifact.get(key, [])
+                if isinstance(item, dict)
+                and str(item.get("seed_id") or "") != seed_id
+            ]
+            artifact["updated_at"] = now
+            saver(run_id, artifact)
+
+        mapping_artifacts = (
+            (
+                "supplier_sku_selections.json",
+                self.repo.load_supplier_sku_selections,
+                self.repo.save_supplier_sku_selections,
+                "selections",
+            ),
+            (
+                "supplier_truth_profiles.json",
+                self.repo.load_supplier_truth_profiles,
+                self.repo.save_supplier_truth_profiles,
+                "profiles",
+            ),
+            (
+                "category_resolutions.json",
+                self.repo.load_category_resolutions,
+                self.repo.save_category_resolutions,
+                "items",
+            ),
+            (
+                "subject_masters.json",
+                self.repo.load_subject_masters,
+                self.repo.save_subject_masters,
+                "items",
+            ),
+            (
+                "pricing_evidence.json",
+                self.repo.load_pricing_evidence,
+                self.repo.save_pricing_evidence,
+                "items",
+            ),
+            (
+                "generated_content_result.json",
+                self.repo.load_generated_content_result,
+                self.repo.save_generated_content_result,
+                "items",
+            ),
+            (
+                "required_attribute_evidence.json",
+                self.repo.load_required_attribute_evidence,
+                self.repo.save_required_attribute_evidence,
+                "items",
+            ),
+            (
+                "upload_previews.json",
+                self.repo.load_upload_previews,
+                self.repo.save_upload_previews,
+                "items",
+            ),
+            (
+                "upload_submissions.json",
+                self.repo.load_upload_submissions,
+                self.repo.save_upload_submissions,
+                "items",
+            ),
+        )
+        for filename, loader, saver, key in mapping_artifacts:
+            if not (self.repo.run_dir(run_id) / filename).exists():
+                continue
+            artifact = loader(run_id)
+            values = dict(artifact.get(key) or {})
+            values.pop(seed_id, None)
+            artifact[key] = values
+            artifact["updated_at"] = now
+            saver(run_id, artifact)
+
+        template_path = self.repo.run_dir(run_id) / "attribute_template_result.json"
+        if template_path.exists():
+            templates = self.repo.load_attribute_template_result(run_id)
+            templates["seed_templates"] = [
+                template
+                for template in templates.get("seed_templates", [])
+                if isinstance(template, dict)
+                and str(template.get("seed_id") or "") != seed_id
+            ]
+            templates["updated_at"] = now
+            self.repo.save_attribute_template_result(run_id, templates)
+
+        pending = {
+            str(value).strip()
+            for value in run.get("supplier_recapture_seed_ids") or []
+            if str(value).strip()
+        }
+        pending.add(seed_id)
+        run["supplier_recapture_seed_ids"] = sorted(pending)
+        run["browser_task_cancelled"] = False
+        run.pop("browser_task_cancelled_at", None)
+        run.pop("browser_task_cancel_reason", None)
+        run["browser_task_resumed_at"] = now
+        self.repo.save_run(run)
+        self.repo.append_run_event(
+            run_id,
+            "supplier_selection.identity_conflict_recapture_requested",
+            "A conflicting supplier identity chain was invalidated and queued for targeted re-collection.",
+            {
+                "seed_id": seed_id,
+                "conflict_field_keys": assessment.get("conflict_field_keys") or [],
+                "required_conflict_field_keys": assessment.get(
+                    "required_conflict_field_keys"
+                )
+                or [],
+                "conflict_reasons": {
+                    field_key: str((field_results.get(field_key) or {}).get("reason") or "")
+                    for field_key in assessment.get("conflict_field_keys") or []
+                },
+                "dispatch_token": now,
             },
         )
 
@@ -4831,6 +5386,129 @@ class WorkbenchService:
         record["image_task_package_status"] = bound_path.parent.name
         record.pop("image_task_package_error", None)
 
+    def _record_accepted_upload_identity(
+        self,
+        *,
+        run_id: str,
+        seed_id: str,
+        record: dict[str, Any],
+        preview: dict[str, Any] | None,
+        seller_status: dict[str, Any] | None = None,
+    ) -> None:
+        if str(record.get("status") or "").strip().casefold() != "accepted_by_ozon":
+            return
+        effective_status = seller_status or record.get("seller_api_status") or {}
+        offer_id = str(record.get("offer_id") or "").strip()
+        product_id = _product_id_from_import_status(
+            effective_status if isinstance(effective_status, dict) else {},
+            offer_id=offer_id,
+        )
+        if product_id is None:
+            product_state = record.get("seller_product_state")
+            if isinstance(product_state, dict):
+                product_id = _product_id_from_import_status(
+                    {"items": [product_state]},
+                    offer_id=offer_id,
+                )
+        if product_id is None:
+            return
+
+        seed = next(
+            (
+                item
+                for item in self.repo.load_sampled_seeds(run_id)
+                if item.seed_id == seed_id
+            ),
+            None,
+        )
+        try:
+            ozon_result = self.repo.load_ozon_collection_result(run_id)
+        except FileNotFoundError:
+            ozon_result = {}
+        ozon_candidate = next(
+            (
+                item
+                for item in ozon_result.get("ozon_candidates", [])
+                if isinstance(item, dict)
+                and str(item.get("seed_id") or "") == seed_id
+            ),
+            {},
+        )
+        try:
+            supplier_result = self.repo.load_supplier_collection_result(run_id)
+        except FileNotFoundError:
+            supplier_result = {}
+        supplier_product = next(
+            (
+                item
+                for item in supplier_result.get("supplier_products", [])
+                if isinstance(item, dict)
+                and str(item.get("seed_id") or "") == seed_id
+            ),
+            {},
+        )
+        seller_item = (
+            preview.get("seller_api_item")
+            if isinstance(preview, dict)
+            and isinstance(preview.get("seller_api_item"), dict)
+            else {}
+        )
+        title = str(seller_item.get("name") or offer_id or product_id).strip()
+        supplier_offer_id = str(
+            supplier_product.get("offer_id")
+            or supplier_product.get("supplier_product_id")
+            or ""
+        ).strip()
+        if not supplier_offer_id:
+            match = re.match(r"^OZV2-(\d{6,})(?:-|$)", offer_id, flags=re.IGNORECASE)
+            supplier_offer_id = match.group(1) if match else ""
+        images = seller_item.get("images")
+        primary_image = str(seller_item.get("primary_image") or "").strip()
+        if not primary_image and isinstance(images, list) and images:
+            primary_image = str(images[0] or "").strip()
+        self.repo.merge_existing_products(
+            [
+                ExistingStoreProduct(
+                    store_product_id=str(product_id),
+                    title=title,
+                    normalized_identity_key=normalize_identity_text(title),
+                    offer_id_when_available=offer_id or None,
+                    category_path=str(
+                        seller_item.get("description_category_id") or ""
+                    ).strip()
+                    or None,
+                    main_image_reference=primary_image or None,
+                    source_seed_identity_key=(
+                        self.repo.seed_identity_key(seed) if seed is not None else None
+                    ),
+                    seed_subject_identity_key=(
+                        normalize_identity_text(
+                            seed.title_or_keyword or seed.product_clue
+                        )
+                        if seed is not None
+                        else None
+                    ),
+                    source_ozon_product_id=str(
+                        ozon_candidate.get("ozon_product_id") or ""
+                    ).strip()
+                    or None,
+                    source_ozon_title=str(
+                        ozon_candidate.get("title") or ""
+                    ).strip()
+                    or None,
+                    supplier_offer_id=supplier_offer_id or None,
+                    supplier_title=str(
+                        supplier_product.get("title") or ""
+                    ).strip()
+                    or None,
+                    source_captured_at=str(
+                        record.get("status_checked_at") or utc_now_iso()
+                    ),
+                    notes=f"accepted upload lineage {run_id}:{seed_id}",
+                )
+            ]
+        )
+
     def submit_product_upload(
         self,
         run_id: str,
@@ -5330,6 +6008,13 @@ class WorkbenchService:
             preview=preview if isinstance(preview, dict) else None,
             seller_status=seller_status,
         )
+        self._record_accepted_upload_identity(
+            run_id=run_id,
+            seed_id=seed_id,
+            record=record,
+            preview=preview if isinstance(preview, dict) else None,
+            seller_status=seller_status,
+        )
         submissions["items"][seed_id] = record
         self.repo.save_upload_submissions(run_id, submissions)
         return Result.success(
@@ -5664,6 +6349,25 @@ class WorkbenchService:
         product["seed_id"] = seed_id
         product["supplier_url"] = supplier_url
         product["offer_id"] = supplier_offer_id
+        existing_store_match = next(
+            (
+                item
+                for item in self.repo.load_existing_products()
+                if str(item.supplier_offer_id or "").strip() == supplier_offer_id
+            ),
+            None,
+        )
+        if existing_store_match is not None:
+            return Result.failure(
+                "supplier_selection.offer_exists_in_store",
+                "This 1688 Offer already belongs to a product in the store history.",
+                data={
+                    "run_id": run_id,
+                    "seed_id": seed_id,
+                    "offer_id": supplier_offer_id,
+                    "store_product_id": existing_store_match.store_product_id,
+                },
+            )
         if is_late_recapture:
             missing = self._supplier_product_missing_fields(product)
             if missing:
@@ -5824,13 +6528,13 @@ class WorkbenchService:
             collection["supplier_products"] = ordered_products
             collection["updated_at"] = utc_now_iso()
             self.repo.save_supplier_collection_result(run_id, collection)
-            run["supplier_recapture_seed_ids"] = sorted(recapture_seed_ids - {seed_id})
+            run["supplier_recapture_seed_ids"] = sorted(recapture_seed_ids)
             run["browser_task_cancelled"] = False
             self.repo.save_run(run)
             event = self.repo.append_run_event(
                 run_id,
-                "supplier_selection.recapture_complete",
-                "One incomplete supplier product was re-collected without rolling back the batch stage.",
+                "supplier_selection.recapture_product_captured",
+                "One supplier product was re-collected and is waiting for exact SKU confirmation.",
                 {
                     "seed_id": seed_id,
                     "sku_matrix_status": product.get("sku_matrix_status"),
@@ -5838,7 +6542,7 @@ class WorkbenchService:
                 },
             )
             return Result.success(
-                "supplier_selection.recapture_complete",
+                "supplier_selection.recapture_product_captured",
                 "The supplier product was re-collected and is ready for SKU confirmation.",
                 self._response_payload(
                     run,
@@ -6137,6 +6841,9 @@ class WorkbenchService:
         run["ozon_collection_contract_ready"] = False
         run["ozon_collected"] = False
         run["browser_task_cancelled"] = False
+        run.pop("browser_task_cancelled_at", None)
+        run.pop("browser_task_cancel_reason", None)
+        run["browser_task_resumed_at"] = utc_now_iso()
         for filename in (
             "attribute_template_contract.json",
             "ozon_collection_contract.json",
@@ -6274,7 +6981,10 @@ class WorkbenchService:
         normalized_reason = str(reason or "").strip() or (
             "User marked the product as unsuitable for cross-border sale."
         )
-        template_payload = self.repo.load_attribute_template_result(run_id)
+        legacy_template_path = (
+            self.repo.run_dir(run_id) / "attribute_template_result.json"
+        )
+        template_payload = self._load_supplier_official_template_result(run_id)
         excluded_template = next(
             (
                 item
@@ -6334,13 +7044,14 @@ class WorkbenchService:
 
         remaining = [seed for seed in sampled if seed.seed_id != seed_id]
         self.repo.save_sampled_seeds(run_id, remaining)
-        template_payload["seed_templates"] = [
-            item
-            for item in template_payload.get("seed_templates", [])
-            if str(item.get("seed_id") or "") != seed_id
-        ]
-        template_payload["updated_at"] = utc_now_iso()
-        self.repo.save_attribute_template_result(run_id, template_payload)
+        if legacy_template_path.exists():
+            template_payload["seed_templates"] = [
+                item
+                for item in template_payload.get("seed_templates", [])
+                if str(item.get("seed_id") or "") != seed_id
+            ]
+            template_payload["updated_at"] = utc_now_iso()
+            self.repo.save_attribute_template_result(run_id, template_payload)
         ozon_payload["ozon_candidates"] = [
             item
             for item in ozon_payload.get("ozon_candidates", [])
@@ -6449,6 +7160,18 @@ class WorkbenchService:
                 self.repo.load_supplier_sku_selections,
                 self.repo.save_supplier_sku_selections,
                 "selections",
+            ),
+            (
+                "supplier_truth_profiles.json",
+                self.repo.load_supplier_truth_profiles,
+                self.repo.save_supplier_truth_profiles,
+                "profiles",
+            ),
+            (
+                "category_resolutions.json",
+                self.repo.load_category_resolutions,
+                self.repo.save_category_resolutions,
+                "items",
             ),
             (
                 "subject_masters.json",
@@ -6780,6 +7503,29 @@ class WorkbenchService:
             seed_id=seed_id,
             profile=profile,
         )
+        recapture_seed_ids = {
+            str(value).strip()
+            for value in run.get("supplier_recapture_seed_ids") or []
+            if str(value).strip()
+        }
+        supplier_identity_rebuilt = seed_id in recapture_seed_ids
+        if supplier_identity_rebuilt:
+            run["supplier_recapture_seed_ids"] = sorted(
+                recapture_seed_ids - {seed_id}
+            )
+            self.repo.save_run(run)
+            review_path = self.repo.run_dir(run_id) / "supplier_review.json"
+            if review_path.exists():
+                review = self.repo.load_supplier_review(run_id)
+                for item in review.get("items", []):
+                    if (
+                        isinstance(item, dict)
+                        and str(item.get("seed_id") or "") == seed_id
+                    ):
+                        item.pop("supplier_identity_conflict", None)
+                        item["supplier_identity_rebuilt_at"] = utc_now_iso()
+                review["updated_at"] = utc_now_iso()
+                self.repo.save_supplier_review(run_id, review)
         selection_status = self._supplier_sku_selection_status(run_id)
         event = self.repo.append_run_event(
             run_id,
@@ -6792,6 +7538,7 @@ class WorkbenchService:
                 "selection_path": str(saved_path),
                 "supplier_truth_path": str(saved_truth_path),
                 "category_resolution_status": category_resolution.get("status"),
+                "supplier_identity_rebuilt": supplier_identity_rebuilt,
             },
         )
         return Result.success(
@@ -6802,6 +7549,44 @@ class WorkbenchService:
                 event,
                 {"receipt": receipt.to_dict(), "selection_status": selection_status},
             ),
+        )
+
+    def _ozon_reference_product_type(
+        self,
+        run_id: str,
+        *,
+        seed_id: str,
+        slot_id: str,
+        candidate_revision: int,
+    ) -> str | None:
+        try:
+            candidates = self.repo.load_ozon_collection_result(run_id).get(
+                "ozon_candidates", []
+            )
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            return None
+        product = next(
+            (
+                item
+                for item in candidates
+                if isinstance(item, dict)
+                and str(item.get("seed_id") or "") == seed_id
+                and str(item.get("slot_id") or "") == slot_id
+                and int(item.get("candidate_revision") or 0) == candidate_revision
+            ),
+            None,
+        )
+        attributes = product.get("attributes") if isinstance(product, dict) else None
+        if not isinstance(attributes, dict):
+            return None
+        return next(
+            (
+                str(value).strip()
+                for key, value in attributes.items()
+                if str(key).strip().casefold() in {"type", "тип", "类型", "商品类型"}
+                and str(value or "").strip()
+            ),
+            None,
         )
 
     def _resolve_supplier_truth_category(
@@ -6815,10 +7600,32 @@ class WorkbenchService:
             (item for item in self._safe_load_sampled_seeds(run_id) if item.seed_id == seed_id),
             None,
         )
+        run = self.repo.load_run(run_id)
+        slot = next(
+            (
+                item
+                for item in run.get("candidate_slots", [])
+                if isinstance(item, dict) and str(item.get("seed_id") or "") == seed_id
+            ),
+            {},
+        )
+        slot_id = str(profile.get("slot_id") or slot.get("slot_id") or "")
+        candidate_revision = int(
+            profile.get("candidate_revision") or slot.get("candidate_revision") or 1
+        )
+        reference_product_type = self._ozon_reference_product_type(
+            run_id,
+            seed_id=seed_id,
+            slot_id=slot_id,
+            candidate_revision=candidate_revision,
+        )
         try:
             resolution = SellerCategoryResolver(self.seller_api_adapter).resolve(
                 profile,
                 seed_query_terms=list(seed.ozon_query_terms_ru if seed else []),
+                seed_subject=seed.title_or_keyword if seed else None,
+                seed_category_hint=seed.category_hint if seed else None,
+                reference_product_type=reference_product_type,
             )
         except (SellerApiError, AttributeError, OSError, TypeError, ValueError) as exc:
             resolution = {
@@ -6829,22 +7636,12 @@ class WorkbenchService:
                 "error": str(exc),
             }
 
-        run = self.repo.load_run(run_id)
-        slot = next(
-            (
-                item
-                for item in run.get("candidate_slots", [])
-                if isinstance(item, dict) and str(item.get("seed_id") or "") == seed_id
-            ),
-            {},
-        )
         resolution = {
             **resolution,
             "seed_id": seed_id,
-            "slot_id": str(profile.get("slot_id") or slot.get("slot_id") or ""),
-            "candidate_revision": int(
-                profile.get("candidate_revision") or slot.get("candidate_revision") or 1
-            ),
+            "slot_id": slot_id,
+            "candidate_revision": candidate_revision,
+            "reference_product_type": reference_product_type,
             "updated_at": utc_now_iso(),
         }
         chosen = resolution.get("chosen") if isinstance(resolution.get("chosen"), dict) else None
@@ -7137,11 +7934,77 @@ class WorkbenchService:
             subjects["updated_at"] = reopened_at
             self.repo.save_subject_masters(run_id, subjects)
 
+        invalidated_artifacts: list[str] = []
+        downstream_artifacts = (
+            (
+                "category_resolutions.json",
+                self.repo.load_category_resolutions,
+                self.repo.save_category_resolutions,
+            ),
+            (
+                "pricing_evidence.json",
+                self.repo.load_pricing_evidence,
+                self.repo.save_pricing_evidence,
+            ),
+            (
+                "generated_content_result.json",
+                self.repo.load_generated_content_result,
+                self.repo.save_generated_content_result,
+            ),
+            (
+                "required_attribute_evidence.json",
+                self.repo.load_required_attribute_evidence,
+                self.repo.save_required_attribute_evidence,
+            ),
+            (
+                "upload_previews.json",
+                self.repo.load_upload_previews,
+                self.repo.save_upload_previews,
+            ),
+            (
+                "upload_submissions.json",
+                self.repo.load_upload_submissions,
+                self.repo.save_upload_submissions,
+            ),
+        )
+        for filename, loader, saver in downstream_artifacts:
+            if not (self.repo.run_dir(run_id) / filename).exists():
+                continue
+            payload = loader(run_id)
+            stale_entry = (payload.get("items") or {}).get(seed_id)
+            if stale_entry is None:
+                continue
+            payload.setdefault("history", []).append(
+                {
+                    "seed_id": seed_id,
+                    "reopened_at": reopened_at,
+                    "artifact": filename,
+                    "entry": stale_entry,
+                }
+            )
+            payload.setdefault("items", {}).pop(seed_id, None)
+            payload["updated_at"] = reopened_at
+            saver(run_id, payload)
+            invalidated_artifacts.append(filename)
+
+        pending_recovery_seed_ids = {
+            str(value).strip()
+            for value in run.get("supplier_recapture_seed_ids") or []
+            if str(value).strip()
+        }
+        pending_recovery_seed_ids.add(seed_id)
+        run["supplier_recapture_seed_ids"] = sorted(pending_recovery_seed_ids)
+        self.repo.save_run(run)
+
         event = self.repo.append_run_event(
             run_id,
             "supplier_sku_selection.reopened",
             "The unstarted supplier SKU decision was archived and reopened for user selection.",
-            {"seed_id": seed_id, "stopped_image_job_id": job_id or None},
+            {
+                "seed_id": seed_id,
+                "stopped_image_job_id": job_id or None,
+                "invalidated_artifacts": invalidated_artifacts,
+            },
         )
         return Result.success(
             "supplier_sku_selection.reopened",
@@ -7152,6 +8015,7 @@ class WorkbenchService:
                 {
                     "seed_id": seed_id,
                     "stopped_image_job_id": job_id or None,
+                    "invalidated_artifacts": invalidated_artifacts,
                     "selection_status": self._supplier_sku_selection_status(run_id),
                 },
             ),
@@ -10183,7 +11047,9 @@ def _field_candidate_evidence_refs(
         return reference.rsplit(".", 1)[-1]
 
     def permitted(reference: str) -> bool:
-        return creative_field or not reference.startswith("ozon.")
+        if creative_field or not reference.startswith("ozon."):
+            return True
+        return reference.startswith("ozon.attributes.")
 
     candidates: list[str] = []
     for reference in evidence_index:
@@ -10202,6 +11068,13 @@ def _field_candidate_evidence_refs(
         "set_item_count": {"package_contents", "quantity"},
         "factory_package_count": {"quantity"},
     }
+    if canonical_label == "type":
+        candidates.extend(
+            reference
+            for reference in evidence_index
+            if reference == "supplier.title"
+            or reference.startswith("supplier_truth.subject.")
+        )
     candidates.extend(
         reference
         for reference in evidence_index
@@ -10567,6 +11440,7 @@ def _content_result_is_accepted(
     result: dict[str, Any] | None,
     *,
     visual_evidence_refs: list[str] | None = None,
+    candidate_evidence_refs: list[str] | None = None,
 ) -> bool:
     if not isinstance(result, dict):
         return False
@@ -10589,12 +11463,36 @@ def _content_result_is_accepted(
             not in _CONTENT_RESOLUTION_CLASSES
         ):
             return False
+        if (
+            str(result.get("resolution_class") or "") == "evidence_conflict"
+            and not is_locked_supplier_internal_conflict(result)
+        ):
+            return False
         current_visual_refs_set = set(current_visual_refs)
         prior_refs = {
             str(reference)
             for reference in (result.get("evidence_refs") or [])
             if str(reference or "").strip()
         }
+        current_candidate_refs = {
+            str(reference)
+            for reference in (candidate_evidence_refs or [])
+            if str(reference or "").strip()
+        }
+        try:
+            result_candidate_policy_version = int(
+                result.get("candidate_policy_version") or 0
+            )
+        except (TypeError, ValueError):
+            result_candidate_policy_version = 0
+        if (
+            str(result.get("resolution_class") or "")
+            == "source_fact_missing"
+            and current_candidate_refs
+            and result_candidate_policy_version
+            < _FIELD_CANDIDATE_POLICY_VERSION
+        ):
+            return False
         return not current_visual_refs_set or bool(
             current_visual_refs_set.intersection(prior_refs)
         )

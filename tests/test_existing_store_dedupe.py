@@ -93,6 +93,36 @@ class ExistingStoreDedupeTests(RuntimeTestCase):
         repo = FsRepo(self.context)
         run = repo.create_workbench_batch_record(target_count=1)
         run_id = run["run_id"]
+        seed = SeedProduct(
+            seed_id="seed-local",
+            title_or_keyword="Electronic desktop clock",
+            product_clue="Electronic desktop clock",
+        )
+        repo.save_sampled_seeds(run_id, [seed])
+        repo.save_ozon_collection_result(
+            run_id,
+            {
+                "ozon_candidates": [
+                    {
+                        "seed_id": seed.seed_id,
+                        "ozon_product_id": "source-ozon-local",
+                        "title": "Public Ozon source title",
+                    }
+                ]
+            },
+        )
+        repo.save_supplier_collection_result(
+            run_id,
+            {
+                "supplier_products": [
+                    {
+                        "seed_id": seed.seed_id,
+                        "offer_id": "123456789012",
+                        "title": "Supplier source title",
+                    }
+                ]
+            },
+        )
         repo.save_upload_previews(
             run_id,
             {
@@ -141,3 +171,7 @@ class ExistingStoreDedupeTests(RuntimeTestCase):
         self.assertEqual(1, len(products))
         self.assertEqual("5780000001", products[0].store_product_id)
         self.assertEqual("OZV2-local-1", products[0].offer_id_when_available)
+        self.assertEqual(repo.seed_identity_key(seed), products[0].source_seed_identity_key)
+        self.assertEqual("electronicdesktopclock", products[0].seed_subject_identity_key)
+        self.assertEqual("source-ozon-local", products[0].source_ozon_product_id)
+        self.assertEqual("123456789012", products[0].supplier_offer_id)

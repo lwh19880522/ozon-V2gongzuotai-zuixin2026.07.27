@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import re
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 
@@ -142,6 +143,7 @@ _ALIASES = {
     for alias in aliases
 }
 _CREATIVE_FIELDS = {"title", "description", "rich_content", "hashtags"}
+_FIELD_CANDIDATE_POLICY_VERSION = 2
 _VISUAL_INFERENCE_FIELDS = {
     "color",
     "factory_package_count",
@@ -195,6 +197,33 @@ def canonical_attribute_label(value: Any) -> str:
 
 def is_visual_inference_field(value: Any) -> bool:
     return canonical_attribute_label(value) in _VISUAL_INFERENCE_FIELDS
+
+
+def is_locked_supplier_internal_conflict(result: dict[str, Any]) -> bool:
+    """Return whether an unresolved conflict is proven inside 1688 truth.
+
+    Ozon fields are market-reference evidence only.  A difference between an
+    Ozon reference and a locked supplier fact must therefore be re-drafted from
+    the supplier fact, not treated as proof that the supplier binding is wrong.
+    """
+
+    if str(result.get("resolution_class") or "").strip() != "evidence_conflict":
+        return False
+    evidence_refs = {
+        str(reference).strip()
+        for reference in result.get("evidence_refs") or []
+        if str(reference or "").strip()
+    }
+    if any(reference.startswith("ozon.") for reference in evidence_refs):
+        return False
+    supplier_refs = {
+        reference
+        for reference in evidence_refs
+        if reference.startswith(
+            ("supplier.", "supplier_selection.", "supplier_truth.")
+        )
+    }
+    return len(supplier_refs) >= 2
 
 
 def attribute_content_score_progress(
@@ -547,6 +576,23 @@ def map_template_attributes(
                 and generated_result
                 and generated_result.get("structured") is True
                 and generated_result["decision"] == "unresolved"
+                and (
+                    generated_result.get("resolution_class")
+                    != "evidence_conflict"
+                    or is_locked_supplier_internal_conflict(generated_result)
+                )
+                and (
+                    generated_result.get("resolution_class")
+                    != "source_fact_missing"
+                    or generated_result.get("candidate_policy_version", 0)
+                    >= _FIELD_CANDIDATE_POLICY_VERSION
+                    or not _current_policy_candidate_available(
+                        label,
+                        ozon_candidate=ozon_candidate,
+                        supplier_product=supplier_product,
+                        supplier_truth_profile=supplier_truth_profile,
+                    )
+                )
             ):
                 missing_field.update(
                     {
@@ -588,6 +634,16 @@ def map_template_attributes(
 
     required_fields = [field for field in mapped_fields if field["required"]]
     required_mapped = [field for field in required_fields if field["status"] == "mapped"]
+    missing_required_fact_count = sum(
+        1
+        for field in mapped_fields
+        if field["status"] == "missing_fact" and field["required"]
+    )
+    missing_optional_fact_count = sum(
+        1
+        for field in mapped_fields
+        if field["status"] == "missing_fact" and not field["required"]
+    )
     missing_required = [
         {
             key: field.get(key)
@@ -626,6 +682,8 @@ def map_template_attributes(
         "missing_fact_count": sum(
             1 for field in mapped_fields if field["status"] == "missing_fact"
         ),
+        "missing_required_fact_count": missing_required_fact_count,
+        "missing_optional_fact_count": missing_optional_fact_count,
         "not_applicable_count": sum(
             1 for field in mapped_fields if field["status"] == "not_applicable"
         ),
@@ -696,6 +754,15 @@ def _collect_evidence(
                 f"supplier_selection.supplier_sku.selected_options.{label}",
                 10,
             )
+        locked_weight = _locked_sku_explicit_weight(supplier_sku)
+        if locked_weight is not None:
+            add(
+                "Вес товара, г",
+                locked_weight[0],
+                "confirmed_supplier_sku",
+                locked_weight[1],
+                4,
+            )
         add(
             "Количество товара в УЕИ",
             supplier_sku.get("set_quantity"),
@@ -735,6 +802,49 @@ def _collect_evidence(
                 2,
             )
     return items
+
+
+_EXPLICIT_WEIGHT_RE = re.compile(
+    r"(?<!\d)(\d+(?:[.,]\d+)?)\s*(kg|кг|公斤|千克|g|гр|г|克)(?![a-zа-я])",
+    flags=re.IGNORECASE,
+)
+
+
+def _locked_sku_explicit_weight(
+    supplier_sku: dict[str, Any],
+) -> tuple[str, str] | None:
+    candidates: list[tuple[Any, str]] = [
+        (
+            supplier_sku.get("raw_label"),
+            "supplier_selection.supplier_sku.raw_label",
+        ),
+        (
+            supplier_sku.get("combination_key"),
+            "supplier_selection.supplier_sku.combination_key",
+        ),
+    ]
+    candidates.extend(
+        (
+            value,
+            f"supplier_selection.supplier_sku.selected_options.{label}",
+        )
+        for label, value in _mapping_items(supplier_sku.get("selected_options"))
+    )
+    matches: dict[str, str] = {}
+    for raw_value, evidence_ref in candidates:
+        for number, unit in _EXPLICIT_WEIGHT_RE.findall(str(raw_value or "")):
+            try:
+                grams = Decimal(number.replace(",", "."))
+            except InvalidOperation:
+                continue
+            if unit.casefold() in {"kg", "кг", "公斤", "千克"}:
+                grams *= 1000
+            normalized = format(grams.normalize(), "f")
+            matches.setdefault(normalized, evidence_ref)
+    if len(matches) != 1:
+        return None
+    value, evidence_ref = next(iter(matches.items()))
+    return value, evidence_ref
 
 
 def _is_supplier_specification_artifact(label: Any, value: Any) -> bool:
@@ -783,6 +893,29 @@ def _mapping_items(value: Any) -> list[tuple[Any, Any]]:
     return list(value.items()) if isinstance(value, dict) else []
 
 
+def _current_policy_candidate_available(
+    label: Any,
+    *,
+    ozon_candidate: dict[str, Any],
+    supplier_product: dict[str, Any] | None,
+    supplier_truth_profile: dict[str, Any] | None,
+) -> bool:
+    canonical_label = canonical_attribute_label(label)
+    ozon_attributes = ozon_candidate.get("attributes")
+    if isinstance(ozon_attributes, dict) and any(
+        canonical_attribute_label(source_label) == canonical_label
+        and _has_value(value)
+        for source_label, value in ozon_attributes.items()
+    ):
+        return True
+    if canonical_label != "type":
+        return False
+    if _has_value((supplier_product or {}).get("title")):
+        return True
+    subject = (supplier_truth_profile or {}).get("subject")
+    return isinstance(subject, dict) and _has_value(subject.get("value"))
+
+
 def _has_value(value: Any) -> bool:
     if value is None:
         return False
@@ -791,6 +924,13 @@ def _has_value(value: Any) -> bool:
     if isinstance(value, (list, dict, tuple, set)):
         return bool(value)
     return True
+
+
+def _candidate_policy_version(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _plain_value(value: Any) -> Any:
@@ -904,6 +1044,9 @@ def _generated_field_result(value: Any) -> dict[str, Any] | None:
             "resolution_class": str(
                 value.get("resolution_class") or ""
             ).strip(),
+            "candidate_policy_version": _candidate_policy_version(
+                value.get("candidate_policy_version")
+            ),
             "structured": True,
         }
     if _has_value(value):

@@ -32,7 +32,7 @@ class WorkbenchBackgroundRunnerTests(RuntimeTestCase):
         self.assertIn("autopilot.blocked", events)
         self.assertIn("runner.blocked", events)
 
-    def test_runner_invokes_attribute_template_worker_before_next_gate(self) -> None:
+    def test_runner_blocks_retired_template_collection_without_invoking_worker(self) -> None:
         repo = FsRepo(self.context)
         self.save_test_credentials(repo)
         seed = SeedProduct(
@@ -80,14 +80,14 @@ class WorkbenchBackgroundRunnerTests(RuntimeTestCase):
         events = [event.event_type for event in repo.load_run_events(run_id)]
 
         self.assertTrue(result.ok)
-        self.assertEqual(1, worker.collect_count)
+        self.assertEqual(0, worker.collect_count)
         self.assertFalse(status["running"])
         self.assertEqual("blocked", status["state"])
-        self.assertEqual("supplier_review_required", status["blocked_reason"])
-        self.assertTrue((repo.run_dir(run_id) / "attribute_template_result.json").exists())
-        self.assertIn("attribute_template.ingested", events)
+        self.assertEqual("legacy_batch_restart_required", status["blocked_reason"])
+        self.assertFalse((repo.run_dir(run_id) / "attribute_template_result.json").exists())
+        self.assertNotIn("attribute_template.ingested", events)
 
-    def test_runner_reports_attribute_template_worker_failure_without_crashing(self) -> None:
+    def test_runner_blocks_retired_collected_template_batch(self) -> None:
         repo = FsRepo(self.context)
         self.save_test_credentials(repo)
         seed = SeedProduct(
@@ -100,7 +100,7 @@ class WorkbenchBackgroundRunnerTests(RuntimeTestCase):
         service = WorkbenchService(repo)
         run_id = service.start_batch(target_count=1).data["run"]["run_id"]
         run = repo.load_run(run_id)
-        run["status"] = WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTING.value
+        run["status"] = WorkbenchState.ATTRIBUTE_TEMPLATE_COLLECTED.value
         repo.save_run(run)
         repo.save_sampled_seeds(run_id, [seed])
         runner = WorkbenchBackgroundRunner(service, attribute_template_worker=FailingAttributeTemplateWorker())
@@ -109,8 +109,8 @@ class WorkbenchBackgroundRunnerTests(RuntimeTestCase):
         status = self.wait_until_idle(runner, run_id)
 
         self.assertEqual("blocked", status["state"])
-        self.assertEqual("attribute_template_worker.failed", status["blocked_reason"])
-        self.assertIn("captcha", status["message"])
+        self.assertEqual("legacy_batch_restart_required", status["blocked_reason"])
+        self.assertIn("retired", status["message"])
 
     def test_runner_stops_for_collection_review_after_supplier_collection(self) -> None:
         repo = FsRepo(self.context)

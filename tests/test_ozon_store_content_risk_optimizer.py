@@ -117,6 +117,48 @@ def test_non_media_score_renormalizes_only_available_text_groups(optimizer) -> N
     assert optimizer.non_media_score({"media": {"earned": 30, "maximum": 30}}) is None
 
 
+def test_normalize_rating_groups_uses_official_weights_and_excludes_nothing(
+    optimizer,
+) -> None:
+    groups = optimizer.normalize_rating_groups(
+        {
+            "sku": 70011,
+            "rating": 47,
+            "groups": [
+                {
+                    "key": "media",
+                    "name": "Media",
+                    "rating": 50,
+                    "weight": 45,
+                    "conditions": [{"key": "images", "rating": 50}],
+                    "improve_attributes": [{"id": 123}],
+                },
+                {
+                    "key": "text",
+                    "name": "Description",
+                    "rating": 50,
+                    "weight": 25,
+                    "conditions": [],
+                    "improve_attributes": [{"id": 4191}],
+                },
+                {
+                    "key": "other_attributes",
+                    "name": "Attributes",
+                    "rating": 100,
+                    "weight": 30,
+                    "conditions": [],
+                    "improve_attributes": [],
+                },
+            ],
+        }
+    )
+
+    assert groups["media"]["earned"] == 22.5
+    assert groups["text"]["maximum"] == 25
+    assert groups["text"]["improve_attributes"] == [{"id": 4191}]
+    assert optimizer.non_media_score(groups) == 77
+
+
 def test_scan_skips_archived_and_does_not_requeue_unchanged_completed(
     optimizer, tmp_path: Path
 ) -> None:
@@ -167,6 +209,48 @@ def test_changed_content_and_affected_rule_domain_requeue_product(
     )["queued"] == 1
 
 
+def test_changed_locked_evidence_requeues_without_repeating_unchanged_products(
+    optimizer, tmp_path: Path
+) -> None:
+    class ChangingEvidence(FakeEvidence):
+        def __init__(self) -> None:
+            self.value = "1"
+
+        def for_offer(self, offer_id: str) -> dict[str, Any]:
+            return {
+                "offer_id": offer_id,
+                "run_id": "wb-test",
+                "seed_id": "seed-1",
+                "locked_supplier_sku": True,
+                "evidence_insufficient": False,
+                "objective_evidence": {
+                    "6318": {
+                        "value": self.value,
+                        "refs": ["workbench:wb-test:seed-1:attribute:6318"],
+                    }
+                },
+                "pricing_evidence": {},
+                "supplier_selection": {"selection_sha256": "locked"},
+            }
+
+    gateway = FakeGateway([product("11", "sale-11")])
+    ledger = optimizer.Ledger(tmp_path / "optimizer.sqlite3")
+    evidence = ChangingEvidence()
+    optimizer.scan_store(gateway, ledger, evidence, rule_hashes())
+    first = ledger.next_task()
+    assert first is not None
+    ledger.mark_completed("11", first["source_fingerprint"], "proposal-a")
+
+    assert optimizer.scan_store(
+        gateway, ledger, evidence, rule_hashes()
+    )["skipped_unchanged"] == 1
+
+    evidence.value = "2"
+    assert optimizer.scan_store(
+        gateway, ledger, evidence, rule_hashes(), problems_only=True
+    )["queued"] == 1
+
+
 def test_unchanged_evidence_insufficient_product_is_not_regenerated(
     optimizer, tmp_path: Path
 ) -> None:
@@ -184,6 +268,117 @@ def test_unchanged_evidence_insufficient_product_is_not_regenerated(
     )
     assert result["queued"] == 0
     assert result["skipped_unchanged"] == 1
+
+
+def test_problem_only_rescan_queues_low_score_and_preserved_risk_only(
+    optimizer, tmp_path: Path
+) -> None:
+    safe = product("11", "safe-11")
+    low = product("12", "low-12")
+    low["content_score_groups"] = {
+        "text": {"earned": 25, "maximum": 25},
+        "other_attributes": {"earned": 7.5, "maximum": 30},
+    }
+    risky = product("13", "risky-13")
+    gateway = FakeGateway([safe, low, risky])
+    ledger = optimizer.Ledger(tmp_path / "optimizer.sqlite3")
+    optimizer.scan_store(gateway, ledger, FakeEvidence(), rule_hashes())
+    for product_id in ("11", "12", "13"):
+        queued = ledger.next_task()
+        assert queued is not None
+        ledger.mark_completed(
+            product_id, queued["source_fingerprint"], f"proposal-{product_id}"
+        )
+    ledger.mark_status(
+        "13",
+        "paused",
+        risk_level="high",
+        risk_codes=["category_type_semantic_mismatch:test"],
+    )
+
+    result = optimizer.scan_store(
+        gateway,
+        ledger,
+        FakeEvidence(),
+        rule_hashes(),
+        problems_only=True,
+    )
+
+    assert result == {
+        "queued": 2,
+        "skipped_archived": 0,
+        "skipped_unchanged": 0,
+        "skipped_problem_free": 1,
+    }
+
+
+def test_recovery_scan_can_target_one_exact_product(optimizer, tmp_path: Path) -> None:
+    gateway = FakeGateway([product("11", "safe-11"), product("12", "safe-12")])
+    ledger = optimizer.Ledger(tmp_path / "optimizer.sqlite3")
+
+    result = optimizer.scan_store(
+        gateway,
+        ledger,
+        FakeEvidence(),
+        rule_hashes(),
+        product_ids={"12"},
+    )
+
+    assert result["queued"] == 1
+    assert ledger.get_state("11") is None
+    assert ledger.get_state("12") is not None
+
+
+def test_problem_only_rescan_restores_problem_free_migration_queue(
+    optimizer, tmp_path: Path
+) -> None:
+    gateway = FakeGateway([product("11", "safe-11")])
+    ledger = optimizer.Ledger(tmp_path / "optimizer.sqlite3")
+    evidence = FakeEvidence(insufficient=True)
+    optimizer.scan_store(gateway, ledger, evidence, rule_hashes())
+    assert ledger.next_task() is not None
+    ledger.mark_status("11", "evidence_insufficient")
+
+    optimizer.scan_store(
+        gateway, ledger, evidence, rule_hashes("migration"), force=True
+    )
+    assert ledger.get_state("11")["status"] == "queued"
+
+    result = optimizer.scan_store(
+        gateway, ledger, evidence, rule_hashes("migration"), problems_only=True
+    )
+
+    assert result["queued"] == 0
+    assert result["skipped_problem_free"] == 1
+    assert ledger.get_state("11")["status"] == "evidence_insufficient"
+
+
+def test_source_fingerprint_ignores_media_and_inventory(optimizer) -> None:
+    original = product("11", "safe-11")
+    original["attribute_schema"] = [
+        {
+            "id": 20,
+            "name": "Second",
+            "dictionary": True,
+            "dictionary_id": 7,
+            "current_values": [{"value": "b"}, {"value": "a"}],
+            "dictionary_values": [{"id": 999, "value": "runtime page"}],
+        },
+        {"id": 10, "name": "First", "current_values": []},
+    ]
+    changed = deepcopy(original)
+    changed["images"] = ["https://example.test/replaced.jpg"]
+    changed["primary_image"] = changed["images"][0]
+    changed["stocks"] = [{"present": 0, "reserved": 7}]
+    changed["attribute_schema"] = list(reversed(changed["attribute_schema"]))
+    changed["attribute_schema"][1]["current_values"].reverse()
+    changed["attribute_schema"][1]["dictionary_values"] = [
+        {"id": 1000, "value": "another runtime page"}
+    ]
+
+    assert optimizer.source_fingerprint(original) == optimizer.source_fingerprint(
+        changed
+    )
 
 
 def test_workbench_evidence_ignores_non_workbench_runs_and_matches_exact_offer(
@@ -232,6 +427,82 @@ def test_workbench_evidence_ignores_non_workbench_runs_and_matches_exact_offer(
     assert result["locked_supplier_sku"] is True
 
 
+def test_workbench_evidence_binds_real_seed_shaped_artifacts(optimizer) -> None:
+    class SeedShapedRepo:
+        def list_runs(self):
+            return [{"run_id": "wb-real", "kind": "workbench_batch"}]
+
+        def load_upload_submissions(self, run_id):
+            return {
+                "items": {
+                    "seed-7": {
+                        "seed_id": "seed-7",
+                        "offer_id": "sale-11",
+                        "status": "accepted_by_ozon",
+                    }
+                }
+            }
+
+        def load_upload_previews(self, run_id):
+            return {
+                "items": {
+                    "seed-7": {
+                        "seed_id": "seed-7",
+                        "seller_api_item": {"offer_id": "sale-11"},
+                    }
+                }
+            }
+
+        def load_supplier_sku_selections(self, run_id):
+            return {
+                "selections": {
+                    "seed-7": {
+                        "decision": "confirmed_match",
+                        "confirmed_by": "user",
+                        "selection_sha256": "abc123",
+                        "supplier_sku": {
+                            "supplier_sku_id": "sku-7",
+                            "complete": True,
+                            "set_quantity": 10,
+                        },
+                    }
+                }
+            }
+
+        def load_required_attribute_evidence(self, run_id):
+            return {
+                "items": {
+                    "seed-7": {
+                        "description_category_id": 123,
+                        "type_id": 456,
+                        "values": {
+                            "6318": {
+                                "value": "10",
+                                "source": "user_confirmed_required_attribute",
+                            }
+                        },
+                    }
+                }
+            }
+
+        def load_pricing_evidence(self, run_id):
+            return {"items": {"seed-7": {"minimum_price": "99"}}}
+
+    result = optimizer.WorkbenchEvidence(SeedShapedRepo()).for_offer("sale-11")
+
+    assert result["seed_id"] == "seed-7"
+    assert result["locked_supplier_sku"] is True
+    assert result["evidence_insufficient"] is False
+    assert result["objective_evidence"]["6318"] == {
+        "value": "10",
+        "refs": ["workbench:wb-real:seed-7:attribute:6318"],
+    }
+    assert result["objective_evidence"]["quantity"] == {
+        "value": 10,
+        "refs": ["workbench:wb-real:seed-7:supplier_sku:set_quantity"],
+    }
+
+
 def test_ledger_schema_is_limited_to_product_state_and_action_log(
     optimizer, tmp_path: Path
 ) -> None:
@@ -244,6 +515,55 @@ def test_ledger_schema_is_limited_to_product_state_and_action_log(
         if not str(row[0]).startswith("sqlite_")
     }
     assert names == {"product_state", "action_log"}
+
+
+def test_terminal_apply_clears_resolved_ledger_risks(optimizer, tmp_path: Path) -> None:
+    ledger = optimizer.Ledger(tmp_path / "optimizer.sqlite3")
+    current_task = task()
+    ledger.upsert_task(current_task, rule_hashes())
+    ledger.mark_status(
+        "11",
+        "pending_risk",
+        risk_level="high",
+        risk_codes=["seller_validation_status:pending"],
+    )
+
+    ledger.mark_applied("11", "evidence_insufficient", "fresh", "proposal")
+
+    state = ledger.get_state("11")
+    assert state["risk_level"] is None
+    assert json.loads(state["risk_codes_json"]) == []
+
+
+def test_mark_status_deduplicates_risk_codes(optimizer, tmp_path: Path) -> None:
+    ledger = optimizer.Ledger(tmp_path / "optimizer.sqlite3")
+    ledger.upsert_task(task(), rule_hashes())
+
+    ledger.mark_status(
+        "11",
+        "pending_risk",
+        risk_level="high",
+        risk_codes=["active_order", "active_order"],
+    )
+
+    assert json.loads(ledger.get_state("11")["risk_codes_json"]) == [
+        "active_order"
+    ]
+
+
+def test_retried_action_replaces_stale_result(optimizer, tmp_path: Path) -> None:
+    ledger = optimizer.Ledger(tmp_path / "optimizer.sqlite3")
+    request = {"offer_id": "sale-11", "attributes": []}
+
+    ledger.log_action("11", "safe_hashtag_update", request, "failed")
+    ledger.log_action(
+        "11", "safe_hashtag_update", request, "pending_readback"
+    )
+
+    row = ledger.connection.execute(
+        "SELECT result FROM action_log WHERE product_id = '11'"
+    ).fetchone()
+    assert row["result"] == "pending_readback"
 
 
 def task(
@@ -358,7 +678,7 @@ def valid_proposal(
 def test_customer_text_gate_rejects_forbidden_or_broken_text(
     optimizer, bad_text: str
 ) -> None:
-    proposal = valid_proposal()
+    proposal = valid_proposal(attribute_decisions=[])
     proposal["name"] = bad_text
     with pytest.raises(optimizer.ValidationError):
         optimizer.validate_proposal(task(), proposal)
@@ -379,6 +699,33 @@ def test_objective_attribute_requires_exact_evidence(optimizer) -> None:
         optimizer.validate_proposal(task(objective_value="1"), proposal)
 
 
+def test_objective_attribute_accepts_exact_existing_seller_text_only(
+    optimizer,
+) -> None:
+    current_task = task()
+    current_task["current"]["description"] += " Material: zinc alloy."
+    current_task["attribute_schema"].append(
+        {"id": 7405, "name": "Material", "objective": True}
+    )
+    proposal = valid_proposal(
+        attribute_decisions=[
+            {
+                "id": 7405,
+                "decision": "set",
+                "values": [{"value": "zinc alloy"}],
+                "evidence_refs": ["seller.description"],
+            }
+        ]
+    )
+
+    result = optimizer.validate_proposal(current_task, proposal)
+    assert result["unresolved_blocking_risk"] is False
+
+    proposal["attribute_decisions"][0]["values"] = [{"value": "aluminum"}]
+    with pytest.raises(optimizer.ValidationError, match="objective evidence mismatch"):
+        optimizer.validate_proposal(current_task, proposal)
+
+
 def test_missing_workbench_evidence_keeps_objective_fields_and_blocks_stock(
     optimizer,
 ) -> None:
@@ -388,6 +735,104 @@ def test_missing_workbench_evidence_keeps_objective_fields_and_blocks_stock(
     )
     assert result["evidence_insufficient"] is True
     assert result["allow_inventory_restore"] is False
+
+
+def test_queued_task_evidence_cannot_be_injected_in_memory(optimizer) -> None:
+    current_task = task()
+    current_task["task_integrity_fingerprint"] = optimizer.task_integrity_fingerprint(
+        current_task
+    )
+    current_task["objective_evidence"]["6318"] = {
+        "value": "29",
+        "refs": ["invented.at.runtime"],
+    }
+
+    with pytest.raises(optimizer.ValidationError, match="task evidence changed"):
+        optimizer.validate_proposal(current_task, valid_proposal())
+
+
+def test_exact_seller_type_evidence_can_fill_required_type_without_workbench(
+    optimizer,
+) -> None:
+    current_task = task(evidence_insufficient=True)
+    current_task["attribute_schema"].append(
+        {
+            "id": 8229,
+            "name": "Тип",
+            "required": True,
+            "dictionary": True,
+            "dictionary_values": [{"id": 77, "value": "Настенный светильник"}],
+            "objective": True,
+        }
+    )
+    current_task["objective_evidence"]["8229"] = {
+        "value": "Настенный светильник",
+        "refs": ["seller.type_id:456"],
+    }
+    current_task["required_missing_attribute_ids"] = [8229]
+    current_task["deterministic_findings"] = [
+        {
+            "code": "missing_required_attribute:8229",
+            "level": "high",
+            "resolution": "unresolved",
+        }
+    ]
+    proposal = valid_proposal(
+        attribute_decisions=[
+            {
+                "id": 8229,
+                "decision": "set",
+                "values": [
+                    {
+                        "dictionary_value_id": 77,
+                        "value": "Настенный светильник",
+                    }
+                ],
+                "evidence_refs": ["seller.type_id:456"],
+            }
+        ]
+    )
+
+    result = optimizer.validate_proposal(current_task, proposal)
+
+    assert result["unresolved_blocking_risk"] is False
+
+
+def test_type_tree_extracts_exact_type_name_by_type_id(optimizer) -> None:
+    tree = [
+        {
+            "description_category_id": 1,
+            "children": [
+                {
+                    "type_id": 456,
+                    "type_name": "Настенный светильник",
+                    "children": [],
+                }
+            ],
+        }
+    ]
+
+    assert optimizer._description_type_names(tree) == {
+        456: "Настенный светильник"
+    }
+
+
+def test_build_task_merges_exact_seller_objective_evidence(optimizer) -> None:
+    current_product = product("11", "sale-11")
+    current_product["seller_objective_evidence"] = {
+        "8229": {
+            "value": "Настенный светильник",
+            "refs": ["seller.type_id:456"],
+        }
+    }
+
+    built = optimizer._build_task(current_product, FakeEvidence().for_offer("sale-11"))
+
+    assert built["objective_evidence"]["6318"]["value"] == "1"
+    assert built["objective_evidence"]["8229"] == {
+        "value": "Настенный светильник",
+        "refs": ["seller.type_id:456"],
+    }
 
 
 def test_merge_preserves_every_media_value_exactly(optimizer) -> None:
@@ -687,7 +1132,9 @@ def test_failed_readback_rolls_back_original_payload(
     optimizer, tmp_path: Path
 ) -> None:
     current_task = task()
-    original = optimizer.build_original_content_import(current_task)
+    original = optimizer.build_original_attribute_update(
+        current_task, valid_proposal()
+    )
     gateway = FakeActionGateway(readback_is_bad=True)
     result = optimizer.apply_one(
         gateway,
@@ -697,7 +1144,8 @@ def test_failed_readback_rolls_back_original_payload(
         sleep_fn=lambda _seconds: None,
     )
     assert result["status"] == "rolled_back"
-    assert gateway.import_requests[-1] == [original]
+    assert gateway.import_requests == []
+    assert gateway.attribute_update_requests[-1] == original
 
 
 def test_rollback_failure_pauses_with_stock_zero(
@@ -839,6 +1287,188 @@ def test_missing_media_uses_attribute_update_when_title_is_unchanged(
     assert len(gateway.attribute_update_requests) == 1
 
 
+def test_missing_media_uses_attribute_update_when_title_changes(
+    optimizer, tmp_path: Path
+) -> None:
+    current_task = task()
+    current_task["read_only_images"] = []
+    current_task["seller_api_item"]["images"] = []
+    current_task["seller_api_item"]["primary_image"] = ""
+    live_product = product("11", "sale-11", visibility="IN_SALE")
+    live_product["images"] = []
+    live_product["primary_image"] = ""
+    live_product["seller_api_item"] = deepcopy(live_product)
+    gateway = FakeActionGateway(live_product)
+
+    result = optimizer.apply_one(
+        gateway,
+        seeded_ledger(optimizer, tmp_path, current_task),
+        current_task,
+        valid_proposal(),
+        sleep_fn=lambda _seconds: None,
+    )
+
+    assert result["status"] == "completed"
+    assert gateway.import_requests == []
+    assert len(gateway.attribute_update_requests) == 1
+
+
+def test_duplicated_title_recovery_uses_sanitized_import(
+    optimizer, tmp_path: Path
+) -> None:
+    current_task = task()
+    duplicated = current_task["current"]["name"] * 2
+    current_task["current"]["name"] = duplicated
+    current_task["seller_api_item"]["name"] = duplicated
+    current_task["deterministic_findings"] = [
+        {
+            "code": "duplicated_full_text:name",
+            "level": "severe",
+            "resolution": "unresolved",
+        }
+    ]
+    live_product = product("11", "sale-11", visibility="IN_SALE")
+    live_product["name"] = duplicated
+    live_product["seller_api_item"] = deepcopy(live_product)
+    proposal = valid_proposal()
+    proposal["risk_findings"] = [
+        {
+            "code": "duplicated_full_text:name",
+            "level": "severe",
+            "resolution": "fixed",
+        }
+    ]
+    gateway = FakeActionGateway(live_product)
+
+    result = optimizer.apply_one(
+        gateway,
+        seeded_ledger(optimizer, tmp_path, current_task),
+        current_task,
+        proposal,
+        sleep_fn=lambda _seconds: None,
+    )
+
+    assert result["status"] == "completed"
+    assert len(gateway.import_requests) == 1
+    assert gateway.attribute_update_requests == []
+
+
+def test_duplicated_title_without_media_uses_attribute_update(
+    optimizer, tmp_path: Path
+) -> None:
+    current_task = task()
+    duplicated = current_task["current"]["name"] * 2
+    current_task["current"]["name"] = duplicated
+    current_task["seller_api_item"]["name"] = duplicated
+    current_task["seller_api_item"]["images"] = []
+    current_task["seller_api_item"]["primary_image"] = ""
+    current_task["deterministic_findings"] = [
+        {
+            "code": "duplicated_full_text:name",
+            "level": "severe",
+            "resolution": "unresolved",
+        }
+    ]
+    live_product = product("11", "sale-11", visibility="IN_SALE")
+    live_product["name"] = duplicated
+    live_product["images"] = []
+    live_product["primary_image"] = ""
+    live_product["seller_api_item"] = deepcopy(live_product)
+    proposal = valid_proposal()
+    proposal["risk_findings"] = [
+        {
+            "code": "duplicated_full_text:name",
+            "level": "severe",
+            "resolution": "fixed",
+        }
+    ]
+    gateway = FakeActionGateway(live_product)
+
+    result = optimizer.apply_one(
+        gateway,
+        seeded_ledger(optimizer, tmp_path, current_task),
+        current_task,
+        proposal,
+        sleep_fn=lambda _seconds: None,
+    )
+
+    assert result["status"] == "completed"
+    assert gateway.import_requests == []
+    assert len(gateway.attribute_update_requests) == 1
+
+
+def test_media_present_still_uses_non_media_attribute_update(
+    optimizer, tmp_path: Path
+) -> None:
+    current_task = task()
+    gateway = FakeActionGateway(product("11", "sale-11"))
+
+    result = optimizer.apply_one(
+        gateway,
+        seeded_ledger(optimizer, tmp_path, current_task),
+        current_task,
+        valid_proposal(),
+        sleep_fn=lambda _seconds: None,
+    )
+
+    assert result["status"] == "completed"
+    assert gateway.import_requests == []
+    assert len(gateway.attribute_update_requests) == 1
+
+
+def test_media_snapshot_treats_primary_image_fallback_as_unchanged(optimizer) -> None:
+    current_task = task()
+    current_task["seller_api_item"]["primary_image"] = ""
+    actual = deepcopy(current_task["seller_api_item"])
+    actual["primary_image"] = actual["images"][0]
+
+    assert optimizer._original_snapshot_matches(
+        current_task, valid_proposal(), actual
+    )
+
+
+def test_apply_waits_for_eventually_consistent_readback(
+    optimizer, tmp_path: Path
+) -> None:
+    class DelayedReadbackGateway(FakeActionGateway):
+        def __init__(self) -> None:
+            super().__init__(product("11", "sale-11"))
+            self.desired: dict[str, Any] | None = None
+            self.stale_reads = 0
+
+        def update_product_attributes(self, item: dict[str, Any]) -> int:
+            before = deepcopy(self.current)
+            task_id = super().update_product_attributes(item)
+            self.desired = deepcopy(self.current)
+            self.current = before
+            self.stale_reads = 2
+            return task_id
+
+        def fetch_product(self, product_id: str) -> dict[str, Any]:
+            if self.desired is not None:
+                if self.stale_reads:
+                    self.stale_reads -= 1
+                else:
+                    self.current = self.desired
+                    self.desired = None
+            return super().fetch_product(product_id)
+
+    sleeps: list[int] = []
+    gateway = DelayedReadbackGateway()
+    current_task = task()
+
+    result = optimizer.apply_one(
+        gateway,
+        seeded_ledger(optimizer, tmp_path, current_task),
+        current_task,
+        valid_proposal(),
+        sleep_fn=sleeps.append,
+    )
+
+    assert result["status"] == "completed"
+    assert sleeps == [2, 4]
+
+
 def test_existing_media_still_uses_attribute_update_when_title_is_unchanged(
     optimizer, tmp_path: Path
 ) -> None:
@@ -860,7 +1490,7 @@ def test_existing_media_still_uses_attribute_update_when_title_is_unchanged(
     assert len(gateway.attribute_update_requests) == 1
 
 
-def test_duplicate_successful_import_is_not_submitted_again_or_left_applying(
+def test_duplicate_successful_update_is_not_submitted_again_or_left_applying(
     optimizer, tmp_path: Path
 ) -> None:
     current_task = task()
@@ -882,7 +1512,8 @@ def test_duplicate_successful_import_is_not_submitted_again_or_left_applying(
     )
     assert first["status"] == "completed"
     assert second["status"] == "duplicate_skipped"
-    assert len(gateway.import_requests) == 1
+    assert gateway.import_requests == []
+    assert len(gateway.attribute_update_requests) == 1
     assert ledger.get_state("11")["status"] == "completed"
 
 
@@ -903,6 +1534,17 @@ def test_execute_command_drives_scan_next_and_status_without_live_api(
     assert next_result["task"]["product_id"] == "11"
     status_result = optimizer.execute_command("status", runtime)
     assert status_result["counts"] == {"drafting": 1}
+    assert status_result["actions"] == {}
+    assert status_result["products"] == [
+        {
+            "product_id": "11",
+            "offer_id": "sale-11",
+            "status": "drafting",
+            "risk_level": None,
+            "risk_codes": [],
+            "last_error": None,
+        }
+    ]
 
 
 def test_fetch_attributes_accepts_the_live_v4_list_result_shape(optimizer) -> None:
@@ -944,6 +1586,25 @@ def test_fetch_product_uses_focused_readback_instead_of_full_catalog(optimizer) 
             }
 
         def _post_json(self, path, payload):
+            if path == "/v1/product/rating-by-sku":
+                assert payload == {"skus": [70011]}
+                return {
+                    "products": [
+                        {
+                            "sku": 70011,
+                            "rating": 47,
+                            "groups": [
+                                {"key": "media", "rating": 50, "weight": 45},
+                                {"key": "text", "rating": 50, "weight": 25},
+                                {
+                                    "key": "other_attributes",
+                                    "rating": 100,
+                                    "weight": 30,
+                                },
+                            ],
+                        }
+                    ]
+                }
             assert path == "/v4/product/info/attributes"
             return {
                 "result": [
@@ -973,6 +1634,8 @@ def test_fetch_product_uses_focused_readback_instead_of_full_catalog(optimizer) 
     assert result["product_id"] == "11"
     assert result["name"] == "Точное название"
     assert result["visibility"] == "IN_SALE"
+    assert result["content_rating"] == 47
+    assert optimizer.non_media_score(result["content_score_groups"]) == 77
 
 
 def test_build_task_reads_title_description_and_rich_content_attributes(
@@ -1068,7 +1731,7 @@ def test_rejected_attribute_update_with_unchanged_readback_never_zeros_stock(
 
         def update_product_attributes(self, item: dict[str, Any]) -> int:
             self.attribute_update_called = True
-            raise AssertionError("attribute-only update must not be used")
+            raise RuntimeError("request rejected before mutation")
 
         def import_product(self, item: dict[str, Any]) -> int:
             self.import_called = True
@@ -1086,8 +1749,8 @@ def test_rejected_attribute_update_with_unchanged_readback_never_zeros_stock(
 
     assert result["status"] == "pending_risk"
     assert result["reason"] == "write_rejected_no_change"
-    assert gateway.import_called is True
-    assert gateway.attribute_update_called is False
+    assert gateway.import_called is False
+    assert gateway.attribute_update_called is True
     assert gateway.stock_requests == []
 
 
@@ -1111,6 +1774,7 @@ def test_build_task_exposes_seller_errors_required_gaps_and_raw_status(
     optimizer,
 ) -> None:
     current_product = product("11", "sale-11", visibility="NOT_IN_SALE")
+    current_product["type_id"] = None
     current_product["statuses"] = {
         "status_name": "Не продается",
         "status_description": "Ошибка валидации",
@@ -1137,6 +1801,396 @@ def test_build_task_exposes_seller_errors_required_gaps_and_raw_status(
     assert built["required_missing_attribute_ids"] == [8229]
     assert "seller_error:INCORRECT_DENSITY" in built["deterministic_risk_codes"]
     assert "missing_required_attribute:8229" in built["deterministic_risk_codes"]
+
+
+def test_seller_warning_level_is_not_misclassified_as_severe(optimizer) -> None:
+    assert optimizer._seller_error_severity("ERROR_LEVEL_WARNING") == "medium"
+    assert optimizer._seller_error_severity("ERROR_LEVEL_ERROR") == "severe"
+
+
+def test_hashtag_warning_is_normalized_without_changing_meaning(optimizer) -> None:
+    assert optimizer._normalize_hashtag_text(
+        "#растения #подвязка растений #держатели для цветов"
+    ) == "#растения #подвязка_растений #держатели_для_цветов"
+
+
+def test_confirmed_package_fields_are_revalidated_and_converted(optimizer) -> None:
+    pricing_evidence = {
+        "status": "confirmed",
+        "confirmed_by": "workbench_user",
+        "inputs": {
+            "purchase_price_cny": "0.24",
+            "domestic_shipping_cny": "2.7",
+            "package_weight_g": "60",
+            "package_length_cm": "14",
+            "package_width_cm": "9",
+            "package_height_cm": "1",
+            "target_margin_rate": "0.20",
+        },
+    }
+
+    assert optimizer._confirmed_package_import_fields(pricing_evidence) == {
+        "depth": 140,
+        "width": 90,
+        "height": 10,
+        "dimension_unit": "mm",
+        "weight": 60,
+        "weight_unit": "g",
+    }
+
+
+def test_invalid_confirmed_package_density_is_a_deterministic_risk(
+    optimizer,
+) -> None:
+    current_product = product("11", "sale-11", visibility="NOT_IN_SALE")
+    current_product["statuses"] = {"is_created": False}
+    current_product["errors"] = [
+        {"code": "INCORRECT_DENSITY", "level": "ERROR_LEVEL_ERROR"}
+    ]
+    current_product["seller_api_item"] = deepcopy(current_product)
+    evidence = {
+        "evidence_insufficient": False,
+        "pricing_evidence": {
+            "status": "confirmed",
+            "confirmed_by": "workbench_user",
+            "inputs": {
+                "purchase_price_cny": "0.24",
+                "domestic_shipping_cny": "2.7",
+                "package_weight_g": "60",
+                "package_length_cm": "1",
+                "package_width_cm": "1",
+                "package_height_cm": "1",
+                "target_margin_rate": "0.20",
+            },
+        },
+    }
+
+    built = optimizer._build_task(current_product, evidence)
+
+    assert "invalid_user_confirmed_package_density" in built[
+        "deterministic_risk_codes"
+    ]
+
+
+def test_uncreated_product_hashtag_repair_uses_full_import_with_confirmed_package(
+    optimizer, tmp_path: Path
+) -> None:
+    current_product = product(
+        "11", "sale-11", visibility="NOT_IN_SALE", stock=0
+    )
+    current_product["statuses"] = {"is_created": False}
+    current_product["attributes"].append(
+        {
+            "id": 23171,
+            "complex_id": 0,
+            "values": [
+                {
+                    "dictionary_value_id": 0,
+                    "value": "#автосалон #влажные салфетки",
+                }
+            ],
+        }
+    )
+    current_product["errors"] = [
+        {"code": "BR_hashtag_validation", "level": "ERROR_LEVEL_WARNING"}
+    ]
+    current_product["seller_api_item"] = deepcopy(current_product)
+    current_task = optimizer._build_task(
+        current_product,
+        {
+            "evidence_insufficient": False,
+            "pricing_evidence": {
+                "status": "confirmed",
+                "confirmed_by": "workbench_user",
+                "inputs": {
+                    "purchase_price_cny": "0.24",
+                    "domestic_shipping_cny": "2.7",
+                    "package_weight_g": "60",
+                    "package_length_cm": "14",
+                    "package_width_cm": "9",
+                    "package_height_cm": "1",
+                    "target_margin_rate": "0.20",
+                },
+            },
+        },
+    )
+
+    class ImportRepairGateway(FakeActionGateway):
+        def import_product(self, item: dict[str, Any]) -> int:
+            task_id = super().import_product(item)
+            self.current["errors"] = []
+            self.current["statuses"] = {"is_created": True}
+            self.current["seller_api_item"] = deepcopy(self.current)
+            return task_id
+
+    gateway = ImportRepairGateway(current_product)
+    ledger = seeded_ledger(optimizer, tmp_path, current_task)
+    result = optimizer._apply_safe_hashtag_repair(
+        gateway,
+        ledger,
+        current_task,
+        gateway.fetch_product("11"),
+        sleep_fn=lambda _seconds: None,
+    )
+
+    assert result is not None
+    assert result["status"] == "success"
+    assert gateway.attribute_update_requests == []
+    request = gateway.import_requests[0][0]
+    assert request["depth"] == 140
+    assert request["width"] == 90
+    assert request["height"] == 10
+    assert request["weight"] == 60
+    hashtags = next(
+        attribute for attribute in request["attributes"] if attribute["id"] == 23171
+    )
+    assert hashtags["values"][0]["value"] == "#автосалон #влажные_салфетки"
+
+
+def test_uncreated_product_does_not_retry_hashtag_with_invalid_package(
+    optimizer, tmp_path: Path
+) -> None:
+    current_product = product(
+        "11", "sale-11", visibility="NOT_IN_SALE", stock=0
+    )
+    current_product["statuses"] = {"is_created": False}
+    current_product["attributes"].append(
+        {
+            "id": 23171,
+            "complex_id": 0,
+            "values": [{"value": "#автосалон #влажные салфетки"}],
+        }
+    )
+    current_product["errors"] = [
+        {"code": "BR_hashtag_validation", "level": "ERROR_LEVEL_WARNING"},
+        {"code": "INCORRECT_DENSITY", "level": "ERROR_LEVEL_ERROR"},
+    ]
+    current_product["seller_api_item"] = deepcopy(current_product)
+    current_task = optimizer._build_task(
+        current_product,
+        {
+            "evidence_insufficient": False,
+            "pricing_evidence": {
+                "status": "confirmed",
+                "confirmed_by": "workbench_user",
+                "inputs": {
+                    "purchase_price_cny": "0.24",
+                    "domestic_shipping_cny": "2.7",
+                    "package_weight_g": "60",
+                    "package_length_cm": "1",
+                    "package_width_cm": "1",
+                    "package_height_cm": "1",
+                    "target_margin_rate": "0.20",
+                },
+            },
+        },
+    )
+    gateway = FakeActionGateway(current_product)
+    ledger = seeded_ledger(optimizer, tmp_path, current_task)
+
+    result = optimizer._apply_safe_hashtag_repair(
+        gateway,
+        ledger,
+        current_task,
+        gateway.fetch_product("11"),
+        sleep_fn=lambda _seconds: None,
+    )
+
+    assert result is not None
+    assert result["status"] == "blocked"
+    assert "package density" in result["error"]
+    assert gateway.attribute_update_requests == []
+    assert gateway.import_requests == []
+
+
+def test_safe_hashtag_repair_runs_before_unrelated_density_pause(
+    optimizer, tmp_path: Path
+) -> None:
+    current_product = product(
+        "11", "sale-11", visibility="NOT_IN_SALE", stock=0
+    )
+    current_product["attributes"].append(
+        {
+            "id": 23171,
+            "complex_id": 0,
+            "values": [
+                {
+                    "dictionary_value_id": 0,
+                    "value": "#растения #подвязка растений",
+                }
+            ],
+        }
+    )
+    current_product["errors"] = [
+        {
+            "code": "BR_hashtag_validation",
+            "level": "ERROR_LEVEL_WARNING",
+        },
+        {
+            "code": "INCORRECT_DENSITY",
+            "level": "ERROR_LEVEL_ERROR",
+        },
+    ]
+    current_product["seller_api_item"] = deepcopy(current_product)
+    current_task = optimizer._build_task(
+        current_product,
+        {"evidence_insufficient": False, "objective_evidence": {}},
+    )
+
+    class HashtagClearingGateway(FakeActionGateway):
+        def update_product_attributes(self, item: dict[str, Any]) -> int:
+            task_id = super().update_product_attributes(item)
+            if any(
+                int(attribute.get("id") or 0) == 23171
+                for attribute in item.get("attributes") or []
+            ):
+                self.current["errors"] = [
+                    error
+                    for error in self.current.get("errors") or []
+                    if error.get("code") != "BR_hashtag_validation"
+                ]
+            return task_id
+
+    gateway = HashtagClearingGateway(current_product)
+    proposal = valid_proposal(attribute_decisions=[])
+    proposal["base_fingerprint"] = current_task["source_fingerprint"]
+    result = optimizer.apply_one(
+        gateway,
+        seeded_ledger(optimizer, tmp_path, current_task),
+        current_task,
+        proposal,
+        sleep_fn=lambda _seconds: None,
+    )
+
+    assert result["status"] == "paused"
+    assert result["safe_repairs"] == ["hashtag_format"]
+    assert result["remaining_risk_codes"] == [
+        "seller_error:INCORRECT_DENSITY"
+    ]
+    assert gateway.attribute_update_requests[0] == {
+        "offer_id": "sale-11",
+        "attributes": [
+            {
+                "id": 23171,
+                "complex_id": 0,
+                "values": [
+                    {
+                        "dictionary_value_id": 0,
+                        "value": "#растения #подвязка_растений",
+                    }
+                ],
+            }
+        ],
+    }
+    assert gateway.stock_requests[0]["stock"] == 0
+
+
+def test_accepted_hashtag_repair_with_delayed_readback_is_not_rolled_back(
+    optimizer, tmp_path: Path
+) -> None:
+    current_product = product(
+        "11", "sale-11", visibility="NOT_IN_SALE", stock=0
+    )
+    current_product["attributes"].append(
+        {
+            "id": 23171,
+            "complex_id": 0,
+            "values": [
+                {
+                    "dictionary_value_id": 0,
+                    "value": "#влажные салфетки",
+                }
+            ],
+        }
+    )
+    current_product["errors"] = [
+        {
+            "code": "BR_hashtag_validation",
+            "level": "ERROR_LEVEL_WARNING",
+        },
+        {
+            "code": "INCORRECT_DENSITY",
+            "level": "ERROR_LEVEL_ERROR",
+        },
+    ]
+    current_product["seller_api_item"] = deepcopy(current_product)
+    current_task = optimizer._build_task(
+        current_product,
+        {"evidence_insufficient": False, "objective_evidence": {}},
+    )
+
+    class DeferredReadbackGateway(FakeActionGateway):
+        def update_product_attributes(self, item: dict[str, Any]) -> int:
+            self.attribute_update_requests.append(deepcopy(item))
+            return len(self.attribute_update_requests)
+
+    gateway = DeferredReadbackGateway(current_product)
+    ledger = seeded_ledger(optimizer, tmp_path, current_task)
+    proposal = valid_proposal(attribute_decisions=[])
+    proposal["base_fingerprint"] = current_task["source_fingerprint"]
+    result = optimizer.apply_one(
+        gateway,
+        ledger,
+        current_task,
+        proposal,
+        sleep_fn=lambda _seconds: None,
+    )
+
+    assert result["status"] == "paused"
+    assert result["safe_repairs_submitted"] == ["hashtag_format"]
+    assert len(gateway.attribute_update_requests) == 1
+    actions = ledger.connection.execute(
+        "SELECT action, result FROM action_log ORDER BY id"
+    ).fetchall()
+    assert [(row["action"], row["result"]) for row in actions] == [
+        ("safe_hashtag_update", "pending_readback"),
+        ("stock_0", "success"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "Locked-вариант содержит один флакон объемом 260 мл.",
+        "Размер указан на изображении поставщика.",
+    ],
+)
+def test_deterministic_findings_block_internal_supplier_language(
+    optimizer, description: str
+) -> None:
+    current_product = product("11", "sale-11")
+    current_product["description"] = description
+    current_product["seller_api_item"] = deepcopy(current_product)
+
+    codes = {
+        item["code"]
+        for item in optimizer._deterministic_findings(current_product)
+    }
+
+    assert "prohibited_supplier_language:description" in codes
+
+
+def test_deterministic_findings_block_fully_duplicated_title(optimizer) -> None:
+    current_product = product("11", "sale-11")
+    current_product["name"] = current_product["name"] * 2
+    current_product["seller_api_item"] = deepcopy(current_product)
+
+    codes = {
+        item["code"]
+        for item in optimizer._deterministic_findings(current_product)
+    }
+
+    assert "duplicated_full_text:name" in codes
+
+
+def test_top_level_type_id_satisfies_required_type_attribute(optimizer) -> None:
+    current_product = product("11", "sale-11")
+    current_product["attribute_schema"] = [
+        {"id": 8229, "name": "Тип", "required": True, "objective": True}
+    ]
+    current_product["seller_api_item"] = deepcopy(current_product)
+
+    assert optimizer._missing_required_attribute_ids(current_product) == []
 
 
 @pytest.mark.parametrize(
@@ -1228,6 +2282,29 @@ def test_changed_product_without_official_non_media_score_is_not_completed_or_re
     assert gateway.stock_requests == []
 
 
+def test_missing_score_is_reported_even_when_objective_evidence_is_also_limited(
+    optimizer, tmp_path: Path
+) -> None:
+    current_task = task(evidence_insufficient=True)
+    current_task["non_media_score"] = None
+    proposal = valid_proposal(attribute_decisions=[])
+    live_product = product("11", "sale-11")
+    live_product["content_score_groups"] = {}
+    gateway = FakeActionGateway(live_product)
+
+    result = optimizer.apply_one(
+        gateway,
+        seeded_ledger(optimizer, tmp_path, current_task),
+        current_task,
+        proposal,
+        sleep_fn=lambda _seconds: None,
+    )
+
+    assert result["status"] == "score_unverified"
+    assert "official_non_media_score_unavailable" in result["risk_codes"]
+    assert "objective_evidence_insufficient" in result["risk_codes"]
+
+
 def test_seller_error_change_requeues_a_previously_terminal_product(
     optimizer, tmp_path: Path
 ) -> None:
@@ -1249,6 +2326,41 @@ def test_seller_error_change_requeues_a_previously_terminal_product(
     assert result["skipped_unchanged"] == 0
 
 
+def test_rescan_preserves_unresolved_semantic_risk_until_explicitly_fixed(
+    optimizer, tmp_path: Path
+) -> None:
+    current_product = product("11", "sale-11")
+    gateway = FakeGateway([current_product])
+    ledger = optimizer.Ledger(tmp_path / "optimizer.sqlite3")
+    optimizer.scan_store(gateway, ledger, FakeEvidence(), rule_hashes())
+    assert ledger.next_task() is not None
+    ledger.mark_status(
+        "11",
+        "paused",
+        risk_level="high",
+        risk_codes=["category_type_semantic_mismatch:cup_vs_hiking_bowl"],
+    )
+
+    optimizer.scan_store(
+        gateway, ledger, FakeEvidence(), rule_hashes("changed"), force=True
+    )
+    state = ledger.get_state("11")
+    assert state is not None
+    assert json.loads(state["risk_codes_json"]) == [
+        "category_type_semantic_mismatch:cup_vs_hiking_bowl"
+    ]
+    queued = ledger.next_task()
+    assert queued is not None
+    assert queued["prior_risk_codes"] == [
+        "category_type_semantic_mismatch:cup_vs_hiking_bowl"
+    ]
+
+    proposal = valid_proposal(attribute_decisions=[])
+    proposal["base_fingerprint"] = queued["source_fingerprint"]
+    with pytest.raises(optimizer.ValidationError, match="must be reviewed"):
+        optimizer.validate_proposal(queued, proposal)
+
+
 def test_catalog_audit_reports_risks_and_score_evidence_without_mutation(
     optimizer,
 ) -> None:
@@ -1260,7 +2372,7 @@ def test_catalog_audit_reports_risks_and_score_evidence_without_mutation(
         {"code": "INCORRECT_DENSITY", "level": "ERROR_LEVEL_ERROR"}
     ]
     broken["attribute_schema"] = [
-        {"id": 8229, "name": "Тип", "required": True, "objective": True}
+        {"id": 8230, "name": "Обязательное поле", "required": True, "objective": True}
     ]
     broken["seller_api_item"] = deepcopy(broken)
 
@@ -1273,7 +2385,63 @@ def test_catalog_audit_reports_risks_and_score_evidence_without_mutation(
     issue = result["problem_products"][0]
     assert issue["product_id"] == "12"
     assert "seller_error:INCORRECT_DENSITY" in issue["risk_codes"]
-    assert "missing_required_attribute:8229" in issue["risk_codes"]
+    assert "missing_required_attribute:8230" in issue["risk_codes"]
+    assert [item["product_id"] for item in result["products"]] == ["11", "12"]
+
+
+def test_catalog_audit_keeps_semantic_ledger_risks_visible_at_score_100(
+    optimizer,
+) -> None:
+    clean_score_but_wrong_category = product("11", "sale-11")
+
+    result = optimizer.audit_catalog(
+        [clean_score_but_wrong_category],
+        ledger_products=[
+            {
+                "product_id": "11",
+                "offer_id": "sale-11",
+                "status": "paused",
+                "risk_level": "high",
+                "risk_codes": [
+                    "category_type_semantic_mismatch:cup_vs_hiking_bowl"
+                ],
+                "last_error": None,
+            }
+        ],
+    )
+
+    assert result["problem_product_count"] == 1
+    assert result["problem_products"][0]["non_media_score"] == 80
+    assert result["problem_products"][0]["risk_codes"] == [
+        "category_type_semantic_mismatch:cup_vs_hiking_bowl"
+    ]
+
+
+def test_completion_gate_never_calls_partial_work_complete(optimizer) -> None:
+    partial = optimizer.completion_gate(
+        [
+            {"product_id": "11", "status": "completed"},
+            {"product_id": "12", "status": "evidence_insufficient"},
+            {"product_id": "13", "status": "paused"},
+        ]
+    )
+    assert partial == {
+        "run_complete": False,
+        "completed_count": 1,
+        "unresolved_count": 2,
+    }
+
+    complete = optimizer.completion_gate(
+        [
+            {"product_id": "11", "status": "completed"},
+            {"product_id": "12", "status": "completed"},
+        ]
+    )
+    assert complete == {
+        "run_complete": True,
+        "completed_count": 2,
+        "unresolved_count": 0,
+    }
 
 
 def test_dictionary_values_are_resolved_exactly_through_seller_api_before_apply(

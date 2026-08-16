@@ -771,6 +771,11 @@ async function openManagedSupplierTask(task, source, openedTasks, key, previous,
 
   const previousChannels = Array.isArray(previous.channels) ? previous.channels : [];
   const sameDispatch = previous.dispatchToken === dispatchToken;
+  const sameChannelContract = previousChannels.length === items.length
+    && items.every((item, index) => (
+      previousChannels.some((channel) => sameSupplierChannel(channel, item, index))
+    ));
+  const sameRound = sameDispatch && sameChannelContract;
   const existingWindowTabs = await managedWindowTabs(previous.windowId);
   if (existingWindowTabs.length) {
     await recoverActiveManagedSupplierTab(openedTasks, key, previous, items, existingWindowTabs);
@@ -782,14 +787,29 @@ async function openManagedSupplierTask(task, source, openedTasks, key, previous,
     let missingIndexes = alignedTabs
       .map((tab, index) => (tab ? -1 : index))
       .filter((index) => index >= 0);
-    if (!sameDispatch) {
+    const assignedTabIds = new Set(alignedTabs.filter(Boolean).map((tab) => tab.id));
+    const recyclableTabs = previousChannels
+      .map((channel) => ({ channel, tab: tabsById.get(channel.tabId) || null }))
+      .filter(({ tab }) => tab && !assignedTabIds.has(tab.id));
+    if (!sameRound) {
       for (const index of missingIndexes) {
+        const item = items[index];
+        const recyclableIndex = recyclableTabs.findIndex(({ channel }) => (
+          channel.channel_index === (Number.isInteger(item.channel_index) ? item.channel_index : index)
+        ));
+        const fallbackIndex = recyclableIndex >= 0 ? recyclableIndex : (recyclableTabs.length ? 0 : -1);
+        const recyclable = fallbackIndex >= 0 ? recyclableTabs.splice(fallbackIndex, 1)[0] : null;
         try {
-          alignedTabs[index] = await chrome.tabs.create({
-            windowId: previous.windowId,
-            url: "https://www.1688.com/",
-            active: false,
-          });
+          alignedTabs[index] = recyclable
+            ? await chrome.tabs.update(recyclable.tab.id, {
+              url: "https://www.1688.com/",
+              active: false,
+            })
+            : await chrome.tabs.create({
+              windowId: previous.windowId,
+              url: "https://www.1688.com/",
+              active: false,
+            });
         } catch (_) {
           alignedTabs[index] = null;
         }
@@ -815,16 +835,23 @@ async function openManagedSupplierTask(task, source, openedTasks, key, previous,
       launchState: missingIndexes.length ? "incomplete" : "opened",
       closingByExtension: false,
       closedByUser: false,
-      pendingNavigation: sameDispatch ? previous.pendingNavigation || null : null,
+      pendingNavigation: sameRound ? previous.pendingNavigation || null : null,
       pendingNavigations: [],
       lastUpdatedAt: new Date().toISOString(),
     };
     await saveOpenedTasks(openedTasks);
+    for (const { tab } of recyclableTabs) {
+      try {
+        await chrome.tabs.remove(tab.id);
+      } catch (_) {
+        // The stale managed lane may already be gone.
+      }
+    }
     for (const tab of alignedTabs.filter(Boolean)) await ensureContentScript(tab, task);
     return {
       opened: false,
       reused: true,
-      waiting: sameDispatch && missingIndexes.length > 0,
+      waiting: sameRound && missingIndexes.length > 0,
       partial: missingIndexes.length > 0,
       windowId: previous.windowId,
       tabIds: alignedTabs.filter(Boolean).map((tab) => tab.id),

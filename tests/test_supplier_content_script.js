@@ -48,6 +48,7 @@ const pageImages = [
 ];
 const skuScript = {
   textContent: `window.__INIT_DATA__ = ${JSON.stringify({
+    offerTitle: "测试收纳盒",
     skuProps: [
       {
         prop: "颜色",
@@ -95,10 +96,10 @@ const skuScript = {
 };
 
 const document = {
-  title: "测试收纳盒 - 1688",
+  title: "广东测试供应商有限公司 - 1688",
   body: textNode("广东测试供应商有限公司 测试收纳盒 ¥ 12 .80 送至 福建泉州 包邮"),
   querySelector(selector) {
-    if (selector.includes("og:title")) return { getAttribute: () => "测试收纳盒" };
+    if (selector.includes("og:title")) return { getAttribute: () => "广东测试供应商有限公司" };
     if (selector.includes("og:image")) return null;
     if (selector === "h1") return textNode("广东测试供应商有限公司");
     if (selector.includes("offerTitle")) return null;

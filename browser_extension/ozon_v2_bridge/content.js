@@ -141,8 +141,10 @@ function textOf(node, limit = 240) {
 }
 
 function hasChallenge() {
-  const text = `${location.href} ${document.title} ${textOf(document.body, 1600)}`;
-  return /captcha|robot|fab_chlg|challenge|checking|enable JavaScript|not a robot|VPN/i.test(text);
+  const href = String(location.href || "");
+  if (/(?:captcha|fab_chlg|(?:^|[/?&=_-])challenge(?:[/?&=_-]|$))/i.test(href)) return true;
+  const pageText = `${document.title || ""} ${textOf(document.body, 2600)}`;
+  return /\bcaptcha\b|not\s+a\s+robot|verify\s+(?:that\s+)?you\s+are\s+human|checking\s+your\s+browser|enable\s+javascript|доступ\s+ограничен|подтвердите[^.!?]{0,80}(?:не\s+робот|что\s+вы\s+человек)|провер(?:ка|яем)[^.!?]{0,80}(?:браузер|человек)|подозрительн(?:ая|ую)\s+активност|отключите[^.!?]{0,60}(?:vpn|прокси)/iu.test(pageText);
 }
 
 function links(selector, limit = 12) {

@@ -601,6 +601,30 @@ class FsRepo:
             preview_items = previews.get("items") if isinstance(previews, dict) else None
             if not isinstance(submission_items, dict) or not isinstance(preview_items, dict):
                 continue
+            try:
+                seeds_by_id = {
+                    seed.seed_id: seed for seed in self.load_sampled_seeds(run_dir.name)
+                }
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                seeds_by_id = {}
+            try:
+                ozon_result = self.load_ozon_collection_result(run_dir.name)
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                ozon_result = {}
+            ozon_by_seed = {
+                str(item.get("seed_id") or ""): item
+                for item in ozon_result.get("ozon_candidates", [])
+                if isinstance(item, dict) and str(item.get("seed_id") or "")
+            }
+            try:
+                supplier_result = self.load_supplier_collection_result(run_dir.name)
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                supplier_result = {}
+            supplier_by_seed = {
+                str(item.get("seed_id") or ""): item
+                for item in supplier_result.get("supplier_products", [])
+                if isinstance(item, dict) and str(item.get("seed_id") or "")
+            }
             for seed_id, submission in submission_items.items():
                 if not isinstance(submission, dict):
                     continue
@@ -635,12 +659,47 @@ class FsRepo:
                         product_id = str(matching["product_id"])
                         break
                 title = str(seller_item.get("name") or offer_id).strip()
+                seed = seeds_by_id.get(str(seed_id))
+                ozon_candidate = ozon_by_seed.get(str(seed_id)) or {}
+                supplier_product = supplier_by_seed.get(str(seed_id)) or {}
+                supplier_offer_id = str(
+                    supplier_product.get("offer_id")
+                    or supplier_product.get("supplier_product_id")
+                    or ""
+                ).strip()
                 products.append(
                     ExistingStoreProduct(
                         store_product_id=product_id or f"offer:{offer_id}",
                         offer_id_when_available=offer_id,
                         title=title,
                         normalized_identity_key=re.sub(r"[\W_]+", "", title.casefold()),
+                        source_seed_identity_key=(
+                            self.seed_identity_key(seed) if seed is not None else None
+                        ),
+                        seed_subject_identity_key=(
+                            re.sub(
+                                r"[\W_]+",
+                                "",
+                                str(
+                                    seed.title_or_keyword or seed.product_clue
+                                ).casefold(),
+                            )
+                            if seed is not None
+                            else None
+                        ),
+                        source_ozon_product_id=str(
+                            ozon_candidate.get("ozon_product_id") or ""
+                        ).strip()
+                        or None,
+                        source_ozon_title=str(
+                            ozon_candidate.get("title") or ""
+                        ).strip()
+                        or None,
+                        supplier_offer_id=supplier_offer_id or None,
+                        supplier_title=str(
+                            supplier_product.get("title") or ""
+                        ).strip()
+                        or None,
                         source_captured_at=str(
                             submission.get("submitted_at") or utc_now_iso()
                         ),
@@ -681,9 +740,32 @@ class FsRepo:
             offer_id = str(product.offer_id_when_available or "").strip().casefold()
             if offer_id:
                 keys.append(f"offer:{offer_id}")
+            source_ozon_product_id = str(
+                product.source_ozon_product_id or ""
+            ).strip().casefold()
+            if source_ozon_product_id:
+                keys.append(f"source_ozon:{source_ozon_product_id}")
+            supplier_offer_id = str(product.supplier_offer_id or "").strip().casefold()
+            if supplier_offer_id:
+                keys.append(f"supplier_offer:{supplier_offer_id}")
+            source_seed_identity_key = str(
+                product.source_seed_identity_key or ""
+            ).strip().casefold()
+            if source_seed_identity_key:
+                keys.append(f"source_seed:{source_seed_identity_key}")
             if not keys:
                 keys.append(f"title:{product.normalized_identity_key}")
             return keys
+
+        def preserve_lineage(
+            previous: ExistingStoreProduct,
+            current: ExistingStoreProduct,
+        ) -> ExistingStoreProduct:
+            combined = previous.to_dict()
+            for key, value in current.to_dict().items():
+                if value not in (None, "", [], {}):
+                    combined[key] = value
+            return ExistingStoreProduct.from_dict(combined)
 
         for product in existing + list(products):
             keys = identities(product)
@@ -695,8 +777,11 @@ class FsRepo:
                 matched_index = len(merged)
                 merged.append(product)
             else:
-                merged[matched_index] = product
-            for key in keys:
+                merged[matched_index] = preserve_lineage(
+                    merged[matched_index],
+                    product,
+                )
+            for key in identities(merged[matched_index]):
                 index_by_key[key] = matched_index
         self.replace_existing_products(merged)
         return {

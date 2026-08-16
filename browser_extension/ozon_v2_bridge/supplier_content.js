@@ -728,18 +728,25 @@
   }
 
   function collectTitle() {
-    return firstVisibleText([
+    const pageTitle = firstVisibleText([
       "[data-testid='offer-title']",
       "[class*='offer-title']",
       "[class*='offerTitle']",
     ], 500)
-      || metaContent(["meta[property='og:title']", "meta[name='title']"])
       || firstVisibleText(["main h1", "h1"], 500)
-      || normalizedText(document.title, 500)
-      || scriptEvidence([
+      || "";
+    const embeddedTitle = scriptEvidence([
         /"offerTitle"\s*:\s*"([^"]+)"/i,
         /"subject"\s*:\s*"([^"]+)"/i,
-      ])
+      ]);
+    const fallbackTitle = metaContent(["meta[property='og:title']", "meta[name='title']"])
+      || normalizedText(document.title, 500).replace(/\s*[-_|]\s*1688.*$/i, "");
+    const looksLikeCompany = (value) => /(?:有限责任公司|有限公司|公司|商行|经营部|工厂|厂)\s*$/.test(normalizedText(value, 500));
+    return [pageTitle, embeddedTitle, fallbackTitle]
+      .find((value) => value && !looksLikeCompany(value))
+      || embeddedTitle
+      || pageTitle
+      || fallbackTitle
       || "";
   }
 

@@ -293,6 +293,43 @@ class CollectionPolicyTests(TestCase):
         self.assertEqual("ozon-1", decision.matched_product_id)
         self.assertEqual("ozon_product_id", decision.evidence["matched_by"])
 
+    def test_uploaded_lineage_blocks_equivalent_seed_after_store_title_was_rewritten(self) -> None:
+        seed = SeedProduct(
+            seed_id="seed-new",
+            title_or_keyword="电子桌面时钟",
+            product_clue="电子桌面时钟",
+            ozon_query_terms_ru=["электронные настольные часы с календарем"],
+            query_generation_status="generated",
+        )
+        existing = ExistingStoreProduct(
+            store_product_id="store-3",
+            title="Новый рекламный заголовок после оптимизации",
+            normalized_identity_key="новыйрекламныйзаголовокпослеоптимизации",
+            seed_subject_identity_key="电子桌面时钟",
+            source_ozon_title="Электронные настольные часы с календарем, белый корпус",
+        )
+
+        decision = decide_seed_existing_product_dedupe(seed, [existing])
+
+        self.assertEqual("duplicate", decision.kind.value)
+        self.assertEqual("seed_subject_identity", decision.evidence["matched_by"])
+
+    def test_uploaded_source_ozon_lineage_blocks_same_product_under_store_listing_id(self) -> None:
+        candidate = self.ozon_candidate(self.verified_seller_decision())
+        candidate.ozon_product_id = "source-ozon-77"
+        candidate.title = "Public market title"
+        existing = ExistingStoreProduct(
+            store_product_id="new-store-card-9001",
+            title="Completely rewritten seller title",
+            normalized_identity_key="completelyrewrittensellertitle",
+            source_ozon_product_id="source-ozon-77",
+        )
+
+        decision = decide_ozon_candidate_dedupe(candidate, [existing])
+
+        self.assertEqual("duplicate", decision.kind.value)
+        self.assertEqual("source_ozon_product_id", decision.evidence["matched_by"])
+
     def test_chinese_query_terms_are_not_safe_for_ozon(self) -> None:
         self.assertTrue(contains_cjk("收纳盒"))
         self.assertFalse(generated_query_terms_are_safe("收纳盒", ["收纳盒"]))

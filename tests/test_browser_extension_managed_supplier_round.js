@@ -638,6 +638,50 @@ function sendMessage(message, tab) {
   stored.openedTasks = {};
   tabs.clear();
   windows.clear();
+  updatedTabs.length = 0;
+  const replacementRound = supplierTask(5, "replacement-stable-token");
+  await context.performOpenTask(replacementRound, "managed_round_replacement", { allowCreate: true });
+  const replacementKey = "wb-managed-round:supplier_selection";
+  const originalReplacementEntry = stored.openedTasks[replacementKey];
+  const originalReplacementWindowId = originalReplacementEntry.windowId;
+  const staleLaneTabId = originalReplacementEntry.channels[1].tabId;
+  const replacementRefresh = supplierTask(5, "replacement-stable-token");
+  replacementRefresh.data.contract.items[1] = {
+    ...replacementRefresh.data.contract.items[1],
+    seed_id: "seed-replacement",
+    ozon_product_id: "ozon-replacement",
+  };
+  const replacementResult = await context.performOpenTask(
+    replacementRefresh,
+    "managed_round_replacement",
+    { allowCreate: true },
+  );
+  const refreshedReplacementEntry = stored.openedTasks[replacementKey];
+  assert.equal(replacementResult.reused, true, "a replacement contract must reuse the managed supplier window");
+  assert.equal(windows.size, 1, "a replacement contract must not open a second managed supplier window");
+  assert.equal(refreshedReplacementEntry.windowId, originalReplacementWindowId);
+  assert.equal(
+    refreshedReplacementEntry.channels[1].tabId,
+    staleLaneTabId,
+    "a changed supplier lane must recycle its stale tab instead of leaving an unbound detail tab",
+  );
+  assert.equal(
+    refreshedReplacementEntry.channels[1].seed_id,
+    "seed-replacement",
+    "the recycled lane must receive the replacement product binding",
+  );
+  assert.ok(
+    updatedTabs.some(({ tabId, changes }) => (
+      tabId === staleLaneTabId
+      && changes.url === "https://www.1688.com/"
+    )),
+    "the recycled lane must return to the 1688 start page before collecting the replacement product",
+  );
+  assert.equal(tabs.size, 5, "replacement reconciliation must keep exactly one tab per active lane");
+
+  stored.openedTasks = {};
+  tabs.clear();
+  windows.clear();
   removedWindows.length = 0;
   const userCloseTask = supplierTask(1, "user-close-token");
   await context.performOpenTask(userCloseTask, "managed_round_test", { allowCreate: true });

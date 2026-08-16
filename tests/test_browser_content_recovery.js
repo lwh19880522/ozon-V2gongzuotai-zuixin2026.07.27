@@ -49,6 +49,10 @@ const context = vm.createContext({
 const contentPath = path.join(__dirname, "..", "browser_extension", "ozon_v2_bridge", "content.js");
 const source = fs.readFileSync(contentPath, "utf8").replace(/\ntriggerRun\(\);\s*$/, "\n");
 vm.runInContext(source, context, { filename: contentPath });
+assert.doesNotThrow(
+  () => vm.runInContext(source, context, { filename: contentPath }),
+  "content script reinjection after an extension reload must be idempotent",
+);
 
 (async () => {
   await context.window.OzonV2BrowserBridge.run().catch(() => null);

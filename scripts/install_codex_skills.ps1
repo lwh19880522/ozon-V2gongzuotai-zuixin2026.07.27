@@ -23,6 +23,19 @@ $skillNames = @(
 )
 $retiredSkillNames = @('ozon-image-generation-controller')
 
+function Get-Sha256Hex {
+    param([string]$Path)
+    $stream = [System.IO.File]::OpenRead($Path)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return ([System.BitConverter]::ToString($sha256.ComputeHash($stream))).Replace('-', '')
+    }
+    finally {
+        $sha256.Dispose()
+        $stream.Dispose()
+    }
+}
+
 function Get-RelativeFileMap {
     param([string]$Root)
     $map = @{}
@@ -31,7 +44,7 @@ function Get-RelativeFileMap {
     }
     foreach ($file in Get-ChildItem -LiteralPath $Root -File -Recurse) {
         $relative = $file.FullName.Substring($Root.Length).TrimStart('\', '/')
-        $map[$relative] = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+        $map[$relative] = Get-Sha256Hex -Path $file.FullName
     }
     return $map
 }

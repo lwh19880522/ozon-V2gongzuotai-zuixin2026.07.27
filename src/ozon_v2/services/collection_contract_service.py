@@ -140,6 +140,11 @@ class CollectionContractService:
         excluded_product_ids.update(
             self.repo.load_used_ozon_product_ids(exclude_run_id=run_id)
         )
+        excluded_product_ids.update(
+            str(product.source_ozon_product_id).strip()
+            for product in self.repo.load_existing_products()
+            if str(product.source_ozon_product_id or "").strip()
+        )
         payload = {
             "run_id": run_id,
             "purpose": "resolve the Seller API category template for each final locked Ozon product",
@@ -237,6 +242,11 @@ class CollectionContractService:
         excluded_product_ids = set(self.repo.load_blacklisted_ozon_product_ids())
         excluded_product_ids.update(
             self.repo.load_used_ozon_product_ids(exclude_run_id=run_id)
+        )
+        excluded_product_ids.update(
+            str(product.source_ozon_product_id).strip()
+            for product in self.repo.load_existing_products()
+            if str(product.source_ozon_product_id or "").strip()
         )
         try:
             previous_ozon_result = self.repo.load_ozon_collection_result(run_id)

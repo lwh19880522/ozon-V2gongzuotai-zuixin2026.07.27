@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timezone
 from enum import Enum
+import re
 from typing import Any
 
 
@@ -166,12 +167,24 @@ class ExistingStoreProduct:
     main_image_reference: str | None = None
     selected_sku_or_options_when_available: dict[str, Any] = field(default_factory=dict)
     product_url_when_available: str | None = None
+    source_seed_identity_key: str | None = None
+    seed_subject_identity_key: str | None = None
+    source_ozon_product_id: str | None = None
+    source_ozon_title: str | None = None
+    supplier_offer_id: str | None = None
+    supplier_title: str | None = None
     source_captured_at: str = field(default_factory=utc_now_iso)
     notes: str = ""
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "ExistingStoreProduct":
-        return cls(**payload)
+        data = dict(payload)
+        if not str(data.get("supplier_offer_id") or "").strip():
+            legacy_offer = str(data.get("offer_id_when_available") or "").strip()
+            match = re.match(r"^OZV2-(\d{6,})(?:-|$)", legacy_offer, flags=re.IGNORECASE)
+            if match:
+                data["supplier_offer_id"] = match.group(1)
+        return cls(**data)
 
     def to_dict(self) -> dict[str, Any]:
         return to_plain(self)

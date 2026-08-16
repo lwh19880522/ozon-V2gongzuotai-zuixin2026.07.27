@@ -48,7 +48,8 @@ def test_field_drafter_skill_owns_intelligent_field_workflow() -> None:
     assert "Ozon" in text
     assert "pre-resolved store defaults" in text
     assert "Do not spend model decisions" in text
-    assert "collected structured Ozon attributes" in text
+    assert "Ozon title, attributes, category, SKU, and prose" in text
+    assert "reference-only" in text
     assert "现货当天发" in text
     assert "supplier fulfillment" in text
     assert "workflow.defaults.disable_product_grouping" in text
@@ -56,7 +57,7 @@ def test_field_drafter_skill_owns_intelligent_field_workflow() -> None:
     assert "boolean confirmation" in text
     assert "no whitespace inside a hashtag" in text
     assert "replace multi-word hashtag spaces with underscores" in text
-    assert "ozon.category_path.leaf" in text
+    assert "Never cite `ozon.*` as proof" in text
     assert "supplier truth" in text
     assert "Do not upload" in text
     assert "Do not publish" in text
@@ -72,14 +73,14 @@ def test_field_drafter_skill_has_detailed_source_and_validation_policy() -> None
     assert "Source precedence" in policy
     assert "confirmed_supplier_sku" in policy
     assert "supplier_attributes" in policy
-    assert "ozon_attributes" in policy
+    assert "Ozon title, attributes, category, SKU, and prose" in policy
     assert "Identity fields" in policy
     assert "Dictionary fields" in policy
     assert "Russian normalization" in policy
     assert "Resolution classes" in policy
     assert "workflow_defaults" in policy
     assert "country of manufacture is always `Китай`" in policy
-    assert "structured Ozon attributes remain active evidence" in policy
+    assert "never product-fact evidence" in policy
     assert "现货当天发" in policy
     assert "customer-facing normalization" in policy
     assert "disable_product_grouping" in policy

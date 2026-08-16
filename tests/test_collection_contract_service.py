@@ -3,6 +3,7 @@ from __future__ import annotations
 from ozon_v2.adapters.fs_repo import FsRepo
 from ozon_v2.domain.models import (
     CollectionPair,
+    ExistingStoreProduct,
     MatchedSupplierSku,
     OzonCandidate,
     PairStatus,
@@ -91,6 +92,32 @@ class CollectionContractServiceTests(RuntimeTestCase):
         self.assertEqual(0.60, subject_contract["minimum_match_ratio"])
         self.assertTrue(subject_contract["required_stems"])
         self.assertEqual("market_reference", result.data["payload"]["ozon_evidence_role"])
+
+    def test_ozon_contract_excludes_source_product_ids_from_uploaded_store_lineage(self) -> None:
+        repo = FsRepo(self.context)
+        self.save_test_credentials(repo)
+        service = RunService(repo)
+        run_id = service.start_run(target_count=1, random_seed=10).data["run"]["run_id"]
+        sampled_seed_id = repo.load_sampled_seeds(run_id)[0].seed_id
+        service.attach_seed_queries(run_id, {sampled_seed_id: ["desk clock"]})
+        repo.merge_existing_products(
+            [
+                ExistingStoreProduct(
+                    store_product_id="store-card-9001",
+                    title="Rewritten store title",
+                    normalized_identity_key="rewrittenstoretitle",
+                    source_ozon_product_id="source-ozon-77",
+                )
+            ]
+        )
+
+        result = CollectionContractService(repo).build_ozon_collection_contract(run_id)
+
+        self.assertTrue(result.ok)
+        self.assertIn(
+            "source-ozon-77",
+            result.data["payload"]["excluded_ozon_product_ids"],
+        )
 
     def test_ozon_contract_does_not_reuse_a_pre_lock_template_snapshot(self) -> None:
         repo = FsRepo(self.context)

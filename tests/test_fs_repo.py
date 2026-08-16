@@ -4,12 +4,62 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 
 from ozon_v2.adapters.fs_repo import FsRepo
-from ozon_v2.domain.models import SeedProduct
+from ozon_v2.domain.models import ExistingStoreProduct, SeedProduct
 
 from tests.helpers import RuntimeTestCase
 
 
 class FsRepoTests(RuntimeTestCase):
+    def test_store_refresh_preserves_uploaded_product_lineage(self) -> None:
+        repo = FsRepo(self.context)
+        repo.merge_existing_products(
+            [
+                ExistingStoreProduct(
+                    store_product_id="900001",
+                    title="Uploaded title",
+                    normalized_identity_key="uploadedtitle",
+                    offer_id_when_available="OZV2-898078910803-ABCDEF12",
+                    source_seed_identity_key="source:seed-1440",
+                    seed_subject_identity_key="电子桌面时钟",
+                    source_ozon_product_id="1189584062",
+                    source_ozon_title="Электронные настольные часы",
+                    supplier_offer_id="898078910803",
+                )
+            ]
+        )
+
+        repo.merge_existing_products(
+            [
+                ExistingStoreProduct(
+                    store_product_id="900001",
+                    title="Seller API rewritten title",
+                    normalized_identity_key="sellerapirewrittentitle",
+                    offer_id_when_available="OZV2-898078910803-ABCDEF12",
+                    notes="refreshed from Ozon Seller API",
+                )
+            ]
+        )
+
+        [stored] = repo.load_existing_products()
+        self.assertEqual("Seller API rewritten title", stored.title)
+        self.assertEqual("source:seed-1440", stored.source_seed_identity_key)
+        self.assertEqual("电子桌面时钟", stored.seed_subject_identity_key)
+        self.assertEqual("1189584062", stored.source_ozon_product_id)
+        self.assertEqual("Электронные настольные часы", stored.source_ozon_title)
+        self.assertEqual("898078910803", stored.supplier_offer_id)
+
+    def test_legacy_ozv2_offer_recovers_supplier_identity(self) -> None:
+        product = ExistingStoreProduct.from_dict(
+            {
+                "store_product_id": "900002",
+                "title": "Legacy upload",
+                "normalized_identity_key": "legacyupload",
+                "offer_id_when_available": "OZV2-856597416777-2CD945D5",
+            }
+        )
+
+        self.assertEqual("856597416777", product.supplier_offer_id)
+
     def test_clear_workbench_batches_removes_all_recognized_batch_directories(self) -> None:
         repo = FsRepo(self.context)
         repo.initialize_runtime()

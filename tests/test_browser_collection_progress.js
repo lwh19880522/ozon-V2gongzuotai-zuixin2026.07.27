@@ -138,6 +138,18 @@ function assertProgress(value, expected) {
 }
 
 (async () => {
+  document.title = "car cleaning cloth - buy on Ozon";
+  document.body.textContent = "Search results include a portable VPN router, a robot vacuum, and a checking gauge among 37 normal products.";
+  assert.equal(
+    context.hasChallenge(),
+    false,
+    "normal product titles containing VPN, robot, or checking must not be treated as a challenge page",
+  );
+  document.body.textContent = "Please verify that you are human before continuing.";
+  assert.equal(context.hasChallenge(), true, "an explicit human-verification page must remain blocked");
+  document.title = "Ozon product";
+  document.body.textContent = "Ozon product";
+
   sessionStorage.setItem("ozon_v2_browser_bridge_state", JSON.stringify({
     schemaVersion: 5,
     runId: "wb-old-schema",
