@@ -4442,13 +4442,17 @@ def create_handler(
                         for product in draft.get("supplier_products", [])
                         if isinstance(product, dict) and product.get("seed_id")
                     }
+                completed_seed_ids = service.supplier_selection_completed_seed_ids(
+                    review,
+                    captured_seed_ids,
+                )
                 channels = []
                 for channel_index, item in enumerate(review.get("items", [])):
                     if not isinstance(item, dict):
                         continue
                     if recapture_seed_ids and str(item.get("seed_id") or "") not in recapture_seed_ids:
                         continue
-                    if str(item.get("seed_id") or "") in captured_seed_ids:
+                    if str(item.get("seed_id") or "") in completed_seed_ids:
                         continue
                     reference_image_urls = []
                     for value in item.get("ozon_reference_images") or [item.get("ozon_main_image")]:

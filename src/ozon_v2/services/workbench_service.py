@@ -1931,7 +1931,11 @@ class WorkbenchService:
                         for product in products
                         if isinstance(product, dict) and str(product.get("seed_id") or "").strip()
                     }
-                completed_count = len(expected_seed_ids.intersection(captured_seed_ids))
+                completed_seed_ids = self.supplier_selection_completed_seed_ids(
+                    review,
+                    captured_seed_ids,
+                )
+                completed_count = len(expected_seed_ids.intersection(completed_seed_ids))
                 if completed_count >= total_count:
                     return Result.failure(
                         "browser_task.restart_completed",
@@ -9952,6 +9956,20 @@ class WorkbenchService:
             item.get("user_verified_exact_match") is True and self._is_1688_product_url(str(item.get("supplier_url") or ""))
             for item in items
         )
+
+    def supplier_selection_completed_seed_ids(
+        self,
+        review: dict[str, Any],
+        captured_seed_ids: set[str],
+    ) -> set[str]:
+        return {
+            str(item.get("seed_id") or "").strip()
+            for item in review.get("items") or []
+            if isinstance(item, dict)
+            and str(item.get("seed_id") or "").strip() in captured_seed_ids
+            and item.get("user_verified_exact_match") is True
+            and self._is_1688_product_url(str(item.get("supplier_url") or ""))
+        }
 
     def _collection_review_items(
         self,

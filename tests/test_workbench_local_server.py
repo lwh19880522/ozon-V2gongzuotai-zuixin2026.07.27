@@ -2478,7 +2478,12 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
                     "ozon_product_id": f"ozon-supplier-{index}",
                     "ozon_title": f"Ozon supplier product {index}",
                     "ozon_main_image": f"https://img.example/supplier-{index}.jpg",
-                    "supplier_url": None,
+                    "supplier_url": (
+                        "https://detail.1688.com/offer/100.html"
+                        if index == 0
+                        else None
+                    ),
+                    "user_verified_exact_match": index == 0,
                 }
             )
             review["items"].append(item)
@@ -2510,6 +2515,91 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             ["seed-supplier-1", "seed-supplier-2"],
             [item["seed_id"] for item in task["data"]["contract"]["items"]],
         )
+
+    def test_supplier_selection_task_requeues_draft_product_missing_review_confirmation(self) -> None:
+        run_id, _seed = self.prepare_supplier_review_run()
+        review = self.repo.load_supplier_review(run_id)
+        base = dict(review["items"][0])
+        review["items"] = []
+        for index in range(2):
+            item = dict(base)
+            item.update(
+                {
+                    "seed_id": f"seed-mismatch-{index}",
+                    "ozon_product_id": f"ozon-mismatch-{index}",
+                    "supplier_url": (
+                        "https://detail.1688.com/offer/100.html"
+                        if index == 0
+                        else None
+                    ),
+                    "user_verified_exact_match": index == 0,
+                }
+            )
+            review["items"].append(item)
+        self.repo.save_supplier_review(run_id, review)
+        self.repo.save_supplier_selection_draft(
+            run_id,
+            {
+                "schema_version": 1,
+                "run_id": run_id,
+                "supplier_products": [
+                    {
+                        "seed_id": f"seed-mismatch-{index}",
+                        "supplier_url": f"https://detail.1688.com/offer/{100 + index}.html",
+                    }
+                    for index in range(2)
+                ],
+            },
+        )
+
+        task = self.get_json(f"/api/batches/{run_id}/browser-task")
+
+        self.assertEqual(
+            ["seed-mismatch-1"],
+            [item["seed_id"] for item in task["data"]["contract"]["items"]],
+        )
+
+    def test_restart_requeues_draft_product_missing_review_confirmation(self) -> None:
+        run_id, _seed = self.prepare_supplier_review_run()
+        review = self.repo.load_supplier_review(run_id)
+        base = dict(review["items"][0])
+        review["items"] = []
+        for index in range(2):
+            item = dict(base)
+            item.update(
+                {
+                    "seed_id": f"seed-mismatch-{index}",
+                    "ozon_product_id": f"ozon-mismatch-{index}",
+                    "supplier_url": (
+                        "https://detail.1688.com/offer/100.html"
+                        if index == 0
+                        else None
+                    ),
+                    "user_verified_exact_match": index == 0,
+                }
+            )
+            review["items"].append(item)
+        self.repo.save_supplier_review(run_id, review)
+        self.repo.save_supplier_selection_draft(
+            run_id,
+            {
+                "schema_version": 1,
+                "run_id": run_id,
+                "supplier_products": [
+                    {
+                        "seed_id": f"seed-mismatch-{index}",
+                        "supplier_url": f"https://detail.1688.com/offer/{100 + index}.html",
+                    }
+                    for index in range(2)
+                ],
+            },
+        )
+
+        restarted = self.post_json(f"/api/batches/{run_id}/browser-task/restart", {})
+
+        self.assertEqual("supplier_selection", restarted["data"]["task_type"])
+        self.assertEqual(1, restarted["data"]["completed_count"])
+        self.assertEqual(1, restarted["data"]["pending_count"])
 
     def test_restart_browser_task_maps_supplier_collecting_without_changing_contract(self) -> None:
         run_id, seed = self.prepare_supplier_review_run()
@@ -2775,6 +2865,12 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
                     "ozon_product_id": f"ozon-{index}",
                     "ozon_title": f"Ozon product {index}",
                     "ozon_main_image": f"https://img.example/{index}.jpg",
+                    "supplier_url": (
+                        f"https://detail.1688.com/offer/{100 + index}.html"
+                        if index < 2
+                        else None
+                    ),
+                    "user_verified_exact_match": index < 2,
                 }
             )
             review["items"].append(item)
