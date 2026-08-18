@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,10 @@ from typing import Any
 
 class ImageTaskInboxError(RuntimeError):
     pass
+
+
+CLAIM_LOCK_STALE_SECONDS = 120
+IN_PROGRESS_STALE_SECONDS = 6 * 60 * 60
 
 
 class ImageTaskInbox:
@@ -49,18 +54,32 @@ class ImageTaskInbox:
         in_progress = self.directory("in_progress")
         grid_ready = self.directory("grid_ready")
         lock_path = self.root / ".claim.lock"
-        try:
-            lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
+        lock_fd = _acquire_claim_lock(lock_path)
+        if lock_fd is None:
             return None
         try:
+            self._recover_stale_in_progress(in_progress)
             if any(in_progress.glob("*.json")):
                 return None
             candidates: list[tuple[Path, dict[str, Any]]] = []
             for lifecycle in (pending, grid_ready):
                 for source in lifecycle.glob("*.json"):
-                    payload = _read_json(source)
-                    _validate_package_contract(payload, source.stem)
+                    try:
+                        payload = _read_json(source)
+                        _validate_package_contract(payload, source.stem)
+                        expected_status = (
+                            "grid_ready"
+                            if lifecycle.name == "grid_ready"
+                            else "pending"
+                        )
+                        if payload.get("status") != expected_status:
+                            raise ImageTaskInboxError(
+                                f"Package {source.stem} is not {expected_status}: "
+                                f"{payload.get('status')}"
+                            )
+                    except ImageTaskInboxError as exc:
+                        self._quarantine(source, exc)
+                        continue
                     candidates.append((source, payload))
             if not candidates:
                 return None
@@ -122,11 +141,14 @@ class ImageTaskInbox:
                 return None
             expected_status = "grid_ready" if phase == "grid_crop" else "pending"
             if payload.get("status") != expected_status:
-                _write_json(target, payload)
-                raise ImageTaskInboxError(
-                    f"Package {source.stem} is not {expected_status}: "
-                    f"{payload.get('status')}"
+                self._quarantine(
+                    target,
+                    ImageTaskInboxError(
+                        f"Package {source.stem} is not {expected_status}: "
+                        f"{payload.get('status')}"
+                    ),
                 )
+                return None
             payload["status"] = "in_progress"
             payload["assignment"] = {
                 "executor": "ozon-product-media-generator",
@@ -139,6 +161,59 @@ class ImageTaskInbox:
         finally:
             os.close(lock_fd)
             lock_path.unlink(missing_ok=True)
+
+    def _recover_stale_in_progress(self, in_progress: Path) -> None:
+        now = time.time()
+        for source in in_progress.glob("*.json"):
+            try:
+                payload = _read_json(source)
+                _validate_package_contract(payload, source.stem)
+                assignment = payload.get("assignment") or {}
+                claimed_at = _iso_epoch(assignment.get("claimed_at"))
+                if claimed_at is not None and now - claimed_at < IN_PROGRESS_STALE_SECONDS:
+                    continue
+                phase = str(assignment.get("phase") or "")
+                if phase not in {"grid_generation", "grid_crop", "upload_only"}:
+                    raise ImageTaskInboxError(
+                        f"Package {source.stem} has no recoverable assignment phase."
+                    )
+            except ImageTaskInboxError as exc:
+                self._quarantine(source, exc)
+                continue
+            return_status = "grid_ready" if phase == "grid_crop" else "pending"
+            payload["status"] = return_status
+            payload.pop("assignment", None)
+            payload["last_release"] = {
+                "reason": "stale_in_progress_recovered",
+                "released_at": _utc_now(),
+            }
+            target = self.directory(return_status) / source.name
+            source.replace(target)
+            _write_json(target, payload)
+
+    def _quarantine(self, source: Path, error: Exception) -> Path:
+        failed = self.directory("failed")
+        target = failed / source.name
+        if target.exists():
+            target = failed / f"{source.stem}-{int(time.time() * 1000)}{source.suffix}"
+        try:
+            payload = _read_json(source)
+        except ImageTaskInboxError:
+            source.replace(target)
+        else:
+            payload["status"] = "failed"
+            payload["failed_at"] = _utc_now()
+            payload["failure"] = {
+                "code": "image_task.invalid_package",
+                "message": str(error),
+            }
+            source.replace(target)
+            _write_json(target, payload)
+        target.with_suffix(target.suffix + ".error.txt").write_text(
+            str(error) + "\n",
+            encoding="utf-8",
+        )
+        return target
 
     def stage_grid(
         self,
@@ -339,6 +414,40 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ImageTaskInboxError(f"Invalid image task package object: {path}")
     return payload
+
+
+def _acquire_claim_lock(lock_path: Path) -> int | None:
+    for _attempt in range(2):
+        try:
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                age_seconds = time.time() - lock_path.stat().st_mtime
+            except FileNotFoundError:
+                continue
+            if age_seconds < CLAIM_LOCK_STALE_SECONDS:
+                return None
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                continue
+        else:
+            os.write(
+                lock_fd,
+                f"pid={os.getpid()} acquired_at={_utc_now()}\n".encode("utf-8"),
+            )
+            return lock_fd
+    return None
+
+
+def _iso_epoch(value: Any) -> float | None:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return None
+    try:
+        return datetime.fromisoformat(normalized.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:

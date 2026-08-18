@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import ssl
+import time
 import urllib.error
 import urllib.request
 from typing import Any
@@ -14,6 +15,14 @@ from ozon_v2.domain.policies import normalize_identity_text
 
 class SellerApiError(RuntimeError):
     pass
+
+
+class SellerApiTransportError(SellerApiError):
+    """The request outcome is unknown because no HTTP response was received."""
+
+
+class SellerApiHttpError(SellerApiError):
+    """Ozon returned a definite HTTP response."""
 
 
 class SellerCategoryMatchError(SellerApiError):
@@ -261,7 +270,14 @@ class SellerApiAdapter:
             raise SellerApiError("At least one product is required for Seller API import.")
         if len(items) > 100:
             raise SellerApiError("Seller API product import accepts at most 100 products.")
-        payload = self._post_json("/v3/product/import", {"items": items})
+        # Product import is not retried at the transport layer. A timeout can
+        # happen after Ozon accepted the request, so replaying it here would
+        # create a second import task with an unknown first outcome.
+        payload = self._post_json(
+            "/v3/product/import",
+            {"items": items},
+            retry_transient=False,
+        )
         result = payload.get("result", {})
         if not isinstance(result, dict):
             result = {}
@@ -376,7 +392,7 @@ class SellerApiAdapter:
 
         values_by_kind = {
             "video_url": normalized_video,
-            "video_cover_url": normalized_video,
+            "video_cover_url": normalized_cover,
             "video_cover_image_url": normalized_cover,
             "video_title": "Видео о товаре",
         }
@@ -467,7 +483,13 @@ class SellerApiAdapter:
                     info_by_id[product_id] = item
         return info_by_id
 
-    def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _post_json(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        retry_transient: bool = True,
+    ) -> dict[str, Any]:
         credentials = self.repo.load_credentials()
         if not credentials:
             raise SellerApiError("Seller credentials are missing.")
@@ -481,28 +503,51 @@ class SellerApiAdapter:
             },
             method="POST",
         )
-        for attempt in range(2):
+        # A definite 429 response is safe to retry even for product import:
+        # Ozon rejected that request before accepting an import task. Unknown
+        # transport failures remain single-attempt for non-idempotent imports.
+        max_attempts = 4
+        for attempt in range(max_attempts):
             try:
                 with urllib.request.urlopen(request, timeout=45) as response:
                     return json.loads(response.read().decode("utf-8"))
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")
-                raise SellerApiError(f"Ozon Seller API returned HTTP {exc.code}: {body[:300]}") from exc
+                if exc.code == 429 and attempt < max_attempts - 1:
+                    retry_after = _retry_after_seconds(exc.headers.get("Retry-After"))
+                    time.sleep(retry_after if retry_after is not None else min(0.5 * (2**attempt), 4.0))
+                    continue
+                raise SellerApiHttpError(
+                    f"Ozon Seller API returned HTTP {exc.code}: {body[:300]}"
+                ) from exc
             except (
                 urllib.error.URLError,
                 TimeoutError,
                 ssl.SSLError,
                 ConnectionResetError,
             ) as exc:
-                if attempt == 0:
+                if retry_transient and attempt < max_attempts - 1:
+                    time.sleep(min(0.25 * (2**attempt), 2.0))
                     continue
                 reason = exc.reason if isinstance(exc, urllib.error.URLError) else str(exc)
-                raise SellerApiError(f"Ozon Seller API request failed: {reason}") from exc
+                raise SellerApiTransportError(
+                    f"Ozon Seller API request failed with an unknown outcome: {reason}"
+                ) from exc
         raise SellerApiError("Ozon Seller API request failed after retry.")
 
 
 def _chunks(values: list[int], size: int) -> list[list[int]]:
     return [values[index : index + size] for index in range(0, len(values), size)]
+
+
+def _retry_after_seconds(value: Any) -> float | None:
+    try:
+        parsed = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if parsed < 0:
+        return None
+    return min(parsed, 10.0)
 
 
 def _first_string(value: Any) -> str | None:

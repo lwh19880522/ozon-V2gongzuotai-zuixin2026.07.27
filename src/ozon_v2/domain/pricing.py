@@ -19,6 +19,11 @@ _STANDARD_CHANNEL_CODES = {
     "premium_small_standard",
     "premium_big_standard",
 }
+_STANDARD_PRICE_BANDS = (
+    (Decimal("1"), Decimal("1500")),
+    (Decimal("1501"), Decimal("7000")),
+    (Decimal("7001"), Decimal("250000")),
+)
 
 OZON_MIN_PACKAGE_DENSITY_KG_M3 = Decimal("1.293")
 OZON_MAX_PACKAGE_DENSITY_KG_M3 = Decimal("13546")
@@ -270,8 +275,11 @@ def calculate_listing_price(
             or standard_quote.freight_rmb is None
             or standard_quote.billing_weight_kg is None
         ):
-            raise ValueError(
-                "No GUOO land-air standard quote matches this product."
+            return _calculate_stable_band_quote(
+                inputs,
+                policy,
+                denominator=denominator,
+                iterations=iteration,
             )
 
         total_cost = (
@@ -309,4 +317,83 @@ def calculate_listing_price(
         previous_channel_code = standard_quote.channel_code
         sale_rub = listing_price_rub
 
-    raise ValueError("GUOO freight and listing price did not converge.")
+    return _calculate_stable_band_quote(
+        inputs,
+        policy,
+        denominator=denominator,
+        iterations=5,
+    )
+
+
+def _calculate_stable_band_quote(
+    inputs: PricingInput,
+    policy: PricingPolicy,
+    *,
+    denominator: Decimal,
+    iterations: int,
+) -> PricingQuote:
+    candidates: list[PricingQuote] = []
+    for minimum_sale_rub, maximum_sale_rub in _STANDARD_PRICE_BANDS:
+        freight_input = CelRfbsFreightInput.from_values(
+            sale_rub=minimum_sale_rub,
+            actual_weight_kg=inputs.package_weight_g / Decimal("1000"),
+            length_cm=inputs.package_length_cm,
+            width_cm=inputs.package_width_cm,
+            height_cm=inputs.package_height_cm,
+        )
+        standard_quote = next(
+            (
+                quote
+                for quote in available_cel_rfbs_freight(freight_input)
+                if quote.channel_code in _STANDARD_CHANNEL_CODES
+            ),
+            None,
+        )
+        if (
+            standard_quote is None
+            or standard_quote.freight_rmb is None
+            or standard_quote.billing_weight_kg is None
+        ):
+            continue
+        total_cost = (
+            inputs.purchase_price_cny
+            + inputs.domestic_shipping_cny
+            + policy.packaging_fee_cny
+            + standard_quote.freight_rmb
+        )
+        raw_listing_price = total_cost / denominator
+        minimum_band_price_cny = (
+            (minimum_sale_rub - Decimal("1")) / policy.rub_per_cny
+            + Decimal("0.0000001")
+        )
+        listing_price_cny = round_up_to_dot_90(
+            max(raw_listing_price, minimum_band_price_cny)
+        )
+        listing_price_rub = (
+            listing_price_cny * policy.rub_per_cny
+        ).to_integral_value(rounding=ROUND_CEILING)
+        if not minimum_sale_rub <= listing_price_rub <= maximum_sale_rub:
+            continue
+        old_price_cny = round_up_to_dot_90(
+            listing_price_cny / policy.old_price_discount_rate
+        )
+        old_price_rub = (
+            listing_price_rub / policy.old_price_discount_rate
+        ).to_integral_value(rounding=ROUND_CEILING)
+        candidates.append(
+            PricingQuote(
+                cross_border_freight_cny=standard_quote.freight_rmb,
+                total_cost_cny=total_cost,
+                raw_listing_price_cny=raw_listing_price,
+                listing_price_cny=listing_price_cny,
+                old_price_cny=old_price_cny,
+                listing_price_rub=listing_price_rub,
+                old_price_rub=old_price_rub,
+                freight_channel_code=standard_quote.channel_code,
+                billing_weight_kg=standard_quote.billing_weight_kg,
+                iterations=iterations,
+            )
+        )
+    if not candidates:
+        raise ValueError("No GUOO land-air standard quote matches this product.")
+    return min(candidates, key=lambda quote: quote.listing_price_rub)

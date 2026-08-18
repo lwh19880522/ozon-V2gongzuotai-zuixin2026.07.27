@@ -141,6 +141,13 @@ _REPLACEMENT_RECOVERY_STATES = frozenset(
         WorkbenchState.FAILED_BLOCKED,
     }
 )
+_UPLOAD_STATE_LOCK = threading.RLock()
+_UPLOAD_WORKSPACE_LOCKS_GUARD = threading.Lock()
+_UPLOAD_WORKSPACE_LOCKS: dict[str, threading.RLock] = {}
+_UPLOAD_SUBMISSION_LOCKS_GUARD = threading.Lock()
+_UPLOAD_SUBMISSION_LOCKS: dict[str, threading.RLock] = {}
+_RUN_MUTATION_LOCKS_GUARD = threading.Lock()
+_RUN_MUTATION_LOCKS: dict[str, threading.RLock] = {}
 
 
 class WorkbenchService:
@@ -161,13 +168,19 @@ class WorkbenchService:
         self.collection_contract_service = collection_contract_service or CollectionContractService(self.repo)
         self.seller_api_adapter = seller_api_adapter or SellerApiAdapter(self.repo)
         self.supplier_image_downloader = supplier_image_downloader or self._download_supplier_image
-        self._upload_state_lock = threading.RLock()
-        self._run_mutation_locks_guard = threading.Lock()
-        self._run_mutation_locks: dict[str, threading.RLock] = {}
+        self._upload_state_lock = _UPLOAD_STATE_LOCK
 
     def _run_mutation_lock(self, run_id: str) -> threading.RLock:
-        with self._run_mutation_locks_guard:
-            return self._run_mutation_locks.setdefault(run_id, threading.RLock())
+        with _RUN_MUTATION_LOCKS_GUARD:
+            return _RUN_MUTATION_LOCKS.setdefault(run_id, threading.RLock())
+
+    def _upload_workspace_lock(self, run_id: str) -> threading.RLock:
+        with _UPLOAD_WORKSPACE_LOCKS_GUARD:
+            return _UPLOAD_WORKSPACE_LOCKS.setdefault(run_id, threading.RLock())
+
+    def _upload_submission_lock(self, run_id: str) -> threading.RLock:
+        with _UPLOAD_SUBMISSION_LOCKS_GUARD:
+            return _UPLOAD_SUBMISSION_LOCKS.setdefault(run_id, threading.RLock())
 
     @staticmethod
     def _browser_dispatch_token(run: dict[str, Any]) -> str:
@@ -2787,6 +2800,10 @@ class WorkbenchService:
         }
 
     def upload_workspace(self, run_id: str) -> Result:
+        with self._upload_workspace_lock(run_id):
+            return self._upload_workspace_locked(run_id)
+
+    def _upload_workspace_locked(self, run_id: str) -> Result:
         conflict_audit = self.audit_supplier_identity_conflicts(run_id)
         if not conflict_audit.ok:
             return conflict_audit
@@ -5520,6 +5537,20 @@ class WorkbenchService:
         *,
         confirmation_token: str,
     ) -> Result:
+        with self._upload_submission_lock(run_id):
+            return self._submit_product_upload_locked(
+                run_id,
+                seed_id,
+                confirmation_token=confirmation_token,
+            )
+
+    def _submit_product_upload_locked(
+        self,
+        run_id: str,
+        seed_id: str,
+        *,
+        confirmation_token: str,
+    ) -> Result:
         try:
             previews = self.repo.load_upload_previews(run_id)
         except FileNotFoundError:
@@ -5655,6 +5686,22 @@ class WorkbenchService:
         )
 
     def batch_upload_products(
+        self,
+        run_id: str,
+        *,
+        seed_ids: list[str] | None = None,
+        confirmed: bool = False,
+        max_workers: int = 4,
+    ) -> Result:
+        with self._upload_submission_lock(run_id):
+            return self._batch_upload_products_locked(
+                run_id,
+                seed_ids=seed_ids,
+                confirmed=confirmed,
+                max_workers=max_workers,
+            )
+
+    def _batch_upload_products_locked(
         self,
         run_id: str,
         *,
@@ -5949,6 +5996,14 @@ class WorkbenchService:
         )
 
     def refresh_product_upload_status(self, run_id: str, seed_id: str) -> Result:
+        with self._upload_submission_lock(run_id):
+            return self._refresh_product_upload_status_locked(run_id, seed_id)
+
+    def _refresh_product_upload_status_locked(
+        self,
+        run_id: str,
+        seed_id: str,
+    ) -> Result:
         try:
             submissions = self.repo.load_upload_submissions(run_id)
         except FileNotFoundError:
@@ -8564,10 +8619,21 @@ class WorkbenchService:
                     history,
                 )
 
+            if state == WorkbenchState.FAILED_RETRYABLE:
+                result = self.dispatch(run_id, WorkbenchAction.RETRY_FAILED.value)
+                history.append(self._history_item(result))
+                if not result.ok:
+                    return self._autopilot_blocked(
+                        run_id,
+                        result.code,
+                        result.message,
+                        history,
+                    )
+                continue
+
             if state in {
                 WorkbenchState.NEEDS_MANUAL_REVIEW,
                 WorkbenchState.NEEDS_SLIDER,
-                WorkbenchState.FAILED_RETRYABLE,
                 WorkbenchState.FAILED_BLOCKED,
                 WorkbenchState.DRAFT_READY,
                 WorkbenchState.PUBLISH_WAITING_CONFIRMATION,
@@ -8597,6 +8663,10 @@ class WorkbenchService:
         )
 
     def dispatch(self, run_id: str, action: str) -> Result:
+        with self._run_mutation_lock(run_id):
+            return self._dispatch_locked(run_id, action)
+
+    def _dispatch_locked(self, run_id: str, action: str) -> Result:
         run = self.repo.load_run(run_id)
         current = WorkbenchState(run["status"])
         try:
@@ -8636,6 +8706,8 @@ class WorkbenchService:
             return self._check_credentials(run)
         if parsed_action == WorkbenchAction.SAVE_CREDENTIALS:
             return self._recheck_saved_credentials(run)
+        if parsed_action == WorkbenchAction.RETRY_FAILED:
+            return self._retry_failed(run)
         if parsed_action == WorkbenchAction.START_DEDUPE:
             return self._start_store_dedupe(run)
         if parsed_action == WorkbenchAction.SELECT_SEEDS:
@@ -9364,6 +9436,8 @@ class WorkbenchService:
         current = WorkbenchState(run["status"])
         if refresh_result.ok:
             run["status"] = transition_workbench_state(current, WorkbenchAction.MARK_STORE_DEDUPED).value
+            run.pop("retry_resume_status", None)
+            run.pop("retry_failure_code", None)
             self.repo.save_run(run)
             event = self.repo.append_run_event(
                 run["run_id"],
@@ -9376,6 +9450,8 @@ class WorkbenchService:
                 "Existing-store dedupe refresh finished.",
                 self._response_payload(run, event, {"dedupe_refresh": refresh_result.to_dict()}),
             )
+        run["retry_resume_status"] = current.value
+        run["retry_failure_code"] = refresh_result.code
         run["status"] = transition_workbench_state(current, WorkbenchAction.MARK_FAILED_RETRYABLE).value
         self.repo.save_run(run)
         event = self.repo.append_run_event(
@@ -9389,6 +9465,41 @@ class WorkbenchService:
             "Existing-store dedupe refresh failed.",
             errors=refresh_result.errors,
             data=self._response_payload(run, event, {"dedupe_refresh": refresh_result.to_dict()}),
+        )
+
+    def _retry_failed(self, run: dict[str, Any]) -> Result:
+        if WorkbenchState(run["status"]) != WorkbenchState.FAILED_RETRYABLE:
+            return self._reject_invalid_action(run, WorkbenchAction.RETRY_FAILED)
+        raw_resume_status = str(run.get("retry_resume_status") or "").strip()
+        try:
+            resume_state = WorkbenchState(raw_resume_status)
+        except ValueError:
+            resume_state = WorkbenchState.CREATED
+        if resume_state in {
+            WorkbenchState.FAILED_RETRYABLE,
+            WorkbenchState.FAILED_BLOCKED,
+            WorkbenchState.DONE,
+        }:
+            resume_state = WorkbenchState.CREATED
+        failed_status = run["status"]
+        failure_code = str(run.pop("retry_failure_code", "") or "")
+        run.pop("retry_resume_status", None)
+        run["status"] = resume_state.value
+        self.repo.save_run(run)
+        event = self.repo.append_run_event(
+            run["run_id"],
+            "workbench.retry_resumed",
+            "A retryable failure was restored to its recorded pre-failure gate.",
+            {
+                "from_status": failed_status,
+                "to_status": resume_state.value,
+                "failure_code": failure_code,
+            },
+        )
+        return Result.success(
+            "workbench.retry_resumed",
+            "The retryable batch was restored and can continue.",
+            self._response_payload(run, event),
         )
 
     def _action_is_allowed(self, run: dict, action: WorkbenchAction) -> bool:

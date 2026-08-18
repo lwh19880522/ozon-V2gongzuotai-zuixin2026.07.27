@@ -89,6 +89,7 @@ class WorkbenchAction(str, Enum):
     MARK_NEEDS_MANUAL_REVIEW = "mark_needs_manual_review"
     MARK_FAILED_RETRYABLE = "mark_failed_retryable"
     MARK_FAILED_BLOCKED = "mark_failed_blocked"
+    RETRY_FAILED = "retry_failed"
 
 
 def utc_now_iso() -> str:

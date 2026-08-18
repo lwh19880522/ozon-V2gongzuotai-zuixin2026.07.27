@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -110,13 +111,15 @@ def test_image_task_inbox_rejects_ozon_reference_images_before_claim(
     package.write_text(json.dumps(payload), encoding="utf-8")
     inbox = ImageTaskInbox(tmp_path)
 
-    with pytest.raises(
-        ImageTaskInboxError,
-        match="must not send Ozon images to generation",
-    ):
-        inbox.claim_next()
+    claimed = inbox.claim_next()
 
-    assert package.is_file()
+    assert claimed is None
+    assert not package.exists()
+    failed = tmp_path / "image_tasks" / "failed" / "ozon-image-001.json"
+    assert failed.is_file()
+    assert "must not send Ozon images to generation" in json.loads(
+        failed.read_text(encoding="utf-8")
+    )["failure"]["message"]
     assert not (
         tmp_path / "image_tasks" / "in_progress" / "ozon-image-001.json"
     ).exists()
@@ -346,13 +349,62 @@ def test_image_task_inbox_rejects_package_without_exact_ozon_product_binding(
     package.write_text(json.dumps(payload), encoding="utf-8")
     inbox = ImageTaskInbox(tmp_path)
 
-    with pytest.raises(
-        ImageTaskInboxError,
-        match="positive product_id",
-    ):
-        inbox.claim_next()
+    claimed = inbox.claim_next()
 
-    assert package.is_file()
+    assert claimed is None
+    assert not package.exists()
+    assert (
+        tmp_path / "image_tasks" / "failed" / "ozon-image-001.json"
+    ).is_file()
+
+
+def test_image_task_inbox_reclaims_stale_claim_lock(tmp_path: Path) -> None:
+    write_package(tmp_path, "ozon-image-001")
+    inbox = ImageTaskInbox(tmp_path)
+    lock = tmp_path / "image_tasks" / ".claim.lock"
+    lock.write_text("crashed worker", encoding="utf-8")
+    stale = lock.stat().st_mtime - 300
+    os.utime(lock, (stale, stale))
+
+    claimed = inbox.claim_next()
+
+    assert claimed is not None
+    assert claimed["package_id"] == "ozon-image-001"
+    assert not lock.exists()
+
+
+def test_image_task_inbox_quarantines_poison_and_claims_next_valid_package(
+    tmp_path: Path,
+) -> None:
+    poison = tmp_path / "image_tasks" / "pending" / "ozon-image-000.json"
+    poison.parent.mkdir(parents=True, exist_ok=True)
+    poison.write_text("{broken", encoding="utf-8")
+    write_package(tmp_path, "ozon-image-001")
+    inbox = ImageTaskInbox(tmp_path)
+
+    claimed = inbox.claim_next()
+
+    assert claimed is not None
+    assert claimed["package_id"] == "ozon-image-001"
+    assert (tmp_path / "image_tasks" / "failed" / poison.name).is_file()
+
+
+def test_image_task_inbox_recovers_stale_in_progress_package(
+    tmp_path: Path,
+) -> None:
+    write_package(tmp_path, "ozon-image-001")
+    inbox = ImageTaskInbox(tmp_path)
+    first = inbox.claim_next()
+    active = Path(first["package_path"])
+    payload = json.loads(active.read_text(encoding="utf-8"))
+    payload["assignment"]["claimed_at"] = "2020-01-01T00:00:00+00:00"
+    active.write_text(json.dumps(payload), encoding="utf-8")
+
+    recovered = inbox.claim_next()
+
+    assert recovered is not None
+    assert recovered["package_id"] == "ozon-image-001"
+    assert recovered["last_release"]["reason"] == "stale_in_progress_recovered"
 
 
 def test_schema3_deferred_package_can_generate_then_wait_for_product_binding(

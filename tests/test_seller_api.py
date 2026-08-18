@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import io
 import ssl
+import urllib.error
 from unittest import TestCase
 from unittest.mock import patch
 
 from ozon_v2.adapters.seller_api import (
     SellerApiAdapter,
     SellerApiError,
+    SellerApiTransportError,
     _category_match_score,
     _category_title_match_score,
     _iter_description_category_nodes,
@@ -148,7 +151,8 @@ class SellerCategoryTreeTests(TestCase):
         ]
         adapter = SellerApiAdapter(repo=FakeCredentialsRepo())
 
-        result = adapter._post_json("/v3/product/list", {"limit": 1000})
+        with patch("ozon_v2.adapters.seller_api.time.sleep"):
+            result = adapter._post_json("/v3/product/list", {"limit": 1000})
 
         self.assertEqual({"result": {"items": []}}, result)
         self.assertEqual(2, urlopen.call_count)
@@ -158,13 +162,16 @@ class SellerCategoryTreeTests(TestCase):
         urlopen.side_effect = [
             FakeHttpResponse(read_error=TimeoutError("The read operation timed out")),
             FakeHttpResponse(read_error=TimeoutError("The read operation timed out")),
+            FakeHttpResponse(read_error=TimeoutError("The read operation timed out")),
+            FakeHttpResponse(read_error=TimeoutError("The read operation timed out")),
         ]
         adapter = SellerApiAdapter(repo=FakeCredentialsRepo())
 
-        with self.assertRaisesRegex(SellerApiError, "timed out"):
-            adapter._post_json("/v3/product/list", {"limit": 1000})
+        with patch("ozon_v2.adapters.seller_api.time.sleep"):
+            with self.assertRaisesRegex(SellerApiError, "timed out"):
+                adapter._post_json("/v3/product/list", {"limit": 1000})
 
-        self.assertEqual(2, urlopen.call_count)
+        self.assertEqual(4, urlopen.call_count)
 
     @patch("ozon_v2.adapters.seller_api.urllib.request.urlopen")
     def test_post_json_retries_once_after_ssl_unexpected_eof(self, urlopen) -> None:
@@ -179,10 +186,44 @@ class SellerCategoryTreeTests(TestCase):
         ]
         adapter = SellerApiAdapter(repo=FakeCredentialsRepo())
 
-        result = adapter._post_json("/v1/product/import/info", {"task_id": 7001})
+        with patch("ozon_v2.adapters.seller_api.time.sleep"):
+            result = adapter._post_json("/v1/product/import/info", {"task_id": 7001})
 
         self.assertEqual({"result": {"items": []}}, result)
         self.assertEqual(2, urlopen.call_count)
+
+    @patch("ozon_v2.adapters.seller_api.urllib.request.urlopen")
+    def test_post_json_retries_429_with_retry_after_backoff(self, urlopen) -> None:
+        urlopen.side_effect = [
+            urllib.error.HTTPError(
+                "https://api-seller.ozon.ru/v3/product/list",
+                429,
+                "Too Many Requests",
+                {"Retry-After": "2"},
+                io.BytesIO(b'{"message":"rate limited"}'),
+            ),
+            FakeHttpResponse(payload=b'{"result":{"items":[]}}'),
+        ]
+        adapter = SellerApiAdapter(repo=FakeCredentialsRepo())
+
+        with patch("ozon_v2.adapters.seller_api.time.sleep") as sleep:
+            result = adapter._post_json("/v3/product/list", {"limit": 1000})
+
+        self.assertEqual({"result": {"items": []}}, result)
+        sleep.assert_called_once_with(2.0)
+        self.assertEqual(2, urlopen.call_count)
+
+    @patch("ozon_v2.adapters.seller_api.urllib.request.urlopen")
+    def test_product_import_does_not_replay_unknown_timeout(self, urlopen) -> None:
+        urlopen.return_value = FakeHttpResponse(
+            read_error=TimeoutError("The read operation timed out")
+        )
+        adapter = SellerApiAdapter(repo=FakeCredentialsRepo())
+
+        with self.assertRaisesRegex(SellerApiTransportError, "unknown outcome"):
+            adapter.import_products([{"offer_id": "OZV2-ONE"}])
+
+        self.assertEqual(1, urlopen.call_count)
 
     def test_type_node_inherits_description_category_id_from_parent(self) -> None:
         tree = [
@@ -545,8 +586,8 @@ class SellerCategoryTreeTests(TestCase):
     def test_import_products_submits_one_explicit_batch_and_returns_task_id(self) -> None:
         adapter = SellerApiAdapter()
         calls = []
-        adapter._post_json = lambda path, payload: (
-            calls.append((path, payload))
+        adapter._post_json = lambda path, payload, **kwargs: (
+            calls.append((path, payload, kwargs))
             or {"result": {"task_id": 321}}
         )
         item = {"offer_id": "OZV2-ONE", "name": "Тестовый товар"}
@@ -555,7 +596,13 @@ class SellerCategoryTreeTests(TestCase):
 
         self.assertEqual({"task_id": 321}, submitted)
         self.assertEqual(
-            [("/v3/product/import", {"items": [item]})],
+            [
+                (
+                    "/v3/product/import",
+                    {"items": [item]},
+                    {"retry_transient": False},
+                )
+            ],
             calls,
         )
 
@@ -584,7 +631,7 @@ class SellerCategoryTreeTests(TestCase):
     def test_replace_product_pictures_submits_complete_ordered_gallery(self) -> None:
         adapter = SellerApiAdapter()
         calls = []
-        adapter._post_json = lambda path, payload: (
+        adapter._post_json = lambda path, payload, **_kwargs: (
             calls.append((path, payload))
             or {"result": {"pictures": [{"url": url} for url in payload["images"]]}}
         )
@@ -623,7 +670,7 @@ class SellerCategoryTreeTests(TestCase):
     ) -> None:
         adapter = SellerApiAdapter()
         calls = []
-        adapter._post_json = lambda path, payload: (
+        adapter._post_json = lambda path, payload, **_kwargs: (
             calls.append((path, payload))
             or {"result": {"task_id": 9090}}
         )
@@ -660,7 +707,7 @@ class SellerCategoryTreeTests(TestCase):
             attribute["id"]: attribute["values"][0]["value"]
             for attribute in item["attributes"]
         }
-        self.assertEqual("https://media.example/slideshow.mp4", values[21845])
+        self.assertEqual("https://media.example/video-cover.jpg", values[21845])
         self.assertEqual("https://media.example/slideshow.mp4", values[21846])
         self.assertEqual("Видео о товаре", values[21847])
         self.assertEqual(9090, result["task_id"])

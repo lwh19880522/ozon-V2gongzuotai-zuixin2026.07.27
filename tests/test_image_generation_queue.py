@@ -232,6 +232,39 @@ def test_assigned_claim_never_takes_a_different_job(tmp_path: Path) -> None:
     assert queue.get_job(second["job_id"])["status"] == "pending"
 
 
+def test_dispatch_releases_assignment_that_was_never_claimed(tmp_path: Path) -> None:
+    queue = ImageGenerationQueue(tmp_path / "image_jobs.sqlite3")
+    receipt = selection_receipt("ozon-stale-assignment", "sku-stale-assignment")
+    job = queue.enqueue(
+        receipt=receipt,
+        subject_master=subject_master(tmp_path, receipt),
+    )
+    queue.register_worker_slot("ozon-image-worker-01", "thread-01")
+    first = queue.dispatch_assignments(
+        run_id="wb-image",
+        limit=1,
+        now_epoch=100,
+    )
+
+    reassigned = queue.dispatch_assignments(
+        run_id="wb-image",
+        limit=1,
+        now_epoch=401,
+    )
+
+    assert len(first) == 1
+    assert len(reassigned) == 1
+    assert reassigned[0]["job_id"] == job["job_id"]
+    claimed = queue.claim_assigned(
+        reassigned[0]["worker_id"],
+        reassigned[0]["job_id"],
+        reassigned[0]["instruction_id"],
+        now_epoch=401,
+        lease_seconds=30,
+    )
+    assert claimed["status"] == "in_progress"
+
+
 def test_dispatch_recovers_an_expired_in_progress_job(tmp_path: Path) -> None:
     queue = ImageGenerationQueue(tmp_path / "image_jobs.sqlite3")
     receipt = selection_receipt("ozon-expired", "sku-expired")

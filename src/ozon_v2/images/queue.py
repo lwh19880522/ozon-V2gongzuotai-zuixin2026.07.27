@@ -29,7 +29,8 @@ from ozon_v2.images.worker import (
 REGULAR_IMAGE_WORKER_IDS = tuple(
     f"ozon-image-worker-{index:02d}" for index in range(1, 11)
 )
-DEFAULT_IMAGE_LEASE_SECONDS = 1800
+DEFAULT_IMAGE_LEASE_SECONDS = 7200
+DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS = 300
 REPAIR_ISSUE_CODES = frozenset(
     {
         "product_truth",
@@ -370,6 +371,8 @@ class ImageGenerationQueue:
             WHERE status = 'assigned'
               AND (
                     current_job_id IS NULL
+                    OR assigned_at IS NULL
+                    OR assigned_at < ?
                     OR NOT EXISTS (
                         SELECT 1
                         FROM image_jobs
@@ -378,7 +381,7 @@ class ImageGenerationQueue:
                     )
               )
             """,
-            (now,),
+            (now, now - DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS),
         )
 
     def dispatch_assignments(

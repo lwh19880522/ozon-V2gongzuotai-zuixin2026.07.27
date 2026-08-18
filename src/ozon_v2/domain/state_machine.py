@@ -118,7 +118,9 @@ WORKBENCH_TRANSITIONS: dict[WorkbenchState, dict[WorkbenchAction, WorkbenchState
         WorkbenchAction.MARK_FAILED_RETRYABLE: WorkbenchState.FAILED_RETRYABLE,
         WorkbenchAction.MARK_FAILED_BLOCKED: WorkbenchState.FAILED_BLOCKED,
     },
-    WorkbenchState.FAILED_RETRYABLE: {},
+    WorkbenchState.FAILED_RETRYABLE: {
+        WorkbenchAction.RETRY_FAILED: WorkbenchState.CREATED,
+    },
     WorkbenchState.FAILED_BLOCKED: {},
     WorkbenchState.DONE: {},
 }

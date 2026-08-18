@@ -46,6 +46,28 @@ def test_first_product_uses_guoo_standard_and_rounds_up_to_dot_90() -> None:
     assert quote.iterations == 2
 
 
+def test_pricing_stabilizes_threshold_cycle_in_the_higher_valid_band() -> None:
+    quote = calculate_listing_price(
+        PricingInput.from_values(
+            purchase_price_cny="39.7",
+            domestic_shipping_cny="0",
+            package_weight_g="600",
+            package_length_cm="10",
+            package_width_cm="10",
+            package_height_cm="10",
+            target_margin_rate="0.20",
+        ),
+        PricingPolicy.default(),
+        initial_sale_rub="100",
+    )
+
+    assert quote.freight_channel_code == "small_standard"
+    assert quote.cross_border_freight_cny == Decimal("38.48")
+    assert quote.listing_price_cny == Decimal("125.90")
+    assert quote.listing_price_rub == Decimal("1511")
+    assert quote.iterations == 5
+
+
 def test_pricing_policy_round_trips_as_decimal_strings() -> None:
     policy = PricingPolicy.default()
 

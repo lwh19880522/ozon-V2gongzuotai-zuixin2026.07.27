@@ -8602,6 +8602,59 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual(2, len(adapter.imported_items))
         self.assertEqual(1, len(retried.data["attempt_history"]))
 
+    def test_concurrent_single_upload_confirmations_submit_only_once(self) -> None:
+        run_id, seed = self.prepare_supplier_review_run()
+        ozon_result = self.repo.load_ozon_collection_result(run_id)
+        ozon_result["ozon_candidates"][0]["attributes"]["Цвет"] = "белый"
+        self.repo.save_ozon_collection_result(run_id, ozon_result)
+        self.attach_locked_subject_master(run_id, seed.seed_id)
+        self.prepare_pricing_sources(run_id, seed.seed_id)
+
+        class SlowSellerApiAdapter(FakeSellerApiAdapter):
+            def import_products(self, items: list[dict]) -> dict:
+                time.sleep(0.05)
+                return super().import_products(items)
+
+        adapter = SlowSellerApiAdapter()
+        first_service = WorkbenchService(self.repo, seller_api_adapter=adapter)
+        second_service = WorkbenchService(self.repo, seller_api_adapter=adapter)
+        self.assertTrue(
+            first_service.confirm_pricing_evidence(
+                run_id,
+                self.pricing_input_payload(seed.seed_id),
+            ).ok
+        )
+        preview = first_service.preview_product_upload(run_id, seed.seed_id)
+        barrier = threading.Barrier(2)
+        results: list[Result] = []
+
+        def submit(service: WorkbenchService) -> None:
+            barrier.wait()
+            results.append(
+                service.submit_product_upload(
+                    run_id,
+                    seed.seed_id,
+                    confirmation_token=preview.data["confirmation_token"],
+                )
+            )
+
+        threads = [
+            threading.Thread(target=submit, args=(first_service,)),
+            threading.Thread(target=submit, args=(second_service,)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertEqual(2, len(results))
+        self.assertTrue(all(result.ok for result in results))
+        self.assertEqual(1, len(adapter.imported_items))
+        self.assertEqual(
+            {"product_upload.submitted", "product_upload.already_submitted"},
+            {result.code for result in results},
+        )
+
     def test_upload_page_exposes_per_product_preview_and_confirm_controls(self) -> None:
         run_id, _seed = self.prepare_supplier_review_run()
 

@@ -302,6 +302,53 @@ class WorkbenchSkeletonTests(RuntimeTestCase):
         self.assertEqual(1, dedupe.refresh_count)
         self.assertEqual("dedupe.refreshed", repo.load_run_events(run_id)[-1].event_type)
 
+    def test_retryable_dedupe_failure_can_resume_from_continue_autopilot(self) -> None:
+        class FailOnceDedupeService(FakeDedupeRefreshService):
+            def refresh_from_adapter(self) -> Result:
+                self.refresh_count += 1
+                if self.refresh_count == 1:
+                    return Result.failure(
+                        "seller_api.temporary_failure",
+                        "temporary network failure",
+                    )
+                return Result.success(
+                    "dedupe.refreshed",
+                    "refreshed",
+                    {"existing_product_count": 0},
+                )
+
+        repo = FsRepo(self.context)
+        self.save_test_credentials(repo)
+        dedupe = FailOnceDedupeService()
+        service = WorkbenchService(repo, seller_history_service=dedupe)
+        run_id = service.start_batch(target_count=1).data["run"]["run_id"]
+
+        failed = service.dispatch(run_id, WorkbenchAction.START_DEDUPE.value)
+        allowed = service.allowed_actions(run_id)
+        resumed = service.run_until_blocked(run_id, max_steps=2)
+
+        self.assertFalse(failed.ok)
+        self.assertEqual(
+            WorkbenchState.FAILED_RETRYABLE.value,
+            failed.data["run"]["status"],
+        )
+        self.assertIn(
+            WorkbenchAction.RETRY_FAILED.value,
+            allowed.data["allowed_actions"],
+        )
+        self.assertTrue(resumed.ok)
+        self.assertEqual(2, dedupe.refresh_count)
+        self.assertEqual(
+            WorkbenchState.STORE_DEDUPED.value,
+            repo.load_run(run_id)["status"],
+        )
+        self.assertTrue(
+            any(
+                event.event_type == "workbench.retry_resumed"
+                for event in repo.load_run_events(run_id)
+            )
+        )
+
     def test_autopilot_resumes_interrupted_store_dedupe(self) -> None:
         repo = FsRepo(self.context)
         self.save_test_credentials(repo)

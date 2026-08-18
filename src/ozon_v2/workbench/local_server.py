@@ -831,6 +831,7 @@ def build_home_html() -> str:
       mark_done: "完成 (Done)",
       mark_needs_manual_review: "人工复核 (Manual Review)",
       mark_failed_retryable: "可重试失败 (Retryable Fail)",
+      retry_failed: "恢复并重试 (Resume Retry)",
       mark_failed_blocked: "阻塞失败 (Blocked Fail)"
     };
     const AUTO_ADVANCE_RUN_KEY = "ozon_v2_auto_advance_run_id";
