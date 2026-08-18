@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import shutil
+import socket
 import urllib.request
 import uuid
 from collections.abc import Callable, Iterable, Mapping
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from PIL import Image
 
@@ -18,6 +21,9 @@ from ozon_v2.images.worker import crop_grid, file_sha256
 
 MINIMUM_REFERENCE_EDGE = 512
 DEFAULT_MINIMUM_REFERENCES = 4
+MAXIMUM_REFERENCE_BYTES = 20 * 1024 * 1024
+MAXIMUM_REFERENCE_PIXELS = 40_000_000
+TRUSTED_OZON_IMAGE_HOST_SUFFIXES = (".ozone.ru", ".ozon.ru")
 
 
 def upgrade_ozon_reference_url(url: str) -> str:
@@ -25,13 +31,77 @@ def upgrade_ozon_reference_url(url: str) -> str:
     return normalized.replace("/wc50/", "/wc1000/").replace("/wc100/", "/wc1000/")
 
 
+def _validate_reference_url(url: str) -> str:
+    parsed = urlparse(str(url or "").strip())
+    hostname = str(parsed.hostname or "").rstrip(".").casefold()
+    if parsed.scheme != "https" or not hostname:
+        raise ValueError("reference image URL must use HTTPS")
+    if parsed.username or parsed.password or parsed.port not in {None, 443}:
+        raise ValueError("reference image URL contains unsupported authority data")
+    if not any(hostname.endswith(suffix) for suffix in TRUSTED_OZON_IMAGE_HOST_SUFFIXES):
+        raise ValueError("reference image host is not an approved Ozon CDN")
+    try:
+        addresses = {
+            item[4][0]
+            for item in socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)
+        }
+    except socket.gaierror as exc:
+        raise ValueError("reference image host could not be resolved") from exc
+    if not addresses:
+        raise ValueError("reference image host did not resolve to an address")
+    for raw_address in addresses:
+        address = ipaddress.ip_address(raw_address)
+        if not address.is_global:
+            raise ValueError("reference image host resolves to a non-public address")
+    return parsed.geturl()
+
+
+class _SafeReferenceRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        return super().redirect_request(
+            req,
+            fp,
+            code,
+            msg,
+            headers,
+            _validate_reference_url(newurl),
+        )
+
+
 def fetch_reference_bytes(url: str) -> bytes:
+    safe_url = _validate_reference_url(url)
     request = urllib.request.Request(
-        url,
+        safe_url,
         headers={"User-Agent": "Mozilla/5.0 OzonV2ReferenceMaterializer/1.0"},
     )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return response.read()
+    opener = urllib.request.build_opener(_SafeReferenceRedirectHandler())
+    with opener.open(request, timeout=30) as response:
+        _validate_reference_url(str(response.geturl() or safe_url))
+        content_type = str(response.headers.get("Content-Type") or "").casefold()
+        if content_type and not content_type.startswith("image/"):
+            raise ValueError("reference response is not an image")
+        content_length = str(response.headers.get("Content-Length") or "").strip()
+        if content_length and int(content_length) > MAXIMUM_REFERENCE_BYTES:
+            raise ValueError("reference image exceeds the download size limit")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = response.read(min(64 * 1024, MAXIMUM_REFERENCE_BYTES + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > MAXIMUM_REFERENCE_BYTES:
+                raise ValueError("reference image exceeds the download size limit")
+        return b"".join(chunks)
 
 
 def _pixel_digest(image: Image.Image) -> str:
@@ -84,6 +154,8 @@ def materialize_ozon_references(
         try:
             content = fetch_bytes(url)
             with Image.open(BytesIO(content)) as opened:
+                if opened.width * opened.height > MAXIMUM_REFERENCE_PIXELS:
+                    raise ValueError("reference image exceeds the pixel limit")
                 image = opened.convert("RGB")
                 width, height = image.size
                 pixel_sha256 = _pixel_digest(image)

@@ -18,6 +18,7 @@ $StderrLog = Join-Path $RuntimeState 'server.stderr.log'
 $StartScript = Join-Path $ProjectRoot 'scripts\start_workbench.py'
 $HealthUrl = "http://127.0.0.1:$Port/api/health"
 $StopUrl = "http://127.0.0.1:$Port/api/runtime/stop"
+$AuthTokenFile = Join-Path $RuntimeState 'api_auth_token'
 
 function Initialize-RuntimeState {
     New-Item -ItemType Directory -Path $RuntimeState -Force | Out-Null
@@ -253,7 +254,16 @@ function Stop-Workbench {
     $healthIsOnline = Test-WorkbenchHealth
     if ($healthIsOnline) {
         try {
-            Invoke-RestMethod -Uri $StopUrl -Method Post -ContentType 'application/json' -Body '{}' -TimeoutSec 3 | Out-Null
+            $authToken = if (Test-Path -LiteralPath $AuthTokenFile) {
+                (Get-Content -LiteralPath $AuthTokenFile -Raw -Encoding UTF8).Trim()
+            }
+            else {
+                ''
+            }
+            if ($authToken.Length -lt 32) {
+                throw 'Workbench authentication token is unavailable.'
+            }
+            Invoke-RestMethod -Uri $StopUrl -Method Post -ContentType 'application/json' -Headers @{ 'X-Ozon-Workbench-Token' = $authToken } -Body '{}' -TimeoutSec 3 | Out-Null
         }
         catch {
             Write-LifecycleLog "stop.api_unavailable error=$($_.Exception.Message)"
@@ -360,7 +370,6 @@ switch ($Action) {
         exit $script:ResultCode
     }
 }
-
 
 
 

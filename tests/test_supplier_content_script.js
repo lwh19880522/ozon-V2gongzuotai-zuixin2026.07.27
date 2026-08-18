@@ -135,6 +135,16 @@ const chrome = {
     getManifest() { return { version: "9.8.7" }; },
     async sendMessage(message) {
       if (message.type === "ozon_v2_get_current_task") return { ok: true, task };
+      if (message.type === "ozon_v2_local_api_request") {
+        const request = message.request || {};
+        const body = JSON.parse(request.body || "{}");
+        if (String(request.path).includes("supplier-collection-progress")) progressPayloads.push(body);
+        if (String(request.path).includes("supplier-collection-result")) submittedPayload = body;
+        return {
+          transport_ok: true,
+          body: { ok: true, code: "supplier_collection.ingested", message: "saved" },
+        };
+      }
       return { ok: true };
     },
     onMessage: { addListener() {} },
@@ -151,11 +161,6 @@ const context = vm.createContext({
   console,
   document,
   location: { href: supplierUrl, hostname: "detail.1688.com" },
-  fetch: async (url, options = {}) => {
-    if (String(url).includes("supplier-collection-progress")) progressPayloads.push(JSON.parse(options.body));
-    if (String(url).includes("supplier-collection-result")) submittedPayload = JSON.parse(options.body);
-    return { json: async () => ({ ok: true, code: "supplier_collection.ingested", message: "saved" }) };
-  },
   setTimeout,
   clearTimeout,
   URL,

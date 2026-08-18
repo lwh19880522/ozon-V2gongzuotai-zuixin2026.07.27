@@ -10,6 +10,13 @@ from tests.helpers import RuntimeTestCase
 
 
 class FsRepoTests(RuntimeTestCase):
+    def test_run_dir_rejects_path_traversal_and_absolute_paths(self) -> None:
+        repo = FsRepo(self.context)
+
+        for unsafe in ("../outside", "..", "C:/outside", "wb-safe/../../outside", "<script>"):
+            with self.subTest(run_id=unsafe), self.assertRaises(ValueError):
+                repo.run_dir(unsafe)
+
     def test_store_refresh_preserves_uploaded_product_lineage(self) -> None:
         repo = FsRepo(self.context)
         repo.merge_existing_products(

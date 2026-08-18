@@ -21,6 +21,20 @@ const chrome = {
       if (message.type === "ozon_v2_get_current_task") {
         throw new Error("background unavailable");
       }
+      if (message.type === "ozon_v2_local_api_request") {
+        const path = String((message.request || {}).path || "");
+        if (path.endsWith("/api/browser-bridge/heartbeat")) {
+          return { transport_ok: true, body: { ok: true } };
+        }
+        if (path.endsWith("/api/browser-task/active")) {
+          activeTaskRequests += 1;
+          if (activeTaskRequests === 1) return await new Promise(() => {});
+          return {
+            transport_ok: true,
+            body: { ok: true, code: "browser_task.none", message: "No browser task is pending." },
+          };
+        }
+      }
       return { ok: true };
     },
   },
@@ -31,28 +45,6 @@ const context = vm.createContext({
   chrome,
   console: { info() {}, error() {} },
   document: {},
-  fetch: async (url, options = {}) => {
-    if (String(url).endsWith("/api/browser-bridge/heartbeat") && options.method === "POST") {
-      return { ok: true, json: async () => ({ ok: true }) };
-    }
-    if (String(url).endsWith("/api/browser-task/active")) {
-      activeTaskRequests += 1;
-      if (activeTaskRequests === 1) {
-        return await new Promise((_resolve, reject) => {
-          options.signal.addEventListener("abort", () => reject(options.signal.reason));
-        });
-      }
-      return {
-        ok: true,
-        json: async () => ({
-          ok: true,
-          code: "browser_task.none",
-          message: "No browser task is pending.",
-        }),
-      };
-    }
-    throw new Error(`unexpected fetch: ${url}`);
-  },
   location: { href: "https://www.ozon.ru/product/test-1/" },
   localStorage: {
     getItem() { return null; },

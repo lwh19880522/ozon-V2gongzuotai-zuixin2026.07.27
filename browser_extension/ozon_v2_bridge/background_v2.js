@@ -9,6 +9,7 @@ const MANAGED_TAB_QUERY_DELAY_MS = 100;
 const NATIVE_NEW_TAB_INTENT_MS = 2500;
 const SUPPLIER_NAVIGATION_INTENT_MS = 30000;
 const SUPPLIER_TERMINAL_STATES = new Set(["collected", "user_skipped"]);
+const WORKBENCH_AUTH_STORAGE_KEY = "workbenchAuthToken";
 const supplierNativeNewTabIntents = new Map();
 let openTaskQueue = Promise.resolve();
 let supplierNavigationQueue = Promise.resolve();
@@ -21,13 +22,31 @@ function searchUrl(query) {
   return `https://www.ozon.ru/search/?from_global=true&text=${encodeURIComponent(scopedQuery)}&__rr=1`;
 }
 
+async function workbenchFetch(path, options = {}) {
+  if (typeof path !== "string" || !path.startsWith("/api/")) {
+    throw new Error("Only local workbench API paths may be requested.");
+  }
+  const stored = await chrome.storage.local.get({ [WORKBENCH_AUTH_STORAGE_KEY]: "" });
+  const token = String(stored[WORKBENCH_AUTH_STORAGE_KEY] || "");
+  if (!token) throw new Error("Open or refresh the local workbench to authenticate the browser bridge.");
+  const headers = {
+    "Content-Type": "application/json",
+    ...(options.headers || {}),
+    "X-Ozon-Workbench-Token": token,
+  };
+  return await fetch(`${BASE_URL}${path}`, { ...options, headers });
+}
+
+async function workbenchJson(path, options = {}) {
+  const response = await workbenchFetch(path, options);
+  return await response.json();
+}
+
 async function postJson(path, payload) {
-  const response = await fetch(`${BASE_URL}${path}`, {
+  return await workbenchJson(path, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-  return await response.json();
 }
 
 async function stopRunUntilExplicitResume(runId) {
@@ -63,16 +82,13 @@ async function heartbeat(payload = {}) {
 async function activeTask() {
   const stored = await chrome.storage.local.get({ currentRunId: "" });
   if (stored.currentRunId) {
-    const response = await fetch(`${BASE_URL}/api/batches/${encodeURIComponent(stored.currentRunId)}/browser-task`);
-    const current = await response.json();
+    const current = await workbenchJson(`/api/batches/${encodeURIComponent(stored.currentRunId)}/browser-task`);
     if (isRunnableTask(current)) return current;
-    const activeResponse = await fetch(`${BASE_URL}/api/browser-task/active`);
-    const active = await activeResponse.json();
+    const active = await workbenchJson("/api/browser-task/active");
     if (isRunnableTask(active) && isNewerTask(active, current)) return active;
     return current;
   }
-  const response = await fetch(`${BASE_URL}/api/browser-task/active`);
-  return await response.json();
+  return await workbenchJson("/api/browser-task/active");
 }
 
 async function currentWorkbenchTask() {
@@ -185,8 +201,7 @@ async function handleTaskTabRemoved(tabId) {
     const runId = key.split(":", 1)[0];
     let task = null;
     try {
-      const response = await fetch(`${BASE_URL}/api/batches/${encodeURIComponent(runId)}/browser-task`);
-      task = await response.json();
+      task = await workbenchJson(`/api/batches/${encodeURIComponent(runId)}/browser-task`);
     } catch (_) {
       // Local suppression still prevents a reopen while the workbench restarts.
     }
@@ -1269,6 +1284,34 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const senderWindowId = sender && sender.tab && Number.isInteger(sender.tab.windowId)
     ? sender.tab.windowId
     : null;
+  if (message.type === "ozon_v2_set_workbench_auth") {
+    const senderUrl = String((sender && sender.url) || (sender && sender.tab && sender.tab.url) || "");
+    const token = String(message.token || "");
+    if (!/^http:\/\/(?:127\.0\.0\.1|localhost):8765\//i.test(senderUrl) || token.length < 32) {
+      sendResponse({ ok: false, error: "Workbench authentication bootstrap was rejected." });
+      return false;
+    }
+    chrome.storage.local.set({ [WORKBENCH_AUTH_STORAGE_KEY]: token })
+      .then(() => sendResponse({ ok: true }))
+      .catch((error) => sendResponse({ ok: false, error: String(error) }));
+    return true;
+  }
+  if (message.type === "ozon_v2_local_api_request") {
+    const request = message.request && typeof message.request === "object" ? message.request : {};
+    const path = String(request.path || "");
+    const method = String(request.method || "GET").toUpperCase();
+    if (!path.startsWith("/api/") || !["GET", "POST"].includes(method)) {
+      sendResponse({ transport_ok: false, error: "Unsupported local API request." });
+      return false;
+    }
+    workbenchJson(path, {
+      method,
+      body: method === "POST" ? String(request.body || "{}") : undefined,
+    })
+      .then((body) => sendResponse({ transport_ok: true, body }))
+      .catch((error) => sendResponse({ transport_ok: false, error: String(error) }));
+    return true;
+  }
   if (message.type === "ozon_v2_content_task_failed") {
     const tabId = sender && sender.tab && Number.isInteger(sender.tab.id)
       ? sender.tab.id
@@ -1416,17 +1459,42 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message.type === "ozon_v2_fetch_reference_image") {
     const value = String(message.url || "");
-    if (!/^https:\/\//i.test(value)) {
-      sendResponse({ ok: false, error: "A secure reference image URL is required." });
+    let referenceUrl = null;
+    try {
+      referenceUrl = new URL(value);
+    } catch (_) {
+      referenceUrl = null;
+    }
+    const trustedReferenceHost = referenceUrl
+      && referenceUrl.protocol === "https:"
+      && [".ozone.ru", ".ozon.ru"].some((suffix) => referenceUrl.hostname.toLowerCase().endsWith(suffix));
+    if (!trustedReferenceHost) {
+      sendResponse({ ok: false, error: "An approved Ozon CDN reference image URL is required." });
       return false;
     }
     fetch(value)
       .then(async (response) => {
         if (!response.ok) throw new Error(`Reference image request failed: ${response.status}`);
+        const finalUrl = new URL(response.url || value);
+        if (
+          finalUrl.protocol !== "https:"
+          || ![".ozone.ru", ".ozon.ru"].some((suffix) => finalUrl.hostname.toLowerCase().endsWith(suffix))
+        ) throw new Error("Reference image redirected outside the approved Ozon CDN.");
+        const contentType = response.headers.get("Content-Type") || "";
+        if (!contentType.toLowerCase().startsWith("image/")) {
+          throw new Error("Reference URL did not return an image.");
+        }
+        const contentLength = Number(response.headers.get("Content-Length") || 0);
+        if (Number.isFinite(contentLength) && contentLength > 20 * 1024 * 1024) {
+          throw new Error("Reference image exceeds the 20 MB limit.");
+        }
         const buffer = await response.arrayBuffer();
+        if (buffer.byteLength > 20 * 1024 * 1024) {
+          throw new Error("Reference image exceeds the 20 MB limit.");
+        }
         return {
           ok: true,
-          contentType: response.headers.get("Content-Type") || "image/jpeg",
+          contentType,
           bytes: Array.from(new Uint8Array(buffer)),
         };
       })

@@ -22,6 +22,12 @@ const runnableTask = {
 };
 
 const context = vm.createContext({
+  document: {
+    querySelector(selector) {
+      if (selector !== 'meta[name="ozon-v2-workbench-token"]') return null;
+      return { getAttribute() { return "test-workbench-auth-token-00000000000000000000"; } };
+    },
+  },
   chrome: {
     runtime: {
       getManifest() {
@@ -81,9 +87,12 @@ const scriptPath = path.join(
 vm.runInContext(fs.readFileSync(scriptPath, "utf8"), context, { filename: scriptPath });
 
 setTimeout(() => {
+  const taskMessages = sentMessages.filter((message) => message.type === "ozon_v2_current_task");
+  const authMessages = sentMessages.filter((message) => message.type === "ozon_v2_set_workbench_auth");
   assert.equal(activeFetchCount, 1, "a stale terminal batch must fall back to the newest active browser task");
-  assert.equal(sentMessages.length, 1, "the newest runnable task must be dispatched automatically");
-  assert.equal(sentMessages[0].task.data.run_id, "wb-new");
+  assert.equal(authMessages.length, 1, "the workbench token must be delivered to the extension background");
+  assert.equal(taskMessages.length, 1, "the newest runnable task must be dispatched automatically");
+  assert.equal(taskMessages[0].task.data.run_id, "wb-new");
   assert.equal(stored.ozon_v2_workbench_run_id, "wb-new", "the workbench must follow the recovered active batch");
   assert.equal(postedHeartbeats.length, 1, "the workbench must report bridge liveness on every poll");
   assert.equal(postedHeartbeats[0].connection_only, true, "workbench liveness must not overwrite task evidence");

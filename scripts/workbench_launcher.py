@@ -112,13 +112,22 @@ def start_workbench(port: int, runtime_state: Path, *, open_browser: bool) -> in
     return 0
 
 
-def stop_workbench(port: int, timeout: float = 8) -> int:
+def stop_workbench(port: int, runtime_state: Path, timeout: float = 8) -> int:
     if not _health_ok(port):
         return 0
+    try:
+        auth_token = (runtime_state / "api_auth_token").read_text(encoding="utf-8").strip()
+    except OSError:
+        return 1
+    if len(auth_token) < 32:
+        return 1
     request = Request(
         f"http://127.0.0.1:{port}/api/runtime/stop",
         data=b"{}",
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "X-Ozon-Workbench-Token": auth_token,
+        },
         method="POST",
     )
     try:
@@ -145,8 +154,8 @@ def main() -> int:
     if args.action == "status":
         return 0 if _health_ok(args.port) else 1
     if args.action == "stop":
-        return stop_workbench(args.port)
-    if args.action == "restart" and stop_workbench(args.port) != 0:
+        return stop_workbench(args.port, runtime_state)
+    if args.action == "restart" and stop_workbench(args.port, runtime_state) != 0:
         return 1
     return start_workbench(args.port, runtime_state, open_browser=not args.no_open)
 

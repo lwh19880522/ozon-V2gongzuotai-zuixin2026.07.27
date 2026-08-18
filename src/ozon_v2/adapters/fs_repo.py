@@ -12,6 +12,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from ozon_v2.app.context import AppContext, build_default_context
+from ozon_v2.adapters.secret_storage import (
+    is_secret_envelope,
+    protect_mapping,
+    unprotect_mapping,
+)
 from ozon_v2.domain.credentials import CredentialStatus, SellerCredentials
 from ozon_v2.domain.pricing import PricingPolicy
 from ozon_v2.domain.models import (
@@ -182,12 +187,28 @@ class FsRepo:
         if existing:
             credentials.created_at = existing.created_at
         credentials.updated_at = utc_now_iso()
-        self._write_json(self.credentials_path, credentials.to_private_dict())
+        self._write_json(
+            self.credentials_path,
+            protect_mapping(credentials.to_private_dict()),
+        )
+        if self.credentials_path.exists():
+            try:
+                self.credentials_path.chmod(0o600)
+            except OSError:
+                pass
 
     def load_credentials(self) -> SellerCredentials | None:
         if not self.credentials_path.exists():
             return None
-        return SellerCredentials.from_dict(self._read_json(self.credentials_path))
+        stored = self._read_json(self.credentials_path)
+        if is_secret_envelope(stored):
+            return SellerCredentials.from_dict(unprotect_mapping(stored))
+        credentials = SellerCredentials.from_dict(stored)
+        self._write_json(
+            self.credentials_path,
+            protect_mapping(credentials.to_private_dict()),
+        )
+        return credentials
 
     def credential_status(self) -> CredentialStatus:
         self.initialize_runtime()
@@ -849,7 +870,14 @@ class FsRepo:
         return run_record
 
     def run_dir(self, run_id: str) -> Path:
-        return self.runs_dir / run_id
+        normalized = str(run_id or "").strip()
+        if not self._is_recognized_batch_directory_name(normalized):
+            raise ValueError("run_id must be a safe workbench or legacy batch identifier")
+        runs_root = self.runs_dir.resolve(strict=False)
+        candidate = (runs_root / normalized).resolve(strict=False)
+        if candidate.parent != runs_root:
+            raise ValueError("run_id resolves outside the workbench runs directory")
+        return candidate
 
     def load_run(self, run_id: str) -> dict[str, Any]:
         return self._read_json(self.run_dir(run_id) / "run.json")

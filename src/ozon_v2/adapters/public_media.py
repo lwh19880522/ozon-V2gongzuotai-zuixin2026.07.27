@@ -35,6 +35,12 @@ STATE_FILENAME = "state.json"
 STOP_FILENAME = "stop.requested"
 TUNNEL_HOST_SUFFIX = ".trycloudflare.com"
 TUNNEL_URL_PATTERN = "https://"
+CLOUDFLARED_VERSION = "2026.7.2"
+CLOUDFLARED_SHA256 = {
+    "cloudflared-windows-amd64.exe": "cdb5d4432f6ae1595654a692a51308b69d2bf7af961f5578d9391837cf072df9",
+    "cloudflared-linux-amd64": "ec905ea7b7e327ff8abdde8cb64697a2152de74dbcdbf6aec9db8364eb3886cd",
+    "cloudflared-linux-arm64": "405df476437e027fc6d18729a5a77155c0a33a6082aeee60a799a688f3052e66",
+}
 
 
 class CloudflareQuickTunnelMediaPublisher:
@@ -80,6 +86,13 @@ class CloudflareQuickTunnelMediaPublisher:
         media_root = Path(gateway["media_root"])
         base_url = str(gateway["base_url"])
         route_token = str(gateway["route_token"])
+        product_directory = media_root.joinpath(
+            "ozon-v2",
+            _safe_segment(run_id),
+            _safe_segment(seed_id),
+        )
+        shutil.rmtree(product_directory, ignore_errors=True)
+        product_directory.mkdir(parents=True, exist_ok=True)
 
         published: list[dict[str, Any]] = []
         for index, item in enumerate(source_files, start=1):
@@ -212,6 +225,7 @@ def serve_quick_tunnel_gateway(runtime_root: str | Path) -> None:
     media_root = gateway_dir / "files"
     state_path = gateway_dir / STATE_FILENAME
     stop_path = gateway_dir / STOP_FILENAME
+    shutil.rmtree(media_root, ignore_errors=True)
     media_root.mkdir(parents=True, exist_ok=True)
     state_path.unlink(missing_ok=True)
     stop_path.unlink(missing_ok=True)
@@ -265,6 +279,7 @@ def serve_quick_tunnel_gateway(runtime_root: str | Path) -> None:
                 tunnel.kill()
         server.shutdown()
         server.server_close()
+        shutil.rmtree(media_root, ignore_errors=True)
 
 
 def _tunnel_command(runtime_root: Path, port: int) -> list[str]:
@@ -291,7 +306,7 @@ def _download_cloudflared(runtime_root: Path) -> Path:
     machine = platform.machine().casefold()
     arch = "arm64" if machine in {"arm64", "aarch64"} else "amd64"
     if system == "windows":
-        asset = f"cloudflared-windows-{arch}.exe"
+        asset = "cloudflared-windows-amd64.exe"
     elif system == "linux":
         asset = f"cloudflared-linux-{arch}"
     elif system == "darwin":
@@ -305,11 +320,19 @@ def _download_cloudflared(runtime_root: Path) -> Path:
     destination = runtime_root / GATEWAY_DIRNAME / "tools" / (
         "cloudflared.exe" if system == "windows" else "cloudflared"
     )
-    if destination.is_file() and destination.stat().st_size > 1_000_000:
-        return destination
+    expected_sha256 = CLOUDFLARED_SHA256.get(asset)
+    if not expected_sha256:
+        raise PublicMediaError(f"No pinned cloudflared checksum is available for {asset}.")
+    if destination.is_file():
+        if destination.stat().st_size > 1_000_000 and _file_sha256(destination) == expected_sha256:
+            return destination
+        destination.unlink(missing_ok=True)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(destination.suffix + ".download")
-    url = f"https://github.com/cloudflare/cloudflared/releases/latest/download/{asset}"
+    url = (
+        "https://github.com/cloudflare/cloudflared/releases/download/"
+        f"{CLOUDFLARED_VERSION}/{asset}"
+    )
     request = Request(url, headers={"User-Agent": "OzonV2/1.0"})
     try:
         with urlopen(request, timeout=120) as response, temporary.open("wb") as output:
@@ -320,6 +343,9 @@ def _download_cloudflared(runtime_root: Path) -> Path:
     if temporary.stat().st_size <= 1_000_000:
         temporary.unlink(missing_ok=True)
         raise PublicMediaError("Downloaded cloudflared binary is unexpectedly small.")
+    if _file_sha256(temporary) != expected_sha256:
+        temporary.unlink(missing_ok=True)
+        raise PublicMediaError("Downloaded cloudflared binary failed SHA-256 verification.")
     temporary.replace(destination)
     if os.name != "nt":
         destination.chmod(0o755)

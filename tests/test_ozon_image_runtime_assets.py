@@ -7,10 +7,54 @@ import pytest
 from PIL import Image
 
 from ozon_v2.images.runtime_assets import (
+    _validate_reference_url,
     load_generation_checkpoints,
     materialize_ozon_references,
     persist_generation_checkpoint,
 )
+
+
+def test_reference_url_validation_rejects_non_https_and_untrusted_hosts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "ozon_v2.images.runtime_assets.socket.getaddrinfo",
+        lambda *args, **kwargs: [(2, 1, 6, "", ("93.184.216.34", 443))],
+    )
+
+    with pytest.raises(ValueError, match="HTTPS"):
+        _validate_reference_url("http://ir.ozone.ru/image.png")
+    with pytest.raises(ValueError, match="approved Ozon CDN"):
+        _validate_reference_url("https://example.com/image.png")
+
+
+def test_reference_url_validation_rejects_private_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "ozon_v2.images.runtime_assets.socket.getaddrinfo",
+        lambda *args, **kwargs: [(2, 1, 6, "", ("127.0.0.1", 443))],
+    )
+
+    with pytest.raises(ValueError, match="non-public"):
+        _validate_reference_url("https://ir.ozone.ru/image.png")
+
+
+def test_materializer_rejects_decompression_bomb_sized_reference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("ozon_v2.images.runtime_assets.MAXIMUM_REFERENCE_PIXELS", 100)
+    oversized = _image_bytes((30, 60, 90), size=(11, 10))
+
+    result = materialize_ozon_references(
+        ["https://ir.ozone.ru/s3/wc1000/oversized.png"],
+        tmp_path / "references",
+        fetch_bytes=lambda _: oversized,
+    )
+
+    assert result["accepted"] == []
+    assert "pixel limit" in result["rejected"][0]["detail"]
 
 
 def _image_bytes(

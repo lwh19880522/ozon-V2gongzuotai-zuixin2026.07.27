@@ -2,11 +2,31 @@
 
 const BASE_URL = "http://127.0.0.1:8765";
 const EXTENSION_VERSION = chrome.runtime.getManifest().version;
+const WORKBENCH_AUTH_HEADER = "X-Ozon-Workbench-Token";
+
+function workbenchToken() {
+  const element = document.querySelector('meta[name="ozon-v2-workbench-token"]');
+  return element ? String(element.getAttribute("content") || "") : "";
+}
+
+async function registerWorkbenchAuth() {
+  const token = workbenchToken();
+  if (!token) throw new Error("Workbench authentication token is missing; refresh the page.");
+  const result = await chrome.runtime.sendMessage({ type: "ozon_v2_set_workbench_auth", token });
+  if (!result || result.ok !== true) throw new Error((result && result.error) || "Browser bridge authentication failed.");
+  return token;
+}
 
 async function api(path, options = {}) {
+  const token = workbenchToken();
+  if (!token) throw new Error("Workbench authentication token is missing; refresh the page.");
   const response = await fetch(`${BASE_URL}${path}`, {
-    headers: { "Content-Type": "application/json" },
     ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...(options.headers || {}),
+      [WORKBENCH_AUTH_HEADER]: token,
+    },
   });
   return await response.json();
 }
@@ -59,6 +79,7 @@ function isNewerTask(candidate, current) {
 
 async function tick() {
   try {
+    await registerWorkbenchAuth();
     const runId = localStorage.getItem("ozon_v2_workbench_run_id") || "";
     let task = await api(runId ? `/api/batches/${encodeURIComponent(runId)}/browser-task` : "/api/browser-task/active");
     if (runId && !isRunnableTask(task)) {

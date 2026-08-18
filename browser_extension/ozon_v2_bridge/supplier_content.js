@@ -4,7 +4,6 @@
   if (globalThis.__OzonV2SupplierBridgeLoaded) return;
   globalThis.__OzonV2SupplierBridgeLoaded = true;
 
-  const BASE_URL = "http://127.0.0.1:8765";
   const EXTENSION_VERSION = chrome.runtime.getManifest().version;
   const SUPPLIER_CHANNEL_WAIT_ATTEMPTS = 60;
   const REFERENCE_UPLOAD_ATTEMPTS = 3;
@@ -26,11 +25,18 @@
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
   async function api(path, options = {}) {
-    const response = await fetch(`${BASE_URL}${path}`, {
-      headers: { "Content-Type": "application/json" },
-      ...options,
+    const response = await chrome.runtime.sendMessage({
+      type: "ozon_v2_local_api_request",
+      request: {
+        path,
+        method: options.method || "GET",
+        body: options.body,
+      },
     });
-    return await response.json();
+    if (!response || response.transport_ok !== true) {
+      throw new Error((response && response.error) || "Local workbench API request failed.");
+    }
+    return response.body || {};
   }
 
   async function heartbeat(payload = {}) {

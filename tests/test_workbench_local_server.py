@@ -225,7 +225,9 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
                 "code": "browser_task.none",
             }
         )
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), create_handler(self.repo))
+        handler = create_handler(self.repo)
+        self.auth_token = handler.workbench_auth_token
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}"
@@ -1098,9 +1100,10 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
 
     def test_runtime_stop_and_restart_use_injected_controller(self) -> None:
         controller = FakeRuntimeController()
+        handler = create_handler(self.repo, runtime_controller=controller)
         server = ThreadingHTTPServer(
             ("127.0.0.1", 0),
-            create_handler(self.repo, runtime_controller=controller),
+            handler,
         )
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1112,7 +1115,10 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
                 request = Request(
                     base_url + f"/api/runtime/{action}",
                     data=json.dumps(request_payload).encode("utf-8"),
-                    headers={"Content-Type": "application/json"},
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Ozon-Workbench-Token": handler.workbench_auth_token,
+                    },
                     method="POST",
                 )
                 with urlopen(request, timeout=5) as response:
@@ -1126,7 +1132,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual([("restart", True), ("stop", False)], controller.actions)
 
     def test_runtime_capsule_is_injected_once_on_every_workbench_page(self) -> None:
-        run_id = "runtime-capsule-test"
+        run_id = "wb-runtime-capsule-test"
         paths = [
             "/",
             f"/batches/{run_id}/supplier-review",
@@ -1152,6 +1158,54 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
                 self.assertIn("const summaryLabels = {", body)
                 self.assertIn("服务在线，扩展离线", body)
                 self.assertIn("重启并连接 (Reconnect)", body)
+
+    def test_workbench_page_bootstraps_local_api_authentication(self) -> None:
+        page = self.get_text("/")
+
+        self.assertIn('name="ozon-v2-workbench-token"', page)
+        self.assertIn("X-Ozon-Workbench-Token", page)
+
+    def test_run_id_is_escaped_in_generated_workbench_html(self) -> None:
+        page = build_upload_workspace_html('wb-test"><script>alert(1)</script>')
+
+        self.assertNotIn('<script>alert(1)</script>', page)
+        self.assertIn('&lt;script&gt;alert(1)&lt;/script&gt;', page)
+
+    def test_local_api_rejects_request_without_workbench_token(self) -> None:
+        request = Request(
+            self.base_url + "/api/operations/settings",
+            headers={"Origin": f"http://127.0.0.1:{self.server.server_address[1]}"},
+        )
+
+        with self.assertRaises(HTTPError) as raised:
+            urlopen(request, timeout=5)
+
+        self.assertEqual(401, raised.exception.code)
+
+    def test_local_api_rejects_authenticated_request_from_foreign_origin(self) -> None:
+        request = Request(
+            self.base_url + "/api/operations/settings",
+            headers={
+                "Origin": "https://malicious.example",
+                "X-Ozon-Workbench-Token": "invalid-placeholder",
+            },
+        )
+
+        with self.assertRaises(HTTPError) as raised:
+            urlopen(request, timeout=5)
+
+        self.assertEqual(403, raised.exception.code)
+
+    def test_local_api_rejects_run_id_path_traversal(self) -> None:
+        request = Request(
+            self.base_url + "/api/batches/%2e%2e/diagnostics.zip",
+            headers={"X-Ozon-Workbench-Token": self.auth_token},
+        )
+
+        with self.assertRaises(HTTPError) as raised:
+            urlopen(request, timeout=5)
+
+        self.assertIn(raised.exception.code, {400, 404})
 
     def test_batch_api_creates_batch_and_events(self) -> None:
         created = self.post_json("/api/batches", {"target_count": 2})
@@ -2050,7 +2104,11 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         run_id = run["run_id"]
         self.repo.append_run_event(run_id, "runner.failed", "Test failure.", {"api_key": "must-not-leak"})
 
-        with urlopen(f"{self.base_url}/api/batches/{run_id}/diagnostics.zip", timeout=5) as response:
+        request = Request(
+            f"{self.base_url}/api/batches/{run_id}/diagnostics.zip",
+            headers={"X-Ozon-Workbench-Token": self.auth_token},
+        )
+        with urlopen(request, timeout=5) as response:
             content = response.read()
             content_type = response.headers.get("Content-Type")
             disposition = response.headers.get("Content-Disposition")
@@ -4259,7 +4317,7 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
     def test_extension_manifest_registers_1688_supplier_content_script(self) -> None:
         manifest_path = self.project_root / "browser_extension" / "ozon_v2_bridge" / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self.assertEqual("0.1.75", manifest["version"])
+        self.assertEqual("0.1.76", manifest["version"])
 
         supplier_scripts = [
             item
@@ -4270,12 +4328,13 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual(1, len(supplier_scripts))
         self.assertTrue(any("1688.com" in pattern for pattern in supplier_scripts[0]["matches"]))
 
-    def test_ozon_content_script_reports_seed_and_resets_for_new_dispatch_token(self) -> None:
+    def test_ozon_content_script_reports_seed_without_persisting_dispatch_token(self) -> None:
         content_path = self.project_root / "browser_extension" / "ozon_v2_bridge" / "content.js"
         content = content_path.read_text(encoding="utf-8")
 
         self.assertIn("seed_id: seedId", content)
-        self.assertIn("state.dispatchToken === dispatchToken", content)
+        self.assertNotIn("state.dispatchToken === dispatchToken", content)
+        self.assertIn("dispatchToken: _sensitiveToken", content)
         self.assertIn("dispatchToken: task.data.dispatch_token", content)
         self.assertIn("dispatch_token: state.dispatchToken", content)
 
@@ -4963,10 +5022,11 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
             )
 
         page = self.get_text(f"/batches/{run_id}/images")
-        with urlopen(
+        request = Request(
             f"{self.base_url}/api/batches/{run_id}/image-job/{job_id}/slot/{slot['slot_id']}/file",
-            timeout=5,
-        ) as response:
+            headers={"X-Ozon-Workbench-Token": self.auth_token},
+        )
+        with urlopen(request, timeout=5) as response:
             original_bytes = response.read()
 
         self.assertIn("上传草稿 (Upload)", page)
@@ -9374,9 +9434,10 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
 
     def test_supervised_action_is_rejected_while_runner_is_active(self) -> None:
         service = WorkbenchService(self.repo)
+        handler = create_handler(self.repo, FakeBusyRunner(service))
         server = ThreadingHTTPServer(
             ("127.0.0.1", 0),
-            create_handler(self.repo, FakeBusyRunner(service)),
+            handler,
         )
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -9387,7 +9448,10 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         request = Request(
             base_url + f"/api/batches/{run_id}/actions",
             data=json.dumps({"action": WorkbenchAction.CHECK_CREDENTIALS.value}).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "X-Ozon-Workbench-Token": handler.workbench_auth_token,
+            },
             method="POST",
         )
 
@@ -9417,7 +9481,11 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         self.assertEqual(WorkbenchState.DRAFT_READY.value, self.repo.load_run(run_id)["status"])
 
     def get_json(self, path: str) -> dict:
-        with urlopen(self.base_url + path, timeout=5) as response:
+        request = Request(
+            self.base_url + path,
+            headers={"X-Ozon-Workbench-Token": self.auth_token},
+        )
+        with urlopen(request, timeout=5) as response:
             return json.loads(response.read().decode("utf-8"))
 
     def required_extension_version(self) -> str:
@@ -9457,7 +9525,10 @@ class WorkbenchLocalServerTests(RuntimeTestCase):
         request = Request(
             self.base_url + path,
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "X-Ozon-Workbench-Token": self.auth_token,
+            },
             method="POST",
         )
         try:

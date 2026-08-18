@@ -15,7 +15,22 @@ const chrome = {
   runtime: {
     getManifest() { return { version: "9.8.7" }; },
     onMessage: { addListener() {} },
-    async sendMessage() { return { ok: true }; },
+    async sendMessage(message) {
+      if (message.type !== "ozon_v2_local_api_request") return { ok: true };
+      const request = message.request || {};
+      const path = String(request.path || "");
+      const body = JSON.parse(request.body || "{}");
+      if (path.endsWith("/api/browser-bridge/heartbeat")) heartbeats.push(body);
+      if (path.endsWith("/ozon-collection-progress")) {
+        checkpointRequests.push(body);
+        if (failNextCheckpoint) {
+          failNextCheckpoint = false;
+          return { transport_ok: true, body: { ok: false, code: "checkpoint.failed", message: "checkpoint failed" } };
+        }
+      }
+      if (path.endsWith("/ozon-collection")) finalRequests.push(body);
+      return { transport_ok: true, body: { ok: true, code: "ok", data: {} } };
+    },
   },
 };
 
@@ -61,26 +76,6 @@ const context = vm.createContext({
   document,
   location,
   sessionStorage,
-  fetch: async (url, options = {}) => {
-    if (String(url).endsWith("/api/browser-bridge/heartbeat")) {
-      heartbeats.push(JSON.parse(options.body));
-    }
-    if (String(url).endsWith("/ozon-collection-progress")) {
-      const body = JSON.parse(options.body);
-      checkpointRequests.push(body);
-      if (failNextCheckpoint) {
-        failNextCheckpoint = false;
-        return {
-          ok: false,
-          json: async () => ({ ok: false, code: "checkpoint.failed", message: "checkpoint failed" }),
-        };
-      }
-    }
-    if (String(url).endsWith("/ozon-collection")) {
-      finalRequests.push(JSON.parse(options.body));
-    }
-    return { ok: true, json: async () => ({ ok: true, code: "ok", data: {} }) };
-  },
   setTimeout,
   clearTimeout,
   URL,
@@ -310,7 +305,7 @@ function assertProgress(value, expected) {
 
   heartbeats.length = 0;
   sessionStorage.setItem("ozon_v2_browser_bridge_state", JSON.stringify({
-    schemaVersion: 6,
+    schemaVersion: 7,
     runId: "wb-early-subject-reject",
     taskType: "ozon_collection",
     dispatchToken: "dispatch-early-subject-reject",
@@ -367,7 +362,7 @@ function assertProgress(value, expected) {
 
   heartbeats.length = 0;
   sessionStorage.setItem("ozon_v2_browser_bridge_state", JSON.stringify({
-    schemaVersion: 6,
+    schemaVersion: 7,
     runId: "wb-normal",
     taskType: "ozon_collection",
     dispatchToken: "dispatch-normal",
@@ -416,7 +411,7 @@ function assertProgress(value, expected) {
     attributes: { Material: "Steel" },
   };
   sessionStorage.setItem("ozon_v2_browser_bridge_state", JSON.stringify({
-    schemaVersion: 6,
+    schemaVersion: 7,
     runId: "wb-resume",
     taskType: "ozon_collection",
     dispatchToken: "dispatch-resume",
@@ -464,7 +459,7 @@ function assertProgress(value, expected) {
   checkpointRequests.length = 0;
   const finalCountBeforeFailure = finalRequests.length;
   sessionStorage.setItem("ozon_v2_browser_bridge_state", JSON.stringify({
-    schemaVersion: 6,
+    schemaVersion: 7,
     runId: "wb-checkpoint-failure",
     taskType: "ozon_collection",
     dispatchToken: "dispatch-checkpoint-failure",

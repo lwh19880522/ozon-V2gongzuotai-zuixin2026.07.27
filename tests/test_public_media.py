@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import hashlib
+from io import BytesIO
 from pathlib import Path
 
 import pytest
@@ -8,6 +10,7 @@ import pytest
 from ozon_v2.adapters.public_media import (
     CloudflareQuickTunnelMediaPublisher,
     PublicMediaError,
+    _download_cloudflared,
     _pid_is_alive,
     _tunnel_command,
 )
@@ -86,6 +89,30 @@ def test_quick_tunnel_publisher_copies_media_and_probes_public_urls(
     assert result["items"][0]["content_type"] == "image/png"
 
 
+def test_quick_tunnel_publisher_removes_stale_files_for_same_product(
+    tmp_path: Path,
+) -> None:
+    gateway = _gateway(tmp_path)
+    stale = Path(str(gateway["media_root"])) / "ozon-v2" / "wb-one" / "seed-one" / "stale.png"
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(b"stale")
+    source = tmp_path / "main.png"
+    source.write_bytes(b"reviewed-image")
+    publisher = CloudflareQuickTunnelMediaPublisher(
+        tmp_path,
+        gateway_starter=lambda runtime_root: gateway,
+        public_probe=lambda url, timeout_seconds: None,
+    )
+
+    publisher.publish_product(
+        run_id="wb-one",
+        seed_id="seed-one",
+        source_files=[{"slot_id": "main_01", "path": str(source)}],
+    )
+
+    assert not stale.exists()
+
+
 def test_quick_tunnel_publisher_stops_before_ozon_when_public_probe_fails(
     tmp_path: Path,
 ) -> None:
@@ -136,3 +163,36 @@ def test_quick_tunnel_uses_http2_for_reliable_windows_networks(
     command = _tunnel_command(tmp_path, 8765)
 
     assert command[-2:] == ["--protocol", "http2"]
+
+
+def test_cloudflared_download_uses_pinned_release_and_verifies_sha256(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"verified-cloudflared" + (b"x" * 1_000_000)
+    digest = hashlib.sha256(payload).hexdigest()
+    requested_urls: list[str] = []
+
+    class Response(BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+    def fake_urlopen(request, timeout):
+        requested_urls.append(request.full_url)
+        return Response(payload)
+
+    monkeypatch.setattr("ozon_v2.adapters.public_media.platform.system", lambda: "Windows")
+    monkeypatch.setattr("ozon_v2.adapters.public_media.platform.machine", lambda: "AMD64")
+    monkeypatch.setattr(
+        "ozon_v2.adapters.public_media.CLOUDFLARED_SHA256",
+        {"cloudflared-windows-amd64.exe": digest},
+    )
+    monkeypatch.setattr("ozon_v2.adapters.public_media.urlopen", fake_urlopen)
+
+    executable = _download_cloudflared(tmp_path)
+
+    assert executable.read_bytes() == payload
+    assert "/releases/download/2026.7.2/" in requested_urls[0]

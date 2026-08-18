@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from ozon_v2.adapters.fs_repo import FsRepo
 from ozon_v2.domain.models import ExistingStoreProduct
 from ozon_v2.services.credential_service import CredentialService
@@ -39,6 +41,26 @@ class CredentialAssistantTests(RuntimeTestCase):
         self.assertEqual("client-123", result.data["client_id"])
         self.assertNotIn(secret, str(result.to_dict()))
         self.assertTrue(result.data["api_key_masked"].endswith("cret"))
+        stored_text = repo.credentials_path.read_text(encoding="utf-8")
+        stored = json.loads(stored_text)
+        self.assertNotIn(secret, stored_text)
+        self.assertNotIn("api_key", stored)
+        self.assertIn(stored["protection"], {"windows_dpapi_current_user", "local_file_permissions"})
+        self.assertEqual(secret, repo.load_credentials().api_key)
+
+    def test_plaintext_credentials_are_migrated_on_first_load(self) -> None:
+        repo = FsRepo(self.context)
+        repo.initialize_runtime()
+        secret = "legacy-plaintext-secret"
+        repo.credentials_path.write_text(
+            json.dumps({"client_id": "client-legacy", "api_key": secret}),
+            encoding="utf-8",
+        )
+
+        loaded = repo.load_credentials()
+
+        self.assertEqual(secret, loaded.api_key)
+        self.assertNotIn(secret, repo.credentials_path.read_text(encoding="utf-8"))
 
     def test_bind_store_saves_new_store_authorization_without_echoing_secret(self) -> None:
         repo = FsRepo(self.context)

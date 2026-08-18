@@ -6,7 +6,11 @@ const path = require("path");
 const vm = require("vm");
 
 const listeners = {};
-const stored = { openedTasks: {}, currentRunId: "" };
+const stored = {
+  openedTasks: {},
+  currentRunId: "",
+  workbenchAuthToken: "test-workbench-auth-token-00000000000000000000",
+};
 const tabs = new Map();
 const manifestVersion = "9.8.7";
 const postedPayloads = [];

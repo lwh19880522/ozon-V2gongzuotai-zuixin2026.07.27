@@ -161,7 +161,12 @@ class WorkbenchControlScriptTests(unittest.TestCase):
         request = Request(
             f"http://127.0.0.1:{self.port}/api/runtime/restart",
             data=b"{}",
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "X-Ozon-Workbench-Token": (
+                    self.runtime_dir / "api_auth_token"
+                ).read_text(encoding="utf-8").strip(),
+            },
             method="POST",
         )
         with urlopen(request, timeout=5) as response:
@@ -415,4 +420,3 @@ class WorkbenchControlScriptTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import hmac
 import html
 import json
 import os
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import secrets
 import traceback
 from typing import Any
 from urllib.parse import urlparse
@@ -24,6 +26,66 @@ from ozon_v2.workbench.runtime_capsule import inject_runtime_capsule
 
 
 BRIDGE_HEARTBEAT_TIMEOUT_SECONDS = 90
+WORKBENCH_AUTH_HEADER = "X-Ozon-Workbench-Token"
+WORKBENCH_AUTH_FILENAME = "api_auth_token"
+
+
+def _load_or_create_workbench_auth_token(runtime_dir: Path) -> str:
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    token_path = runtime_dir / WORKBENCH_AUTH_FILENAME
+    try:
+        existing = token_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        existing = ""
+    if len(existing) >= 32:
+        return existing
+
+    token = secrets.token_urlsafe(48)
+    temporary_path = runtime_dir / f".{WORKBENCH_AUTH_FILENAME}.{os.getpid()}.tmp"
+    temporary_path.write_text(token, encoding="utf-8")
+    os.replace(temporary_path, token_path)
+    try:
+        token_path.chmod(0o600)
+    except OSError:
+        pass
+    return token
+
+
+def _inject_workbench_auth_bootstrap(document: str, auth_token: str) -> str:
+    token_attribute = html.escape(auth_token, quote=True)
+    token_json = json.dumps(auth_token)
+    bootstrap = f"""
+  <meta name="ozon-v2-workbench-token" content="{token_attribute}">
+  <script>
+  (() => {{
+    const workbenchToken = {token_json};
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = (input, options = {{}}) => {{
+      const requestUrl = new URL(typeof input === "string" ? input : input.url, window.location.href);
+      if (requestUrl.origin === window.location.origin && requestUrl.pathname.startsWith("/api/")) {{
+        const headers = new Headers(input instanceof Request ? input.headers : undefined);
+        new Headers(options.headers || undefined).forEach((value, name) => headers.set(name, value));
+        headers.set("{WORKBENCH_AUTH_HEADER}", workbenchToken);
+        return nativeFetch(input, {{...options, headers}});
+      }}
+      return nativeFetch(input, options);
+    }};
+  }})();
+  </script>
+"""
+    marker = "</head>"
+    if marker in document:
+        return document.replace(marker, bootstrap + marker, 1)
+    return bootstrap + document
+
+
+def _json_for_inline_script(value: Any) -> str:
+    return (
+        json.dumps(value, ensure_ascii=False)
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+    )
 
 
 def required_extension_version(project_root: Path) -> str | None:
@@ -1258,7 +1320,8 @@ def build_home_html() -> str:
 
 
 def build_supplier_review_html(run_id: str) -> str:
-    safe_run_id = json.dumps(run_id)
+    safe_run_id = _json_for_inline_script(run_id)
+    run_id = html.escape(run_id, quote=True)
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -2514,7 +2577,8 @@ def build_image_generation_command(run_id: str) -> str:
 
 
 def build_image_workspace_html(run_id: str) -> str:
-    safe_run_id = json.dumps(run_id)
+    safe_run_id = _json_for_inline_script(run_id)
+    run_id = html.escape(run_id, quote=True)
     controller_command = build_image_generation_command(run_id)
     controller_command_html = html.escape(controller_command)
     return f"""<!doctype html>
@@ -3005,7 +3069,8 @@ def build_image_workspace_html(run_id: str) -> str:
 
 
 def build_upload_workspace_html(run_id: str) -> str:
-    safe_run_id = json.dumps(run_id)
+    safe_run_id = _json_for_inline_script(run_id)
+    run_id = html.escape(run_id, quote=True)
     content_controller_command = (
         f"Use $ozon-intelligent-field-drafter for Ozon V2 batch {run_id}. "
         "Read and follow the workspace Skill at "
@@ -3625,7 +3690,8 @@ api(`/api/operations/${{pageKey}}`).then(result=>{{const data=result.data||{{}};
 
 
 def build_category_confirmation_html(run_id: str) -> str:
-    run_json = json.dumps(run_id, ensure_ascii=False)
+    run_json = _json_for_inline_script(run_id)
+    run_id = html.escape(run_id, quote=True)
     return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>确认商品类目 - Ozon V2</title>
@@ -3647,6 +3713,7 @@ def create_handler(
     repo: FsRepo | None = None,
     background_runner: WorkbenchBackgroundRunner | None = None,
     runtime_controller: WorkbenchRuntimeController | None = None,
+    request_secret: str | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     selected_repo = repo or FsRepo()
     service = background_runner.service if background_runner is not None else WorkbenchService(selected_repo)
@@ -3656,13 +3723,33 @@ def create_handler(
         service,
         supplier_worker=None,
     )
+    selected_auth_token = request_secret or secrets.token_urlsafe(48)
 
     class WorkbenchRequestHandler(BaseHTTPRequestHandler):
         server_version = "OzonV2Workbench/0.1"
+        workbench_auth_token = selected_auth_token
 
         def do_GET(self) -> None:
+            try:
+                self._handle_GET()
+            except ValueError as exc:
+                self._send_json(
+                    {
+                        "ok": False,
+                        "code": "http.invalid_request",
+                        "message": str(exc),
+                        "errors": [],
+                    },
+                    HTTPStatus.BAD_REQUEST,
+                )
+            except Exception as exc:
+                self._send_internal_error(exc)
+
+        def _handle_GET(self) -> None:
             parsed = urlparse(self.path)
             path = parsed.path.rstrip("/") or "/"
+            if not self._authorize_request(path):
+                return
             if path == "/":
                 self._send_html(build_home_html())
                 return
@@ -3710,6 +3797,7 @@ def create_handler(
                 self._send_js((selected_repo.context.project_root / "scripts" / "ozon_browser_bridge.js").read_text(encoding="utf-8"))
                 return
             parts = self._path_parts(path)
+            self._validate_routed_run_id(parts)
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "diagnostics.zip":
                 archive = diagnostics_exporter.build_current_batch_zip(
                     parts[2],
@@ -3806,8 +3894,21 @@ def create_handler(
             self._send_json({"ok": False, "code": "http.not_found", "message": "Not found.", "errors": []}, HTTPStatus.NOT_FOUND)
 
         def do_POST(self) -> None:
+            path = urlparse(self.path).path.rstrip("/") or "/"
+            if not self._authorize_request(path):
+                return
             try:
                 self._handle_POST()
+            except ValueError as exc:
+                self._send_json(
+                    {
+                        "ok": False,
+                        "code": "http.invalid_request",
+                        "message": str(exc),
+                        "errors": [],
+                    },
+                    HTTPStatus.BAD_REQUEST,
+                )
             except Exception as exc:
                 self._send_internal_error(exc)
 
@@ -4022,6 +4123,7 @@ def create_handler(
                 )
                 return
             parts = self._path_parts(path)
+            self._validate_routed_run_id(parts)
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "actions":
                 if runner.status(parts[2]).get("running"):
                     self._send_result(
@@ -4312,15 +4414,92 @@ def create_handler(
             self._send_json({"ok": False, "code": "http.not_found", "message": "Not found.", "errors": []}, HTTPStatus.NOT_FOUND)
 
         def do_OPTIONS(self) -> None:
-            self.send_response(HTTPStatus.NO_CONTENT)
-            self._send_cors_headers()
-            self.end_headers()
+            self._send_json(
+                {
+                    "ok": False,
+                    "code": "http.cross_origin_forbidden",
+                    "message": "Cross-origin workbench requests are disabled.",
+                    "errors": [],
+                },
+                HTTPStatus.FORBIDDEN,
+            )
 
         def log_message(self, format: str, *args: Any) -> None:
             return
 
         def _path_parts(self, path: str) -> list[str]:
             return [part for part in path.split("/") if part]
+
+        def _validate_routed_run_id(self, parts: list[str]) -> None:
+            if len(parts) >= 2 and parts[0] == "batches":
+                selected_repo.run_dir(parts[1])
+            elif len(parts) >= 3 and parts[:2] in (["api", "batches"], ["api", "runs"]):
+                selected_repo.run_dir(parts[2])
+
+        def _authorize_request(self, path: str) -> bool:
+            if not self._trusted_host():
+                self._send_json(
+                    {
+                        "ok": False,
+                        "code": "http.host_forbidden",
+                        "message": "The workbench only accepts loopback hostnames.",
+                        "errors": [],
+                    },
+                    HTTPStatus.FORBIDDEN,
+                )
+                return False
+            if not self._trusted_origin():
+                self._send_json(
+                    {
+                        "ok": False,
+                        "code": "http.origin_forbidden",
+                        "message": "The request origin is not allowed to control the workbench.",
+                        "errors": [],
+                    },
+                    HTTPStatus.FORBIDDEN,
+                )
+                return False
+            if not path.startswith("/api/") or path == "/api/health":
+                return True
+            supplied = str(self.headers.get(WORKBENCH_AUTH_HEADER) or "")
+            if hmac.compare_digest(supplied, selected_auth_token):
+                return True
+            self._send_json(
+                {
+                    "ok": False,
+                    "code": "http.authentication_required",
+                    "message": "A valid workbench authentication token is required.",
+                    "errors": [],
+                },
+                HTTPStatus.UNAUTHORIZED,
+            )
+            return False
+
+        def _trusted_host(self) -> bool:
+            raw_host = str(self.headers.get("Host") or "").strip()
+            try:
+                parsed_host = urlparse(f"//{raw_host}")
+                hostname = str(parsed_host.hostname or "").lower()
+                port = parsed_host.port
+            except ValueError:
+                return False
+            expected_port = int(self.server.server_address[1])
+            return hostname in {"127.0.0.1", "localhost", "::1"} and port == expected_port
+
+        def _trusted_origin(self) -> bool:
+            raw_origin = str(self.headers.get("Origin") or "").strip()
+            if not raw_origin:
+                return True
+            try:
+                origin = urlparse(raw_origin)
+                origin_port = origin.port
+            except ValueError:
+                return False
+            hostname = str(origin.hostname or "").lower()
+            expected_port = int(self.server.server_address[1])
+            if origin.scheme == "http":
+                return hostname in {"127.0.0.1", "localhost", "::1"} and origin_port == expected_port
+            return origin.scheme == "chrome-extension" and bool(hostname)
 
         def _read_json(self) -> dict[str, Any]:
             length = int(self.headers.get("Content-Length", "0") or "0")
@@ -4716,7 +4895,7 @@ def create_handler(
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(raw)))
-            self._send_cors_headers()
+            self._send_security_headers()
             self.end_headers()
             self.wfile.write(raw)
 
@@ -4726,15 +4905,17 @@ def create_handler(
             self.send_header("Content-Length", str(len(payload)))
             if filename:
                 self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self._send_security_headers()
             self.end_headers()
             self.wfile.write(payload)
 
-        def _send_html(self, html: str) -> None:
-            raw = inject_runtime_capsule(html).encode("utf-8")
+        def _send_html(self, document: str) -> None:
+            authenticated_document = _inject_workbench_auth_bootstrap(document, selected_auth_token)
+            raw = inject_runtime_capsule(authenticated_document).encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(raw)))
-            self._send_cors_headers()
+            self._send_security_headers()
             self.end_headers()
             self.wfile.write(raw)
 
@@ -4742,7 +4923,7 @@ def create_handler(
             self.send_response(HTTPStatus.SEE_OTHER)
             self.send_header("Location", location)
             self.send_header("Content-Length", "0")
-            self._send_cors_headers()
+            self._send_security_headers()
             self.end_headers()
 
         def _send_js(self, script: str) -> None:
@@ -4750,14 +4931,15 @@ def create_handler(
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/javascript; charset=utf-8")
             self.send_header("Content-Length", str(len(raw)))
-            self._send_cors_headers()
+            self._send_security_headers()
             self.end_headers()
             self.wfile.write(raw)
 
-        def _send_cors_headers(self) -> None:
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type")
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        def _send_security_headers(self) -> None:
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
 
     return WorkbenchRequestHandler
 
@@ -4777,7 +4959,11 @@ def make_server(
     )
     server = ThreadingHTTPServer(
         (host, port),
-        create_handler(selected_repo, runtime_controller=runtime_controller),
+        create_handler(
+            selected_repo,
+            runtime_controller=runtime_controller,
+            request_secret=_load_or_create_workbench_auth_token(selected_runtime_dir),
+        ),
     )
     server.runtime_controller = runtime_controller  # type: ignore[attr-defined]
     return server

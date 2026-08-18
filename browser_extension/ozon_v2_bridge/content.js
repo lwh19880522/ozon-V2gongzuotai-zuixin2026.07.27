@@ -1,8 +1,7 @@
 "use strict";
 
-var BASE_URL = "http://127.0.0.1:8765";
 var STATE_KEY = "ozon_v2_browser_bridge_state";
-var STATE_SCHEMA_VERSION = 6;
+var STATE_SCHEMA_VERSION = 7;
 var EXTENSION_VERSION = chrome.runtime.getManifest().version;
 var API_TIMEOUT_MS = Number(globalThis.OZON_V2_API_TIMEOUT_MS) || 15000;
 var activeRunPromise = null;
@@ -21,39 +20,38 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   return false;
 });
 
-function absoluteUrl(path) {
-  return `${BASE_URL}${path}`;
-}
-
 async function api(path, options = {}) {
-  const controller = typeof AbortController === "function" ? new AbortController() : null;
   const timeoutError = new Error(`Workbench request timed out after ${API_TIMEOUT_MS} ms.`);
   let timedOut = false;
   let timeoutId = null;
   const timeoutPromise = new Promise((_resolve, reject) => {
     timeoutId = setTimeout(() => {
       timedOut = true;
-      if (controller) controller.abort(timeoutError);
       reject(timeoutError);
     }, API_TIMEOUT_MS);
   });
   try {
-    const requestOptions = {
-      headers: { "Content-Type": "application/json" },
-      ...options,
-    };
-    if (controller) requestOptions.signal = controller.signal;
     const response = await Promise.race([
-      fetch(absoluteUrl(path), requestOptions),
+      chrome.runtime.sendMessage({
+        type: "ozon_v2_local_api_request",
+        request: {
+          path,
+          method: options.method || "GET",
+          body: options.body,
+        },
+      }),
       timeoutPromise,
     ]);
-    const body = await response.json();
-    if (!response.ok || body.ok === false) {
+    if (!response || response.transport_ok !== true) {
+      throw new Error((response && response.error) || "Ozon V2 bridge API transport failed.");
+    }
+    const body = response.body || {};
+    if (body.ok === false) {
       throw new Error(body.message || body.code || "Ozon V2 bridge API failed.");
     }
     return body;
   } catch (error) {
-    if (timedOut || (controller && controller.signal.aborted)) throw timeoutError;
+    if (timedOut) throw timeoutError;
     throw error;
   } finally {
     if (timeoutId) clearTimeout(timeoutId);
@@ -78,9 +76,8 @@ function sleep(ms) {
 
 async function heartbeat(payload = {}) {
   try {
-    await fetch(absoluteUrl("/api/browser-bridge/heartbeat"), {
+    await api("/api/browser-bridge/heartbeat", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         bridge_id: "ozon_v2_browser_extension",
         source: "ozon_content_script",
@@ -672,16 +669,15 @@ function loadState(runId, taskType, dispatchToken, seeds = []) {
     const matchesTask = state.schemaVersion === STATE_SCHEMA_VERSION
       && state.runId === runId
       && (!taskType || state.taskType === taskType);
-    if (!matchesTask) return null;
-    if (state.dispatchToken === dispatchToken) return state;
-    return null;
+    return matchesTask ? state : null;
   } catch (_) {
     return null;
   }
 }
 
 function saveState(state) {
-  sessionStorage.setItem(STATE_KEY, JSON.stringify({ ...state, schemaVersion: STATE_SCHEMA_VERSION }));
+  const { dispatchToken: _sensitiveToken, ...persistedState } = state;
+  sessionStorage.setItem(STATE_KEY, JSON.stringify({ ...persistedState, schemaVersion: STATE_SCHEMA_VERSION }));
 }
 
 function productIdFromPage(url) {
